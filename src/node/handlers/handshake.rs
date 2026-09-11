@@ -763,10 +763,8 @@ impl Node {
                     if let Some(existing) = self.peers.get_mut(&peer)
                         && let Some(idx) = existing.abandon_rekey()
                     {
-                        if let Some(tid) = existing.transport_id() {
-                            self.peers_by_index.remove(&(tid, idx.as_u32()));
-                            self.pending_outbound.remove(&(tid, idx.as_u32()));
-                        }
+                        self.peers_by_index.remove(&idx.as_u32());
+                        self.pending_outbound.remove(&idx.as_u32());
                         let _ = self.index_allocator.free(idx);
                     }
                 }
@@ -806,21 +804,17 @@ impl Node {
                 // redialed sends only msg1s on its new connection, so nothing
                 // else would move it.
                 let wire_msg2 = build_msg2(our_new_index, wire.their_index, &wire.msg2_payload);
-                let sent = self.answer_msg1(&peer, &packet, &wire_msg2).await;
-                let link_transport = match sent {
-                    Ok(tid) => tid,
-                    Err(e) => {
-                        warn!(
-                            peer = %self.peer_display_name(&peer),
-                            error = %e,
-                            "Failed to send rekey msg2"
-                        );
-                        let _ = self.index_allocator.free(our_new_index);
-                        self.stats_mut()
-                            .record_reject(RejectReason::Handshake(HandshakeReject::BadState));
-                        return;
-                    }
-                };
+                if let Err(e) = self.answer_msg1(&peer, &packet, &wire_msg2).await {
+                    warn!(
+                        peer = %self.peer_display_name(&peer),
+                        error = %e,
+                        "Failed to send rekey msg2"
+                    );
+                    let _ = self.index_allocator.free(our_new_index);
+                    self.stats_mut()
+                        .record_reject(RejectReason::Handshake(HandshakeReject::BadState));
+                    return;
+                }
                 debug!(
                     peer = %self.peer_display_name(&peer),
                     new_our_index = %our_new_index,
@@ -841,12 +835,8 @@ impl Node {
                     existing.record_peer_rekey();
                 }
 
-                // Register new index in peers_by_index, under the transport
-                // the msg2 went out on: the peer's frames on the new session
-                // arrive there, and retirement removes the entry by the
-                // peer's transport, not the one the msg1 came in on.
-                self.peers_by_index
-                    .insert((link_transport, our_new_index.as_u32()), peer);
+                // Register new index in peers_by_index.
+                self.peers_by_index.insert(our_new_index.as_u32(), peer);
 
                 // Do NOT touch addr_to_link — the entry must keep pointing at the
                 // original link so future msg1s from this address are recognized
@@ -1279,7 +1269,7 @@ impl Node {
         };
 
         // Look up our pending handshake by our sender_idx (receiver_idx in msg2)
-        let key = (packet.transport_id, header.receiver_idx.as_u32());
+        let key = header.receiver_idx.as_u32();
         let link_id = match self.pending_outbound.get(&key) {
             Some(id) => *id,
             None => {
@@ -1335,10 +1325,8 @@ impl Node {
                             }
                             peer.set_pending_session(session, our_index, header.sender_idx);
 
-                            if let Some(transport_id) = peer.transport_id() {
-                                self.peers_by_index
-                                    .insert((transport_id, our_index.as_u32()), peer_node_addr);
-                            }
+                            self.peers_by_index
+                                .insert(our_index.as_u32(), peer_node_addr);
 
                             if remote_epoch_changed {
                                 if self.sessions.remove(&peer_node_addr).is_some() {
@@ -1390,9 +1378,7 @@ impl Node {
                                 "Rekey msg2 processing failed"
                             );
                             if let Some(idx) = peer.abandon_rekey() {
-                                if let Some(tid) = peer.transport_id() {
-                                    self.peers_by_index.remove(&(tid, idx.as_u32()));
-                                }
+                                self.peers_by_index.remove(&idx.as_u32());
                                 let _ = self.index_allocator.free(idx);
                             }
                             self.stats_mut()
@@ -1631,14 +1617,12 @@ impl Node {
                     );
 
                     // Update peers_by_index: remove old inbound index, add outbound
-                    let transport_id = peer.transport_id().unwrap();
                     if let Some(old_idx) = old_our_index {
-                        self.peers_by_index
-                            .remove(&(transport_id, old_idx.as_u32()));
+                        self.peers_by_index.remove(&old_idx.as_u32());
                         let _ = self.index_allocator.free(old_idx);
                     }
                     self.peers_by_index
-                        .insert((transport_id, outbound_our_index.as_u32()), peer_node_addr);
+                        .insert(outbound_our_index.as_u32(), peer_node_addr);
 
                     if suppressed > 0 {
                         debug!(
@@ -1878,10 +1862,8 @@ impl Node {
                 let loser_link_id = old_peer.link_id();
 
                 // Clean up old peer's index from peers_by_index
-                if let (Some(old_tid), Some(old_idx)) =
-                    (old_peer.transport_id(), old_peer.our_index())
-                {
-                    self.peers_by_index.remove(&(old_tid, old_idx.as_u32()));
+                if let Some(old_idx) = old_peer.our_index() {
+                    self.peers_by_index.remove(&old_idx.as_u32());
                     // Unregister the OLD cache_key from the decrypt
                     // worker pool BEFORE freeing the index for reuse.
                     // Otherwise the worker's per-shard HashMap retains a
@@ -1892,7 +1874,7 @@ impl Node {
                     // jobs that land at the recycled cache_key resolve
                     // to the wrong session and AEAD silently fails.
                     #[cfg(unix)]
-                    self.unregister_decrypt_worker_session((old_tid, old_idx.as_u32()));
+                    self.unregister_decrypt_worker_session(old_idx.as_u32());
                     let _ = self.index_allocator.free(old_idx);
                 }
 
@@ -1933,7 +1915,7 @@ impl Node {
 
                 self.peers.insert(peer_node_addr, new_peer);
                 self.peers_by_index
-                    .insert((transport_id, our_index.as_u32()), peer_node_addr);
+                    .insert(our_index.as_u32(), peer_node_addr);
                 self.peering
                     .reconciler
                     .retry_pending
@@ -2043,7 +2025,7 @@ impl Node {
 
             self.peers.insert(peer_node_addr, new_peer);
             self.peers_by_index
-                .insert((transport_id, our_index.as_u32()), peer_node_addr);
+                .insert(our_index.as_u32(), peer_node_addr);
             self.peering
                 .reconciler
                 .retry_pending

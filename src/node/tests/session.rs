@@ -1842,7 +1842,7 @@ async fn a_responder_retires_an_unadopted_rekey_and_the_next_rekey_completes() {
         !nodes[1]
             .node
             .peers_by_index
-            .contains_key(&(nodes[1].transport_id, pending_idx.as_u32())),
+            .contains_key(&pending_idx.as_u32()),
         "the retired pending index must be unregistered"
     );
     assert!(
@@ -2672,11 +2672,11 @@ async fn a_rekey_msg2_answers_on_the_peers_established_link_whatever_the_msg1_so
 }
 
 /// A rekey msg1 that arrives on a transport other than the peer's link is
-/// answered on the link, and the pending session's index is registered under
-/// the link's transport: the peer's frames on the new session arrive there,
-/// and retirement removes the entry by the peer's transport.
+/// answered on the link, and the pending session's index is registered. The
+/// index is keyed by session alone, so the peer's frames on the new session
+/// find it whichever transport they arrive on.
 #[tokio::test]
-async fn a_rekey_answered_on_the_established_link_registers_its_index_on_that_transport() {
+async fn a_rekey_answered_on_the_established_link_registers_its_index() {
     use crate::transport::TransportId;
 
     const REKEY_AFTER_SECS: u64 = 60;
@@ -2717,15 +2717,8 @@ async fn a_rekey_answered_on_the_established_link_registers_its_index_on_that_tr
         nodes[1]
             .node
             .peers_by_index
-            .contains_key(&(link_transport, pending_idx.as_u32())),
-        "the pending index must be registered under the link's transport"
-    );
-    assert!(
-        !nodes[1]
-            .node
-            .peers_by_index
-            .contains_key(&(other_transport, pending_idx.as_u32())),
-        "the pending index must not be registered under the msg1's transport"
+            .contains_key(&pending_idx.as_u32()),
+        "the pending index must be registered"
     );
 
     // node 0 completes and cuts over; its first new-epoch frame, on the link,
