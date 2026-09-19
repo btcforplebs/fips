@@ -50,11 +50,12 @@ traffic:
 # A 4-node mesh forms a spanning tree: one root and three nodes
 # with a parent. All six provably-completed archived runs show exactly
 # that, so these are the shape of a converged mesh rather than a
-# tolerance fitted to observations. This is the only assertion covering
-# Ethernet transport anywhere in CI, and it covers the control plane
-# only: traffic is disabled above, so no datagram crosses an Ethernet
-# link in any test. Framing, the length field that trims NIC minimum-
-# frame padding, and AEAD over Ethernet are all unexercised as a result.
+# tolerance fitted to observations. This scenario covers the Ethernet
+# control plane only (beacon discovery, peering, the tree): traffic is
+# disabled above and no datagram is probed here. Data-plane delivery
+# over Ethernet (framing, AEAD over AF_PACKET) is asserted in
+# ethernet-mesh's delivery assertion, and the length field that trims
+# minimum-frame padding by unit tests on the receive loop's parse.
 assertions:
   baseline:
     min_nodes_reporting: 4

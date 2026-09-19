@@ -105,7 +105,10 @@ Explicit topologies exercising non-UDP transports.
 - **ethernet-only**: 4-node ring on raw Ethernet (AF_PACKET). Peers discovered
   via beacons, not static config. Minimal netem (1-5ms delay).
 - **ethernet-mesh**: Mirrors `tcp-mesh` topology but with Ethernet instead of
-  TCP. UDP edges use static config; Ethernet edges use beacon discovery.
+  TCP. UDP edges use static config; Ethernet edges use beacon discovery. The
+  only scenario that asserts datagram delivery over Ethernet: its `delivery`
+  assertion pings to and from n04, whose only edges are Ethernet, at two
+  payload sizes, and checks that n04 has no peer on another transport.
 - **tcp-mesh**: 6-node mesh with 4 UDP and 3 TCP edges. Both transports use
   static peer config. Netem mutation (30% fraction, every 20-40s) and link
   flaps (1 link max, 10-20s down).
@@ -257,6 +260,23 @@ logging:
 The assertion thresholds in the shipped file are calibrated against
 recorded runs at the invocation CI uses, and the file's own comments say
 what they were derived from. Read those before retuning them.
+
+A `delivery` assertion checks the data plane rather than the tree. It runs
+at teardown, after flapped links and stopped nodes are restored, and pings
+each pair at each payload size until `min_replies` replies arrive or
+`deadline_secs` passes:
+
+```yaml
+assertions:
+  delivery:
+    pairs: [[n04, n06], [n06, n04]]   # [src, dst] node ids
+    payload_bytes: [0, 1200]          # ICMPv6 echo payload sizes, 0-1400
+    min_replies: 3                    # default 3
+    deadline_secs: 60                 # default 60, per pair and size
+    require_transport: ethernet       # optional, with transport_node:
+    transport_node: n04               # fail if n04 has no peers, or any
+                                      # peer on another transport
+```
 
 ## Topology Algorithms
 

@@ -302,6 +302,32 @@ class CongestionSignalsAssertion:
 
 
 @dataclass
+class DeliveryAssertion:
+    """Datagrams of each size must be delivered between each node pair.
+
+    The probe runs at teardown, after every flapped link and stopped node
+    has been restored. For each pair and payload size it repeats a
+    one-packet ping6 over the mesh until ``min_replies`` replies have come
+    back or ``deadline_secs`` has passed. The verdict is binary per pair
+    and size, not a loss ratio, so a busy host slows the probe without
+    failing it.
+
+    ``require_transport`` with ``transport_node`` proves the probes
+    crossed that transport: the node's peers are read before and after
+    the probe, and the assertion fails if the node has no peers or any
+    peer on another transport. Choose a node whose only edges use that
+    transport and put it in every pair.
+    """
+
+    pairs: list[tuple[str, str]] = field(default_factory=list)
+    payload_bytes: list[int] = field(default_factory=list)
+    min_replies: int = 3
+    deadline_secs: int = 60
+    require_transport: str | None = None
+    transport_node: str | None = None
+
+
+@dataclass
 class MaxErrorsAssertion:
     """Ceiling on ERROR-level lines across every node's log.
 
@@ -334,6 +360,7 @@ class AssertionsConfig:
     congestion_signals: CongestionSignalsAssertion | None = None
     tree_parents: TreeParentsAssertion | None = None
     baseline: BaselineAssertion | None = None
+    delivery: DeliveryAssertion | None = None
 
 
 @dataclass
@@ -414,6 +441,7 @@ _SECTION_KEYS = {
     "assertions": {
         "bloom_send_rate", "min_parent_switches", "max_parent_switches",
         "max_errors", "congestion_signals", "tree_parents", "baseline",
+        "delivery",
     },
     "logging": {"rust_log", "output_dir"},
 }
@@ -428,7 +456,14 @@ _ASSERTION_KEYS = {
     "baseline": {
         "min_nodes_reporting", "max_roots", "min_nodes_parented", "min_sessions",
     },
+    "delivery": {
+        "pairs", "payload_bytes", "min_replies", "deadline_secs",
+        "require_transport", "transport_node",
+    },
 }
+# Largest delivery probe payload: an ICMPv6 echo of this size fits the
+# 1280-byte TUN MTU with FIPS overhead to spare.
+_DELIVERY_MAX_PAYLOAD = 1400
 _NETEM_POLICY_KEYS = {
     "delay_ms", "jitter_ms", "loss_pct", "duplicate_pct", "reorder_pct",
     "corrupt_pct",
@@ -776,6 +811,10 @@ def load_scenario(path: str) -> Scenario:
                 "min_nodes_ce_received); a block with none asserts nothing"
             )
         s.assertions.congestion_signals = CongestionSignalsAssertion(**floors)
+    if "delivery" in asrt:
+        s.assertions.delivery = _parse_delivery(
+            asrt["delivery"], s.topology.num_nodes
+        )
     if "tree_parents" in asrt:
         tp = asrt["tree_parents"]
         if not isinstance(tp, dict) or not tp:
@@ -859,6 +898,106 @@ def load_scenario(path: str) -> Scenario:
     _validate(s)
 
     return s
+
+
+def _delivery_node(val, num_nodes: int, where: str) -> str:
+    """Validate one node id named by the delivery assertion."""
+    if not isinstance(val, str) or not _NODE_ID_RE.fullmatch(val):
+        raise ValueError(
+            f"assertions.delivery.{where}: {val!r} is not a node id of the "
+            f"form 'n04'"
+        )
+    idx = int(val[1:])
+    if idx < 1 or idx > num_nodes:
+        raise ValueError(
+            f"assertions.delivery.{where}: '{val}' is outside this "
+            f"scenario's {num_nodes} nodes"
+        )
+    return val
+
+
+def _delivery_int(dl: dict, key: str, default: int) -> int:
+    """Read a positive integer setting of the delivery assertion."""
+    val = dl.get(key, default)
+    if isinstance(val, bool) or not isinstance(val, int) or val < 1:
+        raise ValueError(
+            f"assertions.delivery.{key}: must be a positive integer, got {val!r}"
+        )
+    return val
+
+
+def _parse_delivery(dl, num_nodes: int) -> DeliveryAssertion:
+    """Parse and validate the delivery assertion block."""
+    if not isinstance(dl, dict):
+        raise ValueError("assertions.delivery: must be a mapping")
+    _reject_unknown(dl, _ASSERTION_KEYS["delivery"], "assertions.delivery")
+
+    raw_pairs = dl.get("pairs")
+    if not isinstance(raw_pairs, list) or not raw_pairs:
+        raise ValueError(
+            "assertions.delivery.pairs: give at least one [src, dst] pair; "
+            "an empty list asserts nothing"
+        )
+    pairs = []
+    for pair in raw_pairs:
+        if not isinstance(pair, list) or len(pair) != 2:
+            raise ValueError(
+                f"assertions.delivery.pairs: each entry must be [src, dst], "
+                f"got {pair!r}"
+            )
+        src = _delivery_node(pair[0], num_nodes, "pairs")
+        dst = _delivery_node(pair[1], num_nodes, "pairs")
+        if src == dst:
+            raise ValueError(
+                f"assertions.delivery.pairs: [{src}, {dst}] pings a node from "
+                f"itself, which crosses no link"
+            )
+        pairs.append((src, dst))
+
+    sizes = dl.get("payload_bytes")
+    if not isinstance(sizes, list) or not sizes:
+        raise ValueError(
+            "assertions.delivery.payload_bytes: give at least one size; an "
+            "empty list asserts nothing"
+        )
+    for size in sizes:
+        if (isinstance(size, bool) or not isinstance(size, int)
+                or not 0 <= size <= _DELIVERY_MAX_PAYLOAD):
+            raise ValueError(
+                f"assertions.delivery.payload_bytes: each size must be an "
+                f"integer from 0 to {_DELIVERY_MAX_PAYLOAD}, got {size!r}"
+            )
+
+    transport = dl.get("require_transport")
+    node = dl.get("transport_node")
+    if (transport is None) != (node is None):
+        raise ValueError(
+            "assertions.delivery: require_transport and transport_node go "
+            "together; one without the other proves nothing"
+        )
+    if transport is not None:
+        if transport not in VALID_TRANSPORTS:
+            raise ValueError(
+                f"assertions.delivery.require_transport: {transport!r} is not "
+                f"one of {', '.join(VALID_TRANSPORTS)}"
+            )
+        node = _delivery_node(node, num_nodes, "transport_node")
+        missing = [p for p in pairs if node not in p]
+        if missing:
+            raise ValueError(
+                f"assertions.delivery: pairs {missing} do not include "
+                f"transport_node '{node}', so the transport check says "
+                f"nothing about them"
+            )
+
+    return DeliveryAssertion(
+        pairs=pairs,
+        payload_bytes=list(sizes),
+        min_replies=_delivery_int(dl, "min_replies", 3),
+        deadline_secs=_delivery_int(dl, "deadline_secs", 60),
+        require_transport=transport,
+        transport_node=node,
+    )
 
 
 _SUPPRESSING_LOG_LEVELS = ("off", "error", "warn")

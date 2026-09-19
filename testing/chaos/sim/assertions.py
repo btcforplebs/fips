@@ -10,6 +10,15 @@ Currently supported assertions:
 - ``bloom_send_rate``: per-node trailing-window ceiling on
   ``stats.bloom.sent`` delta. Calibrated for the bloom-storm
   regression scenario but generally usable.
+- ``min_parent_switches`` / ``max_parent_switches``: bounds on the
+  parent switches counted from the node logs.
+- ``max_errors``: ceiling on ERROR-level log lines (applied by default).
+- ``baseline``: the mesh formed, agreed on a root and took parents.
+- ``tree_parents``: named nodes ended with the named parents.
+- ``congestion_signals``: floors on how many nodes saw each congestion
+  counter.
+- ``delivery``: datagrams of each configured size were delivered
+  between node pairs, optionally proven to cross one transport.
 """
 
 from __future__ import annotations
@@ -22,6 +31,7 @@ from .scenario import (
     BaselineAssertion,
     BloomSendRateAssertion,
     CongestionSignalsAssertion,
+    DeliveryAssertion,
     MaxErrorsAssertion,
     MaxParentSwitchesAssertion,
     MinParentSwitchesAssertion,
@@ -367,6 +377,92 @@ def evaluate_congestion_signals(
         name="congestion_signals",
         passed=True,
         detail=f"PASS congestion_signals: {summary}",
+    )
+
+
+_TRANSPORT_LABEL = {"ethernet": "Ethernet", "udp": "UDP", "tcp": "TCP"}
+
+
+def _transport_failure(transport: dict) -> str | None:
+    """Return why the transport proof failed, or None when it holds."""
+    node, want = transport["node"], transport["want"]
+    for read in transport["reads"]:
+        when, peers = read["when"], read["peers"]
+        if peers is None:
+            return (
+                f"traversal unproven: show_peers on {node} failed {when} the "
+                f"probe"
+            )
+        if not peers:
+            return (
+                f"traversal unproven: {node} reported zero peers {when} the "
+                f"probe, after waiting {read['waited_s']:.0f}s"
+            )
+        other = [
+            f"{str(p.get('npub', '?'))[:16]} via "
+            f"{p.get('transport_type', 'no transport_type')}"
+            for p in peers if p.get("transport_type") != want
+        ]
+        if other:
+            return (
+                f"{node} has a non-{_TRANSPORT_LABEL.get(want, want)} peer "
+                f"{when} the probe ({'; '.join(other)}), so a probe to or "
+                f"from it may not have crossed {want}"
+            )
+    return None
+
+
+def evaluate_delivery(
+    cfg: DeliveryAssertion,
+    probe: dict | None,
+) -> AssertionOutcome:
+    """Every configured pair and size got ``min_replies`` replies in time.
+
+    ``probe`` is the runner's delivery probe result. None means the probe
+    never ran, which fails as a harness failure: no probe and no delivery
+    would otherwise look alike.
+    """
+    if probe is None:
+        return AssertionOutcome(
+            name="delivery",
+            passed=False,
+            detail=(
+                "FAIL delivery: the delivery probe never ran, so nothing was "
+                "observed. This is a harness failure, not a statement about "
+                "delivery."
+            ),
+        )
+
+    failures = []
+    transport = probe.get("transport")
+    if transport is not None:
+        why = _transport_failure(transport)
+        if why:
+            failures.append(why)
+
+    parts = []
+    for r in probe["results"]:
+        label = f"{r['src']}->{r['dst']} {r['size']}B"
+        if r["replies"] >= cfg.min_replies:
+            parts.append(f"{label} {r['replies']}/{r['attempts']} in {r['elapsed_s']:.1f}s")
+        else:
+            failures.append(
+                f"{label} got {r['replies']} of {cfg.min_replies} replies in "
+                f"{r['elapsed_s']:.0f}s ({r['attempts']} attempts); last ping: "
+                f"{r['last_output']!r}"
+            )
+
+    if failures:
+        return AssertionOutcome(
+            name="delivery",
+            passed=False,
+            detail=f"FAIL delivery: {'; '.join(failures)}",
+        )
+    via = f" via {transport['want']} ({transport['node']})" if transport else ""
+    return AssertionOutcome(
+        name="delivery",
+        passed=True,
+        detail=f"PASS delivery{via}: {'; '.join(parts)}",
     )
 
 
