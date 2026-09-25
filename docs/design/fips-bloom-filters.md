@@ -201,13 +201,53 @@ there is no incremental update.
 
 ### Update Triggers
 
-Filter updates are event-driven, not periodic:
+New filter content is sent only on these events, never periodically:
 
 - Peer connects (new filter includes the new peer's reachability)
 - Peer disconnects (filter must exclude the departed peer's entries)
 - A peer's inbound filter changes (outbound filters to other peers must
   be recomputed)
 - Local state changes (new identity, leaf-only dependent changes)
+
+The one timed send is the resend of an announce that was not confirmed
+delivered. The transport accepting a FilterAnnounce does not mean the peer
+received it: a datagram can be lost, or a link can go down for less than
+the dead timeout without the peer being removed. Each announce therefore
+stays outstanding until the link's ordinary MMP ReceiverReports show that
+every link frame up to and including the announce's counter arrived. No
+new message or field is involved.
+
+A report covering the announce is compared with the report the announce
+was sent after, its base. Between them the peer counted `got` frames, of
+which `sure` arrived in counter order. A frame that arrived after a higher
+counter is a reorder, and it can be one of the window's frames or a late
+frame from before the base, so the frames of the window number between
+`sure` and `got`. The announce is lost when `got` is below the number of
+counters the window holds, and delivered when `sure` equals it, or when
+`got` equals it and the base has no holes. A base has no holes when
+nothing had been reported yet in the peer's first session, or when it is a
+first-session report that counted exactly its highest counter plus one
+frame. After a rekey the peer's cumulative count includes earlier
+sessions, so no base can be shown to have no holes. Any other pair is no
+evidence, and the 30 s fallback below covers the announce.
+
+An unconfirmed announce is resent:
+
+- on a report that covers it and shows fewer frames arrived than were
+  sent;
+- once, when the reports cannot check it (sent before the session's first
+  usable report, carried over a rekey, or a report left over from the
+  previous session), as soon as a usable report arrives, or after 30 s if
+  none does. A usable report that does not yet cover an announce sent in
+  the current session becomes the base it is checked against instead.
+
+A report whose highest counter is at or above the next counter the current
+session will use describes another session and is ignored. Each announce
+gets at most one unchecked resend and three loss resends per session, and
+a per-peer backoff spaces resends 1, 2, 4 ... s apart up to 60 s until
+120 s pass with none, so a peer connection sees at most six resends in a
+minute and one a minute while losses persist. A resend of content the
+peer already holds changes nothing there, so it propagates no further.
 
 ### Rate Limiting
 
@@ -241,7 +281,9 @@ property of the data structure). Entries are expired through:
 - **Implicit timeout**: If a peer becomes unresponsive, the MMP link
   liveness detector eventually declares the link dead and removes the
   peer, which triggers filter cleanup as a side effect of peer removal.
-  There is no independent filter staleness timer.
+  There is no independent filter staleness timer; the only timer is the
+  30 s fallback that resends an announce the receiver reports cannot
+  confirm (see Update Triggers).
 
 ## Membership Test
 
