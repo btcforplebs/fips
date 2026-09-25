@@ -360,6 +360,17 @@ impl MmpMetrics {
         self.prev_rr_ecn_ce
     }
 
+    /// Cumulative counters of the last accepted ReceiverReport: highest counter,
+    /// packets received and reorder count. `None` until a report is accepted in
+    /// the current session.
+    pub fn rr_counters(&self) -> Option<(u64, u64, u32)> {
+        self.has_prev_rr.then_some((
+            self.prev_rr_highest_counter,
+            self.prev_rr_cum_packets,
+            self.prev_rr_reorder,
+        ))
+    }
+
     /// ReceiverReports processed, including stale and duplicate ones.
     pub fn reports_seen(&self) -> u64 {
         self.reports_seen
