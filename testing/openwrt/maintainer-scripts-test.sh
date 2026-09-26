@@ -34,7 +34,11 @@ fi
 # The .apk wraps the shared bodies for its upgrade path. package-test.sh builds
 # the package on the host with the real build-apk.sh, checks what it registers,
 # and leaves the four scripts here so the scenarios run exactly what ships.
-APK_DIR="$(mktemp -d)" || { echo "openwrt-scripts: mktemp failed" >&2; exit 2; }
+# The directory is bind-mounted into the container, so it must be one the docker
+# daemon can see: under the checkout, not /tmp, which a service running with a
+# private /tmp (as the CI workers do) does not share with the daemon.
+mkdir -p "$PROJECT_ROOT/target" || { echo "openwrt-scripts: cannot create target/" >&2; exit 2; }
+APK_DIR="$(mktemp -d "$PROJECT_ROOT/target/openwrt-apk.XXXXXX")" || { echo "openwrt-scripts: mktemp failed" >&2; exit 2; }
 trap 'rm -rf "$APK_DIR"' EXIT
 bash "$SCRIPT_DIR/package-test.sh" --keep "$APK_DIR"
 rc=$?
