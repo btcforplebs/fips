@@ -192,6 +192,71 @@ print(devs.pop())
 ' "$@"
 }
 
+# How many mappings have mesh_addr $1, from a show_mappings response. Fails
+# on an error response or one without a mappings list, so a failed query
+# cannot read as zero mappings.
+server_mapped() {
+    python3 -c '
+import ipaddress, json, sys
+want = ipaddress.ip_address(sys.argv[1])
+try:
+    r = json.load(sys.stdin)
+except ValueError:
+    sys.exit(1)
+if not isinstance(r, dict) or r.get("status") != "ok":
+    sys.exit(1)
+data = r.get("data")
+if not isinstance(data, dict) or not isinstance(data.get("mappings"), list):
+    sys.exit(1)
+hits = 0
+for m in data["mappings"]:
+    try:
+        if ipaddress.ip_address(m["mesh_addr"]) == want:
+            hits += 1
+    except (KeyError, TypeError, ValueError):
+        sys.exit(1)
+print(hits)
+' "$@"
+}
+
+# The reply destination of the conntrack entries for PROTO $1 to port $2, from
+# `conntrack -L -f ipv6`. Of each line's two tuples the first is the original
+# direction and the second the reply, so the reply destination is the second
+# dst=. It shows which rule rewrote the flow's source: the gateway's LAN
+# address for the LAN masquerade, a pool address for a mapping's SNAT, or the
+# sender's own address for no rewrite. Fails when no entry matches or the
+# matching entries disagree.
+reply_dst() {
+    python3 -c '
+import ipaddress, sys
+proto, dport = sys.argv[1], sys.argv[2]
+found = set()
+for line in sys.stdin:
+    f = line.split()
+    if not f or f[0] != proto:
+        continue
+    dports = [t[6:] for t in f if t.startswith("dport=")]
+    dsts = [t[4:] for t in f if t.startswith("dst=")]
+    if not dports or dports[0] != dport:
+        continue
+    try:
+        found.add(ipaddress.ip_address(dsts[1]))
+    except (IndexError, ValueError):
+        sys.exit(1)
+if len(found) != 1:
+    sys.exit(1)
+print(found.pop())
+' "$@"
+}
+
+# Succeeds when $1 and $2 are the same IPv6 address in any written form.
+same_addr() {
+    python3 -c '
+import ipaddress, sys
+sys.exit(0 if ipaddress.ip_address(sys.argv[1]) == ipaddress.ip_address(sys.argv[2]) else 1)
+' "$@"
+}
+
 # ── Reader self-test ─────────────────────────────────────────────────────
 
 # Run one reader on a canned input and compare its status and output with
@@ -210,9 +275,12 @@ gw_case() {
     return 1
 }
 
-# Feed every reader canned tool output and check its answers. The inputs
-# follow each tool's printed format; the ip -o addr lines follow a capture,
-# the others are written from the tools' documented formats.
+# Feed every reader canned tool output and check its answers. The ip -o addr
+# lines follow a capture. The ip -6 neigh show proxy and conntrack -L lines
+# are verbatim output of those tools from gateway suite runs on 2026-09-23
+# and 2026-09-26; an input that needs two situations at once joins lines
+# from different runs. The nft, show_gateway and show_mappings inputs are
+# written from the documented formats.
 gw_selftest() {
     local fails=0
     local addr_eth0 addr_eth1 addr_claimed addr_at nft_lan nft_nolan
@@ -269,12 +337,56 @@ gw_selftest() {
     gw_case "masq_iface: no LAN masquerade" 1 "" "$nft_nolan" masq_iface || fails=$((fails + 1))
     gw_case "masq_iface: empty input" 1 "" "" masq_iface || fails=$((fails + 1))
 
+    # Captured lines: one run's entries were on eth0 and a wrong-interface
+    # run's on eth1. The mixed inputs join lines from the two captures, since
+    # no single run holds entries on both devices.
+    local nd_one0='fd01::1 dev eth0 proxy ' nd_one1='fd01::1 dev eth1 proxy '
+    local nd_two1='fd01::2 dev eth1 proxy '
+    gw_case "proxy_dev: captured entries on eth0" 0 eth0 \
+        $'fd01::1 dev eth0 proxy \nfd01::2 dev eth0 proxy ' proxy_dev fd01::1 || fails=$((fails + 1))
     gw_case "proxy_dev: entry on eth0 after another on eth1" 0 eth0 \
-        $'fd01::2 dev eth1  proxy\nfd01::1 dev eth0  proxy' proxy_dev fd01::1 || fails=$((fails + 1))
-    gw_case "proxy_dev: no entry" 1 "" 'fd01::2 dev eth1  proxy' proxy_dev fd01::1 || fails=$((fails + 1))
+        "$nd_two1"$'\n'"$nd_one0" proxy_dev fd01::1 || fails=$((fails + 1))
+    gw_case "proxy_dev: no entry" 1 "" "$nd_two1" proxy_dev fd01::1 || fails=$((fails + 1))
     gw_case "proxy_dev: empty input" 1 "" "" proxy_dev fd01::1 || fails=$((fails + 1))
     gw_case "proxy_dev: entry on two devices" 1 "" \
-        $'fd01::1 dev eth0  proxy\nfd01::1 dev eth1  proxy' proxy_dev fd01::1 || fails=$((fails + 1))
+        "$nd_one0"$'\n'"$nd_one1" proxy_dev fd01::1 || fails=$((fails + 1))
+
+    local maps_one
+    maps_one='{"status":"ok","data":{"mappings":[{"virtual_ip":"fd01::1","mesh_addr":"fd3c:9a51:7e02:4b18::2","node_addr":"0a1b2c3d4e5f60718293a4b5c6d7e8f9","dns_name":"npub1example.fips","state":"active","sessions":0,"age_secs":3,"last_ref_secs":3}]}}'
+    gw_case "server_mapped: one mapping to the server" 0 1 "$maps_one" \
+        server_mapped fd3c:9a51:7e02:4b18:0:0:0:2 || fails=$((fails + 1))
+    gw_case "server_mapped: a mapping to another node" 0 0 "$maps_one" \
+        server_mapped fd3c:9a51:7e02:4b18::3 || fails=$((fails + 1))
+    gw_case "server_mapped: no mappings" 0 0 '{"status":"ok","data":{"mappings":[]}}' \
+        server_mapped fd3c:9a51:7e02:4b18::2 || fails=$((fails + 1))
+    gw_case "server_mapped: error response" 1 "" '{"status":"error","message":"gateway not yet initialized"}' \
+        server_mapped fd3c:9a51:7e02:4b18::2 || fails=$((fails + 1))
+    gw_case "server_mapped: ok response without data" 1 "" '{"status":"ok"}' \
+        server_mapped fd3c:9a51:7e02:4b18::2 || fails=$((fails + 1))
+    gw_case "server_mapped: empty input" 1 "" "" server_mapped fd3c:9a51:7e02:4b18::2 || fails=$((fails + 1))
+
+    # Captured lines. ct_masq is one healthy run's whole table after the
+    # probes; ct_snat is a mapping's SNAT entry and ct_unreplied a
+    # wrong-interface run's entry, whose reply tuple is not rewritten.
+    # ct_other is one line of ct_masq, and ct_split joins the SNAT line with
+    # a masquerade line, since no single run holds both for one port.
+    local srv=fda3:bc52:6504:aa72:71ca:376a:9249:ef0c
+    local ct_masq ct_snat ct_unreplied ct_other ct_split ct_masq80
+    ct_masq80='tcp      6 119 TIME_WAIT src=fda3:bc52:6504:aa72:71ca:376a:9249:ef0c dst=fd8d:4f49:3df7:6e1d:171e:c08d:f45f:97f3 sport=48192 dport=18080 src=fd02::20 dst=fd02::10 sport=8080 dport=48192 [ASSURED] mark=0 use=1'
+    ct_other='tcp      6 119 TIME_WAIT src=fda3:bc52:6504:aa72:71ca:376a:9249:ef0c dst=fd8d:4f49:3df7:6e1d:171e:c08d:f45f:97f3 sport=48486 dport=18082 src=fd02::20 dst=fd02::10 sport=8081 dport=48486 [ASSURED] mark=0 use=1'
+    ct_masq='udp      17 29 src=fda3:bc52:6504:aa72:71ca:376a:9249:ef0c dst=fd8d:4f49:3df7:6e1d:171e:c08d:f45f:97f3 sport=57965 dport=18081 src=fd02::20 dst=fd02::10 sport=8081 dport=57965 mark=0 use=1'$'\n'"$ct_masq80"$'\n'"$ct_other"
+    ct_snat='tcp      6 119 TIME_WAIT src=fda3:bc52:6504:aa72:71ca:376a:9249:ef0c dst=fd8d:4f49:3df7:6e1d:171e:c08d:f45f:97f3 sport=48130 dport=18080 src=fd02::20 dst=fd01::1 sport=8080 dport=48130 [ASSURED] mark=0 use=1'
+    ct_unreplied='udp      17 24 src=fda3:bc52:6504:aa72:71ca:376a:9249:ef0c dst=fd8d:4f49:3df7:6e1d:171e:c08d:f45f:97f3 sport=57286 dport=18081 [UNREPLIED] src=fd02:0:0:1::20 dst=fda3:bc52:6504:aa72:71ca:376a:9249:ef0c sport=8081 dport=57286 mark=0 use=1'
+    ct_split="$ct_snat"$'\n'"$ct_masq80"
+    gw_case "reply_dst: masquerade" 0 fd02::10 "$ct_masq" reply_dst tcp 18080 || fails=$((fails + 1))
+    gw_case "reply_dst: mapping SNAT" 0 fd01::1 "$ct_snat" reply_dst tcp 18080 || fails=$((fails + 1))
+    gw_case "reply_dst: udp, replied" 0 fd02::10 "$ct_masq" reply_dst udp 18081 || fails=$((fails + 1))
+    gw_case "reply_dst: udp, unreplied, no rewrite" 0 "$srv" "$ct_unreplied" reply_dst udp 18081 || fails=$((fails + 1))
+    gw_case "reply_dst: only another port's entry" 1 "" "$ct_other" reply_dst tcp 18080 || fails=$((fails + 1))
+    gw_case "reply_dst: empty input" 1 "" "" reply_dst tcp 18080 || fails=$((fails + 1))
+    gw_case "reply_dst: entries disagree" 1 "" "$ct_split" reply_dst tcp 18080 || fails=$((fails + 1))
+    gw_case "same_addr: two forms of one address" 0 "" "" same_addr fd02:0:0:0::10 fd02::10 || fails=$((fails + 1))
+    gw_case "same_addr: different addresses" 1 "" "" same_addr fd01::1 fd02::10 || fails=$((fails + 1))
 
     echo "  selftest: $fails case(s) failed"
     if [ "$fails" -eq 0 ]; then
@@ -604,18 +716,21 @@ else
     check "Proxy NDP entry for '$VIRTUAL_IP' on the LAN interface '$LAN_IF' (none found once)" 1
 fi
 
-# Phase 7: Inbound port forwarding — UDP and a second simultaneous TCP forward.
+# Phase 7: Inbound port-forward rules — UDP and a second simultaneous TCP
+# forward.
 #
-# Three forwards exercised:
+# Three forwards configured:
 #   tcp 18080 → [fd02::20]:8080  (original — single TCP rule)
 #   tcp 18082 → [fd02::20]:8081  (6B — second TCP rule, multiple forwards)
 #   udp 18081 → [fd02::20]:8081  (6A — UDP DNAT runtime path)
 #
-# Mesh peer (gw-server) hits each gw-gateway fips0:<port> rule, which
-# DNATs into the LAN-side gw-client. Exercises the DNAT rules + LAN-side
-# masquerade installed by set_port_forwards().
+# Checks the DNAT rules and the LAN-side masquerade that set_port_forwards()
+# installs. The traffic through them is Phase 8b's: while the Phase 4
+# mapping to gw-server is live, its SNAT rule matches gw-server's inbound
+# flows before the LAN masquerade does, so probes sent here would pass
+# without the masquerade.
 echo ""
-echo "Phase 7: Inbound port forwards"
+echo "Phase 7: Inbound port-forward rules"
 
 # Confirm all three port-forward DNAT rules are present on the gateway.
 # The distinctive listen ports identify our rules regardless of how nft
@@ -647,104 +762,6 @@ if [ -n "$LAN_IF" ] && MASQ_IF=$(masq_iface <<< "$NFT_RULES"); then
 else
     check "LAN masquerade on the LAN interface '$LAN_IF' (no single LAN masquerade rule)" 1
 fi
-
-# Start marker HTTP servers on the LAN-side client.
-#   :8080 → "inbound-forward-ok"   (target of tcp 18080)
-#   :8081 → "inbound-forward-ok-2" (target of tcp 18082)
-# `docker exec -d` is required; `docker exec bash -c 'cmd &'` doesn't
-# keep the child alive past the exec session, even with nohup.
-docker exec "$CLIENT" sh -c '
-    mkdir -p /tmp/inbound /tmp/inbound2
-    echo "inbound-forward-ok"   > /tmp/inbound/index.html
-    echo "inbound-forward-ok-2" > /tmp/inbound2/index.html
-    pkill -f "http.server 8080" 2>/dev/null || true
-    pkill -f "http.server 8081" 2>/dev/null || true
-    pkill -f "udp_echo.py" 2>/dev/null || true
-' >/dev/null 2>&1 || true
-docker exec -d "$CLIENT" python3 -m http.server 8080 --bind :: --directory /tmp/inbound \
-    >/dev/null 2>&1 || true
-docker exec -d "$CLIENT" python3 -m http.server 8081 --bind :: --directory /tmp/inbound2 \
-    >/dev/null 2>&1 || true
-
-# Start a UDP echo server on the LAN-side client at [::]:8081/udp.
-# This is the target of the udp 18081 forward. Stash the script as a
-# named file (`udp_echo.py`) so the cleanup pkill above can find it.
-docker exec "$CLIENT" sh -c 'cat > /tmp/udp_echo.py <<'\''PYEOF'\''
-import socket, sys
-s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
-s.bind(("::", 8081))
-while True:
-    data, addr = s.recvfrom(2048)
-    s.sendto(b"udp-forward-ok:" + data, addr)
-PYEOF' >/dev/null 2>&1 || true
-docker exec -d "$CLIENT" python3 /tmp/udp_echo.py >/dev/null 2>&1 || true
-
-# Give the servers a moment to bind.
-for _ in 1 2 3 4 5; do
-    TCP_READY=$(docker exec "$CLIENT" ss -6lnt 2>/dev/null | grep -cE ':8080|:8081' || true)
-    UDP_READY=$(docker exec "$CLIENT" ss -6lnu 2>/dev/null | grep -c ':8081' || true)
-    if [ "$TCP_READY" -ge 2 ] && [ "$UDP_READY" -ge 1 ]; then
-        break
-    fi
-    sleep 1
-done
-
-# Derive the gateway's mesh IPv6 (fd00::/8 address assigned to fips0).
-GW_MESH_IP=$(docker exec "$GATEWAY" bash -c \
-    "ip -6 -o addr show fips0 | awk '/inet6 fd/ {print \$4}' | cut -d/ -f1 | head -1" \
-    2>/dev/null || echo "")
-
-if [ -z "$GW_MESH_IP" ]; then
-    check "Gateway fips0 IPv6 address" 1
-else
-    echo "  Gateway mesh IPv6: $GW_MESH_IP"
-
-    # From the mesh side (gw-server), fetch through each TCP forward.
-    FWD_RESPONSE=$(docker exec "$SERVER" curl -6 -s --max-time 10 \
-        "http://[${GW_MESH_IP}]:18080/" 2>&1) || true
-    # 8080 backend serves "inbound-forward-ok" (no -2 suffix) — distinct
-    # from the 8081 backend so a misrouted response would be detectable.
-    if echo "$FWD_RESPONSE" | grep -qE '^inbound-forward-ok$'; then
-        check "Inbound HTTP via TCP forward 18080 → [${GW_CLIENT_LAN}]:8080" 0
-    else
-        check "Inbound HTTP via TCP forward 18080 (response: '${FWD_RESPONSE:0:80}')" 1
-    fi
-
-    FWD_RESPONSE_2=$(docker exec "$SERVER" curl -6 -s --max-time 10 \
-        "http://[${GW_MESH_IP}]:18082/" 2>&1) || true
-    if echo "$FWD_RESPONSE_2" | grep -q "inbound-forward-ok-2"; then
-        check "Inbound HTTP via TCP forward 18082 → [${GW_CLIENT_LAN}]:8081 (6B)" 0
-    else
-        check "Inbound HTTP via TCP forward 18082 (response: '${FWD_RESPONSE_2:0:80}')" 1
-    fi
-
-    # 6A: UDP forward. Send a probe via a one-shot Python client on
-    # gw-server; the LAN-side echo server prepends "udp-forward-ok:".
-    UDP_RESPONSE=$(docker exec "$SERVER" python3 -c "
-import socket, sys
-s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
-s.settimeout(5)
-s.sendto(b'ping-via-udp-fwd', ('${GW_MESH_IP}', 18081))
-try:
-    data, _ = s.recvfrom(2048)
-    sys.stdout.write(data.decode('utf-8', 'replace'))
-except Exception as e:
-    sys.stdout.write('ERR: ' + str(e))
-" 2>&1) || true
-    if echo "$UDP_RESPONSE" | grep -q "udp-forward-ok:ping-via-udp-fwd"; then
-        check "Inbound UDP via forward 18081 → [${GW_CLIENT_LAN}]:8081 (6A)" 0
-    else
-        check "Inbound UDP via forward 18081 (response: '${UDP_RESPONSE:0:80}')" 1
-    fi
-fi
-
-# Cleanup: stop the LAN-side responders so Phase 8's pool-reclamation
-# wait isn't interfered with by lingering sessions.
-docker exec "$CLIENT" sh -c '
-    pkill -f "http.server 8080" 2>/dev/null || true
-    pkill -f "http.server 8081" 2>/dev/null || true
-    pkill -f "udp_echo.py" 2>/dev/null || true
-' >/dev/null 2>&1 || true
 
 # Phase 8: TTL expiration and pool reclamation
 echo ""
@@ -782,6 +799,171 @@ if [ "$MAPPING_COUNT" = "0" ]; then
     check "Mapping reclaimed after TTL+grace" 0
 else
     check "Mapping reclaimed (count: $MAPPING_COUNT)" 1
+fi
+
+# Phase 8b: Inbound port forwards through the LAN masquerade
+#
+# Mesh peer (gw-server) hits each gw-gateway fips0:<port> rule, which DNATs
+# into the LAN-side gw-client, and the LAN masquerade rewrites the source to
+# the gateway's LAN address. Runs after Phase 8 has reclaimed the mapping to
+# gw-server, because a live mapping's SNAT rule matches the same flows first
+# and would do the rewrite instead. Runs before Phase 9 kills the daemon.
+#
+# The gate reads both the control socket's mappings, a snapshot refreshed
+# on the pool tick, and the kernel's table, which is what decides the rule
+# that matches. A zero SNAT count needs a successful listing; Phase 11 reads
+# the same pattern expecting one rule per mapping.
+echo ""
+echo "Phase 8b: Inbound port forwards through the LAN masquerade"
+SERVER_MESH=$(docker exec "$SERVER" bash -c \
+    "ip -6 -o addr show fips0 | awk '/inet6 fd/ {print \$4}' | cut -d/ -f1 | head -1" \
+    2>/dev/null || echo "")
+if [ -n "$SERVER_MESH" ] && SERVER_MAPS=$(docker exec "$GATEWAY" bash -c \
+    'echo "{\"command\":\"show_mappings\"}" | nc -U -w1 /run/fips/gateway.sock 2>/dev/null' \
+    | server_mapped "$SERVER_MESH"); then
+    :
+else
+    SERVER_MAPS=error
+fi
+GATE_NFT_RC=0
+GATE_NFT=$(docker exec "$GATEWAY" nft list table inet fips_gateway 2>&1) || GATE_NFT_RC=$?
+GATE_SNAT=$(grep -cE "saddr [0-9a-f:]+ .*snat" <<< "$GATE_NFT" || true)
+GATE_VALUES="server mesh '$SERVER_MESH', mappings to it $SERVER_MAPS, nft rc $GATE_NFT_RC, SNAT rules $GATE_SNAT"
+if [ -n "$SERVER_MESH" ] && [ "$SERVER_MAPS" = "0" ] && [ "$GATE_NFT_RC" -eq 0 ] && [ "$GATE_SNAT" -eq 0 ]; then
+    check "No mapping or SNAT rule to $SERVER before the probes ($GATE_VALUES)" 0
+    GATE_OK=true
+else
+    check "No mapping or SNAT rule to $SERVER before the probes ($GATE_VALUES)" 1
+    GATE_OK=false
+fi
+
+if [ "$GATE_OK" = true ]; then
+    # Start marker HTTP servers on the LAN-side client.
+    #   :8080 → "inbound-forward-ok"   (target of tcp 18080)
+    #   :8081 → "inbound-forward-ok-2" (target of tcp 18082)
+    # `docker exec -d` is required; `docker exec bash -c 'cmd &'` doesn't
+    # keep the child alive past the exec session, even with nohup.
+    docker exec "$CLIENT" sh -c '
+        mkdir -p /tmp/inbound /tmp/inbound2
+        echo "inbound-forward-ok"   > /tmp/inbound/index.html
+        echo "inbound-forward-ok-2" > /tmp/inbound2/index.html
+        pkill -f "http.server 8080" 2>/dev/null || true
+        pkill -f "http.server 8081" 2>/dev/null || true
+        pkill -f "udp_echo.py" 2>/dev/null || true
+    ' >/dev/null 2>&1 || true
+    docker exec -d "$CLIENT" python3 -m http.server 8080 --bind :: --directory /tmp/inbound \
+        >/dev/null 2>&1 || true
+    docker exec -d "$CLIENT" python3 -m http.server 8081 --bind :: --directory /tmp/inbound2 \
+        >/dev/null 2>&1 || true
+
+    # Start a UDP echo server on the LAN-side client at [::]:8081/udp.
+    # This is the target of the udp 18081 forward. Stash the script as a
+    # named file (`udp_echo.py`) so the cleanup pkill above can find it.
+    docker exec "$CLIENT" sh -c 'cat > /tmp/udp_echo.py <<'\''PYEOF'\''
+import socket, sys
+s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+s.bind(("::", 8081))
+while True:
+    data, addr = s.recvfrom(2048)
+    s.sendto(b"udp-forward-ok:" + data, addr)
+PYEOF' >/dev/null 2>&1 || true
+    docker exec -d "$CLIENT" python3 /tmp/udp_echo.py >/dev/null 2>&1 || true
+
+    # Give the servers a moment to bind.
+    for _ in 1 2 3 4 5; do
+        TCP_READY=$(docker exec "$CLIENT" ss -6lnt 2>/dev/null | grep -cE ':8080|:8081' || true)
+        UDP_READY=$(docker exec "$CLIENT" ss -6lnu 2>/dev/null | grep -c ':8081' || true)
+        if [ "$TCP_READY" -ge 2 ] && [ "$UDP_READY" -ge 1 ]; then
+            break
+        fi
+        sleep 1
+    done
+
+    # Derive the gateway's mesh IPv6 (fd00::/8 address assigned to fips0).
+    GW_MESH_IP=$(docker exec "$GATEWAY" bash -c \
+        "ip -6 -o addr show fips0 | awk '/inet6 fd/ {print \$4}' | cut -d/ -f1 | head -1" \
+        2>/dev/null || echo "")
+
+    if [ -z "$GW_MESH_IP" ]; then
+        check "Gateway fips0 IPv6 address" 1
+    else
+        echo "  Gateway mesh IPv6: $GW_MESH_IP"
+
+        # From the mesh side (gw-server), fetch through each TCP forward.
+        FWD_RESPONSE=$(docker exec "$SERVER" curl -6 -s --max-time 10 \
+            "http://[${GW_MESH_IP}]:18080/" 2>&1) || true
+        # 8080 backend serves "inbound-forward-ok" (no -2 suffix) — distinct
+        # from the 8081 backend so a misrouted response would be detectable.
+        if echo "$FWD_RESPONSE" | grep -qE '^inbound-forward-ok$'; then
+            check "Inbound HTTP via TCP forward 18080 → [${GW_CLIENT_LAN}]:8080" 0
+        else
+            check "Inbound HTTP via TCP forward 18080 (response: '${FWD_RESPONSE:0:80}')" 1
+        fi
+
+        FWD_RESPONSE_2=$(docker exec "$SERVER" curl -6 -s --max-time 10 \
+            "http://[${GW_MESH_IP}]:18082/" 2>&1) || true
+        if echo "$FWD_RESPONSE_2" | grep -q "inbound-forward-ok-2"; then
+            check "Inbound HTTP via TCP forward 18082 → [${GW_CLIENT_LAN}]:8081 (6B)" 0
+        else
+            check "Inbound HTTP via TCP forward 18082 (response: '${FWD_RESPONSE_2:0:80}')" 1
+        fi
+
+        # 6A: UDP forward. Send a probe via a one-shot Python client on
+        # gw-server; the LAN-side echo server prepends "udp-forward-ok:".
+        UDP_RESPONSE=$(docker exec "$SERVER" python3 -c "
+import socket, sys
+s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+s.settimeout(5)
+s.sendto(b'ping-via-udp-fwd', ('${GW_MESH_IP}', 18081))
+try:
+    data, _ = s.recvfrom(2048)
+    sys.stdout.write(data.decode('utf-8', 'replace'))
+except Exception as e:
+    sys.stdout.write('ERR: ' + str(e))
+" 2>&1) || true
+        if echo "$UDP_RESPONSE" | grep -q "udp-forward-ok:ping-via-udp-fwd"; then
+            check "Inbound UDP via forward 18081 → [${GW_CLIENT_LAN}]:8081 (6A)" 0
+        else
+            check "Inbound UDP via forward 18081 (response: '${UDP_RESPONSE:0:80}')" 1
+        fi
+    fi
+
+    # A response shows only that some rule rewrote the flow. The reply
+    # destination in the gateway's conntrack entry shows which: the LAN
+    # masquerade sends the reply to the gateway's LAN address, a mapping's
+    # SNAT to a pool address, and no rewrite to gw-server's mesh address.
+    # conntrack lists the reply tuple of an unreplied entry too.
+    if CT_TABLE=$(docker exec "$GATEWAY" conntrack -L -f ipv6 2>/dev/null); then
+        CT_OK=true
+    else
+        CT_OK=false
+        CT_TABLE=""
+    fi
+    for fwd in tcp:18080 tcp:18082 udp:18081; do
+        fwd_proto="${fwd%%:*}"
+        fwd_port="${fwd#*:}"
+        found=""
+        if [ "$CT_OK" = true ] && found=$(reply_dst "$fwd_proto" "$fwd_port" <<< "$CT_TABLE") \
+            && same_addr "$found" "$GW_DNS"; then
+            check "Reply to $fwd_proto $fwd_port goes to $found, the gateway's LAN address $GW_DNS" 0
+        else
+            check "Reply to $fwd_proto $fwd_port goes to '$found' (conntrack read $CT_OK), expected the gateway's LAN address $GW_DNS" 1
+        fi
+    done
+
+    # Stop the LAN-side responders; no later phase uses them.
+    docker exec "$CLIENT" sh -c '
+        pkill -f "http.server 8080" 2>/dev/null || true
+        pkill -f "http.server 8081" 2>/dev/null || true
+        pkill -f "udp_echo.py" 2>/dev/null || true
+    ' >/dev/null 2>&1 || true
+else
+    check "Inbound HTTP via TCP forward 18080 (skipped: gate)" 1
+    check "Inbound HTTP via TCP forward 18082 (skipped: gate)" 1
+    check "Inbound UDP via forward 18081 (skipped: gate)" 1
+    check "Reply to tcp 18080 goes to the gateway's LAN address (skipped: gate)" 1
+    check "Reply to tcp 18082 goes to the gateway's LAN address (skipped: gate)" 1
+    check "Reply to udp 18081 goes to the gateway's LAN address (skipped: gate)" 1
 fi
 
 # Phase 9: SERVFAIL when daemon DNS is down
