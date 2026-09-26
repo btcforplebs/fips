@@ -27,6 +27,7 @@ mod session;
 mod spanning_tree;
 mod tcp;
 mod unit;
+mod update_peers;
 
 pub(super) fn make_node() -> Node {
     make_node_with(Config::new())

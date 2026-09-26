@@ -8,17 +8,19 @@
 //!
 //! # Canonical Arc-wrapper template
 //!
-//! These resources follow a single-writer / many-reader pattern: the node
-//! tick task is the only writer, while the hot path reads the current value
-//! frequently and must never block.
+//! These resources follow a single-writer / many-reader pattern: every write
+//! goes through `&mut Node`, from the node tick task or from
+//! `Node::update_peers`, so there is one writer at a time, while the hot path
+//! reads the current value frequently and must never block.
 //!
 //! - The reader-facing immutable snapshot lives in an
 //!   [`arc_swap::ArcSwap<T>`]. Readers call [`Reloadable::load`], which yields
 //!   a lock-free [`arc_swap::Guard<Arc<T>>`] that derefs straight to the
 //!   snapshot — no mutex, no clone on the read path.
 //! - The owning struct also holds the change-detection state (file mtime,
-//!   immutable base data, source path). That state is touched only by
-//!   [`Reloadable::reload`], which runs on the single writer task.
+//!   base data, source path). That state is touched only by
+//!   [`Reloadable::reload`] and, for the host map's peer-alias base, by
+//!   `HostMapReloadable::set_base`, both reached only through `&mut Node`.
 //! - `reload` builds a brand-new `T` and then stores `Arc::new(new)` into the
 //!   `ArcSwap`, so a reader either sees the entire old snapshot or the entire
 //!   new one — never a partial update.
@@ -92,16 +94,20 @@ pub trait Reloadable: Send {
 /// Reloadable hostname → npub map (base peer aliases merged with the operator
 /// hosts file).
 ///
-/// Holds the immutable base map (from peer-config aliases) plus the
-/// change-detection state for the hosts file. The effective map (base merged
+/// Holds the base map (from peer-config aliases, replaced when the peer list
+/// is replaced at runtime) plus the change-detection state for the hosts
+/// file. The effective map (base merged
 /// with the hosts file) is published through an [`arc_swap::ArcSwap`] so the
 /// display path can read it without locking.
 pub struct HostMapReloadable {
     /// Reader-facing effective snapshot (base merged with hosts file).
     snapshot: arc_swap::ArcSwap<HostMap>,
-    /// Base map from peer-config aliases (never changes). Read only by
-    /// `reload` on the tick task.
+    /// Base map from peer-config aliases. Read by `reload` and replaced by
+    /// `set_base`, both reached only through `&mut Node`.
     base: HostMap,
+    /// The hosts file as last read, kept so a new base can be merged under
+    /// it without reading the file again. Written by `new` and `reload`.
+    file: HostMap,
     /// Path to the operator hosts file. Read only by `reload`.
     path: std::path::PathBuf,
     /// Last observed modification time of the hosts file (`None` if absent).
@@ -118,14 +124,28 @@ impl HostMapReloadable {
         let last_mtime = file_mtime(&path);
         let hosts_file = HostMap::load_hosts_file(&path);
         let mut effective = base.clone();
-        effective.merge(hosts_file);
+        effective.merge(hosts_file.clone());
 
         Self {
             snapshot: arc_swap::ArcSwap::from(Arc::new(effective)),
             base,
+            file: hosts_file,
             path,
             last_mtime,
         }
+    }
+
+    /// Replace the peer-alias base and publish it merged with the hosts file
+    /// as last read, which still wins on conflicts.
+    ///
+    /// Reads no file and leaves the recorded mtime alone. Like `reload`, it is
+    /// reached only through `&mut Node`, which keeps one writer at a time;
+    /// readers see either the whole old snapshot or the whole new one.
+    pub(crate) fn set_base(&mut self, base: HostMap) {
+        let mut effective = base.clone();
+        effective.merge(self.file.clone());
+        self.base = base;
+        self.snapshot.store(Arc::new(effective));
     }
 }
 
@@ -143,7 +163,8 @@ impl Reloadable for HostMapReloadable {
         self.last_mtime = current_mtime;
         let hosts_file = HostMap::load_hosts_file(&self.path);
         let mut new_effective = self.base.clone();
-        new_effective.merge(hosts_file);
+        new_effective.merge(hosts_file.clone());
+        self.file = hosts_file;
 
         let count = new_effective.len();
         self.snapshot.store(Arc::new(new_effective));
@@ -328,5 +349,52 @@ mod tests {
         for key in ["core", "gateway"] {
             assert_eq!(snapshot.lookup_npub(key), expected.lookup_npub(key));
         }
+    }
+
+    /// Build a one-entry host map.
+    fn one_entry(name: &str, id: &Identity) -> HostMap {
+        let mut map = HostMap::new();
+        map.insert(name, &id.npub()).unwrap();
+        map
+    }
+
+    /// Replacing the base swaps the peer aliases while the hosts file, as it
+    /// was last re-read at runtime, stays merged on top and still wins.
+    #[tokio::test]
+    async fn set_base_replaces_peer_aliases_and_keeps_the_last_reloaded_hosts_file_on_top() {
+        let [x, y, z, v, w] = std::array::from_fn(|_| Identity::generate());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hosts");
+        std::fs::write(&path, format!("f {}\na {}\n", y.npub(), z.npub())).unwrap();
+
+        let mut reloadable = HostMapReloadable::new(one_entry("a", &x), path.clone());
+        let npub = |r: &HostMapReloadable, name: &str| r.load().lookup_npub(name).map(String::from);
+        assert_eq!(npub(&reloadable, "f"), Some(y.npub()), "startup file entry");
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(&path, format!("g {}\na {}\n", v.npub(), z.npub())).unwrap();
+        assert!(reloadable.reload().await, "reload sees the rewrite");
+        reloadable.set_base(one_entry("b", &w));
+
+        assert_eq!(npub(&reloadable, "b"), Some(w.npub()), "new base alias");
+        assert_eq!(
+            npub(&reloadable, "g"),
+            Some(v.npub()),
+            "file entry added at runtime survives set_base"
+        );
+        assert_eq!(npub(&reloadable, "a"), Some(z.npub()), "file still wins");
+        assert_eq!(
+            npub(&reloadable, "f"),
+            None,
+            "file entry removed at runtime stays removed"
+        );
+        let x_addr = *crate::PeerIdentity::from_npub(&x.npub())
+            .unwrap()
+            .node_addr();
+        assert_eq!(
+            reloadable.load().lookup_hostname(&x_addr),
+            None,
+            "old base npub no longer reverse-resolves"
+        );
     }
 }

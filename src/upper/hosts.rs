@@ -222,12 +222,17 @@ pub fn file_mtime(path: &Path) -> Option<SystemTime> {
 
 /// Tracks a hosts file and reloads it when the modification time changes.
 ///
-/// Holds the base host map (from peer config aliases) and the current
-/// effective map (base + hosts file). On each `check_reload()`, stats the
-/// hosts file and rebuilds the effective map if the mtime has changed.
+/// Holds the base host map (from peer config aliases), the hosts file as last
+/// read, and the current effective map (base + hosts file). On each
+/// `check_reload()`, stats the hosts file and rebuilds the effective map if
+/// the mtime has changed. The base is replaced when the node's peer list is
+/// replaced at runtime.
 pub struct HostMapReloader {
-    /// Base map from peer config aliases (never changes).
+    /// Base map from peer config aliases, replaced by `set_base`.
     base: HostMap,
+    /// The hosts file as last applied, kept so a new base can be merged under
+    /// it without reading the file again.
+    file: HostMap,
     /// Current effective map (base merged with hosts file).
     effective: HostMap,
     /// Path to the hosts file.
@@ -252,10 +257,11 @@ impl HostMapReloader {
             }
         };
         let mut effective = base.clone();
-        effective.merge(hosts_file);
+        effective.merge(hosts_file.clone());
 
         Self {
             base,
+            file: hosts_file,
             effective,
             path,
             last_mtime,
@@ -307,11 +313,24 @@ impl HostMapReloader {
         Ok(true)
     }
 
+    /// Replace the peer-alias base and rebuild the effective map over the
+    /// hosts file as last read, which still wins on conflicts.
+    ///
+    /// Reads no file and leaves the recorded mtime alone, so a hosts-file
+    /// change is still picked up by the next reload check.
+    pub(crate) fn set_base(&mut self, base: HostMap) {
+        let mut effective = base.clone();
+        effective.merge(self.file.clone());
+        self.base = base;
+        self.effective = effective;
+    }
+
     /// Replace the effective map with the base merged with a freshly read
-    /// hosts file.
+    /// hosts file, and keep that file as the one last applied.
     fn apply(&mut self, hosts_file: HostMap) {
         let mut new_effective = self.base.clone();
-        new_effective.merge(hosts_file);
+        new_effective.merge(hosts_file.clone());
+        self.file = hosts_file;
 
         let count = new_effective.len();
         self.effective = new_effective;
@@ -762,5 +781,70 @@ mod tests {
         assert_eq!(reloader.hosts().len(), 1);
         assert!(reloader.hosts().lookup_npub("core").is_some());
         assert!(reloader.hosts().lookup_npub("gateway").is_none());
+    }
+
+    /// Build a one-entry host map.
+    fn one_entry(name: &str, id: &Identity) -> HostMap {
+        let mut map = HostMap::new();
+        map.insert(name, &id.npub()).unwrap();
+        map
+    }
+
+    /// Replacing the base swaps the peer aliases while the hosts file, as it
+    /// was last re-read at runtime through either reload path, stays merged on
+    /// top and still wins on conflicts.
+    #[test]
+    fn set_base_replaces_peer_aliases_and_keeps_the_last_reloaded_hosts_file_on_top() {
+        let [x, y, z, v, w, u, t] = std::array::from_fn(|_| Identity::generate());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hosts");
+        std::fs::write(&path, format!("f {}\na {}\n", y.npub(), z.npub())).unwrap();
+
+        let mut reloader = HostMapReloader::new(one_entry("a", &x), path.clone());
+        let npub = |r: &HostMapReloader, name: &str| r.hosts().lookup_npub(name).map(String::from);
+        assert_eq!(npub(&reloader, "f"), Some(y.npub()), "startup file entry");
+
+        // Step 1: the file changes at runtime and is re-read by check_reload.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(&path, format!("g {}\na {}\n", v.npub(), z.npub())).unwrap();
+        assert!(reloader.check_reload(), "check_reload sees the rewrite");
+        reloader.set_base(one_entry("b", &w));
+        assert_eq!(npub(&reloader, "b"), Some(w.npub()), "new base alias");
+        assert_eq!(
+            npub(&reloader, "g"),
+            Some(v.npub()),
+            "file entry added at runtime survives set_base"
+        );
+        assert_eq!(npub(&reloader, "a"), Some(z.npub()), "file still wins");
+        assert_eq!(
+            npub(&reloader, "f"),
+            None,
+            "file entry removed at runtime stays removed"
+        );
+        let x_addr = *PeerIdentity::from_npub(&x.npub()).unwrap().node_addr();
+        assert_eq!(
+            reloader.hosts().lookup_hostname(&x_addr),
+            None,
+            "old base npub no longer reverse-resolves"
+        );
+
+        // Step 2: the file changes again and is re-read by try_check_reload.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(&path, format!("h {}\na {}\n", u.npub(), z.npub())).unwrap();
+        assert!(
+            reloader.try_check_reload().unwrap(),
+            "try_check_reload sees the rewrite"
+        );
+        reloader.set_base(one_entry("c", &t));
+        assert_eq!(npub(&reloader, "c"), Some(t.npub()), "second base alias");
+        assert_eq!(
+            npub(&reloader, "h"),
+            Some(u.npub()),
+            "file entry re-read by try_check_reload survives set_base"
+        );
+        assert_eq!(npub(&reloader, "a"), Some(z.npub()), "file still wins");
+        for gone in ["g", "f", "b"] {
+            assert_eq!(npub(&reloader, gone), None, "{gone} no longer resolves");
+        }
     }
 }
