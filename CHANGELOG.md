@@ -360,6 +360,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   four script bodies live in `packaging/openwrt-ipk/scripts/` instead of inside
   heredocs in the two build scripts, so the scenarios in `testing/openwrt/` run
   what ships.
+- An `apk` upgrade on OpenWrt 25 now restarts `fips`, and restarts
+  `fips-gateway` if it was enabled, so the new binaries run without a reboot.
+  apk-tools v3 runs only the incoming package's pre-upgrade and post-upgrade
+  scripts, and the `.apk` registered neither, so an upgrade replaced the files
+  on disk and left the old processes running until a reboot or a manual
+  restart.
+- The packages no longer ship `/etc/dnsmasq.d/fips.conf`. OpenWrt's dnsmasq
+  builds its config from UCI and never reads that directory; `.fips`
+  forwarding has always come from the UCI server entry, which is unchanged. An
+  opkg upgrade removes the old file, and an apk upgrade keeps it only if it
+  was modified. Either way nothing reads it.
+- The package README's upgrade commands and default settings are corrected.
+  It now gives the `apk add` command for OpenWrt 25, where there is no opkg,
+  and for OpenWrt 24.10 and earlier a plain `opkg install` in place of
+  `--force-reinstall`, which removed and reinstalled the package and so left
+  `fips-gateway` disabled. Its description of the default config now matches
+  the shipped `fips.yaml`.
 
 #### Packaging (Debian)
 
