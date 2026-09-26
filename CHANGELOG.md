@@ -118,6 +118,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cleanly, and a peer whose send failed is retried after a shorter fixed
   interval instead. That retry interval gates only a peer whose last attempt
   failed, so it cannot clamp a `heartbeat_interval_secs` configured below it.
+- Replacing the peer list at runtime with `Node::update_peers` now updates
+  everything that reads peer aliases. `.fips` names, peer ACL entries written as
+  an alias, and peer display names kept following the aliases the node started
+  with, so a new peer's alias did not resolve, a removed one still did, and a
+  deny entry naming an alias moved to another key kept denying the old key and
+  admitted the new one. They now follow the new peer list, with the hosts file
+  still taking precedence as it does at startup.
 
 #### Routing and discovery
 
@@ -129,6 +136,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   child's stayed advertised, until some unrelated change. The re-announce fires
   only when that relation flips and only to peers whose filter actually
   changed, so ordinary tree churn does not multiply announce traffic.
+- A bloom filter announce lost on the link is now resent. A node counted an
+  announce as delivered once the transport accepted it, and announces go out
+  only when a filter changes, so a dropped datagram or a link outage shorter
+  than the dead timeout left the peer holding the old filter until something
+  else changed, and destinations could stay missing from discovery. The node
+  now confirms each announce from the link's existing receiver reports,
+  resends when they show a loss, and resends once after 30 seconds when the
+  reports cannot confirm it. Resends over one peer connection are limited to
+  six a minute, and to one a minute while losses persist.
 
 #### Session setup
 
