@@ -170,7 +170,24 @@ pub async fn run_dns_responder(
     socket: tokio::net::UdpSocket,
     identity_tx: DnsIdentityTx,
     ttl: u32,
+    reloader: HostMapReloader,
+    mesh_ifindex: Option<u32>,
+) {
+    run_responder(socket, identity_tx, ttl, reloader, None, mesh_ifindex).await
+}
+
+/// Run the DNS responder UDP server loop, taking peer-alias base updates.
+///
+/// Behaves as [`run_dns_responder`], and in addition, when `aliases` is
+/// `Some`, applies the newest peer-alias base sent on it before answering
+/// each query, so aliases follow the node's peer list when it is replaced
+/// at runtime. The hosts file stays merged over the new base and still wins.
+pub(crate) async fn run_responder(
+    socket: tokio::net::UdpSocket,
+    identity_tx: DnsIdentityTx,
+    ttl: u32,
     mut reloader: HostMapReloader,
+    mut aliases: Option<tokio::sync::watch::Receiver<HostMap>>,
     mesh_ifindex: Option<u32>,
 ) {
     let mut buf = [0u8; 512]; // Standard DNS UDP max
@@ -195,8 +212,9 @@ pub async fn run_dns_responder(
 
         let query_bytes = &buf[..len];
 
-        // Check for hosts file changes on each request (cheap stat call)
-        reloader.check_reload();
+        // Apply any new peer-alias base, then check for hosts file changes
+        // (cheap stat call).
+        refresh_hosts(&mut reloader, aliases.as_mut());
 
         match handle_dns_packet(query_bytes, ttl, reloader.hosts()) {
             Some((response_bytes, identity)) => {
@@ -217,6 +235,29 @@ pub async fn run_dns_responder(
             }
         }
     }
+}
+
+/// Bring the responder's host map up to date before answering a query.
+///
+/// Applies the newest peer-alias base from `aliases` if it has not been seen
+/// yet, then re-reads the hosts file if its mtime changed. The change test is
+/// made on the borrowed value rather than the receiver, so a value sent just
+/// before the sender closed is still applied.
+fn refresh_hosts(
+    reloader: &mut HostMapReloader,
+    aliases: Option<&mut tokio::sync::watch::Receiver<HostMap>>,
+) {
+    if let Some(rx) = aliases {
+        // Take the value out so the watch lock is released before the merge.
+        let next = {
+            let seen = rx.borrow_and_update();
+            seen.has_changed().then(|| seen.clone())
+        };
+        if let Some(base) = next {
+            reloader.set_base(base);
+        }
+    }
+    reloader.check_reload();
 }
 
 /// Receive a UDP datagram with arrival-interface info via `IPV6_PKTINFO`.
@@ -939,5 +980,43 @@ mod tests {
         );
         packet.questions.push(question);
         packet.build_bytes_vec().unwrap()
+    }
+
+    /// Build a one-entry host map.
+    fn one_entry(name: &str, id: &Identity) -> HostMap {
+        let mut map = HostMap::new();
+        map.insert(name, &id.npub()).unwrap();
+        map
+    }
+
+    /// A base sent on the alias channel is applied before the next answer,
+    /// and is kept once the sender is gone.
+    #[test]
+    fn refresh_hosts_applies_the_latest_base_before_answering() {
+        let (x, y) = (Identity::generate(), Identity::generate());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("absent-hosts");
+        let npub = |r: &HostMapReloader| r.hosts().lookup_npub("a").map(String::from);
+
+        let mut reloader = HostMapReloader::new(one_entry("a", &x), path.clone());
+        let (tx, mut rx) = tokio::sync::watch::channel(one_entry("a", &x));
+        tx.send_replace(one_entry("a", &y));
+        refresh_hosts(&mut reloader, Some(&mut rx));
+        assert_eq!(npub(&reloader), Some(y.npub()), "new base applied");
+        drop(tx);
+        refresh_hosts(&mut reloader, Some(&mut rx));
+        assert_eq!(npub(&reloader), Some(y.npub()), "base kept after close");
+
+        // A value sent just before the sender closed is still applied.
+        let mut reloader = HostMapReloader::new(one_entry("a", &x), path);
+        let (tx, mut rx) = tokio::sync::watch::channel(one_entry("a", &x));
+        tx.send_replace(one_entry("a", &y));
+        drop(tx);
+        refresh_hosts(&mut reloader, Some(&mut rx));
+        assert_eq!(
+            npub(&reloader),
+            Some(y.npub()),
+            "pending base applied although the sender is closed"
+        );
     }
 }

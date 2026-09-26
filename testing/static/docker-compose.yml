@@ -419,14 +419,18 @@ services:
     profiles: ["gateway"]
     container_name: fips-gw-gateway${FIPS_CI_NAME_SUFFIX:-}
     hostname: gw-gateway
-    # Privileged required: gateway must enable IPv6 on eth1 (second network,
-    # attached after container start) and manage nftables NAT rules.
+    # Privileged required: gateway must enable IPv6 on the LAN interface
+    # (Docker may attach it after container start) and manage nftables NAT
+    # rules.
     privileged: true
     environment:
       # Debug for the NAT rebuild and pool tick timing lines only; the
       # gateway's --log-level is ignored while RUST_LOG is set.
       - RUST_LOG=info,fips::gateway::nat=debug,fips_gateway=debug
       - FIPS_TEST_MODE=gateway
+      # The entrypoint names the interface holding this address as the
+      # gateway's LAN interface; it must match ipv6_address below.
+      - FIPS_GW_LAN_ADDR=${FIPS_GW_LAN6_PREFIX:-fd02}::10
     sysctls:
       - net.ipv6.conf.all.disable_ipv6=0
       - net.ipv6.conf.default.disable_ipv6=0

@@ -28,7 +28,8 @@ jobs:
   # namcap in an Arch container (neither tool exists on ubuntu-latest) and builds
   # the *checked-out tree* from a local git-archive tarball, so it works for
   # branch/PR builds and unreleased rc tags whose GitHub source archive does not
-  # exist yet. This job never publishes.
+  # exist yet. The lint fails the job on namcap error-level (E:) findings;
+  # warnings (W:) are advisory. This job never publishes.
   # ───────────────────────────────────────────────────────────────────────────
   aur-build:
     name: Build and lint fips AUR package
@@ -48,6 +49,11 @@ jobs:
         # run here, on every trigger, so a change to the gate is exercised
         # before a release tag depends on it.
         run: bash packaging/aur/test-await-package-runs.sh
+
+      - name: Test the namcap gate
+        # Fixture tests, with canned namcap output, for the script the lint
+        # below runs namcap through.
+        run: bash packaging/aur/test-namcap-gate.sh
 
       - name: Resolve package version
         id: ver
@@ -88,6 +94,13 @@ jobs:
           # The checkout is owned by root; hand it to the build user.
           chown -R builder:builder "$GITHUB_WORKSPACE"
 
+      - name: Prove the namcap gate against real namcap
+        # Builds toy packages, one declared correctly and two missing a
+        # dependency, and checks the gate passes the first and fails the others
+        # with this run's namcap. Runs as the build user because makepkg
+        # refuses root and because that is how the lint below runs.
+        run: sudo -u builder bash packaging/aur/test-namcap-gate.sh --live
+
       - name: Build a local source tarball of the checkout
         env:
           VERSION: ${{ steps.ver.outputs.version }}
@@ -122,7 +135,7 @@ jobs:
           sudo -u builder bash -euo pipefail -c '
             cd packaging/aur
             echo "::group::namcap PKGBUILD"
-            namcap PKGBUILD
+            bash namcap-gate.sh PKGBUILD
             echo "::endgroup::"
             echo "::group::makepkg build"
             # --nocheck: skip the PKGBUILD check() (cargo test --lib); the test
@@ -130,10 +143,7 @@ jobs:
             makepkg -s --noconfirm --nocheck
             echo "::endgroup::"
             echo "::group::namcap built package"
-            for pkg in *.pkg.tar.*; do
-              echo "namcap $pkg"
-              namcap "$pkg"
-            done
+            bash namcap-gate.sh ./*.pkg.tar.*
             echo "::endgroup::"
           '
 

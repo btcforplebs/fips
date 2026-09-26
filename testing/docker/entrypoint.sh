@@ -173,6 +173,80 @@ start_tor_directory() {
     fi
 }
 
+# ── Gateway: LAN interface and config copy ──────────────────────────────
+
+# Print the one interface holding the IPv6 address $1. Docker may attach the
+# LAN network after the container starts, so poll for up to 15 s. The rule is
+# the one lan_iface uses in testing/static/scripts/gateway-test.sh: addresses
+# compare as addresses, and an @ifN suffix is dropped from the name.
+lanif_find() {
+    local name
+    for _ in $(seq 1 30); do
+        if name=$(ip -6 -o addr show | python3 -c '
+import ipaddress, sys
+want = ipaddress.ip_address(sys.argv[1])
+holders = set()
+for line in sys.stdin:
+    f = line.split()
+    if len(f) < 4 or f[2] != "inet6":
+        continue
+    try:
+        addr = ipaddress.ip_interface(f[3]).ip
+    except ValueError:
+        continue
+    if addr == want:
+        holders.add(f[1].split("@")[0])
+if len(holders) != 1:
+    sys.exit(1)
+print(holders.pop())
+' "$1"); then
+            echo "$name"
+            return 0
+        fi
+        sleep 0.5
+    done
+    echo "FATAL: no single interface holds $1" >&2
+    ip -6 -o addr show >&2
+    return 1
+}
+
+# Write config $2 to $3 with its lan_interface set to $1. The source is a
+# read-only bind mount, so fips-gateway reads this copy instead. The image has
+# no YAML parser, so the edit is line-based, and it is refused unless the
+# source has exactly one lan_interface line and the result names $1 on
+# exactly one. A failure leaves $3 as it was.
+gwconf_write() {
+    local iface="$1" src="$2" dest="$3"
+    local key='^[[:space:]]*lan_interface:'
+    local n
+    if ! [[ "$iface" =~ ^[A-Za-z0-9_.-]{1,15}$ ]]; then
+        rm -f "$dest.tmp"
+        echo "FATAL: invalid interface name $iface" >&2
+        return 1
+    fi
+    n=$(grep -cE "$key" "$src") || n=0
+    if [ "$n" -ne 1 ]; then
+        rm -f "$dest.tmp"
+        echo "FATAL: $src has $n lan_interface lines" >&2
+        return 1
+    fi
+    # The file carries the node's nsec. The umask is set in a subshell so it
+    # does not reach the daemons this script starts next.
+    if ! ( umask 077 && sed -E "s/^([[:space:]]*lan_interface:).*/\1 $iface/" "$src" > "$dest.tmp" ); then
+        rm -f "$dest.tmp"
+        echo "FATAL: could not write $dest.tmp" >&2
+        return 1
+    fi
+    n=$(grep -cE "$key" "$dest.tmp") || n=0
+    if [ "$n" -ne 1 ] || ! grep -qE "^[[:space:]]*lan_interface: ${iface//./\\.}\$" "$dest.tmp"; then
+        rm -f "$dest.tmp"
+        echo "FATAL: $dest.tmp does not hold exactly one lan_interface: $iface line" >&2
+        return 1
+    fi
+    mv -f "$dest.tmp" "$dest" || { rm -f "$dest.tmp"; return 1; }
+    return 0
+}
+
 # ── Mode dispatch ────────────────────────────────────────────────────────
 
 case "$MODE" in
@@ -209,17 +283,23 @@ case "$MODE" in
         # No dnsmasq — gateway DNS replaces it on port 53
         start_services
 
-        # Extract LAN interface from config (gateway.lan_interface)
-        LAN_IF=$(grep 'lan_interface:' "$CONFIG" | head -1 | sed 's/.*: *//' | tr -d '"' | tr -d "'")
-        LAN_IF="${LAN_IF:-eth0}"
+        # The LAN interface is the one holding the gateway's LAN address,
+        # derived at every start: Docker does not promise which ethN the LAN
+        # network gets, and a restart can change it. The config's own
+        # lan_interface is a placeholder; fips-gateway reads a copy that
+        # names the derived interface.
+        if [ -z "${FIPS_GW_LAN_ADDR:-}" ]; then
+            echo "FATAL: FIPS_GW_LAN_ADDR is not set"
+            exit 1
+        fi
+        LAN_IF=$(lanif_find "$FIPS_GW_LAN_ADDR") || exit 1
+        echo "LAN interface: $LAN_IF holds $FIPS_GW_LAN_ADDR"
+        gwconf_write "$LAN_IF" "$CONFIG" /etc/fips/gateway.yaml || exit 1
 
-        # Wait for LAN interface (Docker attaches second network after start)
-        for i in $(seq 1 15); do
-            [ -e "/sys/class/net/$LAN_IF" ] && break
-            sleep 0.5
-        done
-
-        # Ensure IPv6 is enabled on the LAN interface (may inherit host default)
+        # Ensure IPv6 is enabled on the LAN interface (may inherit host
+        # default). The address was found on it before this runs only
+        # because compose sets net.ipv6.conf.default.disable_ipv6=0 for this
+        # service, so keep that sysctl if this one moves.
         sysctl -w "net.ipv6.conf.${LAN_IF}.disable_ipv6=0" >/dev/null 2>&1 || true
         sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1 || true
         sysctl -w net.ipv6.conf.all.proxy_ndp=1 >/dev/null 2>&1 || true
@@ -255,7 +335,7 @@ case "$MODE" in
         done
 
         echo "fips0 ready, starting gateway"
-        exec fips-gateway --config "$CONFIG" --log-level debug
+        exec fips-gateway --config /etc/fips/gateway.yaml --log-level debug
         ;;
     *)
         echo "Unknown FIPS_TEST_MODE: $MODE"

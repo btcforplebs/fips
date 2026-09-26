@@ -86,9 +86,11 @@ jobs:
             rust_target: aarch64-unknown-linux-musl
             rust_channel: stable
             # MT3000, MT6000, Flint 2, RPi 3/4/5
-          # MIPS disabled: nostr-relay-pool 0.44 uses std::sync::atomic::AtomicU64
-          # directly (fips's own atomics already use portable_atomic). Re-enable
-          # once an upstream portable-atomic patch lands (or via [patch.crates-io]).
+          # MIPS disabled: 32-bit MIPS has no 64-bit atomics, and both
+          # nostr-relay-pool 0.44 and fips itself (outside the transport stats
+          # modules) use std::sync::atomic::AtomicU64. Re-enabling needs both on
+          # portable_atomic, and the nightly entries below also need -Zbuild-std,
+          # which the build step does not pass.
           # - build_arch: mipsel
           #   openwrt_arch: mipsel_24kc
           #   rust_target: mipsel-unknown-linux-musl
@@ -489,7 +491,6 @@ jobs:
             ./etc/init.d/fips-gateway
             ./etc/fips/fips.yaml
             ./etc/fips/firewall.sh
-            ./etc/dnsmasq.d/fips.conf
             ./etc/sysctl.d/fips-gateway.conf
             ./etc/sysctl.d/fips-bridge.conf
             ./etc/hotplug.d/net/99-fips
@@ -830,7 +831,7 @@ jobs:
             usr/bin/fips usr/bin/fipsctl usr/bin/fipstop usr/bin/fips-gateway \
             usr/bin/fips-mesh-setup usr/bin/fips-ap-setup \
             etc/init.d/fips etc/init.d/fips-gateway \
-            etc/fips/fips.yaml etc/fips/firewall.sh etc/dnsmasq.d/fips.conf \
+            etc/fips/fips.yaml etc/fips/firewall.sh \
             etc/sysctl.d/fips-gateway.conf etc/sysctl.d/fips-bridge.conf \
             etc/hotplug.d/net/99-fips etc/uci-defaults/90-fips-setup \
             lib/upgrade/keep.d/fips; do
@@ -838,6 +839,17 @@ jobs:
               echo "  PASS path: $path"
             else
               echo "  FAIL path: missing $path"; fail=1
+            fi
+          done
+
+          # Maintainer scripts. adbdump prints each registered script as a
+          # "<phase>:" key under scripts:. An upgrade runs only pre-upgrade and
+          # post-upgrade, so a package missing either restarts nothing.
+          for s in post-install pre-upgrade post-upgrade pre-deinstall; do
+            if grep -qE "^[[:space:]]*${s}:" "$DUMP"; then
+              echo "  PASS script: $s"
+            else
+              echo "  FAIL script: missing $s"; fail=1
             fi
           done
 

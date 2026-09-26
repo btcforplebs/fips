@@ -774,6 +774,13 @@ with v0.5.x or earlier peers.
   cleanly, and a peer whose send failed is retried after a shorter fixed
   interval instead. That retry interval gates only a peer whose last attempt
   failed, so it cannot clamp a `heartbeat_interval_secs` configured below it.
+- Replacing the peer list at runtime with `Node::update_peers` now updates
+  everything that reads peer aliases. `.fips` names, peer ACL entries written as
+  an alias, and peer display names kept following the aliases the node started
+  with, so a new peer's alias did not resolve, a removed one still did, and a
+  deny entry naming an alias moved to another key kept denying the old key and
+  admitted the new one. They now follow the new peer list, with the hosts file
+  still taking precedence as it does at startup.
 
 - A leaf-profile node no longer self-elects as tree root. A leaf holding the
   smallest node address elected itself, but its peers refuse a non-full node as
@@ -810,6 +817,15 @@ with v0.5.x or earlier peers.
   child's stayed advertised, until some unrelated change. The re-announce fires
   only when that relation flips and only to peers whose filter actually
   changed, so ordinary tree churn does not multiply announce traffic.
+- A bloom filter announce lost on the link is now resent. A node counted an
+  announce as delivered once the transport accepted it, and announces go out
+  only when a filter changes, so a dropped datagram or a link outage shorter
+  than the dead timeout left the peer holding the old filter until something
+  else changed, and destinations could stay missing from discovery. The node
+  now confirms each announce from the link's existing receiver reports,
+  resends when they show a loss, and resends once after 30 seconds when the
+  reports cannot confirm it. Resends over one peer connection are limited to
+  six a minute, and to one a minute while losses persist.
 
 #### Session setup
 
@@ -1058,6 +1074,23 @@ with v0.5.x or earlier peers.
   four script bodies live in `packaging/openwrt-ipk/scripts/` instead of inside
   heredocs in the two build scripts, so the scenarios in `testing/openwrt/` run
   what ships.
+- An `apk` upgrade on OpenWrt 25 now restarts `fips`, and restarts
+  `fips-gateway` if it was enabled, so the new binaries run without a reboot.
+  apk-tools v3 runs only the incoming package's pre-upgrade and post-upgrade
+  scripts, and the `.apk` registered neither, so an upgrade replaced the files
+  on disk and left the old processes running until a reboot or a manual
+  restart.
+- The packages no longer ship `/etc/dnsmasq.d/fips.conf`. OpenWrt's dnsmasq
+  builds its config from UCI and never reads that directory; `.fips`
+  forwarding has always come from the UCI server entry, which is unchanged. An
+  opkg upgrade removes the old file, and an apk upgrade keeps it only if it
+  was modified. Either way nothing reads it.
+- The package README's upgrade commands and default settings are corrected.
+  It now gives the `apk add` command for OpenWrt 25, where there is no opkg,
+  and for OpenWrt 24.10 and earlier a plain `opkg install` in place of
+  `--force-reinstall`, which removed and reinstalled the package and so left
+  `fips-gateway` disabled. Its description of the default config now matches
+  the shipped `fips.yaml`.
 
 #### Packaging (Debian)
 

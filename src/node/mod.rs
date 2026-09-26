@@ -728,7 +728,7 @@ pub struct Node {
 
     // === Display Names ===
     /// Human-readable names for configured peers (alias or short npub).
-    /// Populated at startup from peer config.
+    /// Populated at startup from peer config and updated by `update_peers`.
     peer_aliases: HashMap<NodeAddr, String>,
 
     /// Reloadable peer ACL state from standard allow/deny files.
@@ -736,8 +736,9 @@ pub struct Node {
 
     // === Host Map ===
     /// Static hostname → npub mapping for DNS resolution.
-    /// Built at construction from peer aliases and /etc/fips/hosts, and
-    /// published through a lock-free snapshot for the display path.
+    /// Built at construction from peer aliases and /etc/fips/hosts, with the
+    /// peer aliases replaced by `update_peers`, and published through a
+    /// lock-free snapshot for the display path.
     host_map: reloadable::HostMapReloadable,
 
     /// Sessions whose recv cipher + replay window have been handed
@@ -1511,11 +1512,27 @@ impl Node {
         self.host_map.reload().await
     }
 
+    /// Rebuild every peer-alias map from the current peer list.
+    ///
+    /// Replaces the alias base under the display host map, the peer ACL's
+    /// alias resolution (rebuilding the ACL now) and the running DNS
+    /// responder's map. The hosts file stays merged over each and still wins.
+    pub(crate) async fn rebase_aliases(&mut self) {
+        let base = HostMap::from_peer_configs(self.config().peers());
+        tracing::debug!(entries = base.len(), "Rebuilding peer alias maps");
+        self.host_map.set_base(base.clone());
+        self.peer_acl.rebase(base.clone()).await;
+        if let Some(tx) = &self.supervisor.dns_aliases {
+            tx.send_replace(base);
+        }
+    }
+
     /// Return a human-readable display name for a NodeAddr.
     ///
     /// Lookup order:
     /// 1. Host map hostname (from peer aliases + /etc/fips/hosts)
-    /// 2. Configured peer alias or short npub (from startup map)
+    /// 2. Configured peer alias or short npub (from startup map, updated by
+    ///    `update_peers`)
     /// 3. Active peer's short npub (e.g., inbound peer not in config)
     /// 4. Session endpoint's short npub (end-to-end, may not be direct peer)
     /// 5. Truncated NodeAddr hex (unknown address)
