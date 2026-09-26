@@ -6,6 +6,7 @@
 use crate::NodeAddr;
 use crate::proto::bloom::BloomFilter;
 use crate::proto::bloom::FilterAnnounce;
+use crate::proto::bloom::{LinkEvidence, RrCounters};
 
 use super::reject::BloomReject;
 use super::{Node, NodeError};
@@ -70,6 +71,20 @@ impl Node {
         }
 
         self.metrics().bloom.sent.inc();
+
+        // Read after the send: anything else taking a counter in between only
+        // makes the recorded counter higher, which delays confirmation rather
+        // than confirming a frame that was never covered.
+        if let Some(link) = self.link_evidence(peer_addr) {
+            let counter = link.next_counter.saturating_sub(1);
+            self.bloom_state.record_announce(
+                *peer_addr,
+                &sent_filter,
+                counter,
+                &link,
+                crate::time::mono_ms(),
+            );
+        }
 
         // Self-plausibility check: WARN if our own outgoing filter is
         // above the antipoison cap. Independent detection signal if
@@ -271,10 +286,61 @@ impl Node {
             .mark_changed_peers(from, &peer_addrs, &peer_filters);
     }
 
+    /// Read what `peer_addr`'s link shows about delivery of our frames: the
+    /// session's identity and next send counter, and the last ReceiverReport
+    /// accepted on it. `None` when the peer has no session.
+    fn link_evidence(&self, peer_addr: &NodeAddr) -> Option<LinkEvidence> {
+        let peer = self.peers.get(peer_addr)?;
+        let session = peer.noise_session()?;
+        let mut epoch = [0u8; 8];
+        epoch.copy_from_slice(&session.handshake_hash()[..8]);
+        let rr = peer.mmp().and_then(|mmp| mmp.metrics.rr_counters()).map(
+            |(highest, received, reordered)| RrCounters {
+                highest,
+                received,
+                reordered,
+            },
+        );
+        Some(LinkEvidence {
+            epoch: u64::from_le_bytes(epoch),
+            next_counter: session.current_send_counter(),
+            rr,
+        })
+    }
+
+    /// Mark for resend every peer whose outstanding announce the receiver
+    /// reports show was lost, or could not confirm in time.
+    fn check_announces(&mut self) {
+        let now_ms = crate::time::mono_ms();
+        let waiting: Vec<NodeAddr> = self
+            .peers
+            .keys()
+            .filter(|addr| self.bloom_state.announce_outstanding(addr))
+            .copied()
+            .collect();
+        for addr in waiting {
+            let Some(link) = self.link_evidence(&addr) else {
+                continue;
+            };
+            let counter = self.bloom_state.outstanding_counter(&addr);
+            if let Some(reason) = self.bloom_state.check_announce(&addr, &link, now_ms) {
+                debug!(
+                    peer = %self.peer_display_name(&addr),
+                    reason = ?reason,
+                    counter = ?counter,
+                    "Resending unconfirmed FilterAnnounce"
+                );
+            }
+        }
+    }
+
     /// Check bloom filter state on tick (called from event loop).
     ///
-    /// Sends any pending debounced filter announces.
+    /// Marks peers whose last announce was not confirmed delivered, then sends
+    /// any pending debounced filter announces, so a resend goes out in the
+    /// same tick through the ordinary send path.
     pub(super) async fn check_bloom_state(&mut self) {
+        self.check_announces();
         self.send_pending_filter_announces().await;
     }
 }

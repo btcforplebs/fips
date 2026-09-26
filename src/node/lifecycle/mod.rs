@@ -89,6 +89,11 @@ impl Node {
     /// is already connected and a new concrete candidate appears, FIPS starts
     /// an alternate handshake in parallel; promotion switches only after that
     /// handshake authenticates.
+    ///
+    /// Peer aliases follow the new list: `.fips` names, display names and
+    /// peer ACL entries written as an alias are rebuilt from it, with the
+    /// hosts file still taking precedence. Rebuilding the ACL re-reads the
+    /// ACL files and checks the hosts file before any added peer is dialed.
     pub async fn update_peers(
         &mut self,
         new_peers: Vec<PeerConfig>,
@@ -164,8 +169,12 @@ impl Node {
                     state.peer_config = new_peer.clone();
                     state.retry_after_ms = Self::now_ms();
                 }
-                if let Some(alias) = new_peer.alias.clone() {
-                    self.peer_aliases.insert(*node_addr, alias);
+                if let Ok(identity) = PeerIdentity::from_npub(&new_peer.npub) {
+                    let name = new_peer
+                        .alias
+                        .clone()
+                        .unwrap_or_else(|| identity.short_npub());
+                    self.peer_aliases.insert(*node_addr, name);
                 }
             } else {
                 outcome.unchanged += 1;
@@ -185,6 +194,7 @@ impl Node {
         let mut new_config = (*self.context.config).clone();
         new_config.peers = new_by_addr.into_values().collect();
         self.replace_context(|ctx| ctx.config = std::sync::Arc::new(new_config));
+        self.rebase_aliases().await;
 
         for peer_config in added_configs {
             outcome.added += 1;
@@ -1883,6 +1893,8 @@ impl Node {
                                     let hosts_path = std::path::PathBuf::from(
                                         crate::upper::hosts::DEFAULT_HOSTS_PATH,
                                     );
+                                    let (aliases_tx, aliases_rx) =
+                                        tokio::sync::watch::channel(base_hosts.clone());
                                     let reloader = crate::upper::hosts::HostMapReloader::new(
                                         base_hosts, hosts_path,
                                     );
@@ -1920,17 +1932,19 @@ impl Node {
                                     let dns_child_tx = self.child_exit_tx.clone();
                                     let handle = tokio::spawn(report_exit(
                                         Child::Dns,
-                                        crate::upper::dns::run_dns_responder(
+                                        crate::upper::dns::run_responder(
                                             socket,
                                             identity_tx,
                                             dns_ttl,
                                             reloader,
+                                            Some(aliases_rx),
                                             mesh_ifindex,
                                         ),
                                         dns_child_tx,
                                     ));
                                     self.supervisor.dns_identity_rx = Some(identity_rx);
                                     self.supervisor.dns_task = Some(handle);
+                                    self.supervisor.dns_aliases = Some(aliases_tx);
                                     self.supervisor.dns_local_addr = Some(local_addr);
                                     Event::SubstrateUp { child }
                                 }
@@ -2237,6 +2251,7 @@ impl Node {
                         handle.abort();
                         debug!("DNS responder stopped");
                     }
+                    self.supervisor.dns_aliases.take();
                     // Retract the published address in the same step that kills
                     // the listener, so an embedder polling `dns_local_addr()`
                     // never dials a socket that is already gone.
@@ -2362,10 +2377,11 @@ impl Node {
     /// reads it to rebuild the teardown set, and aborting an already-finished
     /// handle there is harmless.
     ///
-    /// For `Dns` the event comes only from a panic. `run_dns_responder` is an
-    /// unconditional loop whose every failure arm continues, so it has no
-    /// ordinary exit; [`report_exit`] catches a panic in it and reports
-    /// `Child::Dns`, which is what reaches this.
+    /// For `Dns` the event comes only from a panic. `run_responder`, the loop
+    /// the node spawns and `run_dns_responder` wraps, is an unconditional
+    /// loop whose every failure arm continues, so it has no ordinary exit;
+    /// [`report_exit`] catches a panic in it and reports `Child::Dns`, which
+    /// is what reaches this.
     pub(in crate::node) fn retract_child_publications(&mut self, child: Child) {
         if matches!(child, Child::Dns) {
             self.supervisor.dns_local_addr.take();

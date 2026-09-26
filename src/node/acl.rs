@@ -529,7 +529,8 @@ impl PeerAcl {
 /// [`arc_swap::ArcSwap`] so the authorization hot path reads it without
 /// locking, while the reloader's change-detection state (file mtimes, the
 /// embedded hosts reloader) is touched only by [`Reloadable::reload`] on the
-/// single node tick task.
+/// node tick task and by [`PeerAclReloader::rebase`], which `update_peers`
+/// reaches through `&mut Node`, so there is still one writer at a time.
 pub struct PeerAclReloader {
     /// Reader-facing effective ACL snapshot.
     acl: arc_swap::ArcSwap<PeerAcl>,
@@ -551,6 +552,10 @@ pub struct PeerAclReloader {
     retry_pending: bool,
     /// Consecutive reloads held back by the empty-snapshot guard.
     empty_holds: u32,
+    /// Set when the alias base changed, forcing the next reload to rebuild
+    /// although no file changed. Cleared only when a rebuilt ACL is
+    /// published, so a held reload retries the rebuild on later ticks.
+    rebased: bool,
 }
 
 impl PeerAclReloader {
@@ -646,7 +651,20 @@ impl PeerAclReloader {
             last_deny_mtime,
             retry_pending,
             empty_holds: 0,
+            rebased: false,
         }
+    }
+
+    /// Replace the peer-alias base the ACL's alias entries resolve through,
+    /// and rebuild the ACL from it now.
+    ///
+    /// Goes through [`Reloadable::reload`], so an unreadable input holds the
+    /// last good ACL and the empty-ACL guard applies exactly as on a tick.
+    /// Returns `true` if a rebuilt ACL was published.
+    pub(crate) async fn rebase(&mut self, base: HostMap) -> bool {
+        self.hosts.set_base(base);
+        self.rebased = true;
+        self.reload().await
     }
 
     /// Keep the published snapshot after a reload input failed to read.
@@ -714,6 +732,7 @@ impl Reloadable for PeerAclReloader {
             && deny_mtime == self.last_deny_mtime
             && !hosts_changed
             && !self.retry_pending
+            && !self.rebased
             && !allow_moved
             && !deny_moved
         {
@@ -764,6 +783,7 @@ impl Reloadable for PeerAclReloader {
             );
         }
         self.retry_pending = false;
+        self.rebased = false;
         self.empty_holds = 0;
         self.last_allow_mtime = allow_mtime;
         self.last_deny_mtime = deny_mtime;
@@ -1798,6 +1818,49 @@ mod tests {
         assert_eq!(
             reloader.acl().check(&test_peer(&npub)),
             PeerAclDecision::DefaultAllow
+        );
+    }
+
+    /// Rebasing the alias map rebuilds and publishes the ACL although no ACL
+    /// or hosts file changed, and the forced rebuild does not repeat on the
+    /// next reload.
+    #[tokio::test]
+    async fn rebase_republishes_alias_entries_without_any_file_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let allow = dir.path().join("peers.allow");
+        let deny = dir.path().join("peers.deny");
+        let hosts = dir.path().join("hosts");
+        let (x, y) = (test_npub(), test_npub());
+        write_file(&allow, "node-a\n");
+
+        let mut base = HostMap::new();
+        base.insert("node-a", &x).unwrap();
+        let mut reloader = PeerAclReloader::with_alias_sources(allow, deny, base, hosts);
+        assert_eq!(
+            reloader.acl().check(&test_peer(&x)),
+            PeerAclDecision::AllowList,
+            "alias resolves to X at startup"
+        );
+
+        let mut moved = HostMap::new();
+        moved.insert("node-a", &y).unwrap();
+        assert!(
+            reloader.rebase(moved).await,
+            "rebase publishes a rebuilt ACL"
+        );
+        assert_eq!(
+            reloader.acl().check(&test_peer(&y)),
+            PeerAclDecision::AllowList,
+            "alias entry follows the new base to Y"
+        );
+        assert_eq!(
+            reloader.acl().check(&test_peer(&x)),
+            PeerAclDecision::DefaultAllow,
+            "X is no longer on the allow list"
+        );
+        assert!(
+            !reloader.reload().await,
+            "a reload with nothing changed does not rebuild again"
         );
     }
 }

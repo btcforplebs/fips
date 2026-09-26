@@ -17,6 +17,7 @@ from .assertions import (
     BloomSendRateMonitor,
     evaluate_baseline,
     evaluate_congestion_signals,
+    evaluate_delivery,
     evaluate_max_errors,
     evaluate_max_parent_switches,
     evaluate_min_parent_switches,
@@ -25,7 +26,12 @@ from .assertions import (
 )
 from .compose import generate_compose
 from .config_gen import write_configs
-from .control import snapshot_all_congestion, snapshot_all_mmp, snapshot_all_trees
+from .control import (
+    query_peers,
+    snapshot_all_congestion,
+    snapshot_all_mmp,
+    snapshot_all_trees,
+)
 from .docker_exec import docker_compose, existing_containers, force_remove
 from .link_swap import LinkSwapManager
 from .links import LinkManager
@@ -98,6 +104,9 @@ class SimRunner:
         # than as an absence of congestion.
         self.final_congestion: dict | None = None
         self.final_tree: dict | None = None
+        # Set by _probe_delivery. None means the probe never ran, which the
+        # delivery assertion reports as a harness failure.
+        self.delivery_probe: dict | None = None
 
     def _evaluate_max_parent_switches(
         self, cfg, parent_switches: list[tuple[str, str]]
@@ -711,6 +720,17 @@ class SimRunner:
                 log.info("Restoring stopped nodes...")
                 self.node_mgr.restore_all()
 
+            # Every flapped link and stopped node is back, so the delivery
+            # probe measures the restored mesh.
+            if self.scenario.assertions.delivery is not None:
+                try:
+                    self._probe_delivery()
+                except Exception:
+                    # Leaves delivery_probe None, which the assertion
+                    # reports as a harness failure; the rest of teardown
+                    # still has to run.
+                    log.exception("Delivery probe failed")
+
             # Collect iperf3 throughput results before containers stop
             iperf_results: list[dict] = []
             if self.traffic_mgr:
@@ -802,6 +822,15 @@ class SimRunner:
             tp_cfg = self.scenario.assertions.tree_parents
             if tp_cfg is not None:
                 outcome = evaluate_tree_parents(tp_cfg, self.final_tree)
+                self.assertion_outcomes.append(outcome)
+                if outcome.passed:
+                    log.info("%s", outcome.detail)
+                else:
+                    log.error("%s", outcome.detail)
+
+            dl_cfg = self.scenario.assertions.delivery
+            if dl_cfg is not None:
+                outcome = evaluate_delivery(dl_cfg, self.delivery_probe)
                 self.assertion_outcomes.append(outcome)
                 if outcome.passed:
                     log.info("%s", outcome.detail)
@@ -902,6 +931,76 @@ class SimRunner:
                 )
                 return
             self._sleep(SETTLE_INTERVAL_SECS)
+
+    def _read_peers(self, node_id: str, when: str, wait_secs: float) -> dict:
+        """Read a node's peers, waiting up to wait_secs for at least one.
+
+        A node restored at teardown may not have re-peered yet, which is
+        not the failure the transport check is for, so an empty list is
+        re-read until the wait runs out. A failed read is retried the same
+        way and reported as None if it never succeeds.
+        """
+        container = self.topology.container_name(node_id)
+        start = time.monotonic()
+        while True:
+            data = query_peers(container)
+            peers = None if data is None else data.get("peers", [])
+            waited = time.monotonic() - start
+            if peers or waited >= wait_secs:
+                return {"when": when, "peers": peers, "waited_s": waited}
+            time.sleep(2)
+
+    def _ping_until(self, src: str, dst: str, size: int, cfg) -> dict:
+        """Ping dst from src until cfg.min_replies replies or the deadline."""
+        container = self.topology.container_name(src)
+        target = f"{self.topology.nodes[dst].npub}.fips"
+        cmd = ["docker", "exec", container, "ping6", "-c", "1", "-W", "2",
+               "-s", str(size), target]
+        start = time.monotonic()
+        replies = attempts = 0
+        last = ""
+        while replies < cfg.min_replies and time.monotonic() - start < cfg.deadline_secs:
+            attempts += 1
+            try:
+                res = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+                lines = (res.stdout + res.stderr).strip().splitlines()
+                last = lines[-1] if lines else ""
+                if res.returncode == 0:
+                    replies += 1
+                    continue
+            except subprocess.TimeoutExpired:
+                last = "docker exec ping6 timed out"
+            time.sleep(1)
+        return {
+            "src": src, "dst": dst, "size": size, "replies": replies,
+            "attempts": attempts, "elapsed_s": time.monotonic() - start,
+            "last_output": last,
+        }
+
+    def _probe_delivery(self):
+        """Run the delivery assertion's probes and keep the result."""
+        cfg = self.scenario.assertions.delivery
+        log.info("Probing delivery: %d pair(s) x %d size(s)",
+                 len(cfg.pairs), len(cfg.payload_bytes))
+        transport = None
+        if cfg.require_transport:
+            transport = {
+                "node": cfg.transport_node, "want": cfg.require_transport,
+                "reads": [self._read_peers(cfg.transport_node, "before",
+                                           cfg.deadline_secs)],
+            }
+        results = [
+            self._ping_until(src, dst, size, cfg)
+            for src, dst in cfg.pairs
+            for size in cfg.payload_bytes
+        ]
+        if transport is not None:
+            transport["reads"].append(
+                self._read_peers(cfg.transport_node, "after", 0)
+            )
+        self.delivery_probe = {"transport": transport, "results": results}
+        with open(os.path.join(self.output_dir, "delivery-probe.json"), "w") as f:
+            json.dump(self.delivery_probe, f, indent=2)
 
     def _take_snapshot(self, label: str):
         """Query all nodes via control socket and save tree/MMP/congestion snapshots."""

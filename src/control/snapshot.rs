@@ -10,7 +10,8 @@
 //! - the cheap scalar gauges `show_status` needs (`estimated_mesh_size`,
 //!   node `state`, `tun_state`, `tun_name`, `effective_ipv6_mtu`, and the
 //!   peer / session / link / connection / transport counts), plus
-//!   `peer_aliases` (effectively immutable after construction).
+//!   `peer_aliases` (copied from the node's display-name map on each tick;
+//!   it changes when `update_peers` replaces the peer list).
 //!
 //! The snapshot holds *data*, not rendered `Response` envelopes:
 //! rendering happens in the control task off the rx_loop. Staleness is bounded
@@ -62,11 +63,13 @@ pub(crate) struct StatsSnapshot {
     /// transport type. Configured-but-idle types appear with a zero count.
     /// Keyed by the transport type name (`"udp"`, `"tcp"`, `"tor"`, ...).
     pub transport_peer_counts: std::collections::BTreeMap<String, usize>,
-    /// Configured peer aliases, keyed by `NodeAddr`. Effectively immutable
-    /// after construction; shared to avoid a per-tick map clone.
+    /// Configured peer aliases, keyed by `NodeAddr`. Copied from the node's
+    /// display-name map on each stats tick; it changes when `update_peers`
+    /// replaces the peer list.
     pub peer_aliases: Arc<HashMap<NodeAddr, String>>,
     /// Loaded peer-ACL status (`show_acl`). The ACL itself is an
-    /// `arc_swap::ArcSwap<PeerAcl>` mutated only by the tick's `reload_peer_acl`;
+    /// `arc_swap::ArcSwap<PeerAcl>` mutated only by the tick's `reload_peer_acl`
+    /// and by `update_peers`;
     /// the human-readable status is a cheap projection of it.
     pub acl_status: PeerAclStatus,
     /// Per-stats-history-peer metadata resolved against the live peer/session

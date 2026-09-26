@@ -834,6 +834,10 @@ pub(crate) struct Supervisor {
     /// only while the responder is up; published to embedders through
     /// [`Node::dns_local_addr`](crate::Node::dns_local_addr).
     pub(in crate::node) dns_local_addr: Option<std::net::SocketAddr>,
+    /// Sends a new peer-alias base to the running DNS responder; `Some` only
+    /// while it runs.
+    pub(in crate::node) dns_aliases:
+        Option<tokio::sync::watch::Sender<crate::upper::hosts::HostMap>>,
 
     /// Sender for each UDP listen socket the transport spawn binds — its raw
     /// fd and the instance name it was configured under — armed by
@@ -901,6 +905,7 @@ impl Supervisor {
             dns_identity_rx: None,
             dns_task: None,
             dns_local_addr: None,
+            dns_aliases: None,
             #[cfg(unix)]
             udp_fd_tx: None,
             nostr_rendezvous: crate::nostr::RendezvousDriver::default(),
