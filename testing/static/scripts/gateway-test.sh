@@ -5,10 +5,11 @@
 #   gw-client (non-FIPS) → gw-gateway (fips + fips-gateway) → gw-server (fips + http)
 #
 # Usage:
-#   ./scripts/gateway-test.sh [inject-config]
+#   ./scripts/gateway-test.sh [inject-config | selftest]
 #
 # Subcommands:
-#   inject-config  — post-process generated configs to add gateway section
+#   inject-config  — post-process generated configs to add the gateway section
+#   selftest       — check the output readers against canned input
 #   (no args)      — run the test (containers must be running)
 set -e
 
@@ -43,21 +44,26 @@ inject_gateway_config() {
 
     if [ ! -f "$config_file" ]; then
         echo "Error: $config_file not found. Run generate-configs.sh gateway first." >&2
-        exit 1
+        return 1
     fi
 
     echo "Injecting gateway config into $config_file"
-    python3 -c "
-import yaml
+    # Opening with 'w' truncates in place and keeps the inode, which the
+    # container's single-file bind mount of this file needs.
+    python3 - "$config_file" "$GW_CLIENT_LAN" <<'PYEOF' || return 1
+import sys, yaml
+path, client = sys.argv[1:3]
 
-with open('$config_file') as f:
+with open(path) as f:
     cfg = yaml.safe_load(f)
 
 cfg['gateway'] = {
     'enabled': True,
     'pool': 'fd01::/112',
-    # Docker assigns gateway-lan to eth1 (fips-net is eth0). The
-    # LAN-side masquerade for inbound port forwards gates on this.
+    # A placeholder. Docker does not promise which interface the LAN
+    # network gets, so the gateway container's entrypoint replaces this with
+    # the interface holding the gateway's LAN address before fips-gateway
+    # starts. The LAN-side masquerade and the proxy NDP entries use it.
     'lan_interface': 'eth1',
     'dns': {
         'listen': '[::]:53',
@@ -68,33 +74,221 @@ cfg['gateway'] = {
         {
             'listen_port': 18080,
             'proto': 'tcp',
-            'target': '[${GW_CLIENT_LAN}]:8080',
+            'target': f'[{client}]:8080',
         },
         # 6B: second TCP forward — exercises multiple simultaneous TCP
         # rules sharing the same LAN backend on a different listen port.
         {
             'listen_port': 18082,
             'proto': 'tcp',
-            'target': '[${GW_CLIENT_LAN}]:8081',
+            'target': f'[{client}]:8081',
         },
         # 6A: UDP forward — exercises the runtime UDP DNAT path (rule
         # shape + conntrack handling) end-to-end.
         {
             'listen_port': 18081,
             'proto': 'udp',
-            'target': '[${GW_CLIENT_LAN}]:8081',
+            'target': f'[{client}]:8081',
         },
     ],
 }
 
-with open('$config_file', 'w') as f:
+with open(path, 'w') as f:
     yaml.dump(cfg, f, default_flow_style=False, sort_keys=False)
-"
+PYEOF
     echo "  ✓ Gateway config injected"
+    return 0
 }
 
+# ── Readers ──────────────────────────────────────────────────────────────
+#
+# Each reader parses one tool's output on stdin and prints a single answer.
+# A reader that cannot answer exits non-zero and prints nothing, rather than
+# printing a default a check could mistake for an answer. Addresses are
+# compared as addresses, never as strings: ip prints fd02:0:0:0::10 as
+# fd02::10. Arguments reach Python through sys.argv.
+
+# The interface holding address $1, from `ip -6 -o addr show`. Fails when no
+# interface holds it or more than one does.
+lan_iface() {
+    python3 -c '
+import ipaddress, sys
+want = ipaddress.ip_address(sys.argv[1])
+holders = set()
+for line in sys.stdin:
+    f = line.split()
+    if len(f) < 4 or f[2] != "inet6":
+        continue
+    try:
+        addr = ipaddress.ip_interface(f[3]).ip
+    except ValueError:
+        continue
+    if addr == want:
+        holders.add(f[1].split("@")[0])
+if len(holders) != 1:
+    sys.exit(1)
+print(holders.pop())
+' "$@"
+}
+
+# The gateway's lan_interface, from a show_gateway response.
+gw_iface() {
+    python3 -c '
+import json, sys
+try:
+    r = json.load(sys.stdin)
+except ValueError:
+    sys.exit(1)
+if not isinstance(r, dict) or r.get("status") != "ok":
+    sys.exit(1)
+data = r.get("data")
+if not isinstance(data, dict):
+    sys.exit(1)
+name = data.get("lan_interface")
+if not isinstance(name, str) or not name:
+    sys.exit(1)
+print(name)
+'
+}
+
+# The output interface of the LAN masquerade (the one rule matching
+# iifname "fips0" and masquerading), from `nft list table inet fips_gateway`.
+masq_iface() {
+    python3 -c '
+import re, sys
+found = []
+for line in sys.stdin:
+    if "iifname \"fips0\"" not in line or not re.search(r"\bmasquerade\b", line):
+        continue
+    m = re.search(r"\boifname \"([^\"]+)\"", line)
+    found.append(m.group(1) if m else "")
+if len(found) != 1 or not found[0]:
+    sys.exit(1)
+print(found[0])
+'
+}
+
+# The device of the proxy neighbour entry for address $1, from
+# `ip -6 neigh show proxy`, whose lines read `ADDR dev DEV proxy`. Fails when
+# no entry matches or matching entries name different devices.
+proxy_dev() {
+    python3 -c '
+import ipaddress, sys
+want = ipaddress.ip_address(sys.argv[1])
+devs = set()
+for line in sys.stdin:
+    f = line.split()
+    if len(f) < 3 or "dev" not in f[1:-1]:
+        continue
+    try:
+        addr = ipaddress.ip_address(f[0])
+    except ValueError:
+        continue
+    if addr == want:
+        devs.add(f[f.index("dev", 1) + 1])
+if len(devs) != 1:
+    sys.exit(1)
+print(devs.pop())
+' "$@"
+}
+
+# ── Reader self-test ─────────────────────────────────────────────────────
+
+# Run one reader on a canned input and compare its status and output with
+# the expected ones. A case expecting failure also requires empty output.
+# Usage: gw_case LABEL WANT_RC WANT_OUT INPUT READER [ARGS...]
+gw_case() {
+    local label="$1" want_rc="$2" want_out="$3" input="$4"
+    shift 4
+    local out rc
+    if out=$("$@" <<< "$input" 2>/dev/null); then rc=0; else rc=$?; fi
+    if [ "$rc" -eq "$want_rc" ] && [ "$out" = "$want_out" ]; then
+        echo "  selftest $label ... OK"
+        return 0
+    fi
+    echo "  selftest $label ... FAIL (rc $rc, output '$out'; expected rc $want_rc, output '$want_out')"
+    return 1
+}
+
+# Feed every reader canned tool output and check its answers. The inputs
+# follow each tool's printed format; the ip -o addr lines follow a capture,
+# the others are written from the tools' documented formats.
+gw_selftest() {
+    local fails=0
+    local addr_eth0 addr_eth1 addr_claimed addr_at nft_lan nft_nolan
+
+    addr_eth0='1: lo    inet6 ::1/128 scope host \       valid_lft forever preferred_lft forever
+2: fips0    inet6 fd3c:9a51:7e02:4b18::1/8 scope global \       valid_lft forever preferred_lft forever
+2: fips0    inet6 fe80::5c2a:91ff:fe3b:1d7e/64 scope link \       valid_lft forever preferred_lft forever
+40: eth0    inet6 fd02::10/64 scope global nodad \       valid_lft forever preferred_lft forever
+40: eth0    inet6 fe80::42:acff:fe13:3/64 scope link \       valid_lft forever preferred_lft forever
+42: eth1    inet6 fe80::42:acff:fe12:2/64 scope link \       valid_lft forever preferred_lft forever'
+    addr_eth1='1: lo    inet6 ::1/128 scope host \       valid_lft forever preferred_lft forever
+2: fips0    inet6 fd3c:9a51:7e02:4b18::1/8 scope global \       valid_lft forever preferred_lft forever
+2: fips0    inet6 fe80::5c2a:91ff:fe3b:1d7e/64 scope link \       valid_lft forever preferred_lft forever
+40: eth0    inet6 fe80::42:acff:fe12:2/64 scope link \       valid_lft forever preferred_lft forever
+42: eth1    inet6 fd02::10/64 scope global nodad \       valid_lft forever preferred_lft forever
+42: eth1    inet6 fe80::42:acff:fe13:3/64 scope link \       valid_lft forever preferred_lft forever'
+    addr_claimed='1: lo    inet6 ::1/128 scope host \       valid_lft forever preferred_lft forever
+40: eth0    inet6 fe80::42:acff:fe12:2/64 scope link \       valid_lft forever preferred_lft forever
+42: eth1    inet6 fd02:0:0:5::10/64 scope global nodad \       valid_lft forever preferred_lft forever'
+    addr_at='1: lo    inet6 ::1/128 scope host \       valid_lft forever preferred_lft forever
+6: eth0@if5    inet6 fe80::42:acff:fe12:2/64 scope link \       valid_lft forever preferred_lft forever
+8: eth1@if7    inet6 fd02::10/64 scope global nodad \       valid_lft forever preferred_lft forever'
+
+    gw_case "lan_iface: LAN on eth0" 0 eth0 "$addr_eth0" lan_iface fd02::10 || fails=$((fails + 1))
+    gw_case "lan_iface: LAN on eth1" 0 eth1 "$addr_eth1" lan_iface fd02::10 || fails=$((fails + 1))
+    gw_case "lan_iface: claimed prefix" 0 eth1 "$addr_claimed" lan_iface fd02:0:0:5::10 || fails=$((fails + 1))
+    gw_case "lan_iface: first claimed /64 printed short" 0 eth0 "$addr_eth0" lan_iface fd02:0:0:0::10 || fails=$((fails + 1))
+    gw_case "lan_iface: name with @ifN suffix" 0 eth1 "$addr_at" lan_iface fd02::10 || fails=$((fails + 1))
+    gw_case "lan_iface: no holder" 1 "" "$addr_claimed" lan_iface fd02::10 || fails=$((fails + 1))
+    gw_case "lan_iface: empty input" 1 "" "" lan_iface fd02::10 || fails=$((fails + 1))
+
+    gw_case "gw_iface: ok response" 0 eth0 \
+        '{"status":"ok","data":{"pool_cidr":"fd01::/112","lan_interface":"eth0"}}' gw_iface || fails=$((fails + 1))
+    gw_case "gw_iface: error response" 1 "" \
+        '{"status":"error","message":"gateway not yet initialized"}' gw_iface || fails=$((fails + 1))
+    gw_case "gw_iface: empty input" 1 "" "" gw_iface || fails=$((fails + 1))
+
+    nft_lan='table inet fips_gateway {
+	chain prerouting {
+		type nat hook prerouting priority dstnat; policy accept;
+		meta nfproto ipv6 ip6 daddr fd01::1 dnat ip6 to fd3c:9a51:7e02:4b18::2
+		iifname "fips0" meta nfproto ipv6 meta l4proto tcp tcp dport 18080 dnat ip6 to [fd02::20]:8080
+	}
+
+	chain postrouting {
+		type nat hook postrouting priority srcnat; policy accept;
+		oifname "fips0" masquerade
+		meta nfproto ipv6 ip6 saddr fd3c:9a51:7e02:4b18::2 snat ip6 to fd01::1
+		iifname "fips0" oifname "eth0" meta nfproto ipv6 masquerade
+	}
+}'
+    nft_nolan=$(grep -v 'iifname "fips0" oifname' <<< "$nft_lan")
+    gw_case "masq_iface: LAN masquerade on eth0" 0 eth0 "$nft_lan" masq_iface || fails=$((fails + 1))
+    gw_case "masq_iface: no LAN masquerade" 1 "" "$nft_nolan" masq_iface || fails=$((fails + 1))
+    gw_case "masq_iface: empty input" 1 "" "" masq_iface || fails=$((fails + 1))
+
+    gw_case "proxy_dev: entry on eth0 after another on eth1" 0 eth0 \
+        $'fd01::2 dev eth1  proxy\nfd01::1 dev eth0  proxy' proxy_dev fd01::1 || fails=$((fails + 1))
+    gw_case "proxy_dev: no entry" 1 "" 'fd01::2 dev eth1  proxy' proxy_dev fd01::1 || fails=$((fails + 1))
+    gw_case "proxy_dev: empty input" 1 "" "" proxy_dev fd01::1 || fails=$((fails + 1))
+    gw_case "proxy_dev: entry on two devices" 1 "" \
+        $'fd01::1 dev eth0  proxy\nfd01::1 dev eth1  proxy' proxy_dev fd01::1 || fails=$((fails + 1))
+
+    echo "  selftest: $fails case(s) failed"
+    if [ "$fails" -eq 0 ]; then
+        return 0
+    fi
+    return 1
+}
+
+if [ "${1:-}" = "selftest" ]; then
+    if gw_selftest; then exit 0; else exit 1; fi
+fi
+
 if [ "${1:-}" = "inject-config" ]; then
-    inject_gateway_config
+    inject_gateway_config || exit 1
     exit 0
 fi
 
@@ -123,7 +317,50 @@ check() {
     fi
 }
 
+# Record one check that the running gateway's lan_interface is the interface
+# holding its LAN address, derived here from the container's addresses
+# independently of the entrypoint. Sets LAN_IF to the derived name, or to
+# empty when no single interface holds the address. Needs no set -e: callers
+# may run it where set -e is suspended.
+lan_agree() {
+    local label="$1" reported="" derived=""
+    for _ in $(seq 1 30); do
+        if reported=$(docker exec "$GATEWAY" bash -c \
+            'echo "{\"command\":\"show_gateway\"}" | nc -U -w1 /run/fips/gateway.sock 2>/dev/null' \
+            | gw_iface); then
+            break
+        fi
+        reported=""
+        sleep 1
+    done
+    if derived=$(docker exec "$GATEWAY" ip -6 -o addr show 2>/dev/null | lan_iface "$GW_DNS"); then
+        :
+    else
+        derived=""
+    fi
+    LAN_IF="$derived"
+    if [ -z "$derived" ]; then
+        check "$label: no single interface holds $GW_DNS" 1
+    elif [ -z "$reported" ]; then
+        check "$label: gateway did not report its lan_interface (derived $derived)" 1
+    elif [ "$derived" != "$reported" ]; then
+        check "$label: derived $derived, gateway $reported" 1
+    else
+        check "$label: gateway uses $derived, which holds $GW_DNS" 0
+    fi
+    return 0
+}
+
 echo "=== FIPS Gateway Integration Test ==="
+echo ""
+
+# Phase 0: the readers the later phases rely on, against canned input.
+echo "Phase 0: Reader self-test"
+if gw_selftest; then
+    check "Reader self-test" 0
+else
+    check "Reader self-test" 1
+fi
 echo ""
 
 # Phase 1: Wait for mesh convergence (gateway ↔ server, gateway ↔ server-2)
@@ -131,6 +368,19 @@ echo "Phase 1: Mesh convergence"
 wait_for_peers "$GATEWAY" 2 30 || true
 wait_for_peers "$SERVER" 1 30 || true
 wait_for_peers "$SERVER2" 1 30 || true
+
+# Phase 1b: LAN interface
+#
+# A wrong lan_interface that exists passes the gateway's startup check, and
+# the LAN masquerade and the proxy NDP entries then go on the wrong interface.
+# The gateway container's entrypoint derives the interface holding the LAN
+# address at every container start and writes it into the gateway's config.
+# This checks the result against an independent derivation from outside. An
+# empty LAN_IF afterwards makes every later interface check fail.
+echo ""
+echo "Phase 1b: LAN interface"
+LAN_IF=""
+lan_agree "LAN interface"
 
 # Phase 2: Wait for gateway DNS to respond
 echo ""
@@ -340,6 +590,20 @@ else
     check "Gateway counts a session (skipped — no virtual IP)" 1
 fi
 
+# The mapping's proxy neighbour entry must be on the LAN interface, or LAN
+# hosts without a static route cannot reach the virtual IP. Phase 3's static
+# routes bypass neighbour resolution, so nothing else would notice.
+if [ -n "$VIRTUAL_IP" ] && [ -n "$LAN_IF" ] \
+    && PROXY_IF=$(docker exec "$GATEWAY" ip -6 neigh show proxy 2>/dev/null | proxy_dev "$VIRTUAL_IP"); then
+    if [ "$PROXY_IF" = "$LAN_IF" ]; then
+        check "Proxy NDP entry for $VIRTUAL_IP on $PROXY_IF, the LAN interface" 0
+    else
+        check "Proxy NDP entry for $VIRTUAL_IP on $PROXY_IF, but the LAN interface is $LAN_IF" 1
+    fi
+else
+    check "Proxy NDP entry for '$VIRTUAL_IP' on the LAN interface '$LAN_IF' (none found once)" 1
+fi
+
 # Phase 7: Inbound port forwarding — UDP and a second simultaneous TCP forward.
 #
 # Three forwards exercised:
@@ -370,6 +634,18 @@ if echo "$NFT_RULES" | grep -q "18081"; then
     check "nftables port-forward DNAT rule (udp 18081)" 0
 else
     check "nftables port-forward DNAT rule (udp 18081)" 1
+fi
+# The LAN masquerade must name the interface Phase 1b derived. An empty
+# LAN_IF or a reader that found no single rule fails, so a failed listing
+# cannot pass as two empty strings.
+if [ -n "$LAN_IF" ] && MASQ_IF=$(masq_iface <<< "$NFT_RULES"); then
+    if [ "$MASQ_IF" = "$LAN_IF" ]; then
+        check "LAN masquerade on $MASQ_IF, the LAN interface $LAN_IF" 0
+    else
+        check "LAN masquerade on $MASQ_IF, but the LAN interface is $LAN_IF" 1
+    fi
+else
+    check "LAN masquerade on the LAN interface '$LAN_IF' (no single LAN masquerade rule)" 1
 fi
 
 # Start marker HTTP servers on the LAN-side client.
@@ -605,6 +881,24 @@ PYEOF
         check "$prefix: gateway DNS answers after restart" 0
     else
         check "$prefix: gateway DNS answers after restart" 1
+        return 1
+    fi
+
+    # The entrypoint re-derives the LAN interface at this start; a mismatch
+    # reds this check alone, since nothing below depends on the interface.
+    lan_agree "$prefix: LAN interface after restart"
+
+    # fips-gateway reads the entrypoint's copy, not the mounted file checked
+    # above, and the checks below need its ttl and grace.
+    local copy_ttl copy_grace
+    copy_ttl=$(docker exec "$GATEWAY" grep -c "ttl: 1800" /etc/fips/gateway.yaml 2>/dev/null || true)
+    copy_grace=$(docker exec "$GATEWAY" grep -c "pool_grace_period: 1800" /etc/fips/gateway.yaml 2>/dev/null || true)
+    copy_ttl=${copy_ttl:-0}
+    copy_grace=${copy_grace:-0}
+    if [ "$copy_ttl" -ge 1 ] && [ "$copy_grace" -ge 1 ]; then
+        check "$prefix: gateway config copy has ttl 1800 and grace 1800" 0
+    else
+        check "$prefix: gateway config copy (ttl: $copy_ttl, grace: $copy_grace)" 1
         return 1
     fi
 
