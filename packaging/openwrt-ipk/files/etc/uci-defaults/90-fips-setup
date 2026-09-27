@@ -1,8 +1,14 @@
 #!/bin/sh
 # FIPS first-boot setup — runs once after package installation.
 # Configures the firewall and kernel modules for FIPS operation.
-# This script is executed by /etc/rc.d/S19sysctl on first boot and
-# then deleted by the UCI defaults mechanism.
+# The UCI defaults mechanism runs it once and deletes it when it ends with
+# status 0.
+#
+# It is executed by the package's postinst, but sourced, not executed, by
+# OpenWrt's default_postinst for a package built from the SDK feed and by the
+# first-boot uci-defaults run after a sysupgrade. Nothing here may exit early,
+# change directory or set shell options, and it must end with status 0: a
+# non-zero status leaves the script in place to run again on every boot.
 
 # ---------------------------------------------------------------------------
 # 1. Kernel modules
@@ -63,9 +69,13 @@ uci commit firewall
 # dnsmasq init script builds its config from UCI and loads no directory under
 # /etc. The daemon's DNS responder binds ::1. The 127.0.0.1 del_list removes
 # the entry older packages added. While fips-gateway runs, its init script
-# points this entry at the gateway's DNS port instead.
+# points this entry at the gateway's DNS port instead. The two del_lists after
+# the first remove the gateway's entry for its old default port, left behind
+# by a gateway that stopped without its init script's stop running.
 
 uci -q del_list dhcp.@dnsmasq[0].server="/fips/127.0.0.1#5354" 2>/dev/null || true
+uci -q del_list dhcp.@dnsmasq[0].server="/fips/::1#5353" 2>/dev/null || true
+uci -q del_list dhcp.@dnsmasq[0].server="/fips/127.0.0.1#5353" 2>/dev/null || true
 uci -q del_list dhcp.@dnsmasq[0].server="/fips/::1#5354" 2>/dev/null || true
 uci add_list dhcp.@dnsmasq[0].server="/fips/::1#5354"
 uci -q del_list dhcp.@dnsmasq[0].rebind_domain="fips" 2>/dev/null || true
@@ -85,5 +95,41 @@ grep -qxF 'nf_conntrack' /etc/modules.d/nf-conntrack 2>/dev/null || \
 # typically already on for a router, and proxy_ndp has no effect until
 # proxy NDP entries are actually added.
 sysctl -p /etc/sysctl.d/fips-gateway.conf 2>/dev/null || true
+
+# ---------------------------------------------------------------------------
+# 5. Gateway DNS listen port
+# ---------------------------------------------------------------------------
+# Every release up to 0.5.1 shipped the gateway's DNS listener on 5353, the
+# mDNS port, which the daemon's LAN rendezvous can hold. fips.yaml is a
+# conffile and fips-ap-setup edits it, so an upgrade keeps the old line.
+# Rewrite exactly that shipped line, four-space indent and nothing after the
+# closing quote, inside the top-level gateway block, to the line a fresh
+# install ships. Any other value is left as configured; the gateway warns at
+# startup when it is still on the mDNS port.
+#
+# Runs last, and cannot fail the script: see the note at the top.
+fips_migrate_gateway_dns_listen() {
+	local cfg=/etc/fips/fips.yaml
+	local old='    listen: "[::1]:5353"'
+	local new='    # listen: "[::1]:5365"   # the default; the init script points dnsmasq at this port'
+	local msg='fips: moved gateway.dns.listen off the mDNS port 5353 to the default [::1]:5365'
+
+	if [ -f "$cfg" ] && grep -qxF "$old" "$cfg" 2>/dev/null; then
+		if awk -v old="$old" -v new="$new" '
+			/^[A-Za-z_]/ { top = $1 }
+			top == "gateway:" && $0 == old { print new; changed = 1; next }
+			{ print }
+			END { exit changed ? 0 : 1 }
+		' "$cfg" > "$cfg.tmp" 2>/dev/null &&
+			chmod 600 "$cfg.tmp" 2>/dev/null &&
+			mv -f "$cfg.tmp" "$cfg" 2>/dev/null; then
+			logger -t fips "$msg" 2>/dev/null || true
+			echo "$msg"
+		else
+			rm -f "$cfg.tmp" 2>/dev/null || true
+		fi
+	fi
+}
+fips_migrate_gateway_dns_listen
 
 exit 0

@@ -132,7 +132,9 @@ def status_tested(name: str, all_text: str, defining_file: Path) -> list[str]:
         (rf"^\s*{re.escape(name)}\s*\|\|", "<fn> ||"),
         (rf"^\s*{re.escape(name)}\s+[^\n|&]*&&", "<fn> &&"),
         (rf"^\s*{re.escape(name)}\s*&&", "<fn> &&"),
-        (rf"\bif\s+\S*\s*{re.escape(name)}\b.*;\s*then", "if ... <fn> ; then"),
+        # The lookbehind keeps `\S*` from ending inside a longer name, so
+        # `if text=$(read_gateway_log ...); then` is not read as a call of `log`.
+        (rf"\bif\s+\S*\s*(?<![A-Za-z0-9_]){re.escape(name)}\b.*;\s*then", "if ... <fn> ; then"),
         # Command substitution. Found 2026-07-23 while fixing a function this
         # check reported clean: `total=$(count_log_pattern "$p") || { ... }`
         # consumes the status, but the line begins with the variable, so none

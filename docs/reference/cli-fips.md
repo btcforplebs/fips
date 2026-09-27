@@ -76,16 +76,18 @@ first, then `/usr/local/etc/fips`, so the packaged file wins over a
 leftover `/etc/fips` copy from an earlier install. Windows likewise
 probes `\etc\fips` on the current drive, then `C:\ProgramData\fips`.
 
-Adjacent to the highest-priority config file the daemon reads (or
-writes, on first start) the identity files:
+Adjacent to the highest-priority config file the daemon keeps the
+identity files:
 
 | File | Mode | Purpose |
 | ---- | ---- | ------- |
-| `fips.key` | `0600` | Bech32 nsec for the persistent identity (Unix; on Windows the file takes its directory's ACL, which `install-service.ps1` restricts to SYSTEM and Administrators). |
-| `fips.pub` | `0644` | Bech32 npub corresponding to `fips.key`. |
+| `fips.key` | `0600` | Bech32 nsec for the persistent identity, written only in persistent mode (Unix; on Windows the file takes its directory's ACL, which `install-service.ps1` restricts to SYSTEM and Administrators). |
+| `fips.pub` | `0644` | Bech32 npub of the running identity, written on every start. In persistent mode it corresponds to `fips.key`. |
 
 When `node.identity.persistent` is `false` (the default), a fresh
-keypair is written to these files on every start.
+keypair is generated on every start and only `fips.pub` is written.
+A `fips.key` found there is moved aside to `fips.key.unused` and a
+warning is logged.
 
 On Windows the service writes its log to `C:\ProgramData\fips\fips.log`,
 rolled at 10 MiB with four old files kept; a foreground run logs to the

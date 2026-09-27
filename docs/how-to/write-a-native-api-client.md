@@ -85,13 +85,15 @@ that costs a real payload if you get it wrong. A client that sends an empty
 datagram, then a message, then closes, leaves both queued, and a reader that
 trusts `POLLHUP` alone discards the message.
 
-**One case has no answer, and you should design around it rather than solve
-it.** A zero-length datagram that is the last message before a close is
-indistinguishable from the close: reading it drains the queue, and `FIONREAD`
-then reports zero because a zero-length message contributes no bytes. If your
-protocol gives a zero-length payload a meaning, do not send it as a zero-length
-socket message. Carry a one-byte discriminator, and keep the zero-byte read for
-end of file alone.
+**One case has no answer on Linux, where the pair is `SOCK_SEQPACKET`, and you
+should design around it rather than solve it.** A zero-length datagram that is
+the last message before a close is indistinguishable from the close: reading it
+drains the queue, and `FIONREAD` then reports zero because a zero-length message
+contributes no bytes. If your protocol gives a zero-length payload a meaning, do
+not send it as a zero-length socket message. Carry a one-byte discriminator, and
+keep the zero-byte read for end of file alone. On macOS and FreeBSD the pair is
+`SOCK_DGRAM`: the empty datagram reads as zero bytes, and the close is reported
+by the read after it.
 
 Both directions of the mistake are real. Reading an empty datagram as a close
 lets a peer tear down a live flow by sending nothing, and presents as a

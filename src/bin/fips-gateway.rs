@@ -251,8 +251,9 @@ async fn main() {
         std::process::exit(1);
     }
 
-    // Check DNS upstream reachability (proves the FIPS daemon is running)
-    {
+    // Check DNS upstream reachability (proves the FIPS daemon is running).
+    // The resolver later forwards to the address this probe reached.
+    let upstream_addr = {
         let upstream = gw_config.dns.upstream();
         info!(upstream = %upstream, "Checking DNS upstream reachability");
 
@@ -363,6 +364,29 @@ async fn main() {
             );
             std::process::exit(1);
         }
+        upstream_addr
+    };
+
+    // --- Bind the DNS listener ---
+    //
+    // Before the pool, NAT table and routes exist, so a port that is already
+    // taken ends the gateway with nothing to tear down, and a service manager
+    // restarting it does not churn nftables.
+    if gw_config.dns.is_mdns() {
+        warn!(
+            "gateway.dns.listen uses port 5353, the mDNS port; an mDNS responder (the fips daemon's LAN rendezvous, avahi) will conflict with it; the default is now [::1]:5365"
+        );
+    }
+    let dns_socket = match dns::bind_listener(gw_config.dns.listen()).await {
+        Ok(socket) => socket,
+        Err(e) => {
+            error!("{e}");
+            std::process::exit(1);
+        }
+    };
+    match dns_socket.local_addr() {
+        Ok(addr) => info!(addr = %addr, "Gateway DNS resolver listening"),
+        Err(_) => info!(addr = %gw_config.dns.listen(), "Gateway DNS resolver listening"),
     }
 
     // --- Initialize components ---
@@ -421,27 +445,16 @@ async fn main() {
 
     // --- Start DNS resolver task ---
 
-    let dns_pool = Arc::clone(&ip_pool);
-    let dns_event_tx = event_tx.clone();
-    let dns_shutdown = shutdown_rx.clone();
-    let dns_listen = gw_config.dns.listen().to_string();
-    let dns_upstream = gw_config.dns.upstream().to_string();
-    let dns_ttl = gw_config.dns.ttl();
-
-    let dns_task = tokio::spawn(async move {
-        if let Err(e) = dns::run_dns_resolver(
-            &dns_listen,
-            &dns_upstream,
-            dns_ttl,
-            dns_pool,
-            dns_event_tx,
-            dns_shutdown,
-        )
-        .await
-        {
-            error!(error = %e, "DNS resolver error");
-        }
-    });
+    // Held in an Option because the main loop may see it complete, and a
+    // completed JoinHandle panics if it is polled again.
+    let mut dns_task = Some(tokio::spawn(dns::serve(
+        dns_socket,
+        upstream_addr,
+        gw_config.dns.ttl(),
+        Arc::clone(&ip_pool),
+        event_tx.clone(),
+        shutdown_rx.clone(),
+    )));
 
     // --- Snapshot channel for control socket ---
 
@@ -531,6 +544,7 @@ async fn main() {
 
     info!("fips-gateway running");
 
+    let mut exit_code = 0;
     loop {
         tokio::select! {
             Some(event) = event_rx.recv() => {
@@ -559,6 +573,25 @@ async fn main() {
                     }
                 }
             }
+            // The resolver ends only on shutdown, which has not been
+            // signalled while this loop runs, so any completion here means
+            // .fips resolution has stopped. Exit non-zero so systemd or procd
+            // restarts the gateway or shows it failed.
+            result = async { dns_task.as_mut().expect("guarded by the precondition").await },
+                if dns_task.is_some() => {
+                dns_task = None;
+                let cause = match result {
+                    Ok(Ok(())) => "the resolver returned without an error".to_string(),
+                    Ok(Err(e)) => e.to_string(),
+                    Err(e) => e.to_string(),
+                };
+                error!(
+                    cause = %cause,
+                    "Gateway DNS resolver stopped; exiting so the service manager restarts the gateway"
+                );
+                exit_code = 1;
+                break;
+            }
             _ = tokio::signal::ctrl_c() => {
                 info!("Received SIGINT, shutting down");
                 break;
@@ -582,7 +615,9 @@ async fn main() {
         task.abort();
         let _ = task.await;
     }
-    let _ = dns_task.await;
+    if let Some(task) = dns_task {
+        let _ = task.await;
+    }
     let _ = tick_task.await;
 
     // Log final pool status
@@ -606,4 +641,7 @@ async fn main() {
     }
 
     info!("fips-gateway shutdown complete");
+    if exit_code != 0 {
+        std::process::exit(exit_code);
+    }
 }

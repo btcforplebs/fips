@@ -596,13 +596,60 @@ pub fn write_pub_file(path: &Path, npub: &str) -> Result<(), ConfigError> {
     Ok(())
 }
 
+/// Move a key file found at an ephemeral start to `<name>.unused` beside it,
+/// so it is neither used nor overwritten and stays recoverable.
+///
+/// Returns the new path when the file was moved. Does nothing when no file is
+/// at `key_path`; a dangling symlink counts as a file and is moved as a link.
+/// An existing file at the aside path is never replaced: the key is left in
+/// place and a warning says so, as it does when the rename fails. Neither case
+/// stops the start.
+fn retire_key(key_path: &Path) -> Option<PathBuf> {
+    // symlink_metadata rather than exists: a dangling symlink at the key path
+    // reports exists() == false but is still a file the operator put there.
+    key_path.symlink_metadata().ok()?;
+
+    let mut name = key_path.file_name()?.to_os_string();
+    name.push(".unused");
+    let aside = key_path.with_file_name(name);
+
+    let failure = match aside.symlink_metadata() {
+        Ok(_) => "a file already exists at the aside path".to_string(),
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => e.to_string(),
+        Err(_) => match std::fs::rename(key_path, &aside) {
+            Ok(()) => {
+                tracing::warn!(
+                    path = %key_path.display(),
+                    moved_to = %aside.display(),
+                    config_key = "node.identity.persistent",
+                    "An identity key file was found in ephemeral mode and moved aside, not used; \
+                     set node.identity.persistent: true and move it back to use it"
+                );
+                return Some(aside);
+            }
+            Err(e) => e.to_string(),
+        },
+    };
+
+    tracing::warn!(
+        path = %key_path.display(),
+        aside = %aside.display(),
+        error = %failure,
+        config_key = "node.identity.persistent",
+        "An identity key file was found in ephemeral mode and could not be moved aside; \
+         it is not used; set node.identity.persistent: true to use it, or remove it"
+    );
+    None
+}
+
 /// Resolve identity from config and key file.
 ///
 /// Behavior depends on `node.identity.persistent`:
 ///
 /// - **`persistent: false`** (default): generate a fresh ephemeral keypair
-///   every start. Key files are written for operator visibility but overwritten
-///   on each restart.
+///   every start. Only `fips.pub` is written, so the running npub is visible;
+///   the private key is never written. A `fips.key` already at the path is
+///   moved aside to `fips.key.unused` with a warning, not used or overwritten.
 ///
 /// - **`persistent: true`**: use three-tier resolution:
 ///   1. Explicit nsec in config — highest priority
@@ -738,8 +785,8 @@ pub fn resolve_identity(
             }
         }
     } else {
-        // Ephemeral mode (default): fresh keypair every start, write key files
-        // for operator visibility
+        // Ephemeral mode (default): a fresh keypair every start, held only in
+        // memory. Only the public key file is written.
         let identity = Identity::generate();
         // `keypair()` and `secret_key()` each hand back a whole private key
         // rather than a handle, so both temporaries are bound and erased.
@@ -754,25 +801,8 @@ pub fn resolve_identity(
             let _ = std::fs::create_dir_all(parent);
         }
 
-        // symlink_metadata rather than exists: a dangling symlink at the key
-        // path reports exists() == false but is still an existing file the
-        // write is about to act on.
-        if key_path.symlink_metadata().is_ok() {
-            tracing::warn!(
-                path = %key_path.display(),
-                config_key = "node.identity.persistent",
-                "An existing key file at this path is being replaced by a fresh ephemeral \
-                 identity; set node.identity.persistent: true to keep the existing identity"
-            );
-        }
+        retire_key(&key_path);
 
-        if let Err(e) = write_key_file(&key_path, &nsec) {
-            tracing::warn!(
-                path = %key_path.display(),
-                error = %e,
-                "Failed to write the ephemeral key file"
-            );
-        }
         if let Err(e) = write_pub_file(&pub_path, &npub) {
             tracing::warn!(
                 path = %pub_path.display(),
@@ -2118,29 +2148,64 @@ node:
         assert_eq!(fs::read_to_string(&victim).unwrap(), "victim contents\n");
     }
 
+    /// The names in `dir`, sorted, so a test can assert on the whole directory.
+    fn dir_names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// The npub a resolved identity runs as.
+    fn resolved_npub(resolved: &ResolvedIdentity) -> String {
+        crate::Identity::from_secret_str(&resolved.nsec)
+            .unwrap()
+            .npub()
+    }
+
     #[test]
-    fn test_ephemeral_over_existing_key_warns() {
+    fn ephemeral_start_moves_an_existing_key_aside_intact() {
         let temp_dir = TempDir::new().unwrap();
         let config_path = temp_dir.path().join("fips.yaml");
         let key_path = temp_dir.path().join("fips.key");
+        let aside_path = temp_dir.path().join("fips.key.unused");
 
         fs::write(&config_path, "node:\n  identity: {}\n").unwrap();
         let identity = crate::Identity::generate();
         let existing = crate::encode_nsec(&identity.keypair().secret_key());
         write_key_file(&key_path, &existing).unwrap();
+        let planted = fs::read(&key_path).unwrap();
 
         let config = Config::load_file(&config_path).unwrap();
         let (resolved, logs) =
             capture_logs(|| resolve_identity(&config, std::slice::from_ref(&config_path)).unwrap());
 
         assert_ne!(resolved.nsec, existing);
+        assert!(
+            key_path.symlink_metadata().is_err(),
+            "the key file must be moved away from the path a persistent start reads"
+        );
+        assert_eq!(
+            fs::read(&aside_path).unwrap(),
+            planted,
+            "the key set aside must hold the planted bytes exactly"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(fs::metadata(&aside_path).unwrap().mode() & 0o777, 0o600);
+        }
         let warnings = logs.warnings();
         assert!(
             warnings
                 .iter()
                 .any(|w| w.contains(&key_path.display().to_string())
-                    && w.contains("node.identity.persistent")),
-            "expected a warning naming the key path and the config key, got {warnings:?}"
+                    && w.contains(&aside_path.display().to_string())
+                    && w.contains("node.identity.persistent")
+                    && w.contains("and moved aside, not used")),
+            "expected the moved-aside warning naming both paths and the config key, got {warnings:?}"
         );
     }
 
@@ -2150,6 +2215,7 @@ node:
         let temp_dir = TempDir::new().unwrap();
         let config_path = temp_dir.path().join("fips.yaml");
         let key_path = temp_dir.path().join("fips.key");
+        let aside_path = temp_dir.path().join("fips.key.unused");
         let target = temp_dir.path().join("absent-target");
 
         fs::write(&config_path, "node:\n  identity: {}\n").unwrap();
@@ -2163,12 +2229,174 @@ node:
         assert!(
             warnings
                 .iter()
-                .any(|w| w.contains(&key_path.display().to_string())),
-            "expected a warning naming the key path, got {warnings:?}"
+                .any(|w| w.contains(&key_path.display().to_string())
+                    && w.contains("and moved aside, not used")),
+            "expected the moved-aside warning naming the key path, got {warnings:?}"
+        );
+        assert!(
+            key_path.symlink_metadata().is_err(),
+            "the dangling symlink must be moved away from the key path"
+        );
+        assert!(
+            aside_path
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the symlink itself must be what was moved aside, not a file written through it"
         );
         assert!(
             !target.exists(),
             "the write must not have been followed through the dangling symlink"
+        );
+    }
+
+    #[test]
+    fn ephemeral_start_leaves_a_key_in_place_when_the_aside_name_is_taken() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("fips.yaml");
+        let key_path = temp_dir.path().join("fips.key");
+        let aside_path = temp_dir.path().join("fips.key.unused");
+
+        fs::write(&config_path, "node:\n  identity: {}\n").unwrap();
+        let current = crate::encode_nsec(&crate::Identity::generate().keypair().secret_key());
+        let earlier = crate::encode_nsec(&crate::Identity::generate().keypair().secret_key());
+        write_key_file(&key_path, &current).unwrap();
+        write_key_file(&aside_path, &earlier).unwrap();
+        let key_bytes = fs::read(&key_path).unwrap();
+        let aside_bytes = fs::read(&aside_path).unwrap();
+
+        let config = Config::load_file(&config_path).unwrap();
+        let (resolved, logs) =
+            capture_logs(|| resolve_identity(&config, std::slice::from_ref(&config_path)).unwrap());
+
+        assert!(matches!(resolved.source, IdentitySource::Ephemeral));
+        assert_ne!(resolved.nsec, current);
+        assert_eq!(
+            fs::read(&key_path).unwrap(),
+            key_bytes,
+            "the key must be left in place, not overwritten"
+        );
+        assert_eq!(
+            fs::read(&aside_path).unwrap(),
+            aside_bytes,
+            "the file already at the aside path must not be replaced"
+        );
+        let warnings = logs.warnings();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains(&key_path.display().to_string())
+                    && w.contains(&aside_path.display().to_string())
+                    && w.contains("node.identity.persistent")
+                    && w.contains("could not be moved aside")),
+            "expected the could-not-move warning naming both paths and the config key, got {warnings:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ephemeral_start_proceeds_when_the_key_cannot_be_moved() {
+        use std::os::unix::fs::PermissionsExt;
+
+        /// Puts the directory's mode back when dropped, so a failing
+        /// assertion does not leave a read-only directory behind that
+        /// `TempDir` cannot remove.
+        struct RestoreMode<'a>(&'a Path);
+        impl Drop for RestoreMode<'_> {
+            fn drop(&mut self) {
+                let _ = fs::set_permissions(self.0, fs::Permissions::from_mode(0o755));
+            }
+        }
+
+        // Coverage gap: root bypasses directory permissions, so the rename
+        // succeeds and this branch goes unexercised when the suite runs as
+        // root. The aside-name-taken test still covers the same warning.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipped: running as root, which a read-only directory does not stop");
+            return;
+        }
+
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("fips.yaml");
+        let key_path = temp_dir.path().join("fips.key");
+
+        fs::write(&config_path, "node:\n  identity: {}\n").unwrap();
+        let existing = crate::encode_nsec(&crate::Identity::generate().keypair().secret_key());
+        write_key_file(&key_path, &existing).unwrap();
+        let planted = fs::read(&key_path).unwrap();
+        let config = Config::load_file(&config_path).unwrap();
+
+        fs::set_permissions(temp_dir.path(), fs::Permissions::from_mode(0o555)).unwrap();
+        let _restore = RestoreMode(temp_dir.path());
+
+        let (resolved, logs) =
+            capture_logs(|| resolve_identity(&config, std::slice::from_ref(&config_path)).unwrap());
+
+        assert!(matches!(resolved.source, IdentitySource::Ephemeral));
+        assert_ne!(resolved.nsec, existing);
+        assert_eq!(
+            fs::read(&key_path).unwrap(),
+            planted,
+            "a key that cannot be moved must be left as it was, not overwritten"
+        );
+        let warnings = logs.warnings();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains(&key_path.display().to_string())
+                    && w.contains("could not be moved aside")
+                    && w.contains("os error")),
+            "expected a warning naming the key path and the rename error, got {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn ephemeral_restarts_never_leave_a_private_key_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("fips.yaml");
+        let pub_path = temp_dir.path().join("fips.pub");
+
+        fs::write(&config_path, "node:\n  identity: {}\n").unwrap();
+        let config = Config::load_file(&config_path).unwrap();
+
+        for start in 1..=3 {
+            let resolved = resolve_identity(&config, std::slice::from_ref(&config_path)).unwrap();
+            assert_eq!(
+                dir_names(temp_dir.path()),
+                ["fips.pub", "fips.yaml"],
+                "after start {start} the directory must hold only the config and the public key"
+            );
+            assert_eq!(
+                fs::read_to_string(&pub_path).unwrap().trim(),
+                resolved_npub(&resolved),
+                "after start {start} fips.pub must name the running identity"
+            );
+        }
+    }
+
+    #[test]
+    fn persistent_start_ignores_a_key_set_aside() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("fips.yaml");
+        let key_path = temp_dir.path().join("fips.key");
+        let aside_path = temp_dir.path().join("fips.key.unused");
+
+        fs::write(&config_path, "node:\n  identity:\n    persistent: true\n").unwrap();
+        let earlier = crate::encode_nsec(&crate::Identity::generate().keypair().secret_key());
+        write_key_file(&aside_path, &earlier).unwrap();
+        let aside_bytes = fs::read(&aside_path).unwrap();
+
+        let config = Config::load_file(&config_path).unwrap();
+        let resolved = resolve_identity(&config, std::slice::from_ref(&config_path)).unwrap();
+
+        assert!(matches!(resolved.source, IdentitySource::Generated(_)));
+        assert_ne!(resolved.nsec, earlier);
+        assert_eq!(read_key_file(&key_path).unwrap(), resolved.nsec);
+        assert_eq!(
+            fs::read(&aside_path).unwrap(),
+            aside_bytes,
+            "a persistent start must leave the key set aside untouched"
         );
     }
 
@@ -2303,11 +2531,18 @@ node:
         let resolved = resolve_identity(&config, std::slice::from_ref(&config_path)).unwrap();
         assert!(matches!(resolved.source, IdentitySource::Ephemeral));
 
-        // Key files should still be written for operator visibility
+        // Only the public key is written: an ephemeral private key lives in
+        // memory and nowhere else.
         let key_path = temp_dir.path().join("fips.key");
         let pub_path = temp_dir.path().join("fips.pub");
-        assert!(key_path.exists());
-        assert!(pub_path.exists());
+        assert_eq!(
+            key_path.symlink_metadata().unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        assert_eq!(
+            fs::read_to_string(&pub_path).unwrap().trim(),
+            resolved_npub(&resolved)
+        );
     }
 
     #[test]

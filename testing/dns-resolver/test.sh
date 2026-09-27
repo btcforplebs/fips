@@ -701,6 +701,114 @@ DOCKERFILE
 # prepare_binaries) and are copied into each per-distro runtime image.
 # ─────────────────────────────────────────────────────────────────────
 
+# Print a fips-gateway log from the container with terminal colour codes
+# removed, so structured fields can be matched as plain "key=value" text.
+# Fails when the log cannot be read.
+read_gateway_log() {
+    local name="$1" log="$2"
+    local text
+    text=$(docker exec "$name" cat "$log" 2>/dev/null) || return 1
+    printf '%s\n' "$text" | sed 's/\x1b\[[0-9;]*m//g'
+    return 0
+}
+
+# The gateway on its default config binds [::1]:5365 and gets past the
+# bind to the NAT step, logging one of the two NAT lines whichever way NAT
+# goes in this container. Those are the lines the held-port check requires
+# to be absent, so this shows the gateway still emits them in that text.
+check_gateway_default_bind() {
+    local name="$1"
+    local log=/var/log/fips-gateway.log
+    local text="" read_ok=0 listening=0 nat_step=0 _i
+    for _i in $(seq 1 5); do
+        if text=$(read_gateway_log "$name" "$log"); then
+            read_ok=1
+            if printf '%s\n' "$text" | grep -q 'Gateway DNS resolver listening.*addr=\[::1\]:5365'; then
+                listening=1
+            fi
+            if printf '%s\n' "$text" | grep -qE 'Created nftables table|Failed to create nftables table'; then
+                nat_step=1
+                break
+            fi
+        fi
+        sleep 1
+    done
+    if [ "$read_ok" = "0" ]; then
+        fail "could not read $log, so the gateway's default bind was not observed"
+        return
+    fi
+    if [ "$listening" = "1" ]; then
+        pass "fips-gateway listens on its default [::1]:5365"
+    else
+        fail "fips-gateway did not log listening on [::1]:5365"
+    fi
+    if [ "$nat_step" = "1" ]; then
+        pass "fips-gateway gets past the DNS bind to the NAT step"
+    else
+        fail "fips-gateway logged neither NAT-step line after the DNS bind"
+    fi
+    if [ "$listening" = "0" ] || [ "$nat_step" = "0" ]; then
+        echo "  --- $log ---"
+        printf '%s\n' "$text" | tail -20
+    fi
+}
+
+# The gateway exits at the DNS bind when its listen port is held. The
+# daemon in this container holds [::1]:5354, so a gateway configured to
+# listen there must exit non-zero with the hint naming the daemon, before
+# it creates the address pool or the NAT table. Any build that gets past
+# the bind logs one of the pool or NAT lines below, whichever way NAT goes
+# in this container, so their absence shows the exit came first.
+check_gateway_exits_on_held_port() {
+    local name="$1"
+    local log=/var/log/fips-gateway-held.log
+    local fail_before=$FAIL
+    docker exec "$name" bash -c 'cat > /tmp/gateway-held.yaml <<EOF
+node:
+  identity:
+    persistent: true
+gateway:
+  enabled: true
+  pool: "fd01::/112"
+  lan_interface: "eth0"
+  dns:
+    listen: "[::1]:5354"
+EOF'
+    docker exec "$name" bash -c "timeout 30 /usr/bin/fips-gateway --config /tmp/gateway-held.yaml >$log 2>&1; echo \"EXIT=\$?\" >>$log"
+
+    local text
+    if ! text=$(read_gateway_log "$name" "$log"); then
+        fail "could not read $log, so the held-port exit was not observed"
+        return
+    fi
+    local rc
+    rc=$(printf '%s\n' "$text" | sed -n 's/^EXIT=//p' | tail -n 1)
+    if [ -z "$rc" ]; then
+        fail "the held-port gateway run left no exit status in $log"
+    elif [ "$rc" = "0" ] || [ "$rc" = "124" ]; then
+        fail "fips-gateway on a held DNS port exited $rc (expected non-zero, not the timeout)"
+    else
+        pass "fips-gateway on a held DNS port exits $rc"
+    fi
+    if printf '%s\n' "$text" | grep -qF "the fips daemon's own DNS responder listens on 5354"; then
+        pass "the bind error names the daemon as the likely holder of 5354"
+    else
+        fail "the bind error does not carry the 5354 hint"
+    fi
+    local line
+    for line in "Failed to create virtual IP pool" "Failed to create nftables table" "Created nftables table"; do
+        if printf '%s\n' "$text" | grep -qF "$line"; then
+            fail "fips-gateway reached a step after the DNS bind: '$line'"
+        else
+            pass "fips-gateway stopped before '$line'"
+        fi
+    done
+    if [ "$FAIL" -gt "$fail_before" ]; then
+        echo "  --- $log ---"
+        printf '%s\n' "$text" | tail -20
+    fi
+}
+
 # Args: <distro_label> <docker_base_image> <apt_packages>
 # distro_label: short tag for container/image names (e.g. "debian12")
 # docker_base_image: e.g. "debian:12", "ubuntu:26.04"
@@ -913,10 +1021,13 @@ EOF'
         echo "  --- fips-gateway log ---"
         docker exec "$name" tail -20 /var/log/fips-gateway.log 2>&1 || true
     fi
-    # Stop the gateway (it will likely have failed past the upstream
-    # check on something unrelated in this minimal container — we only
-    # care that the upstream reachability step succeeded).
+    check_gateway_default_bind "$name"
+
+    # Stop the gateway (it may have failed after the DNS bind on something
+    # unrelated in this minimal container).
     docker exec "$name" pkill -f fips-gateway 2>/dev/null || true
+
+    check_gateway_exits_on_held_port "$name"
 
     # Teardown via the script: backend config file must be removed
     # (path varies by backend selected above).

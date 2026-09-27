@@ -484,7 +484,8 @@ mod service {
             "Configuration: the service reads {}",
             dir.join("fips.yaml").display()
         );
-        println!("  keep fips.key, hosts, peers.allow and peers.deny beside it.");
+        println!("  keep hosts, peers.allow and peers.deny beside it, and fips.key");
+        println!("  too when node.identity.persistent is true.");
         println!(
             "Logs: the service writes {}",
             dir.join("fips.log").display()

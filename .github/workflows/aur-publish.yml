@@ -138,9 +138,11 @@ jobs:
             bash namcap-gate.sh PKGBUILD
             echo "::endgroup::"
             echo "::group::makepkg build"
-            # --nocheck: skip the PKGBUILD check() (cargo test --lib); the test
-            # suite is already covered by ci.yml. This job validates packaging.
-            makepkg -s --noconfirm --nocheck
+            # No --nocheck. makepkg runs check() by default, so every AUR user
+            # runs it and this job must too. ci.yml runs the tests, but not this
+            # way: frozen and offline against what prepare fetched, with the
+            # Arch toolchain, in this container.
+            makepkg -s --noconfirm
             echo "::endgroup::"
             echo "::group::namcap built package"
             bash namcap-gate.sh ./*.pkg.tar.*

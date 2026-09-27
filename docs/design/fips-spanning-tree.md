@@ -207,6 +207,19 @@ branch, and each only re-announces to its peers.
 - **Convergence time**: A tree of depth D reconverges in roughly D × 0.5s
   to D × 1.0s
 
+The transport accepting a TreeAnnounce is not delivery. Each announce stays
+outstanding until the link's receiver reports confirm it, by the same rule
+as a FilterAnnounce (see "Update Triggers" in
+[fips-bloom-filters.md](fips-bloom-filters.md)). It is resent when the
+reports show a loss, and once after 30 s when they cannot confirm it, with
+the same budgets and backoff: per declaration sequence per session, one
+unchecked resend and three on loss, spaced by a per-peer backoff of 1, 2,
+4 ... up to 60 s. A resend carries the current declaration, so a peer that
+missed an older one gets the newer position, and one that already holds it
+ignores it as not fresher. The periodic re-evaluation under Stability
+Mechanisms, which re-broadcasts an unchanged declaration, stays as the
+backstop on a node with two or more peers.
+
 ### Transitive Trust (v1)
 
 In the v1 protocol, only the sender's outer signature on the TreeAnnounce

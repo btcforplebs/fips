@@ -130,6 +130,31 @@ foreach ($item in @(Get-ChildItem -LiteralPath $ConfigDir -Force)) {
 
 Write-Host "  Restricted $ConfigDir to SYSTEM and Administrators"
 
+# Releases before this one read peers.allow and peers.deny from \etc\fips on
+# the system drive, where any local user can create files, and the service
+# still reads a file there when it is missing from the config directory.
+# Stop rather than enforce, or silently drop, a list nobody has reviewed.
+$legacyAclDir = "$env:SystemDrive\etc\fips"
+foreach ($name in @("peers.allow", "peers.deny")) {
+    $legacy = Join-Path $legacyAclDir $name
+    $current = "$ConfigDir\$name"
+    if ((Test-Path -LiteralPath $legacy) -and -not (Test-Path -LiteralPath $current)) {
+        Write-Error "$legacy exists and $current does not, so the service would enforce the old file. Earlier releases read it, and any local user can write there. Review it, then move it to $current or delete it, and run install-service.ps1 again."
+        exit 1
+    }
+}
+
+# Empty peer ACL files allow every peer. Having them here means the service
+# never falls back to the \etc\fips copies. Empty them to clear a list; do not
+# delete them.
+foreach ($name in @("peers.allow", "peers.deny")) {
+    $aclFile = "$ConfigDir\$name"
+    if (-not (Test-Path -LiteralPath $aclFile)) {
+        New-Item -ItemType File -Path $aclFile | Out-Null
+        Write-Host "  Created empty $aclFile (allows every peer until you add entries)"
+    }
+}
+
 # Copy binaries
 $Binaries = @("fips.exe", "fipsctl.exe", "fipstop.exe")
 foreach ($bin in $Binaries) {

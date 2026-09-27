@@ -130,7 +130,7 @@ There is no `fipsctl gateway` subcommand; clients (including
             │                                   │
             │  ┌──────────────┐  ┌───────────┐  │
             │  │   DNS proxy  │  │  Virtual  │  │
-            │  │ ([::1]:5353) │─▶│  IP pool  │  │
+            │  │ ([::1]:5365) │─▶│  IP pool  │  │
             │  │   .fips only │  │ (state    │  │
             │  └──────┬───────┘  │  machine) │  │
             │         │          └─────┬─────┘  │
@@ -182,8 +182,10 @@ involving the DNS proxy or the pool.
 ### DNS Resolution Flow
 
 1. A LAN client sends a DNS query to the gateway's listener (default
-   `[::1]:5353`, configurable via `gateway.dns.listen`). The default
-   is loopback-only on an unprivileged port: the canonical deployment
+   `[::1]:5365`, configurable via `gateway.dns.listen`). The default
+   is not 5353, the mDNS port, which the daemon's LAN rendezvous and
+   other mDNS responders hold. It is loopback-only on an unprivileged
+   port: the canonical deployment
    has another resolver on the host (dnsmasq, systemd-resolved, BIND)
    holding port 53 and forwarding `.fips` queries to the gateway over
    loopback. Operators on a host without a pre-existing resolver on

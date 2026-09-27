@@ -7,6 +7,7 @@ use super::core::ParentEval;
 use super::limits::FlapDampener;
 use super::{CoordEntry, ParentDeclaration, TreeCoordinate};
 use crate::NodeAddr;
+use crate::proto::mmp::delivery::{Acks, LinkEvidence, ResendReason};
 
 /// What a parent-loss recovery did: whether the tree state changed, and
 /// whether the recovery switch was the one that armed a dampening episode.
@@ -40,6 +41,10 @@ pub struct TreeState {
     peer_declarations: BTreeMap<NodeAddr, ParentDeclaration>,
     /// Each peer's full ancestry to root.
     peer_ancestry: BTreeMap<NodeAddr, TreeCoordinate>,
+    /// Per-peer delivery tracking for sent TreeAnnounces.
+    acks: Acks,
+    /// The declaration sequence last recorded as sent to each peer.
+    announced: BTreeMap<NodeAddr, u64>,
     /// Hysteresis factor for cost-based parent re-selection (0.0-1.0).
     parent_hysteresis: f64,
     /// Flap-dampening / hold-down state machine.
@@ -78,6 +83,8 @@ impl TreeState {
             root: my_node_addr,
             peer_declarations: BTreeMap::new(),
             peer_ancestry: BTreeMap::new(),
+            acks: Acks::new(),
+            announced: BTreeMap::new(),
             parent_hysteresis: 0.0,
             flap: FlapDampener::new(),
             self_is_leaf: false,
@@ -164,6 +171,69 @@ impl TreeState {
     pub fn remove_peer(&mut self, peer_id: &NodeAddr) {
         self.peer_declarations.remove(peer_id);
         self.peer_ancestry.remove(peer_id);
+        self.acks.remove(peer_id);
+        self.announced.remove(peer_id);
+    }
+
+    /// Record a TreeAnnounce the transport accepted for `peer`, carrying our
+    /// declaration sequence `seq` and sent with link counter `counter`, so it
+    /// stays outstanding until the peer's receiver reports show it arrived.
+    ///
+    /// The transport accepting a frame is not delivery. A lost announce would
+    /// leave the peer on our old tree position until the next announce, which
+    /// on a node with one peer may never come. The announce's content changes
+    /// only with the declaration sequence, so a sequence other than the one
+    /// last recorded for `peer` starts a new lineage with fresh resend
+    /// budgets, and a resend or periodic re-broadcast of the same declaration
+    /// spends from its lineage's budget.
+    pub fn record_announce(
+        &mut self,
+        peer: NodeAddr,
+        seq: u64,
+        counter: u64,
+        link: &LinkEvidence,
+        now_ms: u64,
+    ) {
+        let fresh = self.announced.insert(peer, seq) != Some(seq);
+        self.acks.record(peer, fresh, counter, link, now_ms);
+    }
+
+    /// Decide whether the outstanding TreeAnnounce to `peer` must be resent,
+    /// by the shared receiver-report rule ([`Acks::check`]).
+    ///
+    /// Marks nothing: on `Some`, the caller marks the peer's announce pending
+    /// so the ordinary send path delivers the current declaration.
+    pub fn check_announce(
+        &mut self,
+        peer: &NodeAddr,
+        link: &LinkEvidence,
+        now_ms: u64,
+    ) -> Option<ResendReason> {
+        self.acks.check(peer, link, now_ms)
+    }
+
+    /// Whether a TreeAnnounce to `peer` is still awaiting confirmation.
+    pub fn announce_outstanding(&self, peer: &NodeAddr) -> bool {
+        self.outstanding_counter(peer).is_some()
+    }
+
+    /// The link counter of the TreeAnnounce to `peer` awaiting confirmation.
+    pub fn outstanding_counter(&self, peer: &NodeAddr) -> Option<u64> {
+        self.acks.outstanding(peer)
+    }
+
+    /// The declaration sequence of the TreeAnnounce to `peer` awaiting
+    /// confirmation.
+    pub fn outstanding_seq(&self, peer: &NodeAddr) -> Option<u64> {
+        self.outstanding_counter(peer)?;
+        self.announced.get(peer).copied()
+    }
+
+    /// Set how long a TreeAnnounce the receiver reports cannot check waits
+    /// before its fallback resend. Defaults to
+    /// [`FALLBACK_MS`](crate::proto::mmp::delivery::FALLBACK_MS).
+    pub fn set_fallback(&mut self, ms: u64) {
+        self.acks.set_fallback(ms);
     }
 
     /// Update this node's parent selection.
