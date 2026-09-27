@@ -372,6 +372,11 @@ async fn main() {
     // Before the pool, NAT table and routes exist, so a port that is already
     // taken ends the gateway with nothing to tear down, and a service manager
     // restarting it does not churn nftables.
+    if gw_config.dns.is_mdns() {
+        warn!(
+            "gateway.dns.listen uses port 5353, the mDNS port; an mDNS responder (the fips daemon's LAN rendezvous, avahi) will conflict with it; the default is now [::1]:5365"
+        );
+    }
     let dns_socket = match dns::bind_listener(gw_config.dns.listen()).await {
         Ok(socket) => socket,
         Err(e) => {

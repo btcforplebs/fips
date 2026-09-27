@@ -15,8 +15,10 @@ STOP=09
 PROG=/usr/bin/fips-gateway
 CONFIG=/etc/fips/fips.yaml
 
-# Port the gateway DNS listens on (must match dns.listen in fips.yaml).
-GW_DNS_PORT=5353
+# Port the gateway DNS listens on when gateway.dns.listen is not set. Must
+# match DEFAULT_DNS_LISTEN in the gateway's source; the scenario harness checks
+# the two agree. The port actually used comes from gateway_dns_port.
+GW_DNS_DEFAULT=5365
 # Port the FIPS daemon DNS listens on.
 DAEMON_DNS_PORT=5354
 
@@ -40,11 +42,11 @@ start_service() {
 	# Load conntrack module for /proc/net/nf_conntrack.
 	modprobe nf_conntrack 2>/dev/null || true
 
-	# Redirect dnsmasq .fips forwarding from daemon (5354) to gateway (5353)
-	# so LAN clients get virtual IPs instead of raw mesh addresses.
-	# Done early and synchronously so dnsmasq is ready before the gateway
-	# starts accepting DNS queries.
-	dnsmasq_swap_fips_upstream "$GW_DNS_PORT"
+	# Redirect dnsmasq .fips forwarding from the daemon (5354) to the port the
+	# gateway listens on, so LAN clients get virtual IPs instead of raw mesh
+	# addresses. Done early and synchronously so dnsmasq is ready before the
+	# gateway starts accepting DNS queries.
+	dnsmasq_swap_fips_upstream "$(gateway_dns_port)"
 	sleep 1
 
 	# Add a global-scope IPv6 prefix to br-lan so Android/Chrome clients
@@ -85,6 +87,35 @@ reload_service() {
 # when there is no such block.
 gateway_config_enabled() {
 	awk '/^gateway:/{found=1; next} found && /^[^ ]/{found=0} found && /enabled:/{gsub(/.*enabled:[[:space:]]*/, ""); gsub(/["'"'"']/, ""); print; exit}' "$CONFIG"
+}
+
+# Print the port the gateway's DNS listener will bind: the digits after the
+# last ":" of the "listen:" value inside the top-level "gateway:" block of
+# fips.yaml, or $GW_DNS_DEFAULT when there is no such line or its value does
+# not end in a port. Commented lines are skipped, and "listen_port:" (a port
+# forward key) does not match.
+#
+# Block-style YAML only: a flow-style "dns: {listen: ...}" reads as the
+# default. The dnsmasq entry this port feeds is always ::1#<port>, so a
+# gateway listening only on 127.0.0.1 is still not reachable through it.
+gateway_dns_port() {
+	local port
+	port="$(awk '
+		/^[A-Za-z_]/ { top = $1 }
+		top != "gateway:" { next }
+		/^[[:space:]]*#/ { next }
+		/^[[:space:]]+listen:/ {
+			v = $0
+			sub(/^[[:space:]]+listen:[[:space:]]*/, "", v)
+			sub(/[[:space:]]+#.*$/, "", v)
+			gsub(/["'"'"']/, "", v)
+			sub(/[[:space:]]+$/, "", v)
+			n = split(v, part, ":")
+			if (n > 1 && part[n] ~ /^[0-9]+$/) print part[n]
+			exit
+		}
+	' "$CONFIG" 2>/dev/null)"
+	echo "${port:-$GW_DNS_DEFAULT}"
 }
 
 # Extract the gateway pool CIDR from fips.yaml.
@@ -178,13 +209,20 @@ gateway_remove_global_prefix() {
 # $1 = target port number
 dnsmasq_swap_fips_upstream() {
 	local port="$1"
+	local server
 
-	# Remove both possible entries, then add the correct one.
-	uci -q del_list dhcp.@dnsmasq[0].server="/fips/127.0.0.1#${DAEMON_DNS_PORT}" 2>/dev/null
-	uci -q del_list dhcp.@dnsmasq[0].server="/fips/127.0.0.1#${GW_DNS_PORT}" 2>/dev/null
-	# Also handle IPv6 loopback variants.
-	uci -q del_list dhcp.@dnsmasq[0].server="/fips/::1#${DAEMON_DNS_PORT}" 2>/dev/null
-	uci -q del_list dhcp.@dnsmasq[0].server="/fips/::1#${GW_DNS_PORT}" 2>/dev/null
+	# Remove every loopback .fips forward, then add the one for $port. That
+	# covers the daemon's port, this gateway's, and a stale entry for any other
+	# local port, such as the old default 5353 or a changed gateway.dns.listen.
+	# A .fips forward to another host and servers for other domains are kept.
+	# uci prints a list on one line separated by spaces.
+	for server in $(uci -q get 'dhcp.@dnsmasq[0].server' 2>/dev/null); do
+		case "$server" in
+		"/fips/::1#"* | "/fips/127.0.0.1#"*)
+			uci -q del_list dhcp.@dnsmasq[0].server="$server" 2>/dev/null
+			;;
+		esac
+	done
 
 	uci add_list dhcp.@dnsmasq[0].server="/fips/::1#${port}"
 	uci commit dhcp

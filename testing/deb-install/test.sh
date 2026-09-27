@@ -304,6 +304,42 @@ EOF
     return
 }
 
+# The installed gateway, on the default config, serves .fips on its default
+# listen address. Each check needs the gateway running: a gateway that exited
+# fails the first one rather than letting the others pass on nothing.
+# Args: <name> <npub>, the daemon's npub to resolve through the gateway.
+check_gateway_default_listener() {
+    local name="$1" npub="$2"
+    local journal="" _i
+    for _i in $(seq 1 5); do
+        journal=$(docker exec "$name" journalctl -u fips-gateway.service --no-pager 2>/dev/null) || journal=""
+        printf '%s\n' "$journal" | grep -q "fips-gateway running" && break
+        sleep 1
+    done
+    if ! printf '%s\n' "$journal" | grep -q "fips-gateway running"; then
+        fail "the installed fips-gateway did not reach 'fips-gateway running', so its default listener was not observed"
+        echo "  --- fips-gateway journal ---"
+        printf '%s\n' "$journal" | tail -15
+        return
+    fi
+
+    local sockets
+    sockets=$(docker exec "$name" ss -Hulnp 'sport = :5365' 2>/dev/null) || sockets=""
+    if printf '%s\n' "$sockets" | grep -F '[::1]:5365' | grep -q 'fips-gateway'; then
+        pass "fips-gateway listens on its default [::1]:5365"
+    else
+        fail "no fips-gateway socket on [::1]:5365: '$sockets'"
+    fi
+
+    local answer
+    answer=$(docker exec "$name" dig +short +tries=1 +time=3 @::1 -p 5365 AAAA "${npub}.fips" 2>&1)
+    if printf '%s\n' "$answer" | grep -qE '^fd01::[0-9a-f]{1,4}$'; then
+        pass "the gateway answers ${npub}.fips on [::1]:5365 from its fd01::/112 pool"
+    else
+        fail "the gateway did not answer ${npub}.fips on [::1]:5365 from its pool: '$answer'"
+    fi
+}
+
 # Purge the package with the DNS routing file planted and fips-dns stopped, and
 # check that postrm removes the file and restarts systemd-resolved.
 #
@@ -708,6 +744,8 @@ DOCKERFILE
         echo "  --- fips-gateway journal ---"
         docker exec "$name" journalctl -u fips-gateway.service --no-pager 2>&1 | tail -15
     fi
+
+    check_gateway_default_listener "$name" "$npub"
 
     check_purge_clears_dns "$name" "$expected_backend"
 

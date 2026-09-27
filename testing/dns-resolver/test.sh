@@ -712,6 +712,47 @@ read_gateway_log() {
     return 0
 }
 
+# The gateway on its default config binds [::1]:5365 and gets past the
+# bind to the NAT step, logging one of the two NAT lines whichever way NAT
+# goes in this container. Those are the lines the held-port check requires
+# to be absent, so this shows the gateway still emits them in that text.
+check_gateway_default_bind() {
+    local name="$1"
+    local log=/var/log/fips-gateway.log
+    local text="" read_ok=0 listening=0 nat_step=0 _i
+    for _i in $(seq 1 5); do
+        if text=$(read_gateway_log "$name" "$log"); then
+            read_ok=1
+            if printf '%s\n' "$text" | grep -q 'Gateway DNS resolver listening.*addr=\[::1\]:5365'; then
+                listening=1
+            fi
+            if printf '%s\n' "$text" | grep -qE 'Created nftables table|Failed to create nftables table'; then
+                nat_step=1
+                break
+            fi
+        fi
+        sleep 1
+    done
+    if [ "$read_ok" = "0" ]; then
+        fail "could not read $log, so the gateway's default bind was not observed"
+        return
+    fi
+    if [ "$listening" = "1" ]; then
+        pass "fips-gateway listens on its default [::1]:5365"
+    else
+        fail "fips-gateway did not log listening on [::1]:5365"
+    fi
+    if [ "$nat_step" = "1" ]; then
+        pass "fips-gateway gets past the DNS bind to the NAT step"
+    else
+        fail "fips-gateway logged neither NAT-step line after the DNS bind"
+    fi
+    if [ "$listening" = "0" ] || [ "$nat_step" = "0" ]; then
+        echo "  --- $log ---"
+        printf '%s\n' "$text" | tail -20
+    fi
+}
+
 # The gateway exits at the DNS bind when its listen port is held. The
 # daemon in this container holds [::1]:5354, so a gateway configured to
 # listen there must exit non-zero with the hint naming the daemon, before
@@ -980,9 +1021,10 @@ EOF'
         echo "  --- fips-gateway log ---"
         docker exec "$name" tail -20 /var/log/fips-gateway.log 2>&1 || true
     fi
-    # Stop the gateway (it will likely have failed past the upstream
-    # check on something unrelated in this minimal container — we only
-    # care that the upstream reachability step succeeded).
+    check_gateway_default_bind "$name"
+
+    # Stop the gateway (it may have failed after the DNS bind on something
+    # unrelated in this minimal container).
     docker exec "$name" pkill -f fips-gateway 2>/dev/null || true
 
     check_gateway_exits_on_held_port "$name"

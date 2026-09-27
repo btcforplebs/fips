@@ -9,7 +9,10 @@ use serde::{Deserialize, Serialize};
 
 /// Default gateway DNS listen address.
 ///
-/// Loopback-only on the unprivileged port 5353. The canonical
+/// Loopback-only on the unprivileged port 5365, which IANA leaves
+/// unassigned and no common resolver uses. It is not 5353, the mDNS
+/// port, which the daemon's LAN rendezvous, avahi-daemon and
+/// systemd-resolved can hold. The canonical
 /// gateway deployment is a host already serving DHCP/DNS to a LAN
 /// segment (e.g., an OpenWrt AP), where port 53 is taken by the
 /// existing resolver and `.fips` queries are forwarded to the
@@ -21,7 +24,7 @@ use serde::{Deserialize, Serialize};
 /// explicit `::1` do not accept v4-mapped traffic. Forwarders that
 /// reach the gateway over IPv4 loopback (`127.0.0.1`) need to be
 /// pointed at an explicit IPv4 listen address instead.
-const DEFAULT_DNS_LISTEN: &str = "[::1]:5353";
+const DEFAULT_DNS_LISTEN: &str = "[::1]:5365";
 
 /// Default upstream DNS resolver (FIPS daemon).
 ///
@@ -131,7 +134,7 @@ pub struct PortForward {
 /// Gateway DNS resolver configuration (`gateway.dns.*`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GatewayDnsConfig {
-    /// Listen address and port (default: `[::1]:5353`).
+    /// Listen address and port (default: `[::1]:5365`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listen: Option<String>,
 
@@ -146,7 +149,7 @@ pub struct GatewayDnsConfig {
 }
 
 impl GatewayDnsConfig {
-    /// Get the listen address (default: `[::1]:5353`).
+    /// Get the listen address (default: `[::1]:5365`).
     pub fn listen(&self) -> &str {
         self.listen.as_deref().unwrap_or(DEFAULT_DNS_LISTEN)
     }
@@ -165,6 +168,12 @@ impl GatewayDnsConfig {
     /// `None` when they do not form a port. Works on a hostname form too.
     pub(crate) fn port_of(listen: &str) -> Option<u16> {
         listen.rsplit_once(':')?.1.parse().ok()
+    }
+
+    /// Whether the listen address is on the mDNS port, which an mDNS
+    /// responder can take from the gateway at any time.
+    pub fn is_mdns(&self) -> bool {
+        Self::port_of(self.listen()) == Some(5353)
     }
 }
 
@@ -224,12 +233,49 @@ lan_interface: "eth0"
         assert!(!config.enabled);
         assert_eq!(config.pool, "fd01::/112");
         assert_eq!(config.lan_interface, "eth0");
-        assert_eq!(config.dns.listen(), "[::1]:5353");
+        assert_eq!(config.dns.listen(), "[::1]:5365");
         assert_eq!(config.dns.upstream(), "[::1]:5354");
         assert_eq!(config.dns.ttl(), 60);
         assert_eq!(config.grace_period(), 60);
         assert_eq!(config.conntrack.tcp_established(), 432_000);
         assert_eq!(config.conntrack.udp_timeout(), 30);
+    }
+
+    #[test]
+    fn a_listen_on_5353_is_flagged_as_mdns() {
+        for listen in [
+            "[::1]:5353",
+            "[::]:5353",
+            "127.0.0.1:5353",
+            "localhost:5353",
+        ] {
+            let dns = GatewayDnsConfig {
+                listen: Some(listen.to_string()),
+                ..Default::default()
+            };
+            assert!(dns.is_mdns(), "{listen} must be flagged as the mDNS port");
+        }
+    }
+
+    #[test]
+    fn the_default_and_other_ports_are_not_flagged_as_mdns() {
+        assert!(!GatewayDnsConfig::default().is_mdns());
+        for listen in [
+            "[::1]:5365",
+            "[::]:53",
+            "192.168.1.1:53",
+            "[::]:5355",
+            "localhost",
+        ] {
+            let dns = GatewayDnsConfig {
+                listen: Some(listen.to_string()),
+                ..Default::default()
+            };
+            assert!(
+                !dns.is_mdns(),
+                "{listen} must not be flagged as the mDNS port"
+            );
+        }
     }
 
     #[test]

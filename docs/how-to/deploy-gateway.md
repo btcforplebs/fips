@@ -143,7 +143,7 @@ virtual IPs, which is the gateway's hard cap regardless of CIDR
 width.
 
 This minimum config is enough to start the gateway. The `dns.*` block
-is optional and defaults to `listen: "[::1]:5353"` and
+is optional and defaults to `listen: "[::1]:5365"` and
 `upstream: "[::1]:5354"`. The full block — including `dns.*`,
 `pool_grace_period`, `conntrack.*`, and `port_forwards[]` — is
 documented in
@@ -196,7 +196,7 @@ Constraints:
 ```yaml
 gateway:
   dns:
-    listen: "[::1]:5353"
+    listen: "[::1]:5365"
     upstream: "[::1]:5354"
     ttl: 60
 ```
@@ -204,15 +204,16 @@ gateway:
 Common cases:
 
 - **Another resolver on the host (the canonical case):** the default
-  `listen: "[::1]:5353"` is loopback-only on an unprivileged port,
+  `listen: "[::1]:5365"` is loopback-only on an unprivileged port,
   so it never conflicts with dnsmasq, systemd-resolved, or BIND
   holding 53. Configure the existing resolver to forward `.fips`
-  queries to `[::1]:5353` and you are done — this is what the
-  OpenWrt ipk does automatically.
+  queries to `[::1]:5365` and you are done — this is what the
+  OpenWrt ipk does automatically. On OpenWrt the init script reads
+  `gateway.dns.listen` and points dnsmasq at whatever port it sets.
 - **No other resolver on the host:** set `listen: "[::]:53"`
   explicitly and LAN clients can query the gateway directly.
 - **systemd-resolved is on port 53:** the default already side-steps
-  this — leave the listen address at `[::1]:5353` and configure the
+  this — leave the listen address at `[::1]:5365` and configure the
   stub or a small forwarder to delegate `.fips` to the gateway. If
   you would rather have the gateway on 53 directly, disable the
   systemd stub listener (`DNSStubListener=no` in

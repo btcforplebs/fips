@@ -164,15 +164,15 @@ transports:
 
   # No BLE transport: OpenWrt builds target musl, which has no BlueZ backend.
 
-# Outbound LAN gateway. While it runs, the fips-gateway init script points
-# dnsmasq's .fips forwarding at the port dns.listen sets (default [::1]:5365).
-# Requires IPv6 forwarding enabled.
+# Outbound LAN gateway. dnsmasq forwards .fips queries to listen=[::1]:5353
+# while it runs (configured by the fips-gateway init script). Requires IPv6
+# forwarding enabled.
 gateway:
   enabled: true
   pool: "fd01::/112"
   lan_interface: "br-lan"
   dns:
-    # listen: "[::1]:5365"   # the default; the init script points dnsmasq at this port
+    listen: "[::1]:5353"
     upstream: "[::1]:5354"
     ttl: 60
   pool_grace_period: 60
