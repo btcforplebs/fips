@@ -288,8 +288,9 @@ impl Node {
 
     /// Read what `peer_addr`'s link shows about delivery of our frames: the
     /// session's identity and next send counter, and the last ReceiverReport
-    /// accepted on it. `None` when the peer has no session.
-    fn link_evidence(&self, peer_addr: &NodeAddr) -> Option<LinkEvidence> {
+    /// accepted on it. `None` when the peer has no session. Both the filter
+    /// and the tree announce resends read it.
+    pub(super) fn link_evidence(&self, peer_addr: &NodeAddr) -> Option<LinkEvidence> {
         let peer = self.peers.get(peer_addr)?;
         let session = peer.noise_session()?;
         let mut epoch = [0u8; 8];

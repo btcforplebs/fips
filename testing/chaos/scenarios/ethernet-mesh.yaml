@@ -82,6 +82,14 @@ traffic:
 # happened, not a loss ratio, so a busy host slows it without failing
 # it. It runs at teardown, after flapped links are restored.
 #
+# Recovery: a tree or bloom announce lost to a flap is resent from the
+# link's receiver reports a few seconds after the link returns, or within
+# about 30 s when those reports cannot confirm it; only a per-peer backoff
+# built up by earlier resends on a lossy link can hold a resend longer, up
+# to 60 s after the previous one. The 60 s window therefore no longer sits
+# at the ordinary recovery bound, and a red here is investigated, not
+# expected.
+#
 # Sizes: payload 0 is the smallest ICMPv6 echo and 1200 is near the
 # 1280-byte TUN MTU. Neither can reach the receiver's padding trim on a
 # veth link. Measured on a live run of this scenario (2026-09-19): an

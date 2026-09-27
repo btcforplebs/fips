@@ -139,7 +139,26 @@ impl Node {
             peer.record_tree_announce_sent(now_ms);
         }
 
-        trace!(peer = %self.peer_display_name(peer_addr), "Sent TreeAnnounce");
+        // Keep the announce outstanding until the receiver reports confirm
+        // it. Read after the send: anything else taking a counter in between
+        // only makes the recorded counter higher, which delays confirmation
+        // rather than confirming a frame that was never covered.
+        let seq = announce.declaration.sequence();
+        if let Some(link) = self.link_evidence(peer_addr) {
+            self.tree_state.record_announce(
+                *peer_addr,
+                seq,
+                link.next_counter.saturating_sub(1),
+                &link,
+                crate::time::mono_ms(),
+            );
+        }
+
+        trace!(
+            peer = %self.peer_display_name(peer_addr),
+            seq = seq,
+            "Sent TreeAnnounce"
+        );
         Ok(())
     }
 
@@ -584,11 +603,50 @@ impl Node {
 
     /// Periodic tree maintenance, called from the tick handler.
     ///
-    /// Sends pending rate-limited announces and checks for periodic
-    /// parent re-evaluation based on current MMP link costs.
+    /// Marks peers whose last announce was not confirmed delivered, sends
+    /// pending rate-limited announces (so a resend goes out in the same tick
+    /// through the ordinary send path), and checks for periodic parent
+    /// re-evaluation based on current MMP link costs.
     pub(super) async fn check_tree_state(&mut self) {
+        self.tree_resend();
         self.send_pending_tree_announces().await;
         self.check_periodic_parent_reeval().await;
+    }
+
+    /// Mark for resend every peer whose outstanding TreeAnnounce the receiver
+    /// reports show was lost, or could not confirm in time.
+    ///
+    /// The resend is an ordinary announce built from the current declaration,
+    /// so if our position moved on since the lost one, the peer gets the
+    /// newer position.
+    fn tree_resend(&mut self) {
+        let now_ms = crate::time::mono_ms();
+        let waiting: Vec<NodeAddr> = self
+            .peers
+            .keys()
+            .filter(|addr| self.tree_state.announce_outstanding(addr))
+            .copied()
+            .collect();
+        for addr in waiting {
+            let Some(link) = self.link_evidence(&addr) else {
+                continue;
+            };
+            let counter = self.tree_state.outstanding_counter(&addr);
+            let seq = self.tree_state.outstanding_seq(&addr);
+            let Some(reason) = self.tree_state.check_announce(&addr, &link, now_ms) else {
+                continue;
+            };
+            if let Some(peer) = self.peers.get_mut(&addr) {
+                peer.mark_tree_announce_pending();
+            }
+            debug!(
+                peer = %self.peer_display_name(&addr),
+                reason = ?reason,
+                counter = ?counter,
+                seq = ?seq,
+                "Resending unconfirmed TreeAnnounce"
+            );
+        }
     }
 
     /// Periodic parent re-evaluation based on current MMP link costs.
