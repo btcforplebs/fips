@@ -574,8 +574,9 @@ install-smoked on plain FreeBSD 15.1 in CI; it cannot be run on pfSense
 because CE 2.8.1 media no longer exists.
 
 Left behind by `pkg delete`, by design or as known gaps:
-`/usr/local/etc/fips/fips.key` if the daemon generated one (it may be the
-node's identity), `/var/log/fips.log`, and the newsyslog entry under
+`/usr/local/etc/fips/fips.key` if the daemon generated one in persistent
+mode (it is the node's identity), or `fips.key.unused` if it moved a key
+aside in ephemeral mode, `/var/log/fips.log`, and the newsyslog entry under
 `/var/etc`, which a RAM-disk `/var` drops at the next boot anyway.
 
 The hardware and VM runs found several defects, every one in this
