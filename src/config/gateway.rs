@@ -160,6 +160,12 @@ impl GatewayDnsConfig {
     pub fn ttl(&self) -> u32 {
         self.ttl.unwrap_or(DEFAULT_DNS_TTL)
     }
+
+    /// The port of a listen address: the digits after its last `:`, or
+    /// `None` when they do not form a port. Works on a hostname form too.
+    pub(crate) fn port_of(listen: &str) -> Option<u16> {
+        listen.rsplit_once(':')?.1.parse().ok()
+    }
 }
 
 /// Conntrack timeout overrides (`gateway.conntrack.*`).

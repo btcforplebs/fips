@@ -17,6 +17,7 @@ use tracing::{debug, info, trace, warn};
 
 use super::pool::{PoolEvent, VirtualIpPool};
 use crate::NodeAddr;
+use crate::config::GatewayDnsConfig;
 
 /// Timeout for upstream DNS queries.
 const UPSTREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -156,25 +157,108 @@ fn build_aaaa_response(query: &Packet, virtual_ip: Ipv6Addr, ttl: u32) -> Option
     response.build_bytes_vec_compressed().ok()
 }
 
+/// The gateway DNS listener could not be bound.
+///
+/// The message names the listen address and, when the port is already in
+/// use, the service most likely to hold it and how to find the holder.
+#[derive(Debug, thiserror::Error)]
+#[error("cannot bind the gateway DNS listener on {listen}: {source}{}", in_use_hint(.listen, .source))]
+pub struct ListenError {
+    listen: String,
+    source: std::io::Error,
+}
+
+impl ListenError {
+    /// The kind of the underlying bind error.
+    pub fn kind(&self) -> std::io::ErrorKind {
+        self.source.kind()
+    }
+}
+
+/// The suffix `ListenError`'s message carries for an address-in-use error:
+/// the likely holder of the port, and how to find the actual one.
+fn in_use_hint(listen: &str, source: &std::io::Error) -> String {
+    if source.kind() != std::io::ErrorKind::AddrInUse {
+        return String::new();
+    }
+    let (holder, port) = match GatewayDnsConfig::port_of(listen) {
+        Some(port) => (holder_hint(port), port.to_string()),
+        None => (holder_hint(0), "<port>".to_string()),
+    };
+    format!(
+        "; {holder}; find the holder with `ss -ulpn 'sport = :{port}'` or `netstat -ulnp`, \
+         or set gateway.dns.listen to a free port and point the resolver that forwards .fips at it"
+    )
+}
+
+/// The service most likely to hold a DNS listen port that is already in use.
+pub(crate) fn holder_hint(port: u16) -> &'static str {
+    match port {
+        53 => {
+            "another DNS server holds port 53: dnsmasq, systemd-resolved's stub listener, unbound or BIND"
+        }
+        5353 => {
+            "port 5353 is mDNS: the fips daemon's LAN rendezvous (node.rendezvous.lan), \
+             avahi-daemon or systemd-resolved's MulticastDNS may hold it"
+        }
+        5354 => {
+            "the fips daemon's own DNS responder listens on 5354 by default; \
+             gateway.dns.listen must not be the daemon's DNS port"
+        }
+        5355 => "port 5355 is LLMNR, held by systemd-resolved unless LLMNR=no",
+        5365 => "another fips-gateway may already be running",
+        _ => "another process holds it",
+    }
+}
+
+/// Bind the gateway DNS listener.
+///
+/// Called before the gateway creates anything it would have to tear down, so
+/// a port that is already taken stops the gateway before it starts.
+pub async fn bind_listener(listen: &str) -> Result<UdpSocket, ListenError> {
+    UdpSocket::bind(listen).await.map_err(|source| ListenError {
+        listen: listen.to_string(),
+        source,
+    })
+}
+
 /// Run the gateway DNS resolver.
 ///
-/// Listens for DNS queries, forwards `.fips` queries to the upstream
-/// daemon resolver, allocates virtual IPs, and returns them to clients.
+/// Binds `listen_addr`, then serves as [`serve`] does. The gateway binary
+/// binds and serves separately so that a bind failure stops it at startup.
 pub async fn run_dns_resolver(
     listen_addr: &str,
     upstream_addr: &str,
     ttl: u32,
     pool: std::sync::Arc<tokio::sync::Mutex<VirtualIpPool>>,
     event_tx: tokio::sync::mpsc::Sender<PoolEvent>,
-    mut shutdown: watch::Receiver<bool>,
+    shutdown: watch::Receiver<bool>,
 ) -> Result<(), std::io::Error> {
-    let socket = UdpSocket::bind(listen_addr).await?;
+    let socket = bind_listener(listen_addr)
+        .await
+        .map_err(|e| std::io::Error::new(e.kind(), e))?;
     info!(addr = %listen_addr, "Gateway DNS resolver listening");
 
     let upstream: SocketAddr = upstream_addr
         .parse()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
 
+    serve(socket, upstream, ttl, pool, event_tx, shutdown).await
+}
+
+/// Serve DNS queries on a bound listener until shutdown.
+///
+/// Forwards `.fips` queries to the upstream daemon resolver, allocates
+/// virtual IPs, and returns them to clients. Returns `Ok` on shutdown and
+/// `Err` when receiving from the listener fails.
+pub async fn serve(
+    socket: UdpSocket,
+    upstream: SocketAddr,
+    ttl: u32,
+    pool: std::sync::Arc<tokio::sync::Mutex<VirtualIpPool>>,
+    event_tx: tokio::sync::mpsc::Sender<PoolEvent>,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<(), std::io::Error> {
     let mut buf = vec![0u8; MAX_DNS_SIZE];
 
     loop {
@@ -805,6 +889,69 @@ mod tests {
             event_rx.try_recv(),
             Err(mpsc::error::TryRecvError::Empty)
         ));
+    }
+
+    #[test]
+    fn an_in_use_hint_names_the_mdns_responders_for_5353() {
+        let hint = holder_hint(5353);
+        assert!(hint.contains("mDNS"), "{hint}");
+        assert!(hint.contains("node.rendezvous.lan"), "{hint}");
+        assert!(hint.contains("avahi-daemon"), "{hint}");
+    }
+
+    #[test]
+    fn an_in_use_hint_names_llmnr_for_5355() {
+        let hint = holder_hint(5355);
+        assert!(hint.contains("LLMNR"), "{hint}");
+        assert!(!hint.contains("mDNS"), "{hint}");
+    }
+
+    #[test]
+    fn an_in_use_hint_names_the_daemon_for_5354() {
+        let hint = holder_hint(5354);
+        assert!(hint.contains("fips daemon's own DNS responder"), "{hint}");
+    }
+
+    #[test]
+    fn an_in_use_hint_names_a_dns_server_for_53() {
+        let hint = holder_hint(53);
+        assert!(hint.contains("another DNS server"), "{hint}");
+        assert!(hint.contains("dnsmasq"), "{hint}");
+    }
+
+    #[test]
+    fn an_in_use_hint_names_another_gateway_for_the_default_port() {
+        let hint = holder_hint(5365);
+        assert!(hint.contains("another fips-gateway"), "{hint}");
+    }
+
+    #[test]
+    fn an_in_use_hint_names_another_process_for_an_unknown_port() {
+        assert_eq!(holder_hint(40000), "another process holds it");
+    }
+
+    #[tokio::test]
+    async fn binding_a_held_port_fails_with_addr_in_use_and_names_the_port_ss_and_netstat() {
+        let holder = UdpSocket::bind("[::1]:0").await.unwrap();
+        let port = holder.local_addr().unwrap().port();
+        let listen = format!("[::1]:{port}");
+
+        let err = bind_listener(&listen)
+            .await
+            .expect_err("binding a held port must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+        let message = err.to_string();
+        assert!(message.contains(&listen), "{message}");
+        assert!(message.contains(&format!("sport = :{port}")), "{message}");
+        assert!(message.contains("ss -ulpn"), "{message}");
+        assert!(message.contains("netstat -ulnp"), "{message}");
+        assert!(message.contains(holder_hint(port)), "{message}");
+    }
+
+    #[tokio::test]
+    async fn binding_a_free_port_returns_a_bound_socket() {
+        let socket = bind_listener("[::1]:0").await.expect("bind a free port");
+        assert_ne!(socket.local_addr().unwrap().port(), 0);
     }
 
     #[test]

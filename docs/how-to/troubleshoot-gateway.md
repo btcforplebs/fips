@@ -81,28 +81,57 @@ for the full flag list.
 
 ### Port conflict on the DNS listen port
 
-Symptom: gateway fails to start with "address already in use" on
-the configured `gateway.dns.listen` address.
+Symptom: the gateway exits at startup, before it creates the address
+pool or the NAT table, and the log carries an error such as this one,
+wrapped here for reading:
 
-The default `[::1]:5353` is loopback-only on an unprivileged port and
-should not collide with any standard resolver. If you have overridden
-`dns.listen` to bind port 53 (or a LAN-side address) and another DNS
-server (systemd-resolved, dnsmasq, BIND) is already bound there,
-identify it:
-
-```sh
-sudo ss -tulnp | grep ':53'
+```text
+cannot bind the gateway DNS listener on [::]:53: Address already in
+use (os error 98); another DNS server holds port 53: dnsmasq,
+systemd-resolved's stub listener, unbound or BIND; find the holder
+with `ss -ulpn 'sport = :53'` or `netstat -ulnp`, or set
+gateway.dns.listen to a free port and point the resolver that
+forwards .fips at it
 ```
 
-Two options:
+Under systemd the unit restarts every five seconds and fails the same
+way each time; under procd on OpenWrt the service stops respawning
+after five failures within an hour. The gateway also exits, after
+removing its NAT table and routes, when the DNS resolver stops while
+the gateway is running; that log line reads "Gateway DNS resolver
+stopped; exiting so the service manager restarts the gateway".
 
-- **Stay on the loopback default.** Drop the override and let the
-  gateway use `[::1]:5353`. Configure the existing resolver to
-  forward `.fips` queries to it (the canonical OpenWrt deployment
-  works this way out of the box).
+The error names the service most likely to hold the port:
+
+- **53**: another DNS server, such as dnsmasq, systemd-resolved's stub
+  listener, unbound or BIND.
+- **5353**: mDNS. The fips daemon's LAN rendezvous
+  (`node.rendezvous.lan`), avahi-daemon or systemd-resolved's
+  MulticastDNS.
+- **5354**: the fips daemon's own DNS responder. `gateway.dns.listen`
+  must not be the daemon's DNS port.
+- **5355**: LLMNR, held by systemd-resolved unless `LLMNR=no`.
+- **Any other port**: another process.
+
+Find the actual holder, replacing the port with your own:
+
+```sh
+sudo ss -ulpn 'sport = :53'
+# OpenWrt ships netstat but not ss:
+netstat -ulnp
+```
+
+The default listen address, `[::1]:5353`, is loopback-only on an
+unprivileged port. Two options:
+
+- **Move the gateway.** Set `gateway.dns.listen` to a free port and
+  point the resolver that forwards `.fips` at the same port. With the
+  loopback default, configure the existing resolver to forward `.fips`
+  queries to `[::1]:5353` (the canonical OpenWrt deployment works this
+  way out of the box).
 
 - **Relocate the conflicting resolver.** Move it to a different port
-  (or disable it if not needed) and let the gateway bind 53.
+  (or disable it if not needed) and let the gateway bind the port.
   Practical for systemd-resolved (set `DNSStubListener=no` in
   `/etc/systemd/resolved.conf`); rarely worth it for production
   resolvers.
