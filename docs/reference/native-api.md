@@ -260,13 +260,15 @@ because it latches while messages are still queued: a read that trusted it
 would report the close early and discard whatever was waiting. The `EPIPE` that
 `recv` returns means the daemon went away, never that a peer finished.
 
-**One case is reported as `EPIPE` although it is a datagram.** A zero-length
-datagram that is the last message before a close is indistinguishable from the
-close, because reading it drains the queue and `FIONREAD` then reports zero: a
-zero-length message contributes no bytes. Do not give a zero-length payload a
-meaning of its own on this API. Carry a one-byte discriminator instead.
-Separating the two needs a payload that is never zero bytes on the wire, which
-is a protocol change rather than a receive-path one.
+**On Linux, one case is reported as `EPIPE` although it is a datagram.** A
+zero-length datagram that is the last message before a close is
+indistinguishable from the close, because reading it drains the queue and
+`FIONREAD` then reports zero: a zero-length message contributes no bytes. macOS
+and FreeBSD carry the flow on `SOCK_DGRAM`, where the datagram is delivered as
+`Ok(0)` and the close follows it. Do not give a zero-length payload a meaning
+of its own on this API. Carry a one-byte discriminator instead. Separating the
+two needs a payload that is never zero bytes on the wire, which is a protocol
+change rather than a receive-path one.
 
 **`peer_addr()`** and **`local_addr()`** return `FipsAddr`, not
 `io::Result<FipsAddr>`, unlike their `TcpStream` counterparts. These are field
@@ -438,7 +440,7 @@ There is no acknowledgement, no retransmission, no ordering guarantee and no
 flow control between the two ends. A program that needs confirmation gets it
 from the peer, in the payload.
 
-Four places lose data with nothing reported to the client.
+Five places lose data with nothing reported to the client.
 
 **A full per-flow queue.** Inbound datagrams beyond `pending_per_flow` are
 dropped with a trace log and no client-visible signal. A program that stops
@@ -466,6 +468,14 @@ Neither eviction reaches the caller.
 snapshot taken at setup. The daemon re-checks each outbound datagram against
 the node's current limit and drops it silently if the transport MTU has since
 fallen.
+
+**An empty datagram sent just before a close, on Linux.** A program that sends
+a zero-length datagram and then drops its `FipsStream` may have the daemon read
+that datagram as the close: the daemon frees the flow and the empty datagram
+never reaches the peer. In the other direction, an empty datagram from the peer
+that the daemon delivers immediately before its own half of the flow closes,
+as when the daemon stops, reaches `recv` as `EPIPE` rather than `Ok(0)`. macOS
+and FreeBSD are not affected. See `recv` above.
 
 ### The drop causes, and what they mean
 

@@ -286,10 +286,11 @@ port from one dropped because a client was not reading fast enough.
 For the response shape, see
 [../reference/control-socket.md](../reference/control-socket.md#read-only-queries).
 
-Reach for this when datagrams go missing. **Four places lose data with
+Reach for this when datagrams go missing. **Five places lose data with
 nothing reported to your program**: a full per-flow queue, a listener that
 does not accept fast enough, an outbound datagram sent before a session
-exists, and an outbound datagram after the transport MTU has fallen.
+exists, an outbound datagram after the transport MTU has fallen, and, on
+Linux, an empty datagram sent just before a close.
 [../reference/native-api.md](../reference/native-api.md#where-data-disappears)
 describes each and what bounds it.
 

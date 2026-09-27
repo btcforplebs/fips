@@ -488,10 +488,12 @@ impl FipsStream {
     /// [`bytes_queued`](super::seqpacket::bytes_queued) reports nothing behind
     /// it. The daemon half applies the identical rule, on the same pair.
     ///
-    /// One case survives both checks: a zero-length datagram that is the last
-    /// message before the close is indistinguishable from the close, because
-    /// reading it drains the queue and a zero-length message contributes no
-    /// bytes. Do not give a zero-length payload a meaning of its own.
+    /// One case survives both checks on Linux, where the pair is
+    /// `SOCK_SEQPACKET`: a zero-length datagram that is the last message before
+    /// the close is indistinguishable from the close, because reading it drains
+    /// the queue and a zero-length message contributes no bytes, so it is
+    /// reported as `EPIPE`. On macOS and FreeBSD it is delivered as `Ok(0)` and
+    /// the close follows. Do not give a zero-length payload a meaning of its own.
     ///
     /// A datagram longer than `buf` is truncated and the remainder discarded,
     /// which is `SOCK_SEQPACKET` behaviour. Size `buf` at

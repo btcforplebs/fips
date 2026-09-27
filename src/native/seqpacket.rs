@@ -46,7 +46,11 @@ use tokio::io::unix::AsyncFd;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Received {
     /// A datagram of this many bytes. Zero is a legitimate value: a client may
-    /// send an empty datagram, and that is not the same as closing.
+    /// send an empty datagram, and while it keeps its half open that is not the
+    /// same as closing. On Linux, where the pair is `SOCK_SEQPACKET`, an empty
+    /// datagram that is the last thing a client sends before it closes reads as
+    /// [`Received::Eof`] instead; `recv_once` says why that one case cannot be
+    /// told apart.
     Datagram(usize),
     /// The peer closed its half of the pair.
     Eof,
@@ -308,14 +312,18 @@ impl Seqpacket {
 /// message behind it is never taken.
 ///
 /// This matters because reading an empty datagram as a close would let a client
-/// tear down its own flow by sending nothing, and the defect would present as a
-/// spurious disconnect.
+/// tear down its own flow by sending nothing while it is still connected, and the
+/// defect would present as a spurious disconnect.
 ///
-/// **One case survives and cannot be fixed here.** A zero-length datagram that
-/// is the last message before a close is indistinguishable from the close:
-/// reading it drains the queue, and every observation then matches a bare end of
-/// file. Separating those needs a payload that is never zero bytes on the wire,
-/// which is a protocol change rather than a receive-path one.
+/// **One case survives on `SOCK_SEQPACKET`, which is Linux, and cannot be fixed
+/// here.** A zero-length datagram that is the last message before a close is
+/// indistinguishable from the close: reading it drains the queue, and every
+/// observation then matches a bare end of file. The flow ends early and the empty
+/// datagram is never delivered. Separating those needs a payload that is never
+/// zero bytes on the wire, which is a protocol change rather than a receive-path
+/// one. On `SOCK_DGRAM`, which macOS and FreeBSD use, the empty datagram is
+/// delivered and the close is reported by the read after it; the tests below
+/// pin both behaviours.
 ///
 /// **`ECONNRESET` is treated as end of file too**, for the platform whose
 /// datagram sockets report a close that way rather than through `POLLHUP`. Both
@@ -669,6 +677,45 @@ mod tests {
         );
         assert_eq!(&buf[..5], b"after");
         assert_eq!(recv_bounded(&daemon, &mut buf).await, Received::Eof);
+    }
+
+    #[tokio::test]
+    async fn a_trailing_empty_datagram_before_a_close_reads_as_the_close_only_on_seqpacket() {
+        // The case recv_once documents as unfixable, pinned per socket type so
+        // the documentation cannot drift from what the kernel does. On
+        // SOCK_SEQPACKET the empty datagram is the last thing queued when the
+        // client closes, so reading it drains the queue with POLLHUP latched
+        // and it is indistinguishable from the close. On SOCK_DGRAM it is
+        // delivered and the close is reported by the read after it. The branch
+        // is on SOCK_TYPE rather than on the OS, because the socket type is the
+        // property the limitation depends on.
+        let (daemon, theirs) = pair().unwrap();
+        let daemon = Seqpacket::new(daemon).unwrap();
+        let theirs = client(theirs);
+
+        // SAFETY: the descriptor is open and owned by `theirs`.
+        let sent = unsafe { libc::send(theirs.as_raw_fd(), std::ptr::null(), 0, 0) };
+        assert_eq!(sent, 0, "{}", io::Error::last_os_error());
+        drop(theirs);
+
+        let mut buf = [0u8; 64];
+        if SOCK_TYPE == libc::SOCK_SEQPACKET {
+            assert_eq!(
+                recv_bounded(&daemon, &mut buf).await,
+                Received::Eof,
+                "a trailing empty datagram on SOCK_SEQPACKET was delivered rather than \
+                 read as the close; the documented limitation no longer holds on this \
+                 kernel, so re-measure it and correct the docs that describe it"
+            );
+        } else {
+            assert_eq!(
+                recv_bounded(&daemon, &mut buf).await,
+                Received::Datagram(0),
+                "a trailing empty datagram on SOCK_DGRAM was not delivered; the docs \
+                 say only SOCK_SEQPACKET platforms lose it"
+            );
+            assert_eq!(recv_bounded(&daemon, &mut buf).await, Received::Eof);
+        }
     }
 
     #[test]
