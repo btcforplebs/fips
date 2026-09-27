@@ -17,8 +17,8 @@ sudo ./install.sh
 | fipstop (TUI) | /usr/local/bin/fipstop |
 | fips-gateway (LAN bridge) | /usr/local/bin/fips-gateway |
 | Configuration | /etc/fips/fips.yaml |
-| Identity key | /etc/fips/fips.key (auto-generated) |
-| Public key | /etc/fips/fips.pub (auto-generated) |
+| Identity key | /etc/fips/fips.key (generated on first start with `persistent: true`) |
+| Public key | /etc/fips/fips.pub (written on every start) |
 | Hosts file | /etc/fips/hosts |
 | Firewall baseline | /etc/fips/fips.nft |
 | Firewall drop-in directory | /etc/fips/fips.d/ |

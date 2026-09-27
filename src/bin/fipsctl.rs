@@ -593,8 +593,12 @@ fn main() {
         eprintln!("{npub}");
         eprintln!("Key files written to: {}/", dir.display());
         eprintln!();
-        eprintln!("NOTE: Set 'node.identity.persistent: true' in fips.yaml");
-        eprintln!("      or these keys will be overwritten on next daemon start.");
+        eprintln!(
+            "NOTE: Set 'node.identity.persistent: true' in fips.yaml before the next daemon start."
+        );
+        eprintln!(
+            "      Without it the daemon does not use this key: it moves fips.key aside to fips.key.unused."
+        );
         return;
     }
 

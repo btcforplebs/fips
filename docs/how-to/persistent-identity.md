@@ -35,19 +35,12 @@ nodes, and tests where you actively want a fresh identity per run.
 
 The Debian/Ubuntu `.deb` and the Arch `fips` AUR package both ship a
 default `/etc/fips/fips.yaml` with `node.identity.persistent` left as
-the upstream default (false), so the daemon writes a fresh keypair to
-`/etc/fips/fips.{key,pub}` on every start until you set
-`persistent: true`. To pin the current keypair:
+the upstream default (false). In that mode the daemon generates a
+fresh keypair on every start, holds the private key only in memory,
+and writes only `/etc/fips/fips.pub`. To give the node a stable
+identity:
 
-1. Install the package and start the daemon once so it generates
-   `fips.key` / `fips.pub`:
-
-   ```sh
-   sudo systemctl start fips
-   sudo systemctl status fips     # confirm it came up
-   ```
-
-2. Edit `/etc/fips/fips.yaml` and set:
+1. Install the package, then edit `/etc/fips/fips.yaml` and set:
 
    ```yaml
    node:
@@ -55,22 +48,31 @@ the upstream default (false), so the daemon writes a fresh keypair to
        persistent: true
    ```
 
-3. Restart the daemon and verify the identity is reused:
+2. Start or restart the daemon. On this first persistent start it
+   generates a keypair and saves it to `/etc/fips/fips.key`:
 
    ```sh
    sudo systemctl restart fips
+   sudo systemctl status fips     # confirm it came up
+   ```
+
+3. Verify the identity:
+
+   ```sh
    fipsctl show status | grep -E '"npub"|"node_addr"'
    cat /etc/fips/fips.pub
    ```
 
    The npub printed by `fipsctl show status` should match
-   `/etc/fips/fips.pub` and remain stable across subsequent restarts.
+   `/etc/fips/fips.pub`. If the daemon was already running
+   ephemeral, the npub changes once at this restart and is stable
+   from then on.
 
-The package's `postinst` script does **not** generate the keypair —
-the daemon does, on first start. This means the keypair is only
-present after the first successful daemon start. If the daemon never
-came up cleanly (config error, permission problem), the key files
-will be missing.
+The package's `postinst` script does **not** generate the keypair.
+The first successful daemon start with `persistent: true` does, so
+`fips.key` is only present after that start. If the daemon never came
+up cleanly (config error, permission problem), the key file will be
+missing.
 
 ### macOS note
 

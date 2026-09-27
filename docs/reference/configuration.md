@@ -108,8 +108,10 @@ Identity resolution follows a three-tier priority:
 3. **Ephemeral** — when `persistent: false` (default) and no `nsec`, generates a fresh
    keypair on each start
 
-Key files (`fips.key` with mode 0600, `fips.pub` with mode 0644) are written adjacent
-to the highest-priority config file for operator visibility, even in ephemeral mode.
+`fips.pub` (mode 0644) is written adjacent to the highest-priority config file
+on every start. `fips.key` (mode 0600) is written only in persistent mode. In
+ephemeral mode a `fips.key` found at startup is moved aside to
+`fips.key.unused` with a warning.
 
 ### General
 

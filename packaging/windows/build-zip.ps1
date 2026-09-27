@@ -101,9 +101,9 @@ Control Socket:
 
 Configuration:
   The service reads C:\ProgramData\fips\fips.yaml, where
-  install-service.ps1 puts it, and keeps fips.key, hosts,
-  peers.allow and peers.deny beside it. Edit fips.yaml there
-  before starting the service.
+  install-service.ps1 puts it, and keeps hosts, peers.allow,
+  peers.deny and, with node.identity.persistent: true, fips.key
+  beside it. Edit fips.yaml there before starting the service.
 
   install-service.ps1 restricts C:\ProgramData\fips to SYSTEM
   and Administrators before writing into it. Reading or editing
