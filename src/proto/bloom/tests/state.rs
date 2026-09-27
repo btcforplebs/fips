@@ -322,7 +322,7 @@ fn test_bloom_state_mark_changed_peers_excludes_source() {
 // straight after the send.
 
 use crate::NodeAddr;
-use crate::proto::bloom::state::{
+use crate::proto::mmp::delivery::{
     FALLBACK_MS, LOSS_BUDGET, LinkEvidence, QUIET_MS, ResendReason, RrCounters, UNVERIFIED_BUDGET,
 };
 

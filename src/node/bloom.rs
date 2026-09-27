@@ -6,7 +6,7 @@
 use crate::NodeAddr;
 use crate::proto::bloom::BloomFilter;
 use crate::proto::bloom::FilterAnnounce;
-use crate::proto::bloom::{LinkEvidence, RrCounters};
+use crate::proto::mmp::delivery::{LinkEvidence, RrCounters};
 
 use super::reject::BloomReject;
 use super::{Node, NodeError};
