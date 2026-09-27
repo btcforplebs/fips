@@ -359,6 +359,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is still the oldest Debian-family distribution, which is no longer the oldest
   distribution outright.
 
+#### Identity and config
+
+- An ephemeral node no longer writes `fips.key`. It wrote the private key of
+  an identity it discards at every restart to that file, overwriting any key
+  already there, including an operator's key when `persistent: true` had been
+  forgotten. It now writes only `fips.pub`, so the running npub stays visible,
+  and holds the private key in memory only. A `fips.key` found at an ephemeral
+  start is moved to `fips.key.unused` with a warning, so an ephemeral node logs
+  that warning once, on its first start after the upgrade; if that name is
+  taken or the rename fails, the file is left in place and a warning says so.
+  For a stable identity, set `node.identity.persistent: true` and restart: the
+  first persistent start generates and saves a key, so the npub changes once,
+  at that restart, and is stable from then on. Starting once in ephemeral mode
+  and then pinning the key it wrote no longer works.
+
+#### Gateway
+
+- The gateway's default DNS listen address is now `[::1]:5365`; it was
+  `[::1]:5353`, the mDNS port, which the daemon's LAN rendezvous, Avahi and
+  systemd-resolved can hold. On OpenWrt the init script now points dnsmasq at
+  whatever port `gateway.dns.listen` sets, and an upgrade rewrites the
+  previously shipped `listen: "[::1]:5353"` line. On other hosts, a resolver
+  you configured by hand to forward `.fips` to `[::1]:5353` must now forward
+  to `[::1]:5365`, or set `gateway.dns.listen: "[::1]:5353"` to keep the old
+  port. The gateway warns at startup when it is configured on 5353.
+
 #### Packaging (Debian)
 
 - An upgrade of the `.deb` now reapplies the firewall ruleset in place. Until
@@ -393,6 +419,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   against `chacha20` at either version, and 0.10.1 was withdrawn by its
   maintainer rather than flagged by an advisory. What it buys is that a fresh
   checkout can resolve the lockfile without reaching for a yanked version.
+
+#### Documentation (native API)
+
+- The native API documentation now says that on Linux an empty datagram sent
+  immediately before a close may read as end of file, and is then not
+  delivered. Linux carries the flow on `SOCK_SEQPACKET`, where a zero-length
+  datagram that is the last message before a close cannot be told apart from
+  the close; macOS and FreeBSD carry it on `SOCK_DGRAM` and are not affected.
+  The `Received::Datagram` rustdoc, which said an empty datagram is never a
+  close, now says where the exception applies.
 
 ### Removed
 
@@ -615,6 +651,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   resends when they show a loss, and resends once after 30 seconds when the
   reports cannot confirm it. Resends over one peer connection are limited to
   six a minute, and to one a minute while losses persist.
+- A spanning-tree announce lost on the link is now resent. A node counted a
+  tree announce as delivered once the transport accepted it, so after a
+  dropped datagram or a link outage shorter than the dead timeout the peer kept
+  our old tree position until the periodic re-broadcast, up to a minute later,
+  and a node with only one peer had no periodic re-broadcast at all. Meanwhile
+  the peer could leave destinations out of discovery or route toward them by
+  stale coordinates. The node now confirms each tree announce from the link's
+  receiver reports, as it does for bloom filter announces, resends it when
+  they show a loss, and resends it once after 30 seconds when they cannot
+  confirm it, under the same limits.
 
 #### Session setup
 
@@ -788,6 +834,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   warning says which limit refused it. A name that already has a mapping is
   answered before either limit is consulted, so names in use keep resolving
   when the pool is full. The limits are compiled in, not configured.
+- `fips-gateway` exits when its DNS listener cannot bind, or stops while the
+  gateway runs, instead of staying up with `.fips` resolution dead, so systemd
+  or procd restarts it or reports it failed. This applies to a gateway used
+  only for port forwards too. An "address in use" error names the service
+  likely to hold the port. On an OpenWrt access point with the gateway
+  enabled, the gateway had lost its port to the daemon's own mDNS responder
+  and `.fips` names stopped resolving with nothing reported.
 
 #### Nostr and NAT traversal
 
@@ -944,6 +997,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   directory is owned by another account. Rerun the installer after moving files
   into the directory. A foreground run from an unelevated prompt can no longer
   read the files there.
+- The Windows service installer now creates empty `peers.allow` and
+  `peers.deny` files in `C:\ProgramData\fips`. While either was missing there,
+  the service read that file from `\etc\fips` on the system drive, where any
+  local user can create files, so a planted list was enforced. An empty file
+  allows every peer; to clear a list, empty its file rather than deleting it.
+  The installer stops when either file exists under `\etc\fips` and not in
+  `C:\ProgramData\fips`, so an upgrader's list is neither enforced from the
+  old location nor dropped unreviewed: review it, move it into
+  `C:\ProgramData\fips` or delete it, and run the installer again. Windows
+  upgraders should rerun `install-service.ps1`.
 
 ## [0.5.1] - 2026-09-06
 

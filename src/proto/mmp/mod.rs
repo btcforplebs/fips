@@ -27,6 +27,7 @@ use serde::{Deserialize, Serialize};
 
 mod algorithms;
 mod core;
+pub(crate) mod delivery;
 mod limits;
 mod metrics;
 mod path_mtu;

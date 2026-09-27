@@ -28,7 +28,7 @@ mod tests;
 
 pub use core::BloomFilter;
 pub use limits::{DEFAULT_FILTER_SIZE_BITS, DEFAULT_HASH_COUNT, V1_SIZE_CLASS};
-pub use state::{BloomState, LinkEvidence, RrCounters};
+pub use state::BloomState;
 pub use wire::FilterAnnounce;
 
 /// Errors related to Bloom filter operations.

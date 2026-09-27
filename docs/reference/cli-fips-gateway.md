@@ -73,7 +73,7 @@ Linux host) and
 | Code | Meaning |
 | ---- | ------- |
 | `0` | Clean shutdown after `SIGINT` / `SIGTERM`. |
-| `1` | Non-Linux platform, configuration load failure, missing or invalid `gateway:` block, NAT/network setup failure, or control-socket bind failure. The reason is printed to stderr or the log before exit. |
+| `1` | Non-Linux platform, configuration load failure, missing or invalid `gateway:` block, the DNS listener could not bind or stopped while running, or NAT/network setup failure. The reason is printed to stderr or the log before exit. A control-socket bind failure is logged as a warning and the gateway continues without the socket. |
 
 ## Environment
 

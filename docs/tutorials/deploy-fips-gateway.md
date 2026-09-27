@@ -132,7 +132,7 @@ gateway:
   pool: "fd01::/112"            # virtual IP range (up to 65535 addresses)
   lan_interface: "br-lan"       # LAN-facing interface for proxy NDP
   dns:
-    listen: "[::1]:5353"        # gateway DNS bind (IPv6 loopback only)
+    # listen: "[::1]:5365"   # the default; the init script points dnsmasq at this port
     upstream: "[::1]:5354"      # FIPS daemon DNS resolver (matches daemon default)
     ttl: 60                     # DNS TTL and mapping lifetime (seconds)
   pool_grace_period: 60         # seconds after last session before reclaiming
@@ -147,9 +147,10 @@ Three things to notice:
 - `lan_interface: "br-lan"` — the OpenWrt LAN bridge. The gateway
   installs proxy-NDP entries on this interface so LAN clients can
   ARP-equivalent for pool addresses.
-- `dns.listen: "[::1]:5353"` — the gateway's DNS bind, pinned to
-  IPv6 loopback only. dnsmasq, which owns LAN port 53, forwards
-  `.fips` queries to it. The init script wires up that forwarding;
+- `dns.listen`, commented out — the gateway's DNS bind, left at its
+  default `[::1]:5365`, IPv6 loopback only. dnsmasq, which owns LAN
+  port 53, forwards `.fips` queries to it. The init script reads
+  `gateway.dns.listen` and points dnsmasq at whatever port it sets;
   you don't bind to a LAN address yourself.
 
 For the full reference, see
@@ -172,7 +173,7 @@ Behind that single command, the init script
    `/etc/sysctl.d/fips-gateway.conf`.
 2. **Reconfigures dnsmasq via UCI** so `.fips` queries arriving at
    the LAN's port 53 are forwarded to the gateway's loopback
-   listener on port 5353 instead of going straight to the daemon's
+   listener on port 5365 instead of going straight to the daemon's
    resolver on port 5354. (Dnsmasq still owns 53; the gateway sits
    in front of the daemon for `.fips` only.)
 3. **Adds a global-scope IPv6 prefix** to `br-lan`. Without a
@@ -242,7 +243,7 @@ Expectations:
 
 > **What just happened end to end.** Your client asked dnsmasq for
 > `test-us01.fips`. Dnsmasq forwarded the query to the gateway's
-> loopback listener on port 5353. The gateway forwarded the query on
+> loopback listener on port 5365. The gateway forwarded the query on
 > to the daemon's resolver on port 5354. The daemon answered with
 > `test-us01`'s mesh address (`fd97:...`). The gateway allocated a
 > virtual IP from `fd01::/112`, installed nftables DNAT/SNAT/
