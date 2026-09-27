@@ -475,6 +475,54 @@ fn ps_lines(ps1: &str) -> Vec<String> {
         .collect()
 }
 
+/// Asserts that line `i` of install-service.ps1's code lines is an `if` whose
+/// body is `Write-Error` then `exit 1`, so the condition it tests stops the
+/// install rather than only reporting it.
+fn refuses_at(lines: &[String], i: usize, what: &str) {
+    let cond = &lines[i];
+    assert!(
+        cond.starts_with("if (") && cond.ends_with('{'),
+        "install-service.ps1: the {what} is not an if statement: {cond}"
+    );
+    let body = lines.get(i + 1..i + 3).unwrap_or_default();
+    assert!(
+        body.len() == 2 && body[0].starts_with("Write-Error ") && body[1] == "exit 1",
+        "install-service.ps1: the {what} is not followed by Write-Error then exit 1: \
+         {cond}\n  then: {body:?}"
+    );
+}
+
+/// Returns the index of the line that closes the block opened on line
+/// `start`, found by brace depth. Braces inside single- or double-quoted
+/// strings are not counted.
+fn block_end(lines: &[String], start: usize) -> usize {
+    let mut depth = 0i64;
+    for (i, line) in lines.iter().enumerate().skip(start) {
+        let mut quote = None;
+        for c in line.chars() {
+            match (quote, c) {
+                (None, '"' | '\'') => quote = Some(c),
+                (Some(q), _) if c == q => quote = None,
+                (None, '{') => depth += 1,
+                (None, '}') => depth -= 1,
+                _ => {}
+            }
+        }
+        if depth <= 0 {
+            assert!(
+                i > start,
+                "install-service.ps1: no block opens at code line {start}: {}",
+                lines[start]
+            );
+            return i;
+        }
+    }
+    panic!(
+        "install-service.ps1: the block at code line {start} never closes: {}",
+        lines[start]
+    )
+}
+
 /// Guards the order in which install-service.ps1 secures `C:\ProgramData\fips`.
 ///
 /// The directory inherits `C:\ProgramData`'s access, under which any local
@@ -664,19 +712,6 @@ fn windows_installer_restricts_config_dir_before_any_path_inside_it() {
 #[test]
 fn windows_installer_refusal_conditions_stop_the_install() {
     let lines = ps_lines(&repo_file("packaging/windows/install-service.ps1"));
-    let refuses_at = |i: usize, what: &str| {
-        let cond = &lines[i];
-        assert!(
-            cond.starts_with("if (") && cond.ends_with('{'),
-            "install-service.ps1: the {what} is not an if statement: {cond}"
-        );
-        let body = lines.get(i + 1..i + 3).unwrap_or_default();
-        assert!(
-            body.len() == 2 && body[0].starts_with("Write-Error ") && body[1] == "exit 1",
-            "install-service.ps1: the {what} is not followed by Write-Error then exit 1: \
-             {cond}\n  then: {body:?}"
-        );
-    };
     let find = |what: &str, pred: &dyn Fn(&str) -> bool| -> Vec<usize> {
         let found: Vec<usize> = lines
             .iter()
@@ -708,7 +743,7 @@ fn windows_installer_refusal_conditions_stop_the_install() {
     for i in find("owner refusal", &|l| {
         l == "if ($trustedOwners -notcontains $ownerSid) {"
     }) {
-        refuses_at(i, "owner refusal");
+        refuses_at(&lines, i, "owner refusal");
     }
 
     let dir_links = find("refusal of $ConfigDir as a link", &|l| {
@@ -722,7 +757,7 @@ fn windows_installer_refusal_conditions_stop_the_install() {
         dir_links.len()
     );
     for i in dir_links {
-        refuses_at(i, "refusal of $ConfigDir as a link");
+        refuses_at(&lines, i, "refusal of $ConfigDir as a link");
     }
 
     for i in find("refusal of a link or folder entry", &|l| {
@@ -737,7 +772,7 @@ fn windows_installer_refusal_conditions_stop_the_install() {
             "install-service.ps1: an entry must be refused if it is a link or a folder, \
              either one: {cond}"
         );
-        refuses_at(i, "refusal of a link or folder entry");
+        refuses_at(&lines, i, "refusal of a link or folder entry");
     }
 }
 
@@ -802,6 +837,163 @@ fn windows_installer_icacls_calls_act_on_links_and_check_exit_codes() {
             next.contains("$LASTEXITCODE"),
             "install-service.ps1: icacls call not followed by a $LASTEXITCODE check: \
              {call}\n  next line: {next}"
+        );
+    }
+}
+
+/// Guards the peer ACL files install-service.ps1 creates, and its refusal of
+/// legacy ones.
+///
+/// Earlier releases read `peers.allow` and `peers.deny` from `\etc\fips` on
+/// the system drive, where any local user can create files, and the service
+/// still reads a file there when it is missing from `C:\ProgramData\fips`. So
+/// for each of the two files the installer must stop when the legacy file
+/// exists and the current one does not, which is exactly when the service
+/// would enforce the legacy file, and otherwise create the current file empty
+/// if it is missing, without truncating one that exists. Every refusal is
+/// decided before any file is created, and all of it happens after the config
+/// directory is secured and before the binaries are copied or the service is
+/// registered, so a refusal leaves an existing install's binaries, config and
+/// service as they were. Each check is bounded by its loop's closing brace,
+/// since a statement moved out of its loop runs for the last file only.
+#[test]
+fn windows_installer_creates_empty_peer_acl_files_and_refuses_legacy_ones() {
+    let lines = ps_lines(&repo_file("packaging/windows/install-service.ps1"));
+    let all = |pred: &dyn Fn(&str) -> bool| -> Vec<usize> {
+        lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| pred(l))
+            .map(|(i, _)| i)
+            .collect()
+    };
+    let first = |what: &str, pred: &dyn Fn(&str) -> bool| -> usize {
+        all(pred)
+            .first()
+            .copied()
+            .unwrap_or_else(|| panic!("install-service.ps1: no line {what}"))
+    };
+
+    let legacy_dir = first("assigning $legacyAclDir", &|l| {
+        l.starts_with("$legacyAclDir = ")
+    });
+    assert_eq!(
+        lines[legacy_dir], r#"$legacyAclDir = "$env:SystemDrive\etc\fips""#,
+        "install-service.ps1: the legacy peer ACL directory is not \\etc\\fips on the \
+         system drive"
+    );
+
+    let loop_line = r#"foreach ($name in @("peers.allow", "peers.deny")) {"#;
+    let loops = all(&|l| {
+        l.starts_with("foreach") && (l.contains("peers.allow") || l.contains("peers.deny"))
+    });
+    assert_eq!(
+        loops.len(),
+        2,
+        "install-service.ps1: expected two loops over the peer ACL files, the refusal \
+         and the creation, found {}",
+        loops.len()
+    );
+    for &i in &loops {
+        assert_eq!(
+            lines[i], loop_line,
+            "install-service.ps1: a peer ACL loop does not cover both files"
+        );
+    }
+    let (refusal, creation) = (loops[0], loops[1]);
+    let (refusal_end, creation_end) = (block_end(&lines, refusal), block_end(&lines, creation));
+    let refusal_body = refusal + 1..refusal_end;
+    let creation_body = creation + 1..creation_end;
+
+    for text in [
+        "$legacy = Join-Path $legacyAclDir $name",
+        r#"$current = "$ConfigDir\$name""#,
+    ] {
+        assert!(
+            lines[refusal_body.clone()].iter().any(|l| l == text),
+            "install-service.ps1: the refusal loop has no line {text}"
+        );
+    }
+    let check = refusal_body
+        .clone()
+        .find(|&i| lines[i].starts_with("if (") && lines[i].contains("$legacy"))
+        .unwrap_or_else(|| {
+            panic!("install-service.ps1: the refusal loop does not test the legacy file")
+        });
+    assert_eq!(
+        lines[check],
+        "if ((Test-Path -LiteralPath $legacy) -and -not (Test-Path -LiteralPath $current)) {",
+        "install-service.ps1: the refusal must hold only when the legacy file exists and \
+         the current one does not"
+    );
+    refuses_at(&lines, check, "refusal of a legacy peer ACL file");
+    assert!(
+        block_end(&lines, check) < refusal_end,
+        "install-service.ps1: the refusal of a legacy peer ACL file does not close inside \
+         the refusal loop"
+    );
+
+    let aclfile_line = r#"$aclFile = "$ConfigDir\$name""#;
+    let guard_line = "if (-not (Test-Path -LiteralPath $aclFile)) {";
+    let create = creation_body
+        .clone()
+        .find(|&i| lines[i].contains("New-Item") && lines[i].contains("-ItemType File"))
+        .unwrap_or_else(|| panic!("install-service.ps1: the creation loop does not create a file"));
+    let new_item = &lines[create];
+    assert!(
+        new_item.contains("$aclFile") && !new_item.to_ascii_lowercase().contains("-force"),
+        "install-service.ps1: the peer ACL file must be created at $aclFile without -Force, \
+         which would truncate an existing list: {new_item}"
+    );
+    assert!(
+        lines[creation + 1..create]
+            .iter()
+            .any(|l| l == aclfile_line),
+        "install-service.ps1: the creation loop does not set $aclFile to the file in $ConfigDir"
+    );
+    let guard = create - 1;
+    assert!(
+        lines[guard] == guard_line && block_end(&lines, guard) < creation_end,
+        "install-service.ps1: the peer ACL file is not created only when it is missing"
+    );
+    for l in &lines[creation_body] {
+        assert!(
+            [aclfile_line, guard_line, new_item.as_str(), "}"].contains(&l.as_str())
+                || l.starts_with("Write-Host "),
+            "install-service.ps1: the creation loop does more than create a missing file: {l}"
+        );
+    }
+
+    let is_check = |l: &str| l == "& $refuseEntries";
+    let order = [
+        ("check after the reset", all(&is_check).get(2).copied()),
+        ("$legacyAclDir", Some(legacy_dir)),
+        ("refusal loop", Some(refusal)),
+        ("refusal of a legacy file", Some(check)),
+        ("end of the refusal loop", Some(refusal_end)),
+        ("creation loop", Some(creation)),
+        ("creation of a peer ACL file", Some(create)),
+        ("end of the creation loop", Some(creation_end)),
+        (
+            "binary copy",
+            all(&|l| l.contains("$Binaries")).first().copied(),
+        ),
+        (
+            "service registration",
+            all(&|l| l.contains("--install-service")).first().copied(),
+        ),
+    ];
+    for pair in order.windows(2) {
+        let [(a, ia), (b, ib)] = pair else {
+            unreachable!("windows(2) yields pairs")
+        };
+        let (ia, ib) = (
+            ia.unwrap_or_else(|| panic!("install-service.ps1: no {a}")),
+            ib.unwrap_or_else(|| panic!("install-service.ps1: no {b}")),
+        );
+        assert!(
+            ia < ib,
+            "install-service.ps1: {a} (code line {ia}) must come before {b} (code line {ib})"
         );
     }
 }

@@ -105,6 +105,17 @@ Configuration:
   peers.deny and, with node.identity.persistent: true, fips.key
   beside it. Edit fips.yaml there before starting the service.
 
+  install-service.ps1 creates empty peers.allow and peers.deny
+  there, which allow every peer until you add entries. To clear
+  a list, empty the file; do not delete it. While either file
+  is missing from C:\ProgramData\fips, the service still reads
+  that file from \etc\fips on the system drive, where earlier
+  releases kept it and any local user can create it. The
+  installer stops if it finds a file there with none in
+  C:\ProgramData\fips: review that file, move it into
+  C:\ProgramData\fips or delete it, and run install-service.ps1
+  again.
+
   install-service.ps1 restricts C:\ProgramData\fips to SYSTEM
   and Administrators before writing into it. Reading or editing
   files there, fipsctl keygen, fipsctl address with no argument,
