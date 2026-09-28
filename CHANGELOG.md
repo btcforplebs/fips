@@ -1026,6 +1026,10 @@ with v0.5.x or earlier peers.
   mapping, and one whose client did not re-query DNS was reclaimed about two
   minutes after its last DNS reference while its traffic was still flowing.
   Each `dst=` value is now parsed as an address and compared as one.
+- A DNS query that refreshes a draining mapping now cancels its old grace
+  period. Previously the address could be reclaimed while the client's
+  renewed DNS answer was still valid. The mapping now survives the full
+  renewed TTL and a fresh grace period before it can be reused.
 - The conntrack table is read once per tick instead of once per mapping, and
   the read happens off the runtime thread. The whole file was read and scanned
   for each mapping in turn, while the pool lock was held, on the same
