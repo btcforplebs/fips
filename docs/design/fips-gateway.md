@@ -231,34 +231,44 @@ The pool tracks state per address:
 
 ```text
 Allocated ──→ Active ──→ Draining ──→ Free
-    │                                  ▲
-    └──────────────────────────────────┘
-        (TTL expired, no sessions)
+    │                       ▲
+    └───────────────────────┘
+      (TTL expired, no sessions)
+
+Draining ──→ Active      traffic resumes before the grace period ends
+Draining ──→ Allocated   a DNS query for the name
 ```
 
 | State | Meaning |
 | ----- | ------- |
-| Allocated | DNS query created the mapping; no NAT sessions yet. |
+| Allocated | DNS query created or renewed the mapping; no NAT sessions yet. |
 | Active | Conntrack reports at least one session for this virtual IP. |
-| Draining | TTL has expired; sessions may still be in progress, or grace period is running after sessions ended. |
+| Draining | TTL has expired with no sessions; the grace period is running. |
 | Free | Reclaimed and available for new allocations. |
 
 Transitions:
 
 - **Allocated → Active**: conntrack sessions count goes above zero.
-- **Allocated → Free**: TTL expires before any session is ever
+- **Allocated → Draining**: TTL expires before any session is
   observed.
-- **Active → Draining**: TTL expires (sessions may or may not still
-  be present).
-- **Draining → Free**: session count is zero and the grace period
-  has elapsed since draining began.
+- **Active → Draining**: TTL expires after the last session ends.
+  Sessions refresh the mapping at every tick, so a mapping in use
+  does not drain.
+- **Draining → Active**: conntrack reports a session again before
+  the grace period ends. The next drain starts a fresh grace period.
+- **Draining → Allocated**: a DNS query for the name, with or
+  without an address in the answer. The client may now hold a fresh
+  TTL, so reclamation is cancelled: the mapping gets the full TTL
+  and, if it stays idle, a fresh grace period.
+- **Draining → Free**: the grace period has elapsed since draining
+  began with no session seen.
 
 Timing:
 
 - **TTL** (`gateway.dns.ttl`, default 60 s) is both the DNS TTL
-  returned to the client and the mapping's idle lifetime. Repeated
-  DNS queries for the same destination refresh the
-  `last_referenced` timestamp.
+  returned to the client and the mapping's idle lifetime. A DNS
+  query for a mapped name refreshes the mapping's idle clock, and
+  so do conntrack sessions at each tick.
 - **Grace period** (`gateway.pool_grace_period`, default 60 s) is
   the dwell time after the last session ends before the address is
   recycled. It prevents immediate reuse from confusing hosts with

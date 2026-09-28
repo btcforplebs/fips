@@ -509,11 +509,20 @@ impl VirtualIpPool {
     ///
     /// Returns whether a mapping for `node_addr` existed. A query the gateway
     /// answers without an address still says the client is using the name, so
-    /// it must keep the mapping alive without minting one.
+    /// it must keep the mapping alive without minting one. Refreshing a
+    /// draining mapping cancels reclamation for the renewed TTL.
     pub fn refresh_if_present(&mut self, node_addr: NodeAddr) -> bool {
+        self.refresh_at(node_addr, Instant::now())
+    }
+
+    fn refresh_at(&mut self, node_addr: NodeAddr, now: Instant) -> bool {
         match self.mappings.get_mut(&node_addr) {
             Some(mapping) => {
-                mapping.last_referenced = Instant::now();
+                mapping.last_referenced = now;
+                if mapping.state == MappingState::Draining {
+                    mapping.state = MappingState::Allocated;
+                    mapping.drain_start = None;
+                }
                 true
             }
             None => false,
@@ -532,7 +541,7 @@ impl VirtualIpPool {
     }
 
     /// `allocate` at a given instant, which drives the rate limit's refill
-    /// and stamps a new mapping.
+    /// and stamps a new or refreshed mapping.
     ///
     /// An existing mapping is returned before either limit is consulted, so a
     /// name already in use keeps resolving when new names are refused.
@@ -544,7 +553,7 @@ impl VirtualIpPool {
         now: Instant,
     ) -> Result<(Ipv6Addr, bool), PoolError> {
         // Idempotent: return existing mapping, refreshed.
-        if self.refresh_if_present(node_addr)
+        if self.refresh_at(node_addr, now)
             && let Some(mapping) = self.mappings.get(&node_addr)
         {
             return Ok((mapping.virtual_ip, false));
@@ -977,6 +986,70 @@ mod tests {
         assert!(matches!(events[0], PoolEvent::MappingRemoved { .. }));
         assert_eq!(pool.mappings.len(), 0);
         assert_eq!(pool.available.len(), 255); // returned to pool
+    }
+
+    #[test]
+    fn dns_renewal_preserves_the_full_ttl_after_draining() {
+        let t0 = Instant::now();
+        let mut pool = VirtualIpPool::with_limits("fd01::/120", 60, 60, 1, 1, 1).unwrap();
+        let ct = ConntrackSnapshot::default();
+        let node = make_node_addr(1);
+        let mesh = make_mesh_addr(1);
+        let (vip, _) = pool.allocate_at(node, mesh, "test.fips", t0).unwrap();
+
+        pool.tick(t0 + Duration::from_secs(61), &ct);
+        assert_eq!(pool.mappings[&node].state, MappingState::Draining);
+
+        // Renew just before the old grace period ends, with admission full.
+        // The answer reuses the same address and promises another 60s TTL.
+        let renewed = t0 + Duration::from_secs(120);
+        assert_eq!(
+            pool.allocate_at(node, mesh, "test.fips", renewed).unwrap(),
+            (vip, false)
+        );
+        assert_eq!(pool.bucket.tokens(), 0);
+        assert!(pool.tick(t0 + Duration::from_secs(122), &ct).is_empty());
+        assert!(pool.tick(renewed + Duration::from_secs(60), &ct).is_empty());
+        assert_eq!(pool.lookup_virtual_ip(&vip).unwrap().node_addr, node);
+        assert_eq!(pool.mappings[&node].state, MappingState::Allocated);
+
+        // An idle mapping still expires after its renewed TTL and a fresh
+        // grace period; renewal must not make addresses immortal.
+        let drained = renewed + Duration::from_secs(61);
+        assert!(pool.tick(drained, &ct).is_empty());
+        assert_eq!(pool.mappings[&node].state, MappingState::Draining);
+        assert!(pool.tick(drained + Duration::from_secs(60), &ct).is_empty());
+        let events = pool.tick(drained + Duration::from_secs(61), &ct);
+        assert!(matches!(
+            events.as_slice(),
+            [PoolEvent::MappingRemoved { .. }]
+        ));
+        assert!(pool.lookup_virtual_ip(&vip).is_none());
+    }
+
+    #[test]
+    fn dns_refresh_without_an_address_cancels_draining() {
+        let now = Instant::now();
+        let mut pool = VirtualIpPool::new("fd01::/120", 60, 10).unwrap();
+        let ct = ConntrackSnapshot::default();
+        let node = make_node_addr(1);
+        pool.allocate_at(
+            node,
+            make_mesh_addr(1),
+            "test.fips",
+            now - Duration::from_secs(62),
+        )
+        .unwrap();
+        pool.tick(now - Duration::from_secs(1), &ct);
+        assert_eq!(pool.mappings[&node].state, MappingState::Draining);
+
+        // A/other queries refresh existing mappings without creating one.
+        assert!(pool.refresh_if_present(node));
+        assert!(!pool.refresh_if_present(make_node_addr(2)));
+        assert_eq!(pool.mappings.len(), 1);
+        assert!(pool.tick(now + Duration::from_secs(11), &ct).is_empty());
+        assert_eq!(pool.mappings[&node].state, MappingState::Allocated);
+        assert!(pool.mappings[&node].drain_start.is_none());
     }
 
     #[test]
