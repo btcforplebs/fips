@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Nothing yet. Everything previously staged here is folded into
+`[0.5.2]` below.
+
+<!-- The 0.5.2 date below is provisional and is confirmed at the tag, together
+     with the same date in RELEASE-NOTES.md and in
+     docs/releases/release-notes-v0.5.2.md. All three carry it. -->
+
+## [0.5.2] - 2026-09-28
+
 ### Added
 
 #### Gateway
@@ -16,16 +25,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `conntrack -L` does, so a mapping carrying traffic is pinned instead of
   being reclaimed on its TTL and grace period alone. Kernels built without
   `CONFIG_NF_CONNTRACK_PROCFS`, such as Ubuntu's, had session pinning off.
-- The gateway says at startup whether it can read conntrack sessions. It
-  reads the table once, as each tick does, and logs either the source it read
-  or that no source is readable and session pinning is off. An operator on a
-  kernel with no readable source learned this only from a warning at the first
-  failed tick.
+- The gateway says at startup whether it can read conntrack sessions. It reads
+  the table once, as each tick does, and logs either the source it read or
+  that no source is readable and session pinning is off. In v0.5.1 an
+  unreadable source counted as zero sessions and nothing was logged, so an
+  operator on a kernel with no readable source had no way to tell.
 
 ### Changed
 
 #### Identity and config
 
+- The shipped `/etc/fips/hosts` no longer lists `test-us03-next`.
 - An ephemeral node no longer writes `fips.key`. It wrote the private key of
   an identity it discards at every restart to that file, overwriting any key
   already there, including an operator's key when `persistent: true` had been
@@ -34,10 +44,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   start is moved to `fips.key.unused` with a warning, so an ephemeral node logs
   that warning once, on its first start after the upgrade; if that name is
   taken or the rename fails, the file is left in place and a warning says so.
-  For a stable identity, set `node.identity.persistent: true` and restart: the
-  first persistent start generates and saves a key, so the npub changes once,
-  at that restart, and is stable from then on. Starting once in ephemeral mode
-  and then pinning the key it wrote no longer works.
+  For a stable identity, set `node.identity.persistent: true` and restart. The
+  first persistent start uses the `fips.key` it finds; one already moved to
+  `fips.key.unused` can be renamed back to `fips.key` first, as the warning
+  says. With no key file, the first persistent start generates and saves one,
+  so the npub changes once, at that restart, and is stable from then on.
+  Starting once in ephemeral mode and then pinning the key it wrote no longer
+  works.
 
 #### Gateway
 
@@ -45,10 +58,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `[::1]:5353`, the mDNS port, which the daemon's LAN rendezvous, Avahi and
   systemd-resolved can hold. On OpenWrt the init script now points dnsmasq at
   whatever port `gateway.dns.listen` sets, and an upgrade rewrites the
-  previously shipped `listen: "[::1]:5353"` line. On other hosts, a resolver
-  you configured by hand to forward `.fips` to `[::1]:5353` must now forward
-  to `[::1]:5365`, or set `gateway.dns.listen: "[::1]:5353"` to keep the old
-  port. The gateway warns at startup when it is configured on 5353.
+  previously shipped `listen: "[::1]:5353"` line. On other hosts the upgrade
+  leaves `fips.yaml` alone, and a config that sets `gateway.dns.listen`, as
+  the v0.5.1 example config and deployment guide did, keeps its port; the
+  gateway warns at startup when it is configured on 5353. Where `fips.yaml`
+  does not set it, a resolver you configured by hand to forward `.fips` to
+  `[::1]:5353` must now forward to `[::1]:5365`, or set
+  `gateway.dns.listen: "[::1]:5353"` to keep the old port.
 
 #### Linux packages
 
@@ -182,9 +198,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   calls, and because `fips-dns.service` requires the daemon, a daemon that
   failed on every start left the second call, apt and everything queued behind
   it waiting for ever with no message. Each start is now queued and waited on
-  for at most 60 seconds. A unit that does not come up has its status printed
-  and fails the configure step, so apt exits non-zero and names the unit; a
-  masked unit, or one whose condition is not met, is reported and skipped.
+  for at most 60 seconds, 90 for `fips-gateway`. A unit that does not come up
+  has its status printed and fails the configure step, so apt exits non-zero
+  and names the unit; a masked unit, or one whose condition is not met, is
+  reported and skipped.
 - The `.deb` maintainer scripts now manage `fips-gateway` with the rest of the
   package's services. An upgrade stopped the daemon, which the gateway
   requires, and never brought the gateway back, so an operator who had enabled
@@ -248,7 +265,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   leaving nothing behind that says whether the operator wanted it on, so an
   upgrade cannot tell the two apart and keeps the gateway running rather than
   silently turning off a working one. If you had disabled it, run
-  `service fips-gateway disable` once after upgrading. An `apk` upgrade on
+  `service fips-gateway stop` and then `service fips-gateway disable` once
+  after upgrading. Stopping it hands dnsmasq's `.fips` forwarding back to the
+  daemon; disabling it alone leaves it running. An `apk` upgrade on
   OpenWrt 25 runs only the incoming package's scripts, so it keeps the
   gateway's enabled state from the first upgrade on. Later upgrades preserve
   whatever state the service is in: the new prerm stops the services on an
@@ -462,34 +481,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Windows now keeps its config, key, hosts and peer ACL files in
   `C:\ProgramData\fips`, the directory the service installer writes to. The
   config search, the key directory and the peer ACL defaults disagreed: the
-  service found none of the installed files after a reboot and ran on
-  defaults, `fipsctl keygen` wrote to the per-user `%APPDATA%\fips`, and a
-  `peers.deny` placed beside the hosts file was never read, so the ACL failed
-  open. A key left in `%APPDATA%\fips` is still used when the new directory
-  has none, with a note to move it. For one release, a `peers.allow` or
-  `peers.deny` left at the old `\etc\fips` location is still read when the
-  new directory has no such file, with a warning naming both paths.
-- The Windows service installer now restricts `C:\ProgramData\fips` to
-  SYSTEM and Administrators. The directory inherited `C:\ProgramData`'s
-  default ACL, which lets any local user read the files in it and create new
-  ones, so any local account could read the node's key, or create a missing
-  `fips.key`, `fips.yaml` or `hosts` that the service then used. The installer
-  creates the directory with the restricted ACL, or replaces the ACL of an
-  existing one, resets the files already in it to inherit it, and refuses to
-  continue if the directory or anything in it is a link or a folder, or if the
-  directory is owned by another account. Rerun the installer after moving files
-  into the directory. A foreground run from an unelevated prompt can no longer
-  read the files there.
+  config search never looked in `C:\ProgramData\fips`, so the service depended
+  on the `FIPS_CONFIG` the installer set, `fipsctl keygen` wrote to the
+  per-user `%APPDATA%\fips`, and a `peers.deny` placed beside the hosts file
+  was never read, so the ACL failed open. A key left in `%APPDATA%\fips` is
+  still used by a persistent node when the new directory has none, with a note
+  to move it. For one release, a `peers.allow` or `peers.deny` left at the old
+  `\etc\fips` location is still read when the new directory has no such file,
+  with a warning naming both paths.
+- The Windows service installer now restricts `C:\ProgramData\fips` to SYSTEM
+  and Administrators. The directory inherited `C:\ProgramData`'s default ACL,
+  which lets any local user read the files in it and create new ones, so any
+  local account could read the node's key, or create a missing `fips.key`,
+  `fips.yaml` or `hosts` that the service then used. The installer creates the
+  directory with the restricted ACL, or replaces the ACL of an existing one,
+  resets the files already in it to inherit it, and refuses to continue if the
+  directory or anything in it is a link or a folder, or if the directory is
+  owned by another account. After moving files into the directory, stop the
+  service and rerun the installer; it cannot replace `fips.exe` while the
+  service runs. A foreground run from an unelevated prompt can no longer read
+  the files there.
 - The Windows service installer now creates empty `peers.allow` and
-  `peers.deny` files in `C:\ProgramData\fips`. While either was missing there,
-  the service read that file from `\etc\fips` on the system drive, where any
-  local user can create files, so a planted list was enforced. An empty file
-  allows every peer; to clear a list, empty its file rather than deleting it.
-  The installer stops when either file exists under `\etc\fips` and not in
+  `peers.deny` files in `C:\ProgramData\fips`. The service read these lists
+  from `\etc\fips` on the system drive, where any local user can create files,
+  so a planted list was enforced; for this release it still falls back there
+  when a file is missing from `C:\ProgramData\fips`. An empty file allows
+  every peer; to clear a list, empty its file rather than deleting it. The
+  installer stops when either file exists under `\etc\fips` and not in
   `C:\ProgramData\fips`, so an upgrader's list is neither enforced from the
   old location nor dropped unreviewed: review it, move it into
   `C:\ProgramData\fips` or delete it, and run the installer again. Windows
-  upgraders should rerun `install-service.ps1`.
+  upgraders should stop the service and rerun `install-service.ps1`.
 
 #### Links and transports
 

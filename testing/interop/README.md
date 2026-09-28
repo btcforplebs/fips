@@ -244,7 +244,8 @@ working copy at all.
 
 ## How to read the output
 
-The driver runs seven phases:
+The driver runs eight phases (0 to 7), plus 1b and 5b when data-plane
+streams are on:
 
 | Phase | Check                                                            |
 | ----- | ---------------------------------------------------------------- |
@@ -255,6 +256,7 @@ The driver runs seven phases:
 | 4     | Wait out a second rekey cycle.                                   |
 | 5     | All pairs still ping after the second rekey.                     |
 | 6     | Per-node / per-pair interop log analysis.                        |
+| 7     | Every node's mesh-size estimate within ±25% of N after warmup.   |
 
 When data-plane streams are on (`--topology`, or `FIPS_INTEROP_STREAMS`),
 Phase 1b measures stream loss over a quiet control window and Phase 5b

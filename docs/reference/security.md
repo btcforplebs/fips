@@ -117,9 +117,25 @@ and FSP layers.
 
 ## Peer ACL
 
-Mesh-level ACL files at `/etc/fips/peers.allow` and
-`/etc/fips/peers.deny` give the operator allowlist/blocklist control
-over which npubs may complete the FMP Noise IK link handshake.
+Mesh-level ACL files `peers.allow` and `peers.deny`, in `/etc/fips/`
+on Linux and other Unix, `/usr/local/etc/fips/` on macOS and FreeBSD
+and `C:\ProgramData\fips\` on Windows, give the operator
+allowlist/blocklist control over which npubs may complete the FMP
+Noise IK link handshake.
+
+On Windows, v0.5.1 and earlier read both files from `\etc\fips\`,
+where any local user can create files. The daemon still reads a
+`peers.allow` or `peers.deny` left there, on the current drive (for
+the service, normally the system drive), while the same file is
+missing from `C:\ProgramData\fips\`, and logs a warning when it
+does; when the file is in both places, only the `C:\ProgramData\fips\`
+copy is read. `install-service.ps1` creates both files empty in
+`C:\ProgramData\fips\`, which ends the fallback, and stops without
+installing when it finds either file in `\etc\fips\` on the system
+drive with no copy in `C:\ProgramData\fips\`, so that the old list is
+reviewed and moved or deleted first. To clear a list, empty its file
+rather than deleting it, or an old copy in `\etc\fips\` is read
+again.
 
 File format:
 
@@ -182,7 +198,7 @@ mutation; rate-limited msg1s never reach the ACL.
 | ---- | ----- | ---- | ------- |
 | `/etc/fips/fips.key` | root:root | `0600` | Persistent identity private key (sensitive). |
 | `/etc/fips/fips.pub` | root:root | `0644` | Public key (npub). |
-| `/etc/fips/fips.yaml` | root:root | `0644` | Daemon configuration (dpkg conffile). |
+| `/etc/fips/fips.yaml` | root:root | `0600` | Daemon configuration (seeded by `postinst` from `/usr/share/fips/fips.yaml.example`; not a conffile). |
 | `/etc/fips/fips.nft` | root:root | `0644` | nftables baseline (dpkg conffile). |
 | `/etc/fips/fips.d/` | root:root | `0755` | Operator drop-in directory. |
 | `/etc/fips/hosts` | root:root | `0644` | Optional hostname → npub map (dpkg conffile). |
@@ -191,6 +207,11 @@ mutation; rate-limited msg1s never reach the ACL.
 | `/run/fips/control.sock` | root:fips | `0770` | Control socket (members of `fips` group can use `fipsctl`). |
 | `/run/fips/api.sock` | root:fips | `0770` | Native datagram API socket, when `node.native_api.enabled` is set (experimental; absent otherwise). |
 | `/run/fips/` | root:fips | `0750` | Socket parent directory. |
+
+The `/etc/fips/` paths are the Linux ones. macOS and FreeBSD use
+`/usr/local/etc/fips/`; the Windows service keeps the key, config,
+hosts and ACL files in `C:\ProgramData\fips\`, which
+`install-service.ps1` restricts to SYSTEM and Administrators.
 
 Adding a user to the `fips` group grants `fipsctl` access without
 requiring root. The daemon `chown`s the control socket and its parent

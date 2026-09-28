@@ -3,7 +3,7 @@
 ![banner](docs/logos/fips_banner.png)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-orange.svg)](https://www.rust-lang.org/)
-[![Status](https://img.shields.io/badge/status-v0.5.1-green.svg)](#status--roadmap)
+[![Status](https://img.shields.io/badge/status-v0.5.2-green.svg)](#status--roadmap)
 
 A self-organizing encrypted mesh network built on Nostr identities,
 capable of operating over arbitrary transports without central
@@ -121,7 +121,7 @@ On Debian or Ubuntu, download `fips_<version>_amd64.deb` (or
 `_arm64.deb`) and install it:
 
 ```bash
-sudo dpkg -i fips_<version>_amd64.deb
+sudo apt install ./fips_<version>_amd64.deb
 sudo systemctl start fips fips-dns
 ```
 
@@ -133,8 +133,10 @@ enables `fips` and `fips-dns` but starts neither, which is why the
 second command is there.
 
 For macOS, Windows, FreeBSD, OpenWrt, the systemd tarball or a Nix
-flake, see [docs/getting-started.md](docs/getting-started.md)
-for the full multi-platform installation guide.
+flake, [packaging/README.md](packaging/README.md) gives the install
+commands for each package format, and
+[docs/getting-started.md](docs/getting-started.md) is the full
+multi-platform installation guide.
 
 To join a live mesh and reach your first peer, follow the new-user
 tutorial progression starting at
@@ -149,7 +151,7 @@ git clone https://github.com/jmcorgan/fips.git
 cd fips
 cargo install cargo-deb
 cargo deb
-sudo dpkg -i target/debian/fips_*.deb
+sudo apt install ./target/debian/fips_*.deb
 ```
 
 For the binaries alone, without an installer:
@@ -196,10 +198,10 @@ below. **Only the `.deb` is exercised by an install test**, by the
 ubuntu26; neither the AUR package nor the flake is. That suite runs on
 every push and pull request, on x86_64, against a `.deb` built by the same
 pinned container as the released one. The arm64 package, built the same way
-on an arm64 runner, is installed and its daemon started on ubuntu22 on every
-push and pull request as well; its upgrade, purge and conffile paths are not
-exercised. The suite does not run at a tag: no workflow installs a published
-artifact, so the released packages are checked by
+on an arm64 runner, is installed, its daemon started and the package purged on
+ubuntu22 on every push and pull request as well; its upgrade and conffile paths
+are not exercised. The suite does not run at a tag: no workflow installs a
+published artifact, so the released packages are checked by
 hand. OpenWrt is a musl
 target rather than glibc, and it takes an `.ipk` on 24.x and earlier or
 an `.apk` on 25 and later; both carry the `fips-mesh-setup` and
@@ -265,7 +267,7 @@ Nix / NixOS section of [packaging/README.md](packaging/README.md).
   then [fips-architecture.md](docs/design/fips-architecture.md) for
   the protocol stack.
 - **[Release notes](docs/releases/)** — per-version notes, including
-  [v0.5.1](docs/releases/release-notes-v0.5.1.md).
+  [v0.5.2](docs/releases/release-notes-v0.5.2.md).
 
 If you want to contribute, see [CONTRIBUTING.md](CONTRIBUTING.md)
 and [testing/README.md](testing/README.md).
@@ -306,10 +308,10 @@ testing/      Docker-based integration test harnesses + chaos simulation
 
 ## Status & roadmap
 
-FIPS is at **v0.5.1** on the `maint` branch, a maintenance release
-that makes the Linux packages install and run on Debian 12 and Ubuntu
-22.04, where every artifact from v0.3.0 through v0.5.0 installed and
-then could not start.
+FIPS is at **v0.5.2** on the `maint` branch, a maintenance release
+that closes security gaps in the Windows service, the gateway and the
+rekey handshakes, and fixes the gateway, the Linux, OpenWrt and FreeBSD
+packages, and session and discovery recovery after lost messages.
 [v0.5.0](https://github.com/jmcorgan/fips/releases/tag/v0.5.0) was the
 last feature release, so how much of that release is new to you depends on
 which version you are upgrading from. The core
@@ -317,8 +319,12 @@ protocol
 works end-to-end over UDP, TCP, Ethernet, Tor, Nym, and Bluetooth on a
 global, public test mesh of thousands of nodes.
 
-v0.5.1 is a packaging fix and carries two discovery fixes; the feature
-content below is v0.5.0's.
+v0.5.2 and v0.5.1 are maintenance releases; the feature content below
+is v0.5.0's. v0.5.2 moves the gateway's default DNS port to 5365 and the
+Windows config directory to `C:\ProgramData\fips`, and an ephemeral node
+no longer writes `fips.key`; see the
+[v0.5.2 release notes](docs/releases/release-notes-v0.5.2.md) before
+upgrading.
 
 v0.5.0 is a platform-and-lifecycle release. It adds FreeBSD as a
 packaged platform (x86_64 only), OpenWrt setup helpers for an 802.11s

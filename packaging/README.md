@@ -106,7 +106,7 @@ never prompted for or clobbered on upgrade. To reset to defaults, remove
 make deb
 
 # Install
-sudo dpkg -i deploy/fips_<version>_<arch>.deb
+sudo apt install ./deploy/fips_<version>_<arch>.deb
 
 # Remove (preserves config and keys)
 sudo dpkg -r fips
@@ -135,14 +135,18 @@ installation and configuration instructions.
 ### OpenWrt (`.ipk`, opkg — OpenWrt 24.x and earlier)
 
 Cross-compiled with cargo-zigbuild and assembled as a standard `.ipk`
-archive. Supports aarch64, mipsel, mips, arm, and x86\_64 targets.
+archive. The build script accepts aarch64, mipsel, mips, arm and
+x86\_64; releases publish aarch64 and x86\_64. The MIPS targets are
+not built: 32-bit MIPS has no 64-bit atomics, which fips and
+`nostr-relay-pool` both use (see the comment in
+`.github/workflows/package-openwrt.yml`).
 
 ```sh
 # Build (default: aarch64)
 make ipk
 
 # Build for a specific architecture
-bash packaging/openwrt-ipk/build-ipk.sh --arch mipsel
+bash packaging/openwrt-ipk/build-ipk.sh --arch x86_64
 ```
 
 See [openwrt-ipk/README.md](openwrt-ipk/README.md) for router-specific
@@ -228,13 +232,13 @@ powershell -File packaging/windows/build-zip.ps1
 # Extract and install as service (requires Administrator)
 Expand-Archive deploy\fips-<version>-windows-x86_64.zip -DestinationPath fips
 cd fips
-powershell -File install-service.ps1
+powershell -ExecutionPolicy Bypass -File install-service.ps1
 
 # Uninstall (preserves config)
-powershell -File uninstall-service.ps1
+powershell -ExecutionPolicy Bypass -File uninstall-service.ps1
 
 # Uninstall and remove config
-powershell -File uninstall-service.ps1 -RemoveAll
+powershell -ExecutionPolicy Bypass -File uninstall-service.ps1 -RemoveAll
 ```
 
 ### Arch Linux (AUR)

@@ -96,14 +96,18 @@ fips_gateway`, with two chains:
   return-path SNAT, and (when any port-forward is configured) the
   LAN-side masquerade for inbound traffic.
 
-The table is rebuilt atomically on every change. The rebuild
-sequence — delete the existing table (ignore `ENOENT` on first
-call), then create a new table with chains and the full rule set in
-a single netlink batch — avoids reliance on kernel rule-handle
-tracking, which the rustables crate does not expose. The table stays
-small (one always-on masquerade plus two rules per active outbound
-mapping plus one rule per inbound forward, with one extra masquerade
-when any forward is present), so rebuilds are cheap.
+The table is rebuilt atomically on every change, in one netlink
+batch that the kernel applies as a single transaction: add the
+table, delete it, add it again, then the chains and the full rule
+set. Because the delete and the recreate share one transaction, the
+table never leaves the packet path; the leading add gives the
+delete a target when no table exists yet, and a batch the kernel
+refuses leaves the previous table in place. Rebuilding the whole
+table avoids reliance on kernel rule-handle tracking, which the
+rustables crate does not expose. The table holds one always-on
+masquerade, two rules per live outbound mapping (at most 1000
+mappings), one rule per inbound forward, and one extra masquerade
+when any forward is present.
 
 ### Control Socket
 
@@ -202,16 +206,19 @@ involving the DNS proxy or the pool.
    traffic, so a `127.0.0.1:5354` upstream cannot reach a daemon
    bound on `[::1]:5354`.
 4. If the daemon is unreachable or times out (5 s), the gateway
-   replies `SERVFAIL`. If the daemon returns `NXDOMAIN` or a
-   non-`AAAA` answer, the gateway forwards the response unchanged.
+   replies `SERVFAIL`. If the daemon answers with an error such as
+   `NXDOMAIN`, the gateway relays that response code; if it answers
+   without an AAAA record, the gateway replies `SERVFAIL`.
 5. The gateway extracts the AAAA (`fd00::/8`) record from the
    daemon's response. This resolution primes the daemon's identity
    cache as a side effect — a prerequisite for `fips0` routing,
    because the daemon needs the cache entry to map the mesh address
    back to a `NodeAddr` for forwarding.
-6. The gateway allocates a virtual IP from the pool for that mesh
-   address (idempotent: an existing mapping is reused and its TTL
-   refreshed).
+6. If the client asked for AAAA or ANY, the gateway allocates a
+   virtual IP from the pool for that mesh address (idempotent: an
+   existing mapping is reused and its TTL refreshed). Any other
+   query type refreshes an existing mapping's TTL, creates nothing,
+   and is answered with NODATA.
 7. If a new mapping was created, the pool emits `MappingCreated`,
    which the main loop turns into `add_mapping` calls on the NAT
    manager and `add_proxy_ndp` on the network setup.
@@ -283,9 +290,13 @@ way an entry counts once toward each distinct IPv6 destination among
 its original and reply tuples, so an entry counts as a session of a
 virtual IP whose address is its original destination.
 
-If the pool is exhausted, new DNS queries return `SERVFAIL`.
-Existing mappings are never evicted prematurely — the correctness of
-in-flight sessions takes precedence over fresh allocations.
+A new mapping is refused, and the query answered `SERVFAIL`, when
+the pool is exhausted, when it already holds 1000 live mappings, or
+when the new-mapping rate limit is spent (a bucket of 50 that
+refills at 10 per second). A name that already has a mapping keeps
+resolving while new names are refused. Existing mappings are never
+evicted prematurely — the correctness of in-flight sessions takes
+precedence over fresh allocations.
 
 ### NAT Pipeline (Outbound)
 
@@ -435,22 +446,28 @@ and that table is rebuilt as one unit on every state change —
 mapping added, mapping removed, port-forwards updated. The rebuild
 sequence is:
 
-1. Delete the existing table in its own batch (ignore `ENOENT`).
-2. In a fresh batch: add the table; add the `prerouting` and
-   `postrouting` chains; add the always-on `oifname fips0`
-   masquerade; add per-mapping DNAT/SNAT rules for every active
-   pool entry; add per-port-forward DNAT rules; add the LAN-side
+1. Add the table (which succeeds whether or not it exists), delete
+   it, and add it again, so the delete always has a target.
+2. Add the `prerouting` and `postrouting` chains; the always-on
+   `oifname fips0` masquerade; per-mapping DNAT/SNAT rules for
+   every live pool entry; per-port-forward DNAT rules; the LAN-side
    masquerade if any port-forwards exist.
-3. Send the batch as a single netlink transaction.
+3. Send all of it as one batch, which the kernel applies as a single
+   transaction. Only the last message before the batch end requests
+   an acknowledgement, the socket's send buffer is sized to the
+   batch, and a batch too large for any send buffer is refused
+   before it is sent. A batch the kernel refuses leaves the previous
+   table in place; the failure is logged, and the gateway keeps its
+   record of the change, so the next rebuild that succeeds applies
+   it.
 
 The rustables crate does not expose rule-handle tracking, so
 incremental update of individual rules is not available. Atomic
 rebuild was chosen for simplicity and correctness: it eliminates an
 entire class of partial-update inconsistency bugs at the cost of
 repeating the (cheap) rule construction on every change. The total
-rule count is bounded by the pool capacity (2 per mapping, capped
-at 2^16) and the port-forward count, both of which are small in
-practice.
+rule count is bounded by the live-mapping ceiling (1000 mappings,
+two rules each) and the port-forward count.
 
 ## Configuration Reference
 

@@ -77,7 +77,8 @@ own machine, and OpenWrt is a musl target rather than glibc, so none of them
 depends on that floor.
 
 See the [project README's Quick start section](../README.md#quick-start)
-for download links and per-platform invocations.
+for download links, and [packaging/README.md](../packaging/README.md)
+for the install commands for each package format.
 
 ### FreeBSD
 
@@ -139,7 +140,7 @@ make deb         # or: tarball, ipk, apk, aur, pkg, freebsd, zip, all
 
 The resulting installer lands in `deploy/` at the project root.
 Apply it the same way you would a downloaded one (for example
-`sudo dpkg -i deploy/fips_*.deb` on Debian/Ubuntu).
+`sudo apt install ./deploy/fips_*.deb` on Debian/Ubuntu).
 
 See [packaging/README.md](../packaging/README.md) for per-format
 build details, cross-target options, and the full `make` target

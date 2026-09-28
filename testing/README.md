@@ -89,7 +89,17 @@ drop-in semantics.
 
 Six nodes with per-node allowlist files mounted at the runtime ACL
 paths, exercising insiders, outsiders and allowed remotes at once to
-check which peer pairs are admitted and which are rejected.
+check which peer pairs are admitted and which are rejected. Run by hand
+only; retired from both CI runners as redundant with the unit and
+in-process ACL tests (see `ci-local.sh`).
+
+### [openwrt/](openwrt/) -- OpenWrt Maintainer Scripts
+
+Runs the OpenWrt package scripts and the `fips-gateway` init script
+under busybox `ash` against stubbed init scripts and `uci`, and checks
+what the real `build-apk.sh` and `build-ipk.sh` package. No router,
+opkg or apk-tools is involved. Part of both CI runners as
+`openwrt-scripts`.
 
 ### [native-api/](native-api/) -- Native Datagram API
 
