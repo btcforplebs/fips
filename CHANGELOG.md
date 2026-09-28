@@ -50,7 +50,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to `[::1]:5365`, or set `gateway.dns.listen: "[::1]:5353"` to keep the old
   port. The gateway warns at startup when it is configured on 5353.
 
-#### Packaging (Debian)
+#### Linux packages
 
 - An upgrade of the `.deb` now reapplies the firewall ruleset in place. Until
   now an upgrade reloaded nothing, so a changed `/etc/fips/fips.nft` took
@@ -62,9 +62,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   upgrade never turns the firewall on for a host that has not opted in. A
   reload that fails leaves the previous ruleset in place and is reported; the
   upgrade goes on.
-
-#### Packaging (AUR)
-
 - The AUR publish on a release tag now waits until every package workflow of
   that tag has succeeded. It used to push the new `pkgver` while the Linux,
   macOS, Windows, OpenWrt and FreeBSD packages were still building; at v0.5.1
@@ -73,6 +70,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that point left the AUR package unbuildable. A failed or cancelled package
   run now stops the publish, and one that has not finished within an hour
   fails it.
+
+#### Native datagram API
+
+- The native API documentation now says that on Linux an empty datagram sent
+  immediately before a close may read as end of file, and is then not
+  delivered. Linux carries the flow on `SOCK_SEQPACKET`, where a zero-length
+  datagram that is the last message before a close cannot be told apart from
+  the close; macOS and FreeBSD carry it on `SOCK_DGRAM` and are not affected.
+  The `Received::Datagram` rustdoc, which said an empty datagram is never a
+  close, now says where the exception applies.
 
 #### Dependencies
 
@@ -85,51 +92,221 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   maintainer rather than flagged by an advisory. What it buys is that a fresh
   checkout can resolve the lockfile without reaching for a yanked version.
 
-#### Documentation (native API)
-
-- The native API documentation now says that on Linux an empty datagram sent
-  immediately before a close may read as end of file, and is then not
-  delivered. Linux carries the flow on `SOCK_SEQPACKET`, where a zero-length
-  datagram that is the last message before a close cannot be told apart from
-  the close; macOS and FreeBSD carry it on `SOCK_DGRAM` and are not affected.
-  The `Received::Datagram` rustdoc, which said an empty datagram is never a
-  close, now says where the exception applies.
-
 ### Fixed
 
-#### Node lifecycle
+#### Identity and config
 
-- A DNS responder or TUN thread that dies now degrades the node's published
-  health, and a dead responder's address is retracted. The responder's exit
-  report followed a loop that never returns, so it could not run, and a panic
-  in the responder or in either TUN thread unwound past its report. The node
-  kept reporting healthy with the child gone and kept publishing the DNS
-  address with nothing answering on it. Each child now runs inside a wrapper
-  that catches a panic, logs it, and reports the exit either way. A deliberate
-  stop still reports nothing.
+- A persistent node whose identity key path cannot be examined now refuses to
+  start instead of coming up under a new identity. `Path::exists` reports false
+  both for a key that is absent and for one whose metadata cannot be read, so a
+  key symlinked onto a volume that did not mount, or one in a directory the
+  daemon cannot search, read as a first boot: the node generated a fresh
+  identity, failed to store it, and carried on under an npub that every peer
+  whose allowlist names the old one refuses. Only a `NotFound` result is now
+  treated as an absence; any other failure to stat the path aborts the start and
+  names the path. A dangling symlink likewise aborts rather than being replaced.
+  The legacy `/etc/fips/fips.key` lookup follows the same rule.
+- Replacing the peer list at runtime with `Node::update_peers` now updates
+  everything that reads peer aliases. `.fips` names, peer ACL entries written as
+  an alias, and peer display names kept following the aliases the node started
+  with, so a new peer's alias did not resolve, a removed one still did, and a
+  deny entry naming an alias moved to another key kept denying the old key and
+  admitted the new one. They now follow the new peer list, with the hosts file
+  still taking precedence as it does at startup.
 
-#### Data plane and transports
+#### Gateway
 
-- A configured `ble:` transport that this build cannot construct is now
-  reported. The only warning for it was compiled into test builds alone, where
-  logging is compiled out, so macOS, Windows, FreeBSD, OpenWrt and other musl
-  builds, and Android without a BLE radio armed before start, dropped the block
-  silently while reporting healthy. The daemon now warns once per configured
-  instance at startup, naming the reason.
+- The NAT table is rebuilt in one netlink transaction. A rebuild deleted the
+  `fips_gateway` table in a batch of its own, discarded that batch's result,
+  and only then sent the batch that recreated the table, the chains, the
+  `fips0` masquerade and every per-mapping rule. Between the two sends the
+  gateway had no NAT at all, and a recreate the kernel refused left the table
+  absent for good, taking down forwarding for every existing mapping rather
+  than failing the one change that was being made. The delete and the recreate
+  now share a single batch, which the kernel applies as one transaction, so a
+  refused rebuild leaves the previous table in the packet path. The rules sent
+  are unchanged.
+- The gateway's NAT rebuild no longer fails once the table holds more than
+  about 105 mappings. Each rebuild is one netlink batch. From about 105
+  mappings the default socket buffers could not hold its acknowledgements, so
+  rebuilds were logged as failed although they had taken effect. Past about
+  313 mappings the buffers could not hold the batch itself, and new `.fips`
+  names past that count got a virtual IP with no translation. In releases with
+  the gateway through 0.5.1, a rebuild past about 313 mappings also deleted the
+  whole `fips_gateway` table, which stopped every mapping, the `fips0`
+  masquerade and the port forwards. The rebuild now sizes its send buffer to
+  the batch and requests one acknowledgement per batch, and NAT errors now
+  name the kernel errno. A rebuild that still fails is logged, and the next
+  successful rebuild installs the mapping.
+- Conntrack sessions are matched by address rather than by text, so live
+  traffic pins a gateway mapping again. The session count searched each
+  `/proc/net/nf_conntrack` line for `dst=` followed by the virtual IP in its
+  compressed form (`fd01::1`), while the kernel prints tuples in the full
+  uncompressed form (`dst=fd01:0000:0000:0000:0000:0000:0000:0001`), so the
+  count was zero for every mapping on every kernel. Nothing pinned an in-use
+  mapping, and one whose client did not re-query DNS was reclaimed about two
+  minutes after its last DNS reference while its traffic was still flowing.
+  Each `dst=` value is now parsed as an address and compared as one.
+- The conntrack table is read once per tick instead of once per mapping, and
+  the read happens off the runtime thread. The whole file was read and scanned
+  for each mapping in turn, while the pool lock was held, on the same
+  single-threaded runtime that serves DNS. The tick now takes one snapshot with
+  a blocking task before it takes the lock, and the pool does a map lookup per
+  mapping.
+- A conntrack source that cannot be read is reported. It still counts as zero
+  sessions for every mapping, as it always has, so reclamation keeps working
+  rather than pinning the whole pool; but the first failure and each change of
+  outcome after it are now logged, so an unreadable source is no longer
+  indistinguishable from an idle one. A source that fails identically every
+  tick is logged at debug rather than warn on a repeat.
+- A DNS query that refreshes a draining mapping now cancels its old grace
+  period. Previously the address could be reclaimed while the client's renewed
+  DNS answer was still valid. The mapping now survives the full renewed TTL
+  and a fresh grace period before it can be reused. Contributed by Martti
+  Malmi (#169).
+- `fips-gateway` exits when its DNS listener cannot bind, or stops while the
+  gateway runs, instead of staying up with `.fips` resolution dead, so systemd
+  or procd restarts it or reports it failed. This applies to a gateway used
+  only for port forwards too. An "address in use" error names the service
+  likely to hold the port. On an OpenWrt access point with the gateway
+  enabled, the gateway had lost its port to the daemon's own mDNS responder
+  and `.fips` names stopped resolving with nothing reported. A
+  `gateway.dns.upstream` written as a hostname now works: the resolver
+  forwards to the address the startup check resolved, where before the check
+  passed and the resolver then stopped on the unparsed name.
 
-- Two inbound TCP connections that share a peer address but arrive on different
-  local addresses no longer share one pool entry. The kernel names a connection
-  by its four-tuple, so a listener on a wildcard address, which is what the
-  shipped configuration binds, can accept two connections whose peer `ip:port`
-  is the same on two different local addresses. The pool was keyed by the peer
-  address alone: the second connection's entry replaced the first's while the
-  inbound-connection counter counted both, the first connection's teardown then
-  removed the second's entry, and the second's own teardown found nothing to
-  remove, so the counter ended one above the connections it counts. That counter
-  gates the inbound connection limit, so a host repeating the collision could
-  hold it at the limit and lock out further inbound TCP connections until the
-  daemon restarted. Inbound entries now carry the accepted socket's local
-  address in their pool key as well as the remote one.
+#### Linux packages
+
+- A `.deb` upgrade whose new daemon cannot start no longer hangs apt. The
+  postinst started `fips.service` and then `fips-dns.service` with blocking
+  calls, and because `fips-dns.service` requires the daemon, a daemon that
+  failed on every start left the second call, apt and everything queued behind
+  it waiting for ever with no message. Each start is now queued and waited on
+  for at most 60 seconds. A unit that does not come up has its status printed
+  and fails the configure step, so apt exits non-zero and names the unit; a
+  masked unit, or one whose condition is not met, is reported and skipped.
+- The `.deb` maintainer scripts now manage `fips-gateway` with the rest of the
+  package's services. An upgrade stopped the daemon, which the gateway
+  requires, and never brought the gateway back, so an operator who had enabled
+  it lost it until the next reboot; removing or purging the package left the
+  gateway's enablement symlink behind, pointing at a unit file that no longer
+  exists. The gateway is now stopped before the daemon on upgrade and
+  restarted afterwards only when it is enabled and the daemon came up, and it
+  is stopped and disabled on remove and purge. A gateway that does not come
+  back is reported but does not fail the upgrade.
+- Purging the `.deb`, or running `uninstall.sh` from the tarball, now removes
+  the `.fips` DNS routing when `fips-dns` was not running at the time. The
+  cleanup removed the dns-delegate file from the wrong directory, never removed
+  the systemd-resolved global drop-in, and restarted no resolver, so the host
+  kept sending `.fips` queries to `[::1]:5354`, where nothing listens any more,
+  and `.fips` lookups timed out. Both scripts now remove all four files
+  `fips-dns-setup` can write, and restart systemd-resolved or reload dnsmasq or
+  NetworkManager when they removed that resolver's file and it is running. A
+  failed restart is reported and does not fail the removal.
+- The `.deb` now declares `libgcc-s1 (>= 4.2)`. All four binaries link
+  `libgcc_s.so.1`, but cargo-deb removes every libgcc entry from the
+  dependencies it derives, so the package never said so. `libc6` depends on
+  `libgcc-s1` on Debian 12 and Ubuntu 22.04, 24.04 and 26.04, so installs there
+  were not affected. A new check, `testing/check-deb-depends.sh`, runs
+  `dpkg-shlibdeps` over the package's binaries on every build and fails the
+  build when the declared `Depends` leaves out a library the binaries need, or
+  states a floor lower or higher than the one they need. A dependency the
+  packaging tool drops, including one it drops after only a warning when it
+  cannot resolve a binary, now fails the build instead of shipping.
+- The `.deb` now recommends `nftables`, and both AUR `PKGBUILD` files list it
+  as an optional dependency. `fips-firewall.service` runs `/usr/sbin/nft`, so
+  enabling it on a host without nftables failed at start. It is a
+  recommendation rather than a dependency because the firewall unit is opt-in
+  and the daemon itself does not need `nft`.
+- The release `PKGBUILD` now lists `dbus` as a runtime dependency. The `fips`
+  binary links `libdbus-1`, and the `fips-git` package already declared it.
+- `-V` on binaries built into the Linux packages now includes the source
+  revision, as `<version> (rev <git-hash>)`. The build image had no git, so
+  every container-built binary printed the version alone. A package built from
+  a git worktree still has no revision, because the worktree's git directory is
+  outside the tree the build sees. The build image's tag now includes a hash of
+  its Dockerfile, so a host with an older image cached builds a new one instead
+  of reusing it.
+- `packaging/debian/build-deb-container.sh` now returns the package it just
+  built. It picked the most recently modified `fips_*.deb` in the output
+  directory that sorted last by name, so a package with a higher version left
+  there by an earlier run was returned instead.
+
+#### OpenWrt
+
+- A new OpenWrt install no longer enables and starts `fips-gateway`. The
+  generated postinst turned it on unconditionally, contradicting the init
+  script's own header, the package README and the deployment tutorial, all of
+  which say the service ships disabled and is enabled deliberately. The
+  documented `service fips-gateway enable` / `service fips-gateway start` steps
+  are unchanged, and the shipped `fips.yaml` still carries `gateway.enabled:
+  true`, so enabling the service is all that is needed.
+- **The first opkg upgrade to this release re-enables and starts
+  `fips-gateway` on any router that has the `.ipk` installed, including one
+  where the gateway was disabled by hand.** opkg runs the outgoing package's
+  prerm, and every released `.ipk` prerm disabled the service on its way out,
+  leaving nothing behind that says whether the operator wanted it on, so an
+  upgrade cannot tell the two apart and keeps the gateway running rather than
+  silently turning off a working one. If you had disabled it, run
+  `service fips-gateway disable` once after upgrading. An `apk` upgrade on
+  OpenWrt 25 runs only the incoming package's scripts, so it keeps the
+  gateway's enabled state from the first upgrade on. Later upgrades preserve
+  whatever state the service is in: the new prerm stops the services on an
+  upgrade but no longer disables them.
+- An `apk` upgrade on OpenWrt 25 now restarts `fips`, and restarts
+  `fips-gateway` if it was enabled, so the new binaries run without a reboot.
+  apk-tools v3 runs only the incoming package's pre-upgrade and post-upgrade
+  scripts, and the `.apk` registered neither, so an upgrade replaced the files
+  on disk and left the old processes running until a reboot or a manual
+  restart.
+- `start_service` in the `fips-gateway` init script now reads `gateway.enabled`
+  from `/etc/fips/fips.yaml` before doing anything. Starting a gateway that the
+  config disables used to hand dnsmasq's `.fips` forwarding to the gateway's
+  port, add the LAN prefix and advertise the pool route, and only then start a
+  daemon that exits immediately because the gateway is disabled, leaving `.fips`
+  resolution pointed at a port nothing listens on.
+- The packages no longer ship `/etc/dnsmasq.d/fips.conf`. OpenWrt's dnsmasq
+  builds its config from UCI and never reads that directory; `.fips`
+  forwarding has always come from the UCI server entry, which is unchanged. An
+  opkg upgrade removes the old file, and an apk upgrade keeps it only if it
+  was modified. Either way nothing reads it.
+- The package README's upgrade commands and default settings are corrected.
+  It now gives the `apk add` command for OpenWrt 25, where there is no opkg,
+  and for OpenWrt 24.10 and earlier a plain `opkg install` in place of
+  `--force-reinstall`, which removed and reinstalled the package and so left
+  `fips-gateway` disabled. Its description of the default config now matches
+  the shipped `fips.yaml`.
+- The `.ipk` and `.apk` packages now install the same maintainer scripts. The
+  four script bodies live in `packaging/openwrt-ipk/scripts/` instead of inside
+  heredocs in the two build scripts, so the scenarios in `testing/openwrt/` run
+  what ships.
+
+#### Windows
+
+- The Windows service now writes its log to `C:\ProgramData\fips\fips.log`,
+  rolled at 10 MiB with four old files kept. A service has no standard output,
+  so everything the daemon logged in service mode was lost, including
+  config-load failures and panic messages. A foreground run still logs to the
+  console.
+
+#### FreeBSD
+
+- The daemon's log, `/var/log/fips.log`, is now rotated. The package ships a
+  newsyslog entry that keeps five compressed generations of 1000 KB, and the rc
+  script starts `daemon(8)` with `-H` so it reopens the log after a rotation.
+  The log used to grow without bound.
+
+#### Links and transports
+
+- A heartbeat whose send failed no longer counts as one that was delivered. The
+  send was recorded before it was attempted, so a peer whose heartbeat could not
+  go out was treated as heartbeated and was not tried again for a whole
+  `heartbeat_interval_secs`, although it had heard nothing and its own link-dead
+  timer was running. The attempt and the delivery are now recorded separately:
+  the interval that paces a healthy peer advances only on a send that returned
+  cleanly, and a peer whose send failed is retried after a shorter fixed
+  interval instead. That retry interval gates only a peer whose last attempt
+  failed, so it cannot clamp a `heartbeat_interval_secs` configured below it.
 - A peer that moves to a new address now loses the per-peer `connect(2)`-ed UDP
   socket pinned to the address it left. `set_current_addr` returns whether the
   address actually changed so the caller can drop the stale socket, and the
@@ -142,25 +319,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the peer never left the unconnected path. The flags are now set when the
   socket is adopted, after its bind, so the traversal bind still receives a
   port no other socket holds.
+- A configured `ble:` transport that this build cannot construct is now
+  reported. The only warning for it was compiled into test builds alone, where
+  logging is compiled out, so macOS, Windows, FreeBSD, OpenWrt and other musl
+  builds, and Android without a BLE radio armed before start, dropped the block
+  silently while reporting healthy. The daemon now warns once per configured
+  instance at startup, naming the reason. The shipped example configs no longer
+  say BLE needs a `ble` Cargo feature, which does not exist: the common
+  `fips.yaml` names the builds that have the transport, and the OpenWrt
+  `fips.yaml` drops its BLE example, since its musl builds never include it.
 
-#### Peering
+#### Sessions and rekey
 
-- A heartbeat whose send failed no longer counts as one that was delivered. The
-  send was recorded before it was attempted, so a peer whose heartbeat could not
-  go out was treated as heartbeated and was not tried again for a whole
-  `heartbeat_interval_secs`, although it had heard nothing and its own link-dead
-  timer was running. The attempt and the delivery are now recorded separately:
-  the interval that paces a healthy peer advances only on a send that returned
-  cleanly, and a peer whose send failed is retried after a shorter fixed
-  interval instead. That retry interval gates only a peer whose last attempt
-  failed, so it cannot clamp a `heartbeat_interval_secs` configured below it.
-- Replacing the peer list at runtime with `Node::update_peers` now updates
-  everything that reads peer aliases. `.fips` names, peer ACL entries written as
-  an alias, and peer display names kept following the aliases the node started
-  with, so a new peer's alias did not resolve, a removed one still did, and a
-  deny entry naming an alias moved to another key kept denying the old key and
-  admitted the new one. They now follow the new peer list, with the hosts file
-  still taking precedence as it does at startup.
+- A session whose last handshake message is lost no longer stays one-sided.
+  The initiator sent msg3 once and treated the session as established at once;
+  when that one datagram was lost, the responder kept waiting for it and
+  dropped every frame the initiator sent, and nothing sent msg3 again, because
+  the responder's repeated SessionAck was refused as arriving in the wrong
+  state. The session stayed that way until the next session rekey, or with
+  periodic rekey switched off, indefinitely. The initiator now keeps its msg3
+  and resends it on the handshake resend interval, with backoff, until a frame
+  from the responder authenticates or `handshake_max_resends` resends have gone
+  out. The wire format is unchanged: the resend carries the same msg3, and a
+  responder that already completed the session refuses the duplicate as before.
+- A session rekey this node started no longer stays in flight forever when its
+  setup or the peer's ack is lost. Nothing resends a rekey setup, and the only
+  expiry covered a rekey the peer started, so one lost datagram left the
+  rekey pending and blocked every later one: the session kept its current keys
+  and stopped rotating them. The rekey now expires on the handshake timeout,
+  timed from when this node sent its setup, and the next tick starts a fresh
+  one. A forged ack cannot extend it. Expiries are counted as
+  `rekey_unanswered`. The wire format is unchanged.
+- A link rekey whose reply is lost no longer splits the link. The node that
+  answered a rekey used to switch to the new keys on its own next tick, before
+  the other side had them; when the reply was lost, frames from the answering
+  side were dropped until the link was torn down. The answering side now
+  switches only when a frame on the new keys arrives from the side that started
+  the rekey, and drops keys that were never adopted after a hold (120 s by
+  default) so the next rekey can proceed.
+- A node with no coordinates cached for a session's destination no longer
+  sends its own coordinates in their place. The lookup that supplies them falls
+  back to the node's own coordinates, which a first-contact SessionSetup needs
+  because its destination field cannot be empty, but the established data path,
+  the standalone CoordsWarmup and the rekey SessionSetup used the same
+  fallback. Every receiver files the destination coordinates it is sent under
+  the destination's address, so a destination reached this way cached its own
+  address under the sender's coordinates. On a cache miss a data frame now goes
+  out without coordinates and leaves the warmup budget for the first frames
+  after the cache is refilled, a standalone CoordsWarmup is not sent, and a
+  rekey SessionSetup, which can only miss for a direct peer, carries the
+  coordinates that peer announced. First-contact setup is unchanged. The wire
+  format is unchanged.
 
 #### Routing and discovery
 
@@ -192,79 +401,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   they show a loss, and resends it once after 30 seconds when they cannot
   confirm it, under the same limits.
 
-#### Session setup
+#### Node health and control socket
 
-- A session whose last handshake message is lost no longer stays one-sided.
-  The initiator sent msg3 once and treated the session as established at once;
-  when that one datagram was lost, the responder kept waiting for it and
-  dropped every frame the initiator sent, and nothing sent msg3 again, because
-  the responder's repeated SessionAck was refused as arriving in the wrong
-  state. The session stayed that way until the next session rekey, or with
-  periodic rekey switched off, indefinitely. The initiator now keeps its msg3
-  and resends it on the handshake resend interval, with backoff, until a frame
-  from the responder authenticates or `handshake_max_resends` resends have gone
-  out. The wire format is unchanged: the resend carries the same msg3, and a
-  responder that already completed the session refuses the duplicate as before.
-
-#### Link and session rekey
-
-- A session rekey this node started no longer stays in flight forever when its
-  setup or the peer's ack is lost. Nothing resends a rekey setup, and the only
-  expiry covered a rekey the peer started, so one lost datagram left the
-  rekey pending and blocked every later one: the session kept its current keys
-  and stopped rotating them. The rekey now expires on the handshake timeout,
-  timed from when this node sent its setup, and the next tick starts a fresh
-  one. A forged ack cannot extend it. Expiries are counted as
-  `rekey_unanswered`. The wire format is unchanged.
-- A forged rekey msg2 no longer takes the link down. The rekey initiator gave
-  up its handshake before reading msg2 and abandoned the cycle when the read
-  failed, although nothing authenticates a msg2 ahead of that read. Anyone on
-  the path who saw the rekey msg1 go out could answer first with a msg2 of the
-  right size under the index msg1 carries in cleartext. The responder has
-  already committed its new session by then and cuts over on its next tick, so
-  the two ends were left on different keys: frames from the responder were
-  dropped at once, frames to it failed once its drain window closed, and each
-  end removed the other on the link-dead timeout about 30 s later. A msg2 that
-  fails the read now leaves the handshake as it was before the read, along
-  with the msg1 resend schedule and the msg2 dispatch entry, so the
-  responder's genuine msg2 still completes the rekey. In exchange, every such
-  forgery now costs the initiator the msg2 key agreement until the cycle ends,
-  where before only the first one did; the msg1 resend budget bounds that. The
-  wire format is unchanged.
-- A SessionAck that fails to read no longer ends a session rekey this node
-  started. The handler took the rekey handshake off the session before reading
-  the ack's msg2 and abandoned the rekey when the read failed, although nothing
-  authenticates the ack before that read and the only tie to the rekey is the
-  datagram's source address. The handshake now goes back rolled back to its
-  state before the read, so the peer's genuine ack still completes the rekey,
-  and the refusal is counted as `ack_handshake_failed`, as it already was for a
-  first-contact session. The wire format is unchanged.
-- A link rekey whose reply is lost no longer splits the link. The node that
-  answered a rekey used to switch to the new keys on its own next tick, before
-  the other side had them; when the reply was lost, frames from the answering
-  side were dropped until the link was torn down. The answering side now
-  switches only when a frame on the new keys arrives from the side that started
-  the rekey, and drops keys that were never adopted after a hold (120 s by
-  default) so the next rekey can proceed.
-
-#### Session coordinates
-
-- A node with no coordinates cached for a session's destination no longer
-  sends its own coordinates in their place. The lookup that supplies them falls
-  back to the node's own coordinates, which a first-contact SessionSetup needs
-  because its destination field cannot be empty, but the established data path,
-  the standalone CoordsWarmup and the rekey SessionSetup used the same
-  fallback. Every receiver files the destination coordinates it is sent under
-  the destination's address, so a destination reached this way cached its own
-  address under the sender's coordinates. On a cache miss a data frame now goes
-  out without coordinates and leaves the warmup budget for the first frames
-  after the cache is refilled, a standalone CoordsWarmup is not sent, and a
-  rekey SessionSetup, which can only miss for a direct peer, carries the
-  coordinates that peer announced. First-contact setup is unchanged. The wire
-  format is unchanged.
-
-#### Control socket
-
+- A DNS responder or TUN thread that dies now degrades the node's published
+  health, and a dead responder's address is retracted. The responder's exit
+  report followed a loop that never returns, so it could not run, and a panic
+  in the responder or in either TUN thread unwound past its report. The node
+  kept reporting healthy with the child gone and kept publishing the DNS
+  address with nothing answering on it. Each child now runs inside a wrapper
+  that catches a panic, logs it, and reports the exit either way. A deliberate
+  stop still reports nothing.
 - `show_links` (`fipsctl show links`) now reports the traffic a link has
   carried. Its `packets_sent`, `packets_recv`, `bytes_sent`, `bytes_recv` and
   `last_recv_ms` were read from counters on the link record that nothing on
@@ -288,68 +434,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   values the open-discovery tutorial described never occurred, and the
   tutorial no longer lists them. The response shape is unchanged.
 
-#### Identity and config
-
-- A persistent node whose identity key path cannot be examined now refuses to
-  start instead of coming up under a new identity. `Path::exists` reports false
-  both for a key that is absent and for one whose metadata cannot be read, so a
-  key symlinked onto a volume that did not mount, or one in a directory the
-  daemon cannot search, read as a first boot: the node generated a fresh
-  identity, failed to store it, and carried on under an npub that every peer
-  whose allowlist names the old one refuses. Only a `NotFound` result is now
-  treated as an absence; any other failure to stat the path aborts the start and
-  names the path. A dangling symlink likewise aborts rather than being replaced.
-  The legacy `/etc/fips/fips.key` lookup follows the same rule.
+### Security
 
 #### Gateway
 
-- Conntrack sessions are matched by address rather than by text, so live
-  traffic pins a gateway mapping again. The session count searched each
-  `/proc/net/nf_conntrack` line for `dst=` followed by the virtual IP in its
-  compressed form (`fd01::1`), while the kernel prints tuples in the full
-  uncompressed form (`dst=fd01:0000:0000:0000:0000:0000:0000:0001`), so the
-  count was zero for every mapping on every kernel. Nothing pinned an in-use
-  mapping, and one whose client did not re-query DNS was reclaimed about two
-  minutes after its last DNS reference while its traffic was still flowing.
-  Each `dst=` value is now parsed as an address and compared as one.
-- A DNS query that refreshes a draining mapping now cancels its old grace
-  period. Previously the address could be reclaimed while the client's
-  renewed DNS answer was still valid. The mapping now survives the full
-  renewed TTL and a fresh grace period before it can be reused.
-- The conntrack table is read once per tick instead of once per mapping, and
-  the read happens off the runtime thread. The whole file was read and scanned
-  for each mapping in turn, while the pool lock was held, on the same
-  single-threaded runtime that serves DNS. The tick now takes one snapshot with
-  a blocking task before it takes the lock, and the pool does a map lookup per
-  mapping.
-- A conntrack source that cannot be read is reported. It still counts as zero
-  sessions for every mapping, as it always has, so reclamation keeps working
-  rather than pinning the whole pool; but the first failure and each change of
-  outcome after it are now logged, so an unreadable source is no longer
-  indistinguishable from an idle one. A source that fails identically every
-  tick is logged at debug rather than warn on a repeat.
-- The NAT table is rebuilt in one netlink transaction. A rebuild deleted the
-  `fips_gateway` table in a batch of its own, discarded that batch's result,
-  and only then sent the batch that recreated the table, the chains, the
-  `fips0` masquerade and every per-mapping rule. Between the two sends the
-  gateway had no NAT at all, and a recreate the kernel refused left the table
-  absent for good, taking down forwarding for every existing mapping rather
-  than failing the one change that was being made. The delete and the recreate
-  now share a single batch, which the kernel applies as one transaction, so a
-  refused rebuild leaves the previous table in the packet path. The rules sent
-  are unchanged.
-- The gateway's NAT rebuild no longer fails once the table holds more than
-  about 105 mappings. Each rebuild is one netlink batch. From about 105
-  mappings the default socket buffers could not hold its acknowledgements, so
-  rebuilds were logged as failed although they had taken effect. Past about
-  313 mappings the buffers could not hold the batch itself, and new `.fips`
-  names past that count got a virtual IP with no translation. In releases with
-  the gateway through 0.5.1, a rebuild past about 313 mappings also deleted the
-  whole `fips_gateway` table, which stopped every mapping, the `fips0`
-  masquerade and the port forwards. The rebuild now sizes its send buffer to
-  the batch and requests one acknowledgement per batch, and NAT errors now
-  name the kernel errno. A rebuild that still fails is logged, and the next
-  successful rebuild installs the mapping.
 - A `.fips` query the gateway answers without an address no longer takes an
   address from the pool. Every query type was allocated a mapping before the
   code looked at what the client had asked for, and an A or HTTPS query was
@@ -368,140 +456,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   warning says which limit refused it. A name that already has a mapping is
   answered before either limit is consulted, so names in use keep resolving
   when the pool is full. The limits are compiled in, not configured.
-- `fips-gateway` exits when its DNS listener cannot bind, or stops while the
-  gateway runs, instead of staying up with `.fips` resolution dead, so systemd
-  or procd restarts it or reports it failed. This applies to a gateway used
-  only for port forwards too. An "address in use" error names the service
-  likely to hold the port. On an OpenWrt access point with the gateway
-  enabled, the gateway had lost its port to the daemon's own mDNS responder
-  and `.fips` names stopped resolving with nothing reported.
-
-#### Nostr and NAT traversal
-
-- A node no longer publishes NIP-09 deletion requests signed with its routing
-  key after a NAT traversal attempt. Each request put the node's public
-  identity next to the ids of its offer and answer gift wraps on every relay it
-  reached, which the one-time signing keys on those wraps exist to prevent, and
-  most of the requests deleted nothing, since a relay deletes a gift wrap only
-  at its recipient's request. A relay that stores the wraps now keeps them
-  until their NIP-40 expiration; relays that do not store ephemeral events
-  never held them. The advertisement retraction still sends its deletion
-  request, since that names an event the routing key signed itself. The
-  discovery and traversal design documents describe the new behaviour.
-
-#### Packaging (OpenWrt)
-
-- A new OpenWrt install no longer enables and starts `fips-gateway`. The
-  generated postinst turned it on unconditionally, contradicting the init
-  script's own header, the package README and the deployment tutorial, all of
-  which say the service ships disabled and is enabled deliberately. The
-  documented `service fips-gateway enable` / `service fips-gateway start` steps
-  are unchanged, and the shipped `fips.yaml` still carries `gateway.enabled:
-  true`, so enabling the service is all that is needed.
-- **The first upgrade to this release re-enables and starts `fips-gateway` on
-  any router that has the package installed, including one where the gateway
-  was disabled by hand.** Every released package's prerm disabled the service
-  on its way out, leaving nothing behind that says whether the operator wanted
-  it on, so an upgrade cannot tell the two apart and keeps the gateway running
-  rather than silently turning off a working one. If you had disabled it, run
-  `service fips-gateway disable` once after upgrading. Later upgrades preserve
-  whatever state the service is in: the new prerm stops the services on an
-  upgrade but no longer disables them.
-- `start_service` in the `fips-gateway` init script now reads `gateway.enabled`
-  from `/etc/fips/fips.yaml` before doing anything. Starting a gateway that the
-  config disables used to hand dnsmasq's `.fips` forwarding to the gateway's
-  port, add the LAN prefix and advertise the pool route, and only then start a
-  daemon that exits immediately because the gateway is disabled, leaving `.fips`
-  resolution pointed at a port nothing listens on.
-- The `.ipk` and `.apk` packages now install the same maintainer scripts. The
-  four script bodies live in `packaging/openwrt-ipk/scripts/` instead of inside
-  heredocs in the two build scripts, so the scenarios in `testing/openwrt/` run
-  what ships.
-- An `apk` upgrade on OpenWrt 25 now restarts `fips`, and restarts
-  `fips-gateway` if it was enabled, so the new binaries run without a reboot.
-  apk-tools v3 runs only the incoming package's pre-upgrade and post-upgrade
-  scripts, and the `.apk` registered neither, so an upgrade replaced the files
-  on disk and left the old processes running until a reboot or a manual
-  restart.
-- The packages no longer ship `/etc/dnsmasq.d/fips.conf`. OpenWrt's dnsmasq
-  builds its config from UCI and never reads that directory; `.fips`
-  forwarding has always come from the UCI server entry, which is unchanged. An
-  opkg upgrade removes the old file, and an apk upgrade keeps it only if it
-  was modified. Either way nothing reads it.
-- The package README's upgrade commands and default settings are corrected.
-  It now gives the `apk add` command for OpenWrt 25, where there is no opkg,
-  and for OpenWrt 24.10 and earlier a plain `opkg install` in place of
-  `--force-reinstall`, which removed and reinstalled the package and so left
-  `fips-gateway` disabled. Its description of the default config now matches
-  the shipped `fips.yaml`.
-
-#### Packaging (Debian)
-
-- A `.deb` upgrade whose new daemon cannot start no longer hangs apt. The
-  postinst started `fips.service` and then `fips-dns.service` with blocking
-  calls, and because `fips-dns.service` requires the daemon, a daemon that
-  failed on every start left the second call, apt and everything queued behind
-  it waiting for ever with no message. Each start is now queued and waited on
-  for at most 60 seconds. A unit that does not come up has its status printed
-  and fails the configure step, so apt exits non-zero and names the unit; a
-  masked unit, or one whose condition is not met, is reported and skipped.
-- The `.deb` maintainer scripts now manage `fips-gateway` with the rest of the
-  package's services. An upgrade stopped the daemon, which the gateway
-  requires, and never brought the gateway back, so an operator who had enabled
-  it lost it until the next reboot; removing or purging the package left the
-  gateway's enablement symlink behind, pointing at a unit file that no longer
-  exists. The gateway is now stopped before the daemon on upgrade and
-  restarted afterwards only when it is enabled and the daemon came up, and it
-  is stopped and disabled on remove and purge. A gateway that does not come
-  back is reported but does not fail the upgrade.
-- The `.deb` now declares `libgcc-s1 (>= 4.2)`. All four binaries link
-  `libgcc_s.so.1`, but cargo-deb removes every libgcc entry from the
-  dependencies it derives, so the package never said so. `libc6` depends on
-  `libgcc-s1` on Debian 12 and Ubuntu 22.04, 24.04 and 26.04, so installs there
-  were not affected. A new check, `testing/check-deb-depends.sh`, runs
-  `dpkg-shlibdeps` over the package's binaries on every build and fails the
-  build when the declared `Depends` leaves out a library the binaries need, or
-  states a floor lower or higher than the one they need. A dependency the
-  packaging tool drops, including one it drops after only a warning when it
-  cannot resolve a binary, now fails the build instead of shipping.
-- `-V` on binaries built into the Linux packages now includes the source
-  revision, as `<version> (rev <git-hash>)`. The build image had no git, so
-  every container-built binary printed the version alone. A package built from
-  a git worktree still has no revision, because the worktree's git directory is
-  outside the tree the build sees. The build image's tag now includes a hash of
-  its Dockerfile, so a host with an older image cached builds a new one instead
-  of reusing it.
-- `packaging/debian/build-deb-container.sh` now returns the package it just
-  built. It picked the most recently modified `fips_*.deb` in the output
-  directory that sorted last by name, so a package with a higher version left
-  there by an earlier run was returned instead.
-- Purging the `.deb`, or running `uninstall.sh` from the tarball, now removes
-  the `.fips` DNS routing when `fips-dns` was not running at the time. The
-  cleanup removed the dns-delegate file from the wrong directory, never removed
-  the systemd-resolved global drop-in, and restarted no resolver, so the host
-  kept sending `.fips` queries to `[::1]:5354`, where nothing listens any more,
-  and `.fips` lookups timed out. Both scripts now remove all four files
-  `fips-dns-setup` can write, and restart systemd-resolved or reload dnsmasq or
-  NetworkManager when they removed that resolver's file and it is running. A
-  failed restart is reported and does not fail the removal.
-- The `.deb` now recommends `nftables`. `fips-firewall.service` runs
-  `/usr/sbin/nft`, so enabling it on a host without nftables failed at start.
-  It is a recommendation rather than a dependency because the firewall unit is
-  opt-in and the daemon itself does not need `nft`.
-
-#### Packaging (AUR)
-
-- The release `PKGBUILD` now lists `dbus` as a runtime dependency. The `fips`
-  binary links `libdbus-1`, and the `fips-git` package already declared it.
-- Both `PKGBUILD` files list `nftables` as an optional dependency, for
-  `fips-firewall.service`.
-
-#### Packaging (FreeBSD)
-
-- The daemon's log, `/var/log/fips.log`, is now rotated. The package ships a
-  newsyslog entry that keeps five compressed generations of 1000 KB, and the rc
-  script starts `daemon(8)` with `-H` so it reopens the log after a rotation.
-  The log used to grow without bound.
 
 #### Windows
 
@@ -515,11 +469,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   has none, with a note to move it. For one release, a `peers.allow` or
   `peers.deny` left at the old `\etc\fips` location is still read when the
   new directory has no such file, with a warning naming both paths.
-- The Windows service now writes its log to `C:\ProgramData\fips\fips.log`,
-  rolled at 10 MiB with four old files kept. A service has no standard output,
-  so everything the daemon logged in service mode was lost, including
-  config-load failures and panic messages. A foreground run still logs to the
-  console.
 - The Windows service installer now restricts `C:\ProgramData\fips` to
   SYSTEM and Administrators. The directory inherited `C:\ProgramData`'s
   default ACL, which lets any local user read the files in it and create new
@@ -541,6 +490,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   old location nor dropped unreviewed: review it, move it into
   `C:\ProgramData\fips` or delete it, and run the installer again. Windows
   upgraders should rerun `install-service.ps1`.
+
+#### Links and transports
+
+- Two inbound TCP connections that share a peer address but arrive on different
+  local addresses no longer share one pool entry. The kernel names a connection
+  by its four-tuple, so a listener on a wildcard address, which is what the
+  shipped configuration binds, can accept two connections whose peer `ip:port`
+  is the same on two different local addresses. The pool was keyed by the peer
+  address alone: the second connection's entry replaced the first's while the
+  inbound-connection counter counted both, the first connection's teardown then
+  removed the second's entry, and the second's own teardown found nothing to
+  remove, so the counter ended one above the connections it counts. That counter
+  gates the inbound connection limit, so a host repeating the collision could
+  hold it at the limit and lock out further inbound TCP connections until the
+  daemon restarted. Inbound entries now carry the accepted socket's local
+  address in their pool key as well as the remote one.
+
+#### Sessions and rekey
+
+- A SessionAck that fails to read no longer ends a session rekey this node
+  started. The handler took the rekey handshake off the session before reading
+  the ack's msg2 and abandoned the rekey when the read failed, although nothing
+  authenticates the ack before that read and the only tie to the rekey is the
+  datagram's source address. The handshake is now rolled back to its state
+  before the read, so the peer's genuine ack still completes the rekey,
+  and the refusal is counted as `ack_handshake_failed`, as it already was for a
+  first-contact session. The wire format is unchanged.
+- A forged rekey msg2 no longer takes the link down. The rekey initiator gave
+  up its handshake before reading msg2 and abandoned the cycle when the read
+  failed, although nothing authenticates a msg2 ahead of that read. Anyone on
+  the path who saw the rekey msg1 go out could answer first with a msg2 of the
+  right size under the index msg1 carries in cleartext. The responder had
+  already committed its new session by then and cut over on its next tick, so
+  the two ends were left on different keys: frames from the responder were
+  dropped at once, frames to it failed once its drain window closed, and each
+  end removed the other on the link-dead timeout about 30 s later. A msg2 that
+  fails the read now leaves the handshake as it was before the read, along
+  with the msg1 resend schedule and the msg2 dispatch entry, so the
+  responder's genuine msg2 still completes the rekey. In exchange, every such
+  forgery now costs the initiator the msg2 key agreement until the cycle ends,
+  where before only the first one did; the msg1 resend budget bounds that. The
+  wire format is unchanged.
+
+#### Routing and discovery
+
+- A node no longer publishes NIP-09 deletion requests signed with its routing
+  key after a NAT traversal attempt. Each request put the node's public
+  identity next to the ids of its offer and answer gift wraps on every relay it
+  reached, which the one-time signing keys on those wraps exist to prevent, and
+  most of the requests deleted nothing, since a relay deletes a gift wrap only
+  at its recipient's request. A relay that stores the wraps now keeps them
+  until their NIP-40 expiration; relays that do not store ephemeral events
+  never held them. The advertisement retraction still sends its deletion
+  request, since that names an event the routing key signed itself. The
+  discovery and traversal design documents describe the new behaviour.
 
 ## [0.5.1] - 2026-09-06
 
