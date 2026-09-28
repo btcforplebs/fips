@@ -546,6 +546,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   request, since that names an event the routing key signed itself. The
   discovery and traversal design documents describe the new behaviour.
 
+#### Dependencies
+
+- The lockfile moves `rustls` from 0.23.43 to 0.23.45, for RUSTSEC-2026-0285:
+  0.23.43 accepted TLS 1.3 handshake messages across encryption-level
+  boundaries. It is the TLS client the Nostr relay connections use, so every
+  default build reached it. The update is within the version range the
+  dependencies already allowed.
+
 ## [0.5.1] - 2026-09-06
 
 ### Fixed
