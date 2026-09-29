@@ -10,10 +10,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Nothing yet. Everything previously staged here is folded into
 `[0.5.2]` below.
 
-<!-- The 0.5.2 date below is provisional and is confirmed at the tag, together
-     with the same date in RELEASE-NOTES.md and in
-     docs/releases/release-notes-v0.5.2.md. All three carry it. -->
-
 ## [0.5.2] - 2026-09-28
 
 ### Added

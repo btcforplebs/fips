@@ -1,6 +1,6 @@
 # FIPS v0.5.2
 
-**Released**: 2026-09-28 (provisional: the date is confirmed when the release is tagged)
+**Released**: 2026-09-28
 
 v0.5.2 is a maintenance release on the v0.5.x line. It closes several security gaps, changes three defaults, and fixes defects that reach every node as well as the gateway, the Windows service and the Linux, OpenWrt and FreeBSD packages. There is no wire format change, so a mixed mesh works and nodes can be upgraded one at a time.
 
