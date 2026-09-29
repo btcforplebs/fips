@@ -41,6 +41,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reopened after the interface goes away. A running node whose interface was
   removed and not recreated retried the reopen on every beacon interval and
   leaked one descriptor each time.
+- TCP connections try the remaining addresses for a hostname after a
+  connection fails, within the existing overall connection timeout.
 
 ## [0.5.2] - 2026-09-28
 
