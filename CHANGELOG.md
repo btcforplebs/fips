@@ -34,6 +34,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   through `Requires=fips.service`, then restarted only fips, so `.fips`
   resolution stayed down and the gateway stayed stopped until started by hand.
 
+#### Links and transports
+
+- Ethernet startup no longer leaks a socket when the configured interface is
+  missing or invalid on Linux.
+
 ## [0.5.2] - 2026-09-28
 
 ### Added
