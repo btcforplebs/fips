@@ -72,7 +72,7 @@ export APK_BIN="$PWD/build/src/apk"
 
 ```bash
 # from the repo root
-./packaging/openwrt-apk/build-apk.sh --arch aarch64    # or x86_64, mipsel, mips, arm
+./packaging/openwrt-apk/build-apk.sh --arch aarch64    # or x86_64; releases publish these two
 ```
 
 Output: `dist/fips_<version>_<openwrt-arch>.apk`. Override the version with

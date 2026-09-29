@@ -139,8 +139,10 @@ gateway:
 Pick a pool CIDR that does **not** overlap with any address space in
 use on the LAN or in the mesh (the FIPS mesh occupies `fd00::/8`;
 pick a different `fdXX::/N`). The `/112` size yields 65 535 usable
-virtual IPs, which is the gateway's hard cap regardless of CIDR
-width.
+addresses, the most the pool uses whatever the CIDR width. The
+gateway holds at most 1000 live mappings at once and admits new
+names at up to 10 per second after a burst of 50; an AAAA query for
+a new name beyond either limit gets `SERVFAIL`.
 
 This minimum config is enough to start the gateway. The `dns.*` block
 is optional and defaults to `listen: "[::1]:5365"` and
@@ -187,9 +189,10 @@ Constraints:
 - Must not overlap with `fd00::/8` (the FIPS mesh address space).
 - Must not overlap with any LAN-side IPv6 prefix already in use.
 - `/112` is the practical width — wider just wastes address space
-  because the pool is hard-capped at 65 535 usable entries. Narrower is
-  fine if you want a smaller pool, but you'll reject DNS lookups
-  faster under churn.
+  because the pool never uses more than 65 535 addresses. Narrower is
+  fine if you want a smaller pool; one narrower than `/118` (1023
+  usable addresses) runs out before the 1000-mapping ceiling is
+  reached, so new names are refused sooner under churn.
 
 ### Choose the DNS listen address
 

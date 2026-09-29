@@ -1069,7 +1069,7 @@ end-to-end design, see
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `gateway.enabled` | bool | `false` | Enable the gateway. Must be `true` for `fips-gateway` to start. |
-| `gateway.pool` | string | *(required)* | Virtual IPv6 pool CIDR (e.g., `"fd01::/112"`). Must not overlap with the FIPS mesh address space (`fd00::/8`) or any address space already in use on the LAN. The `/112` size yields 65 535 usable virtual IPs (address 0 in the pool is skipped), which is the gateway's hard cap regardless of CIDR width. |
+| `gateway.pool` | string | *(required)* | Virtual IPv6 pool CIDR (e.g., `"fd01::/112"`). Must not overlap with the FIPS mesh address space (`fd00::/8`) or any address space already in use on the LAN. The `/112` size yields 65 535 usable virtual IPs (address 0 in the pool is skipped), the most the pool uses whatever the CIDR width. The gateway holds at most 1000 live mappings at once and admits new names at up to 10 per second after a burst of 50; an AAAA query for a new name beyond either limit gets `SERVFAIL`. |
 | `gateway.lan_interface` | string | *(required)* | LAN-facing network interface name (e.g., `"enp3s0"`). Used for proxy-NDP entry installation so LAN clients can resolve the link-layer address of allocated virtual IPs. |
 | `gateway.pool_grace_period` | u64 | `60` | Seconds a virtual-IP allocation is retained after its last referencing session ends, before the address is returned to the free pool. Larger values reduce churn for short-lived flows; smaller values reclaim addresses faster. |
 

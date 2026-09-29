@@ -215,6 +215,9 @@ New filter content is sent only on these events, never periodically:
 - A peer's inbound filter changes (outbound filters to other peers must
   be recomputed)
 - Local state changes (new identity, leaf-only dependent changes)
+- The tree changes around this node: it switches parent or becomes
+  root, or a peer starts or stops naming it as parent, which changes
+  the set of tree peers whose filters are merged
 
 The one timed send is the resend of an announce that was not confirmed
 delivered. The transport accepting a FilterAnnounce does not mean the peer

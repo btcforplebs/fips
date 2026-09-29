@@ -102,8 +102,8 @@ You should see:
 - `service fips status` reports `running`.
 - `fips0` exists and has one `inet6 fd97:...` address. That is the
   AP's mesh-side identity.
-- `fipsctl show peers` lists at least one peer with active
-  connectivity (not `idle` / not zero bytes).
+- `fipsctl show peers` lists at least one peer whose `connectivity`
+  reads `connected`.
 
 Confirm the AP can resolve a known mesh node by name:
 
@@ -141,7 +141,8 @@ gateway:
 Three things to notice:
 
 - `pool: "fd01::/112"` — the virtual-IP CIDR the gateway hands out
-  to LAN clients. 65 536 addresses, the gateway's hard cap. Pick a
+  to LAN clients. 65 535 usable addresses, the most the pool uses;
+  the gateway holds at most 1000 live mappings at once. Pick a
   different `fdXX::/N` prefix if `fd01::/112` collides with anything
   on your network.
 - `lan_interface: "br-lan"` — the OpenWrt LAN bridge. The gateway

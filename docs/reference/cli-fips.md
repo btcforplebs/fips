@@ -93,6 +93,15 @@ On Windows the service writes its log to `C:\ProgramData\fips\fips.log`,
 rolled at 10 MiB with four old files kept; a foreground run logs to the
 console.
 
+On Windows, `install-service.ps1` restricts `C:\ProgramData\fips` to
+SYSTEM and Administrators. Reading or editing files there,
+`fipsctl keygen`, `fipsctl address` with no argument, and a foreground
+run that relies on `C:\ProgramData\fips\fips.yaml` need an elevated
+prompt; unelevated, a foreground run may skip that file without saying
+so or fail with an access error. Run the installer before `fipsctl keygen`,
+and again after moving files into the directory, since a moved file
+keeps its old permissions.
+
 The control socket path is derived per
 [control-socket.md](control-socket.md).
 

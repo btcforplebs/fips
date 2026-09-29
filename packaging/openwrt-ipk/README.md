@@ -95,6 +95,12 @@ make package/fips/compile V=s
 
 The resulting `.ipk` is placed in `bin/packages/<arch>/`.
 
+A package built from this `Makefile` carries none of the maintainer scripts in
+`scripts/`. Those scripts enable and start `fips` on install and implement the
+gateway-enablement and upgrade behavior described below, so that description
+does not cover a package built this way. Released packages are built by
+`build-ipk.sh` (and `../openwrt-apk/build-apk.sh`), which install those scripts.
+
 ### 4. Pin the source version
 
 For reproducible production builds, replace `PKG_SOURCE_VERSION:=master` in
