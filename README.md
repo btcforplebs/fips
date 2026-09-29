@@ -121,7 +121,7 @@ On Debian or Ubuntu, download `fips_<version>_amd64.deb` (or
 `_arm64.deb`) and install it:
 
 ```bash
-sudo dpkg -i fips_<version>_amd64.deb
+sudo apt install ./fips_<version>_amd64.deb
 sudo systemctl start fips fips-dns
 ```
 
@@ -152,8 +152,10 @@ does and does not share with the `.deb`.
 
 For macOS, Windows, FreeBSD (including a pfSense build under
 `packaging/pfsense/`), OpenWrt, the systemd tarball or a Nix
-flake, see [docs/getting-started.md](docs/getting-started.md)
-for the full multi-platform installation guide.
+flake, [packaging/README.md](packaging/README.md) gives the install
+commands for each package format, and
+[docs/getting-started.md](docs/getting-started.md) is the full
+multi-platform installation guide.
 
 To join a live mesh and reach your first peer, follow the new-user
 tutorial progression starting at
@@ -168,7 +170,7 @@ git clone https://github.com/jmcorgan/fips.git
 cd fips
 cargo install cargo-deb
 cargo deb
-sudo dpkg -i target/debian/fips_*.deb
+sudo apt install ./target/debian/fips_*.deb
 ```
 
 For the binaries alone, without an installer:
@@ -226,10 +228,10 @@ one and only the packaging differs. **Only the `.deb` is exercised by an install
 ubuntu26; neither the AUR package nor the flake is. That suite runs on
 every push and pull request, on x86_64, against a `.deb` built by the same
 pinned container as the released one. The arm64 package, built the same way
-on an arm64 runner, is installed and its daemon started on ubuntu22 on every
-push and pull request as well; its upgrade, purge and conffile paths are not
-exercised. The suite does not run at a tag: no workflow installs a published
-artifact, so the released packages are checked by
+on an arm64 runner, is installed, its daemon started and the package purged on
+ubuntu22 on every push and pull request as well; its upgrade and conffile paths
+are not exercised. The suite does not run at a tag: no workflow installs a
+published artifact, so the released packages are checked by
 hand. OpenWrt is a musl
 target rather than glibc, and it takes an `.ipk` on 24.x and earlier or
 an `.apk` on 25 and later; both carry the `fips-mesh-setup` and
@@ -295,7 +297,7 @@ Nix / NixOS section of [packaging/README.md](packaging/README.md).
   then [fips-architecture.md](docs/design/fips-architecture.md) for
   the protocol stack.
 - **[Release notes](docs/releases/)** — per-version notes, including
-  [v0.5.1](docs/releases/release-notes-v0.5.1.md).
+  [v0.5.2](docs/releases/release-notes-v0.5.2.md).
 
 If you want to contribute, see [CONTRIBUTING.md](CONTRIBUTING.md)
 and [testing/README.md](testing/README.md).
@@ -337,10 +339,11 @@ testing/      Docker-based integration test harnesses + chaos simulation
 ## Status & roadmap
 
 FIPS is at **v0.6.0-dev** on the `master` branch.
-[v0.5.1](https://github.com/jmcorgan/fips/releases/tag/v0.5.1) is the
-current release, a maintenance release on the v0.5.x line that makes the
-Linux packages install and run on Debian 12 and Ubuntu 22.04, where every
-artifact from v0.3.0 through v0.5.0 installed and then could not start.
+[v0.5.2](https://github.com/jmcorgan/fips/releases/tag/v0.5.2) is the
+current release, a maintenance release on the v0.5.x line that closes
+security gaps in the Windows service, the gateway and the rekey
+handshakes, and fixes the gateway, the Linux, OpenWrt and FreeBSD
+packages, and session and discovery recovery after lost messages.
 [v0.5.0](https://github.com/jmcorgan/fips/releases/tag/v0.5.0) was the last
 feature release; this development line continues the testing-and-polishing
 track toward v0.6.0. The core protocol works end-to-end over

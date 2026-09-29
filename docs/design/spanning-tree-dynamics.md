@@ -503,7 +503,11 @@ been offering a better path, but the current path to root remains intact.
 and [fips-mesh-layer.md](fips-mesh-layer.md) for complete reference):
 `heartbeat_interval_secs` is 10 (send heartbeat if link idle),
 `link_dead_timeout_secs` is 30 (declare link dead after no traffic), and
-gossip is event-driven on topology change with no periodic refresh.
+gossip is event-driven on topology change, with two timed sends: an
+announce that the link's receiver reports do not confirm is resent (see
+[fips-spanning-tree.md](fips-spanning-tree.md)), and a node with two or
+more peers re-broadcasts its unchanged declaration every
+`reeval_interval_secs` (60 s by default).
 
 ### Asymmetric Failures
 
@@ -601,10 +605,10 @@ where all links have similar quality, effective depth tracks tree depth closely
 and the algorithm produces minimum-depth trees as before.
 
 **Periodic re-evaluation**: `evaluate_parent()` is event-driven — called on
-TreeAnnounce receipt or parent loss. After the tree stabilizes and TreeAnnounce
-traffic stops, link degradation goes undetected. The periodic re-evaluation
-timer (`reeval_interval_secs`) calls `evaluate_parent()` from the tick handler
-with current MMP link costs, independent of TreeAnnounce traffic.
+TreeAnnounce receipt or parent loss. After the tree stabilizes and change-driven
+TreeAnnounce traffic stops, link degradation goes undetected. The periodic
+re-evaluation timer (`reeval_interval_secs`) calls `evaluate_parent()` from the
+tick handler with current MMP link costs, independent of TreeAnnounce traffic.
 
 ### Design Rationale: Local-Only Cost Metrics
 
@@ -656,9 +660,13 @@ Once converged, what does the network look like and how does it behave?
 
 **Quiescent gossip**:
 
-- TreeAnnounce messages sent only on topology changes, not periodically
-- No periodic root refresh — the tree is maintained purely by change-driven gossip
-- In a stable network, gossip traffic drops to zero
+- TreeAnnounce messages sent on topology changes, and resent, within a budget,
+  while the link's receiver reports do not confirm them; a node with two or more
+  peers also re-broadcasts its unchanged declaration every
+  `reeval_interval_secs` (60 s by default) as a backstop
+- No periodic root refresh — the re-broadcast repeats the declaration
+  without changing or re-signing it
+- In a stable network, gossip traffic falls to that backstop
 - Bandwidth usage proportional to tree depth, not network size
 
 **Consistent coordinates**:
@@ -670,20 +678,24 @@ Once converged, what does the network look like and how does it behave?
 ### Steady State Gossip Pattern
 
 **Normal operation.** During normal operation with no topology changes, the root
-does not send periodic announcements or refresh its timestamp — it announces
-only when its own state changes. Every other node behaves the same way, sending
-a TreeAnnounce only on parent selection change or peer link up/down. Tree gossip
-is entirely change-driven: when the topology is stable, gossip traffic drops to
-zero.
+does not refresh its timestamp — its declaration changes only when its own
+state changes. Every other node behaves the same way, announcing a new
+declaration only on parent selection change or peer link up/down. When the
+topology is stable, change-driven gossip stops; what remains is the resend of
+any announce that the link's receiver reports have not confirmed, and, on a
+node with two or more peers, a re-broadcast of the unchanged declaration every
+`reeval_interval_secs`.
 
 ### Expected Steady State Properties
 
 **Gossip volume.** Each topology change event produces an update of roughly 100
 bytes for the node's own declaration, plus a variable delta for changed
 ancestors, giving a total ranging from O(100 bytes) to O(depth * 100 bytes). In
-steady state with no topology changes, gossip traffic is zero — there are no
-periodic refreshes. Traffic resumes only when links change or nodes join and
-depart, and remains negligible compared to application traffic.
+steady state with no topology changes, the only gossip is the re-broadcast of
+unchanged declarations by nodes with two or more peers, one TreeAnnounce per
+peer every `reeval_interval_secs`. Change-driven traffic resumes only when
+links change or nodes join and depart, and remains negligible compared to
+application traffic.
 
 **Memory usage.** Each node's `TreeState` stores its own entry (~100 bytes),
 direct peer entries (~100 bytes each), and ancestry entries (~100 bytes each,
@@ -752,7 +764,8 @@ peer with a path to A) and sits at depth 2.
 - A is root
 - B, C, D are direct children of A
 - E is child of C (one hop to A through C)
-- No periodic gossip — TreeAnnounce only on topology changes
+- No change-driven gossip; TreeAnnounce traffic is the periodic
+  re-broadcast backstop only (from A, B, C and D; E has one peer)
 
 **Link failure scenario**:
 

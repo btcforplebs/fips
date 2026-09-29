@@ -100,7 +100,10 @@ immediate parent reselection:
 - **Periodic re-evaluation** (`reeval_interval_secs`, default 60s):
   Re-evaluates parent selection using current MMP link costs, independent
   of TreeAnnounce traffic. This catches link degradation after the tree
-  has stabilized and TreeAnnounce gossip has stopped.
+  has stabilized and change-driven TreeAnnounce gossip has stopped. It
+  runs only on a node with two or more peers, and when it finds no
+  reason to switch parent or become root it re-broadcasts the unchanged
+  declaration.
 - **Flap dampening** (`flap_threshold` / `flap_window_secs` /
   `flap_dampening_secs`): If a node switches parents more than
   `flap_threshold` times (default 4) within `flap_window_secs` (default
