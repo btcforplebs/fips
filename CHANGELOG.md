@@ -27,6 +27,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+#### Gateway
+
+- The gateway retries failed firewall rebuilds every ten seconds without
+  waiting for another mapping change. Retries apply the latest desired
+  mappings and port forwards, preserving changes across transient failures.
+
 #### Linux packages
 
 - The systemd tarball's `install.sh` restarts fips-dns and fips-gateway after
