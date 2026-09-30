@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+#### Linux packages
+
+- A release-candidate `.deb` is versioned `X.Y.Z~rcN` instead of
+  `X.Y.Z-rcN`. dpkg read the old form as a revision of the release and sorted
+  it above `X.Y.Z`, so a host that installed a candidate was not upgraded by
+  the release. The tarball, artifact and `.deb` file names keep the tag's
+  `-rcN`.
+
+### Deprecated
+
+#### Sessions and rekey
+
+- Setting `node.rekey.enabled: false`. The disabled path is less tested and is
+  not supported, and the option is removed in v2. It still works as before;
+  the configuration reference and the mesh-layer design now say so.
+
+### Fixed
+
+#### Linux packages
+
+- The systemd tarball's `install.sh` restarts fips-dns and fips-gateway after
+  an upgrade when they were running. It stopped fips first, which stopped both
+  through `Requires=fips.service`, then restarted only fips, so `.fips`
+  resolution stayed down and the gateway stayed stopped until started by hand.
+
 ## [0.5.2] - 2026-09-28
 
 ### Added
