@@ -210,6 +210,7 @@ CHAOS_SUITES=(
 #     testing/chaos/scripts/chaos.sh bloom-storm.
 GATEWAY_SUITES=(gateway)
 OPENWRT_SUITES=(openwrt-scripts)
+TARBALL_INSTALL_SUITES=(tarball-install)
 SIDECAR_SUITES=(sidecar)
 FIREWALL_SUITES=(firewall)
 IFACE_BINDING_SUITES=(iface-binding)
@@ -251,6 +252,9 @@ list_suites() {
     echo ""
     echo "  OpenWrt packaging:"
     for s in "${OPENWRT_SUITES[@]}"; do echo "    $s"; done
+    echo ""
+    echo "  systemd tarball:"
+    for s in "${TARBALL_INSTALL_SUITES[@]}"; do echo "    $s"; done
     echo ""
     echo "  Firewall baseline:"
     for s in "${FIREWALL_SUITES[@]}"; do echo "    $s"; done
@@ -1388,6 +1392,15 @@ run_integration() {
         return
     fi
 
+    # Also ahead of the build context, for the same reason: the tarball
+    # install scenarios use stub binaries and their own systemd image.
+    if [[ -z "$ONLY_SUITE" ]]; then
+        run_tarball_install
+    elif [[ "$ONLY_SUITE" == "tarball-install" ]]; then
+        run_tarball_install
+        return
+    fi
+
     # Populate THIS run's build context, then install the binaries into it.
     # Everything but the binaries is copied from the tracked context directory;
     # the binaries are installed fresh, and a previous run's are deliberately
@@ -1562,6 +1575,8 @@ run_suite() {
             run_gateway ;;
         openwrt-scripts)
             run_openwrt_scripts ;;
+        tarball-install)
+            run_tarball_install ;;
         firewall)
             run_firewall ;;
         iface-binding)
@@ -1662,6 +1677,18 @@ run_openwrt_scripts() {
     return $rc
 }
 
+# The systemd tarball's install.sh, run as an upgrade under real systemd with
+# stub binaries: the units that were running before the upgrade must be the
+# ones running after it, including fips-dns and fips-gateway, which stop with
+# fips through Requires=.
+run_tarball_install() {
+    local rc=0
+    info "[tarball-install] Running the systemd tarball upgrade scenarios"
+    bash "$SCRIPT_DIR/tarball-install/test.sh" || rc=$?
+    record "tarball-install" $rc
+    return $rc
+}
+
 run_ci_parity() {
     local rc=0
     info "[ci-parity] Comparing the local suite set against the GitHub matrix"
@@ -1741,6 +1768,17 @@ run_wait_converge() {
     record "wait-converge" $rc
 }
 
+# The .deb version package-linux.yml derives for a release tag, a candidate
+# tag and a branch. A candidate must sort below its release under dpkg, which
+# the tag's -rcN does not, so the workflow maps it to ~rcN; this runs the
+# workflow's own step text. Static, about a second, and needs nothing built.
+run_deb_version() {
+    local rc=0
+    info "[deb-version] Checking the Debian version derived for tags and branches"
+    bash "$SCRIPT_DIR/check-deb-version.sh" || rc=$?
+    record "deb-version" $rc
+}
+
 # ── Main ───────────────────────────────────────────────────────────────────
 
 main() {
@@ -1762,6 +1800,7 @@ main() {
     run_action_pins
     run_comment_refs
     run_wait_converge
+    run_deb_version
 
     if [[ "$TEST_ONLY" == true ]]; then
         run_tests

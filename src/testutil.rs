@@ -19,6 +19,11 @@ pub(crate) fn make_node_addr(val: u8) -> NodeAddr {
 pub(crate) struct LogCapture(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
 
 impl LogCapture {
+    /// Every captured line, each prefixed with its level.
+    pub(crate) fn lines(&self) -> Vec<String> {
+        self.0.lock().unwrap().clone()
+    }
+
     /// Only the captured lines emitted at WARN.
     pub(crate) fn warnings(&self) -> Vec<String> {
         self.0

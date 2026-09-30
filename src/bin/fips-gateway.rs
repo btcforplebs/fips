@@ -107,6 +107,30 @@ fn report_unreadable_conntrack(
     }
 }
 
+/// Log a pending NAT rebuild retry once per change of outcome.
+///
+/// A recovery is reported whether the retry applied the rules itself or a
+/// mapping change applied them in between and left nothing pending.
+#[cfg(target_os = "linux")]
+fn report_nat_retry(log: &mut nat::RetryLog, result: &Result<bool, nat::NatError>) {
+    match (log.observe(result.as_ref().err()), result) {
+        (nat::RetryReport::Failed, Err(e)) => {
+            warn!(error = %e, "Failed to retry pending NAT rules")
+        }
+        (nat::RetryReport::Repeated, Err(e)) => {
+            debug!(error = %e, "Pending NAT rules still failing to apply")
+        }
+        (nat::RetryReport::Recovered, Ok(true)) => {
+            info!("Applied pending NAT rules; retries recovered")
+        }
+        (nat::RetryReport::Recovered, _) => {
+            info!("Pending NAT rules were applied by a later update; retries recovered")
+        }
+        (nat::RetryReport::Clean, Ok(true)) => info!("Applied pending NAT rules"),
+        _ => {}
+    }
+}
+
 /// Check once at startup which conntrack source the tick will read, and say so.
 ///
 /// Without this, an operator on a kernel with no readable source learns that
@@ -545,8 +569,14 @@ async fn main() {
     info!("fips-gateway running");
 
     let mut exit_code = 0;
+    let mut nat_retry = tokio::time::interval(std::time::Duration::from_secs(10));
+    nat_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut nat_retry_log = nat::RetryLog::default();
     loop {
         tokio::select! {
+            _ = nat_retry.tick() => {
+                report_nat_retry(&mut nat_retry_log, &nat_mgr.retry_pending());
+            }
             Some(event) = event_rx.recv() => {
                 match event {
                     pool::PoolEvent::MappingCreated { virtual_ip, mesh_addr } => {

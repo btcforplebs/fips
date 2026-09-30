@@ -174,6 +174,8 @@ pub struct NatManager {
     mappings: HashMap<Ipv6Addr, NatMapping>,
     /// Inbound port-forward rules.
     port_forwards: Vec<PortForward>,
+    /// Desired state has not yet been acknowledged by the kernel.
+    rebuild_pending: bool,
 }
 
 impl NatManager {
@@ -199,6 +201,7 @@ impl NatManager {
             lan_interface,
             mappings: HashMap::new(),
             port_forwards: Vec::new(),
+            rebuild_pending: false,
         }
     }
 
@@ -222,7 +225,7 @@ impl NatManager {
     /// the nftables table atomically. Pass an empty slice to clear.
     pub fn set_port_forwards(&mut self, forwards: &[PortForward]) -> Result<(), NatError> {
         self.port_forwards = forwards.to_vec();
-        self.rebuild()?;
+        self.rebuild_desired()?;
         info!(
             count = self.port_forwards.len(),
             "Applied inbound port forwards"
@@ -305,6 +308,18 @@ impl NatManager {
     /// Number of active NAT mappings.
     pub fn mapping_count(&self) -> usize {
         self.mappings.len()
+    }
+
+    /// Retry a failed rebuild using the latest desired state.
+    ///
+    /// Returns whether a pending rebuild was applied. A clean manager does
+    /// not open a socket or rebuild the table.
+    pub fn retry_pending(&mut self) -> Result<bool, NatError> {
+        if !self.rebuild_pending {
+            return Ok(false);
+        }
+        self.rebuild_desired()?;
+        Ok(true)
     }
 
     /// The objects a rebuild sends, grouped into the batches that carry them.
@@ -497,11 +512,84 @@ impl NatManager {
 
     /// Rebuild, returning the outcome with the time the rebuild took in
     /// microseconds, so a mapping change can log its cost on either path.
-    fn timed_rebuild(&self) -> (Result<(), NatError>, u64) {
+    fn timed_rebuild(&mut self) -> (Result<(), NatError>, u64) {
         let started = Instant::now();
-        let result = self.rebuild();
+        let result = self.rebuild_desired();
         let elapsed_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
         (result, elapsed_us)
+    }
+
+    /// Rebuild the desired state, leaving it marked pending unless the kernel
+    /// accepts it.
+    fn rebuild_desired(&mut self) -> Result<(), NatError> {
+        self.track_rebuild(Self::rebuild)
+    }
+
+    /// Run `apply` with the desired state marked pending, and clear the mark
+    /// only if it succeeds.
+    ///
+    /// Split from `rebuild_desired` so a test can drive both outcomes without
+    /// a netlink socket.
+    fn track_rebuild(
+        &mut self,
+        apply: impl FnOnce(&Self) -> Result<(), NatError>,
+    ) -> Result<(), NatError> {
+        self.rebuild_pending = true;
+        apply(self)?;
+        self.rebuild_pending = false;
+        Ok(())
+    }
+}
+
+/// How a pending-rebuild retry compares with the retry before it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryReport {
+    /// A failure that differs from the previous retry's outcome, or the first.
+    Failed,
+    /// The same failure as the previous retry.
+    Repeated,
+    /// The first success after a failed retry.
+    Recovered,
+    /// A success with no failed retry before it.
+    Clean,
+}
+
+/// Remembers the last failed retry of a pending rebuild.
+///
+/// A failure that does not clear on its own, for example the kernel refusing
+/// the batch while a module or capability is missing, fails every retry the
+/// same way, and a per-retry warning would repeat for the life of the
+/// process. Warning on a change of outcome, and reporting the recovery once,
+/// keeps the log readable. A retry that finds nothing pending after a failure
+/// counts as recovery, since a mapping change rebuilt the table in between.
+#[derive(Debug, Default)]
+pub struct RetryLog {
+    last_failure: Option<String>,
+}
+
+impl RetryLog {
+    /// Record a retry outcome and say how it compares with the last one.
+    ///
+    /// `None` is a success, whether or not anything was pending; `Some` is
+    /// the retry's error. Two failures are the same when their messages are.
+    pub fn observe(&mut self, failure: Option<&NatError>) -> RetryReport {
+        match (failure.map(ToString::to_string), self.last_failure.take()) {
+            (Some(now), Some(before)) => {
+                let report = if now == before {
+                    RetryReport::Repeated
+                } else {
+                    RetryReport::Failed
+                };
+                self.last_failure = Some(now);
+                report
+            }
+            (Some(now), None) => {
+                self.last_failure = Some(now);
+                RetryReport::Failed
+            }
+            (None, Some(_)) => RetryReport::Recovered,
+            (None, None) => RetryReport::Clean,
+        }
     }
 }
 
@@ -855,6 +943,13 @@ fn send_batch(bytes: &[u8]) -> Result<(), NatError> {
 // `SO_SNDBUF` fallback after `SO_SNDBUFFORCE` returns `EPERM` needs a process
 // without CAP_NET_ADMIN, and the gateway suite's container is privileged, so
 // nothing runs that either. The gateway suite covers only the success path.
+//
+// The pending-rebuild flag is covered here on both sides through
+// `track_rebuild`, with a stand-in for the rebuild: a failure leaves it set and
+// `retry_pending` still retries, and a success clears it so `retry_pending`
+// finds nothing to do. What stays only in the ignored kernel test, which no
+// suite runs, is `retry_pending` itself applying a pending rebuild and
+// returning `Ok(true)`, and a kernel rejection leaving the old table in place.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -881,6 +976,185 @@ mod tests {
             );
         }
         mgr
+    }
+
+    #[test]
+    fn failed_rebuild_retains_latest_desired_state_for_retry() {
+        let mut mgr = manager_with_mappings(2);
+        // Make encoding fail before opening a socket.
+        mgr.pre_chain = Chain::new(&mgr.table);
+        assert!(!mgr.retry_pending().unwrap(), "clean retry must not encode");
+
+        assert!(mgr.add_mapping(vip(3), mesh(3)).is_err());
+        assert!(mgr.rebuild_pending);
+        assert!(mgr.retry_pending().is_err());
+        assert!(mgr.rebuild_pending);
+        assert!(mgr.remove_mapping(vip(3)).is_err());
+        assert!(!mgr.mappings.contains_key(&vip(3)));
+        assert!(mgr.add_mapping(vip(2), mesh(99)).is_err());
+        assert_eq!(mgr.mappings[&vip(2)].mesh_addr, mesh(99));
+        assert!(mgr.remove_mapping(vip(4)).is_err());
+        assert!(
+            mgr.rebuild_pending,
+            "an absent mapping must not clear pending work"
+        );
+    }
+
+    #[test]
+    fn failed_tracked_rebuild_stays_pending_and_retry_still_rebuilds() {
+        let mut mgr = manager_with_mappings(1);
+        let refused = || NatError::Nftables("refused".into());
+
+        assert!(mgr.track_rebuild(|_| Err(refused())).is_err());
+        assert!(mgr.rebuild_pending, "a failed rebuild must stay pending");
+
+        // With encoding made to fail, a retry that is still pending attempts
+        // the rebuild, and fails, instead of reporting nothing to do.
+        mgr.pre_chain = Chain::new(&mgr.table);
+        assert!(mgr.retry_pending().is_err());
+        assert!(mgr.rebuild_pending);
+    }
+
+    #[test]
+    fn successful_tracked_rebuild_clears_pending_and_retry_does_nothing() {
+        let mut mgr = manager_with_mappings(1);
+        assert!(
+            mgr.track_rebuild(|_| Err(NatError::Nftables("refused".into())))
+                .is_err()
+        );
+        assert!(mgr.rebuild_pending);
+
+        let mut applied = 0;
+        mgr.track_rebuild(|m| {
+            assert!(m.rebuild_pending, "the rebuild runs with the mark set");
+            applied += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(applied, 1);
+        assert!(
+            !mgr.rebuild_pending,
+            "a successful rebuild must clear pending"
+        );
+
+        // Encoding would fail, so `Ok(false)` shows the retry did not rebuild.
+        mgr.pre_chain = Chain::new(&mgr.table);
+        assert!(!mgr.retry_pending().unwrap());
+    }
+
+    #[test]
+    fn retry_log_warns_on_a_new_failure_and_reports_recovery_once() {
+        let kernel = |errno| NatError::Kernel {
+            errno: Errno(errno),
+            seq: 3,
+        };
+        let mut log = RetryLog::default();
+
+        assert_eq!(log.observe(None), RetryReport::Clean);
+        assert_eq!(log.observe(Some(&kernel(22))), RetryReport::Failed);
+        assert_eq!(log.observe(Some(&kernel(22))), RetryReport::Repeated);
+        assert_eq!(log.observe(Some(&kernel(22))), RetryReport::Repeated);
+        assert_eq!(
+            log.observe(Some(&kernel(1))),
+            RetryReport::Failed,
+            "a different failure is a different outcome and is worth a line"
+        );
+        assert_eq!(log.observe(None), RetryReport::Recovered);
+        assert_eq!(log.observe(None), RetryReport::Clean);
+        assert_eq!(
+            log.observe(Some(&kernel(1))),
+            RetryReport::Failed,
+            "a failure after recovery warns again"
+        );
+    }
+
+    #[test]
+    fn failed_port_forward_rebuild_remains_pending() {
+        let mut mgr = manager_with_mappings(1);
+        mgr.pre_chain = Chain::new(&mgr.table);
+        let forward = PortForward {
+            proto: Proto::Tcp,
+            listen_port: 8080,
+            target: SocketAddrV6::new(Ipv6Addr::LOCALHOST, 80, 0, 0),
+        };
+        assert!(mgr.set_port_forwards(&[forward]).is_err());
+        assert_eq!(mgr.port_forwards.len(), 1);
+        assert!(mgr.rebuild_pending);
+        assert!(mgr.set_port_forwards(&[]).is_err());
+        assert!(mgr.port_forwards.is_empty());
+        assert!(mgr.rebuild_pending);
+    }
+
+    #[test]
+    #[ignore = "requires CAP_NET_ADMIN and nft in an isolated network namespace"]
+    fn kernel_rejection_retries_latest_state_without_another_mapping_event() {
+        let mut mgr = manager_with_mappings(2);
+        let table_name = format!("{TABLE_NAME}_retry_test_{}", std::process::id());
+        mgr.table = Table::new(ProtocolFamily::Inet).with_name(&table_name);
+        mgr.pre_chain = Chain::new(&mgr.table)
+            .with_name(PREROUTING_CHAIN)
+            .with_type(ChainType::Nat)
+            .with_hook(Hook::new(HookClass::PreRouting, DSTNAT_PRIORITY));
+        mgr.post_chain = Chain::new(&mgr.table)
+            .with_name(POSTROUTING_CHAIN)
+            .with_type(ChainType::Nat)
+            .with_hook(Hook::new(HookClass::PostRouting, SRCNAT_PRIORITY));
+        mgr.rebuild().unwrap();
+        let listing = || {
+            let output = std::process::Command::new("nft")
+                .args(["-j", "list", "table", "inet", &table_name])
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            output.stdout
+        };
+        let before = listing();
+        // Encoding succeeds, but the kernel rejects an overlong chain name.
+        let invalid = Chain::new(&mgr.table).with_name("x".repeat(300));
+        let original = std::mem::replace(&mut mgr.pre_chain, invalid);
+        assert!(matches!(
+            mgr.add_mapping(vip(3), mesh(3)),
+            Err(NatError::Kernel { .. })
+        ));
+        assert!(mgr.remove_mapping(vip(1)).is_err());
+        assert!(mgr.remove_mapping(vip(3)).is_err());
+        assert!(mgr.add_mapping(vip(2), mesh(99)).is_err());
+        assert!(mgr.retry_pending().is_err());
+        assert_eq!(
+            listing(),
+            before,
+            "rejection leaves the old kernel table intact"
+        );
+
+        mgr.pre_chain = original;
+        assert!(mgr.retry_pending().unwrap());
+        assert!(!mgr.retry_pending().unwrap());
+        assert_eq!(mgr.mapping_count(), 1);
+        assert_eq!(mgr.mappings[&vip(2)].mesh_addr, mesh(99));
+        let after = listing();
+        assert_ne!(after, before);
+        let table: serde_json::Value = serde_json::from_slice(&after).unwrap();
+        assert_eq!(
+            table["nftables"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|entry| entry.get("rule").is_some())
+                .count(),
+            3
+        );
+        assert!(String::from_utf8(after).unwrap().contains("fd02::63"));
+
+        // A successful normal update also clears earlier pending work.
+        mgr.pre_chain = Chain::new(&mgr.table);
+        assert!(mgr.add_mapping(vip(4), mesh(4)).is_err());
+        mgr.pre_chain = Chain::new(&mgr.table)
+            .with_name(PREROUTING_CHAIN)
+            .with_type(ChainType::Nat)
+            .with_hook(Hook::new(HookClass::PreRouting, DSTNAT_PRIORITY));
+        mgr.remove_mapping(vip(4)).unwrap();
+        assert!(!mgr.retry_pending().unwrap());
+        mgr.cleanup().unwrap();
     }
 
     #[test]
