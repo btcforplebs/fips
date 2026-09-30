@@ -110,6 +110,14 @@ what the real `build-apk.sh` and `build-ipk.sh` package. No router,
 opkg or apk-tools is involved. Part of both CI runners as
 `openwrt-scripts`.
 
+### [tarball-install/](tarball-install/) -- systemd Tarball Upgrade
+
+Runs the systemd tarball's `install.sh` twice in a Debian 12 systemd
+container, the second time as an upgrade, with stub binaries. Checks
+that the units running before the upgrade (fips, fips-dns and
+fips-gateway, in three combinations) are the ones running after it.
+Part of both CI runners as `tarball-install`.
+
 ### [native-api/](native-api/) -- Native Datagram API
 
 Checks the experimental native datagram API: a client process opens a

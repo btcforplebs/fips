@@ -483,9 +483,12 @@ impl TransportAddr {
     /// Create a UDP/TCP transport address directly from a socket address.
     pub fn from_socket_addr(addr: std::net::SocketAddr) -> Self {
         use std::io::Write;
-        let mut buf = Vec::with_capacity(56);
-        write!(&mut buf, "{addr}").expect("Vec<u8>::write_fmt is infallible");
-        Self::new(buf)
+        // The longest form is 58 bytes: [39-byte IPv6%10-digit scope]:65535.
+        let mut buf = [0u8; 64];
+        let mut cursor = &mut buf[..];
+        write!(&mut cursor, "{addr}").expect("64 bytes is enough for any SocketAddr");
+        let len = 64 - cursor.len();
+        Self::from_bytes(&buf[..len])
     }
 }
 
@@ -1269,28 +1272,23 @@ impl TransportHandle {
 pub(crate) async fn resolve_socket_addr(
     addr: &TransportAddr,
 ) -> Result<SocketAddr, TransportError> {
+    resolve_socket_addrs(addr).await?.next().ok_or_else(|| {
+        TransportError::InvalidAddress(format!("DNS resolution returned no addresses for {}", addr))
+    })
+}
+
+/// Resolve every socket address in resolver order, bypassing DNS for numeric IPs.
+pub(crate) async fn resolve_socket_addrs(
+    addr: &TransportAddr,
+) -> Result<impl Iterator<Item = SocketAddr>, TransportError> {
     let s = addr
         .as_str()
         .ok_or_else(|| TransportError::InvalidAddress("not valid UTF-8".into()))?;
 
-    // Fast path: numeric IP address — no DNS lookup
-    if let Ok(sock_addr) = s.parse::<SocketAddr>() {
-        return Ok(sock_addr);
-    }
-
-    // Slow path: DNS resolution
-    tokio::net::lookup_host(s)
-        .await
-        .map_err(|e| {
-            TransportError::InvalidAddress(format!("DNS resolution failed for {}: {}", s, e))
-        })?
-        .next()
-        .ok_or_else(|| {
-            TransportError::InvalidAddress(format!(
-                "DNS resolution returned no addresses for {}",
-                s
-            ))
-        })
+    // lookup_host handles numeric addresses without allocating or querying DNS.
+    tokio::net::lookup_host(s).await.map_err(|e| {
+        TransportError::InvalidAddress(format!("DNS resolution failed for {}: {}", s, e))
+    })
 }
 
 // ============================================================================
@@ -1400,11 +1398,28 @@ mod tests {
 
     #[test]
     fn test_transport_addr_from_socket_addr() {
-        let addr = TransportAddr::from_socket_addr("127.0.0.1:2121".parse().unwrap());
-        assert_eq!(addr.as_str(), Some("127.0.0.1:2121"));
-
-        let addr = TransportAddr::from_socket_addr("[::1]:2121".parse().unwrap());
-        assert_eq!(addr.as_str(), Some("[::1]:2121"));
+        for text in [
+            "0.0.0.0:0",
+            "127.0.0.1:2121",
+            "255.255.255.255:65535",
+            "[::1]:2121",
+            "[2001:db8::1]:2121",
+            "[::ffff:255.255.255.255]:65535",
+            "[fe80::1%4294967295]:65535",
+            "[ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff%4294967295]:65535",
+        ] {
+            let socket: std::net::SocketAddr = text.parse().unwrap();
+            let addr = TransportAddr::from_socket_addr(socket);
+            assert_eq!(addr.as_str(), Some(text));
+            assert_eq!(addr.as_bytes(), socket.to_string().as_bytes());
+            assert_eq!(
+                addr.as_str()
+                    .unwrap()
+                    .parse::<std::net::SocketAddr>()
+                    .unwrap(),
+                socket
+            );
+        }
     }
 
     #[test]

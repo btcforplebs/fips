@@ -574,14 +574,19 @@ count_node_pattern() {
     docker logs "${CONTAINER[$node]}" 2>&1 | grep -cE "$pattern" || true
 }
 
+# Wait until the count of a pattern across all node logs reaches
+# min_count. Returns 0 when it does, 1 on timeout, and 2 at once when a
+# node's logs cannot be read, since no count is established then; the
+# caller reports that when it takes its own count.
 wait_for_log_pattern_count() {
     local pattern="$1" min_count="$2" timeout="$3"
-    local start=$SECONDS
-    while (( SECONDS - start < timeout )); do
-        [ "$(count_log_pattern "$pattern")" -ge "$min_count" ] && return 0
+    local start=$SECONDS count
+    while :; do
+        count="$(count_log_pattern "$pattern")" || return 2
+        [ "$count" -ge "$min_count" ] && return 0
+        (( SECONDS - start < timeout )) || return 1
         sleep "$LOG_POLL_INTERVAL"
     done
-    [ "$(count_log_pattern "$pattern")" -ge "$min_count" ]
 }
 
 # One node's bloom-union mesh-size estimate, or "null" when the daemon
@@ -866,8 +871,11 @@ PASSED=0; FAILED=0
 wait_for_log_pattern_count \
     "Rekey cutover complete \(initiator\), K-bit flipped" 1 \
     "$FIRST_REKEY_TIMEOUT" || true
-fmp_cutovers="$(count_log_pattern 'Rekey cutover complete \(initiator\), K-bit flipped')"
-if [ "$fmp_cutovers" -ge 1 ]; then
+if ! fmp_cutovers="$(count_log_pattern 'Rekey cutover complete \(initiator\), K-bit flipped')"; then
+    echo "  FAIL  FMP rekey cutovers: node logs unreadable ($fmp_cutovers), not established"
+    FAILED=$((FAILED + 1))
+    INTEROP_FAILURES+=("[log] FMP rekey cutovers: node logs unreadable ($fmp_cutovers)")
+elif [ "$fmp_cutovers" -ge 1 ]; then
     echo "  PASS  FMP rekey initiator cutovers: $fmp_cutovers"
     PASSED=$((PASSED + 1))
 else
@@ -897,10 +905,17 @@ echo "Phase 4: Second rekey cycle (waiting up to ${SECOND_REKEY_WAIT}s for the n
 # the same pre/post cutover-count delta convention as the control window
 # (Phase 1b), instead of a blind sleep. Bounded by SECOND_REKEY_WAIT so a
 # stalled rekey falls through to the strict Phase 5/6 assertions.
-fmp_cutovers_before="$(count_log_pattern 'Rekey cutover complete \(initiator\), K-bit flipped')"
-wait_for_log_pattern_count \
-    "Rekey cutover complete \(initiator\), K-bit flipped" \
-    "$((fmp_cutovers_before + 1))" "$SECOND_REKEY_WAIT" || true
+# An unreadable baseline gives nothing to wait beyond, so do not wait.
+# Phase 4 keeps no PASSED/FAILED of its own; the INTEROP_FAILURES entry
+# is what turns the run red.
+if fmp_cutovers_before="$(count_log_pattern 'Rekey cutover complete \(initiator\), K-bit flipped')"; then
+    wait_for_log_pattern_count \
+        "Rekey cutover complete \(initiator\), K-bit flipped" \
+        "$((fmp_cutovers_before + 1))" "$SECOND_REKEY_WAIT" || true
+else
+    echo "  FAIL  second rekey cycle: node logs unreadable ($fmp_cutovers_before), baseline not established"
+    INTEROP_FAILURES+=("[log] second rekey cycle: node logs unreadable ($fmp_cutovers_before)")
+fi
 echo ""
 
 echo "Phase 5: Post-second-rekey connectivity (reconverge within ${POST_REKEY_TIMEOUT}s)"
@@ -1015,16 +1030,22 @@ done
 # Positive checks — the rekey machinery actually exercised both layers.
 echo ""
 echo "  -- Rekey machinery exercised --"
-fmp_total="$(count_log_pattern 'Rekey cutover complete \(initiator\), K-bit flipped')"
-fsp_total="$(count_log_pattern 'FSP rekey cutover complete')"
-if [ "$fmp_total" -ge 1 ]; then
+# An unreadable log means the harness observed nothing, so it is a FAIL
+# on either layer; the FSP WARN below is for a readable zero only.
+if ! fmp_total="$(count_log_pattern 'Rekey cutover complete \(initiator\), K-bit flipped')"; then
+    echo "    FAIL  FMP rekey cutovers: node logs unreadable ($fmp_total), not established"
+    FAILED=$((FAILED + 1))
+elif [ "$fmp_total" -ge 1 ]; then
     echo "    PASS  FMP rekey cutovers across mesh: $fmp_total"
     PASSED=$((PASSED + 1))
 else
     echo "    FAIL  FMP rekey cutovers: $fmp_total (expected >= 1)"
     FAILED=$((FAILED + 1))
 fi
-if [ "$fsp_total" -ge 1 ]; then
+if ! fsp_total="$(count_log_pattern 'FSP rekey cutover complete')"; then
+    echo "    FAIL  FSP rekey cutovers: node logs unreadable ($fsp_total), not established"
+    FAILED=$((FAILED + 1))
+elif [ "$fsp_total" -ge 1 ]; then
     echo "    PASS  FSP rekey cutovers across mesh: $fsp_total"
     PASSED=$((PASSED + 1))
 else

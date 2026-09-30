@@ -393,9 +393,11 @@ pkg add ./fips-<version>-pfsense-ce2.8-amd64.pkg
 /usr/local/libexec/fips/fips-dns-setup   # edits config.xml; run deliberately
 ```
 
-Not a Netgate-supported package, and a pfSense firmware upgrade removes
-it. See [pfsense/README.md](pfsense/README.md) for the "Allow IPv6"
-prerequisite the mesh depends on, firewall-rule notes, and removal
+Not a Netgate-supported package. A pfSense firmware upgrade keeps it (it
+is a plain pkg, not a `pfSense-pkg-*`); after a major base change,
+reinstall the package built for the new base. See
+[pfsense/README.md](pfsense/README.md) for the "Allow IPv6" prerequisite
+the mesh depends on, firewall-rule notes, and upgrade and removal
 behaviour.
 
 ### Windows (`.zip`)

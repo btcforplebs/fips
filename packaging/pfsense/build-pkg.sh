@@ -24,8 +24,10 @@
 #     This package integrates through the DNS Resolver custom options.
 #   - The responder's bind address, for the reason recorded in
 #     fips.yaml.dns.
-#   - Lifetime. A pfSense firmware upgrade reinstalls the base image and
-#     takes third-party packages with it, so post-install says so.
+#   - Lifetime. A firmware upgrade keeps the package (pfSense-upgrade
+#     reinstalls only pfSense-pkg-* packages), but a major upgrade changes
+#     the FreeBSD base, so post-install says to reinstall the package
+#     built for the new base.
 #
 # Ships fips, fipsctl and fipstop. fips-gateway is excluded: its NAT
 # backend is nftables (Linux-only), and pfSense has pf for that anyway.

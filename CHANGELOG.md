@@ -324,6 +324,10 @@ with v0.5.x or earlier peers.
 
 ### Changed
 
+- Transport address clones share immutable bytes instead of allocating a copy.
+  Socket addresses are formatted on the stack so construction still needs only
+  one allocation, including scoped IPv6 addresses.
+
 - `Degraded` is now a level rather than a latch. The supervisor's reason set
   was monotonic, which was correct while no child could recover; with recovery
   it would have meant "something broke at some point since boot" rather than
@@ -502,6 +506,19 @@ with v0.5.x or earlier peers.
   reaching it means a second build image and a second floor. `FIPS_BUILD_IMAGE`
   is still the oldest Debian-family distribution, which is no longer the oldest
   distribution outright.
+- A release-candidate `.deb` is versioned `X.Y.Z~rcN` instead of
+  `X.Y.Z-rcN`. dpkg read the old form as a revision of the release and sorted
+  it above `X.Y.Z`, so a host that installed a candidate was not upgraded by
+  the release. The tarball, artifact and `.deb` file names keep the tag's
+  `-rcN`.
+
+### Deprecated
+
+#### Sessions and rekey
+
+- Setting `node.rekey.enabled: false`. The disabled path is less tested and is
+  not supported, and the option is removed in v2. It still works as before;
+  the configuration reference and the mesh-layer design now say so.
 
 ### Removed
 
@@ -643,6 +660,24 @@ with v0.5.x or earlier peers.
   the Noise session, tree position and routes survive it. Linux and macOS (the
   platforms with the connected-socket fast path); elsewhere the heartbeat alone
   carries the new address.
+- The Ethernet transport on Linux no longer leaks a socket when the interface
+  is missing or its name is invalid at the moment the socket is opened, as when
+  the interface goes away between the presence check and the bind.
+- TCP connections try the remaining addresses for a hostname after a
+  connection fails, within the existing overall connection timeout.
+
+#### Gateway
+
+- The gateway retries failed firewall rebuilds every ten seconds without
+  waiting for another mapping change. Retries apply the latest desired
+  mappings and port forwards, preserving changes across transient failures.
+
+#### Packaging
+
+- The systemd tarball's `install.sh` restarts fips-dns and fips-gateway after
+  an upgrade when they were running. It stopped fips first, which stopped both
+  through `Requires=fips.service`, then restarted only fips, so `.fips`
+  resolution stayed down and the gateway stayed stopped until started by hand.
 
 - A node no longer relays away the answer to its own lookup. A request is
   flooded to every tree peer whose bloom filter claims the target, so a false
