@@ -519,11 +519,77 @@ impl NatManager {
         (result, elapsed_us)
     }
 
+    /// Rebuild the desired state, leaving it marked pending unless the kernel
+    /// accepts it.
     fn rebuild_desired(&mut self) -> Result<(), NatError> {
+        self.track_rebuild(Self::rebuild)
+    }
+
+    /// Run `apply` with the desired state marked pending, and clear the mark
+    /// only if it succeeds.
+    ///
+    /// Split from `rebuild_desired` so a test can drive both outcomes without
+    /// a netlink socket.
+    fn track_rebuild(
+        &mut self,
+        apply: impl FnOnce(&Self) -> Result<(), NatError>,
+    ) -> Result<(), NatError> {
         self.rebuild_pending = true;
-        self.rebuild()?;
+        apply(self)?;
         self.rebuild_pending = false;
         Ok(())
+    }
+}
+
+/// How a pending-rebuild retry compares with the retry before it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryReport {
+    /// A failure that differs from the previous retry's outcome, or the first.
+    Failed,
+    /// The same failure as the previous retry.
+    Repeated,
+    /// The first success after a failed retry.
+    Recovered,
+    /// A success with no failed retry before it.
+    Clean,
+}
+
+/// Remembers the last failed retry of a pending rebuild.
+///
+/// A failure that does not clear on its own, for example the kernel refusing
+/// the batch while a module or capability is missing, fails every retry the
+/// same way, and a per-retry warning would repeat for the life of the
+/// process. Warning on a change of outcome, and reporting the recovery once,
+/// keeps the log readable. A retry that finds nothing pending after a failure
+/// counts as recovery, since a mapping change rebuilt the table in between.
+#[derive(Debug, Default)]
+pub struct RetryLog {
+    last_failure: Option<String>,
+}
+
+impl RetryLog {
+    /// Record a retry outcome and say how it compares with the last one.
+    ///
+    /// `None` is a success, whether or not anything was pending; `Some` is
+    /// the retry's error. Two failures are the same when their messages are.
+    pub fn observe(&mut self, failure: Option<&NatError>) -> RetryReport {
+        match (failure.map(ToString::to_string), self.last_failure.take()) {
+            (Some(now), Some(before)) => {
+                let report = if now == before {
+                    RetryReport::Repeated
+                } else {
+                    RetryReport::Failed
+                };
+                self.last_failure = Some(now);
+                report
+            }
+            (Some(now), None) => {
+                self.last_failure = Some(now);
+                RetryReport::Failed
+            }
+            (None, Some(_)) => RetryReport::Recovered,
+            (None, None) => RetryReport::Clean,
+        }
     }
 }
 
@@ -877,6 +943,13 @@ fn send_batch(bytes: &[u8]) -> Result<(), NatError> {
 // `SO_SNDBUF` fallback after `SO_SNDBUFFORCE` returns `EPERM` needs a process
 // without CAP_NET_ADMIN, and the gateway suite's container is privileged, so
 // nothing runs that either. The gateway suite covers only the success path.
+//
+// The pending-rebuild flag is covered here on both sides through
+// `track_rebuild`, with a stand-in for the rebuild: a failure leaves it set and
+// `retry_pending` still retries, and a success clears it so `retry_pending`
+// finds nothing to do. What stays only in the ignored kernel test, which no
+// suite runs, is `retry_pending` itself applying a pending rebuild and
+// returning `Ok(true)`, and a kernel rejection leaving the old table in place.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -924,6 +997,74 @@ mod tests {
         assert!(
             mgr.rebuild_pending,
             "an absent mapping must not clear pending work"
+        );
+    }
+
+    #[test]
+    fn failed_tracked_rebuild_stays_pending_and_retry_still_rebuilds() {
+        let mut mgr = manager_with_mappings(1);
+        let refused = || NatError::Nftables("refused".into());
+
+        assert!(mgr.track_rebuild(|_| Err(refused())).is_err());
+        assert!(mgr.rebuild_pending, "a failed rebuild must stay pending");
+
+        // With encoding made to fail, a retry that is still pending attempts
+        // the rebuild, and fails, instead of reporting nothing to do.
+        mgr.pre_chain = Chain::new(&mgr.table);
+        assert!(mgr.retry_pending().is_err());
+        assert!(mgr.rebuild_pending);
+    }
+
+    #[test]
+    fn successful_tracked_rebuild_clears_pending_and_retry_does_nothing() {
+        let mut mgr = manager_with_mappings(1);
+        assert!(
+            mgr.track_rebuild(|_| Err(NatError::Nftables("refused".into())))
+                .is_err()
+        );
+        assert!(mgr.rebuild_pending);
+
+        let mut applied = 0;
+        mgr.track_rebuild(|m| {
+            assert!(m.rebuild_pending, "the rebuild runs with the mark set");
+            applied += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(applied, 1);
+        assert!(
+            !mgr.rebuild_pending,
+            "a successful rebuild must clear pending"
+        );
+
+        // Encoding would fail, so `Ok(false)` shows the retry did not rebuild.
+        mgr.pre_chain = Chain::new(&mgr.table);
+        assert!(!mgr.retry_pending().unwrap());
+    }
+
+    #[test]
+    fn retry_log_warns_on_a_new_failure_and_reports_recovery_once() {
+        let kernel = |errno| NatError::Kernel {
+            errno: Errno(errno),
+            seq: 3,
+        };
+        let mut log = RetryLog::default();
+
+        assert_eq!(log.observe(None), RetryReport::Clean);
+        assert_eq!(log.observe(Some(&kernel(22))), RetryReport::Failed);
+        assert_eq!(log.observe(Some(&kernel(22))), RetryReport::Repeated);
+        assert_eq!(log.observe(Some(&kernel(22))), RetryReport::Repeated);
+        assert_eq!(
+            log.observe(Some(&kernel(1))),
+            RetryReport::Failed,
+            "a different failure is a different outcome and is worth a line"
+        );
+        assert_eq!(log.observe(None), RetryReport::Recovered);
+        assert_eq!(log.observe(None), RetryReport::Clean);
+        assert_eq!(
+            log.observe(Some(&kernel(1))),
+            RetryReport::Failed,
+            "a failure after recovery warns again"
         );
     }
 
