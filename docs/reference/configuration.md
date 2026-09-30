@@ -378,7 +378,7 @@ cutover.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `node.rekey.enabled` | bool | `true` | Initiate periodic Noise rekey on links and sessions. A peer-driven session rekey is still answered when this is off, so session keys can still rotate |
+| `node.rekey.enabled` | bool | `true` | Initiate periodic Noise rekey on links and sessions. A peer-driven session rekey is still answered when this is off, so session keys can still rotate. Disabling rekey is unsupported: it runs the node on a less-tested path, and the option is removed in v2. |
 | `node.rekey.after_secs` | u64 | `120` | Initiate rekey after this many seconds on a session |
 | `node.rekey.after_messages` | u64 | `65536` | Initiate rekey after this many messages sent on a session |
 
@@ -1167,6 +1167,7 @@ node:
     loss_threshold: 0.05             # MMP loss rate threshold for CE marking (5%)
     etx_threshold: 3.0               # MMP ETX threshold for CE marking
   rekey:
+    # enabled: false is unsupported, less tested, and removed in v2
     enabled: true                    # periodic Noise rekey for forward secrecy
     after_secs: 120                  # rekey interval (seconds)
     after_messages: 65536            # rekey after N messages sent
