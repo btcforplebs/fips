@@ -36,8 +36,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 #### Links and transports
 
-- Ethernet startup no longer leaks a socket when the configured interface is
-  missing or invalid on Linux.
+- The Ethernet transport on Linux no longer leaks a socket when the configured
+  interface is missing or invalid, at startup or when the beacon socket is
+  reopened after the interface goes away. A running node whose interface was
+  removed and not recreated retried the reopen on every beacon interval and
+  leaked one descriptor each time.
 
 ## [0.5.2] - 2026-09-28
 

@@ -362,17 +362,20 @@ mod tests {
                 .args([
                     "--exact",
                     "transport::ethernet::io::platform::tests::invalid_interface_does_not_leak_socket",
-                    "--ignored",
+                    "--include-ignored",
                     "--nocapture",
                 ])
                 .env(CHILD, "1")
                 .output()
                 .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "{stdout}\n{stderr}");
+            // libtest exits 0 when the filter selects nothing, so require
+            // that the child actually ran this test.
             assert!(
-                output.status.success(),
-                "{}\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr),
+                stdout.contains("1 passed"),
+                "child did not run the test:\n{stdout}\n{stderr}"
             );
             return;
         }
@@ -382,12 +385,16 @@ mod tests {
         for interface in ["fips-missing-interface", "invalid\0interface"] {
             for _ in 0..8 {
                 let result = PacketSocket::open(interface, 0x88b5);
-                assert!(matches!(
-                    result,
-                    Err(TransportError::StartFailed(ref message))
-                        if message.starts_with("interface not found:")
-                            || message.starts_with("invalid interface name:")
-                ));
+                assert!(
+                    matches!(
+                        result,
+                        Err(TransportError::StartFailed(ref message))
+                            if message.starts_with("interface not found:")
+                                || message.starts_with("invalid interface name:")
+                    ),
+                    "unexpected result for {interface:?}: {:?}",
+                    result.as_ref().map(|_| "PacketSocket")
+                );
             }
         }
         assert_eq!(open_fds(), before, "failed setup leaked a socket");
