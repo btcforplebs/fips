@@ -1572,6 +1572,17 @@ run_wait_converge() {
     record "wait-converge" $rc
 }
 
+# The .deb version package-linux.yml derives for a release tag, a candidate
+# tag and a branch. A candidate must sort below its release under dpkg, which
+# the tag's -rcN does not, so the workflow maps it to ~rcN; this runs the
+# workflow's own step text. Static, about a second, and needs nothing built.
+run_deb_version() {
+    local rc=0
+    info "[deb-version] Checking the Debian version derived for tags and branches"
+    bash "$SCRIPT_DIR/check-deb-version.sh" || rc=$?
+    record "deb-version" $rc
+}
+
 # ── Main ───────────────────────────────────────────────────────────────────
 
 main() {
@@ -1593,6 +1604,7 @@ main() {
     run_action_pins
     run_comment_refs
     run_wait_converge
+    run_deb_version
 
     if [[ "$TEST_ONLY" == true ]]; then
         run_tests

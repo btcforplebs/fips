@@ -18,6 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       linux_package_version: ${{ steps.linux_version.outputs.linux_package_version }}
+      deb_package_version: ${{ steps.linux_version.outputs.deb_package_version }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -42,7 +43,18 @@ jobs:
             VERSION="${BASE_VERSION}+${BRANCH}.${HEIGHT}.${HASH}"
           fi
 
+          # dpkg reads X.Y.Z-rcN as revision rcN of X.Y.Z and sorts it above
+          # the release; X.Y.Z~rcN sorts below it. git refuses '~' in a ref
+          # name, so the tag carries '-' and this maps it, for the .deb only.
+          # testing/check-deb-version.sh runs this step's text.
+          DEB_VERSION="$VERSION"
+          if [[ "$GITHUB_REF" == refs/tags/* ]] \
+            && [[ "$VERSION" =~ ^([0-9]+\.[0-9]+\.[0-9]+)-((alpha|beta|pre|rc)[0-9]*)$ ]]; then
+            DEB_VERSION="${BASH_REMATCH[1]}~${BASH_REMATCH[2]}"
+          fi
+
           echo "linux_package_version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "deb_package_version=${DEB_VERSION}" >> "$GITHUB_OUTPUT"
 
   build:
     name: Build Linux artifacts (${{ matrix.artifact_arch }})
@@ -128,7 +140,7 @@ jobs:
           : ${GITHUB_OUTPUT:=/tmp/github_output}
 
           packaging/debian/build-deb-container.sh \
-            --version "${{ needs.determine-versioning.outputs.linux_package_version }}" \
+            --version "${{ needs.determine-versioning.outputs.deb_package_version }}" \
             --output-dir deploy \
             --image-archive "$RUNNER_TEMP/deb-builder-image.tar" \
             | tee /tmp/build-deb-container.log
@@ -146,6 +158,19 @@ jobs:
             *)
               echo "Package $DEB_FILE is not ${{ matrix.deb_arch }}" >&2
               exit 1
+              ;;
+          esac
+
+          # A candidate's package Version carries '~' (see determine-versioning),
+          # and cargo-deb puts it in the file name. GitHub renames a release
+          # asset whose name has special characters, which would leave
+          # checksums-linux.txt naming a file the release does not have. The
+          # file takes the tag's '-' instead; the Version inside is unchanged.
+          case "$DEB_FILE" in
+            *~*)
+              RENAMED="$(dirname "$DEB_FILE")/$(basename "$DEB_FILE" | tr '~' '-')"
+              mv "$DEB_FILE" "$RENAMED"
+              DEB_FILE="$RENAMED"
               ;;
           esac
 
