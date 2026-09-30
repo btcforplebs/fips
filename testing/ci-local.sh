@@ -208,6 +208,7 @@ CHAOS_SUITES=(
 #     testing/chaos/scripts/chaos.sh bloom-storm.
 GATEWAY_SUITES=(gateway)
 OPENWRT_SUITES=(openwrt-scripts)
+TARBALL_INSTALL_SUITES=(tarball-install)
 SIDECAR_SUITES=(sidecar)
 FIREWALL_SUITES=(firewall)
 NAT_SUITES=(cone symmetric lan)
@@ -247,6 +248,9 @@ list_suites() {
     echo ""
     echo "  OpenWrt packaging:"
     for s in "${OPENWRT_SUITES[@]}"; do echo "    $s"; done
+    echo ""
+    echo "  systemd tarball:"
+    for s in "${TARBALL_INSTALL_SUITES[@]}"; do echo "    $s"; done
     echo ""
     echo "  Firewall baseline:"
     for s in "${FIREWALL_SUITES[@]}"; do echo "    $s"; done
@@ -1207,6 +1211,15 @@ run_integration() {
         return
     fi
 
+    # Also ahead of the build context, for the same reason: the tarball
+    # install scenarios use stub binaries and their own systemd image.
+    if [[ -z "$ONLY_SUITE" ]]; then
+        run_tarball_install
+    elif [[ "$ONLY_SUITE" == "tarball-install" ]]; then
+        run_tarball_install
+        return
+    fi
+
     # Populate THIS run's build context, then install the binaries into it.
     # Everything but the binaries is copied from the tracked context directory;
     # the binaries are installed fresh, and a previous run's are deliberately
@@ -1370,6 +1383,8 @@ run_suite() {
             run_gateway ;;
         openwrt-scripts)
             run_openwrt_scripts ;;
+        tarball-install)
+            run_tarball_install ;;
         firewall)
             run_firewall ;;
         nat-cone|nat-symmetric|nat-lan)
@@ -1463,6 +1478,18 @@ run_openwrt_scripts() {
     info "[openwrt-scripts] Running the OpenWrt maintainer-script scenarios"
     bash "$SCRIPT_DIR/openwrt/maintainer-scripts-test.sh" || rc=$?
     record "openwrt-scripts" $rc
+    return $rc
+}
+
+# The systemd tarball's install.sh, run as an upgrade under real systemd with
+# stub binaries: the units that were running before the upgrade must be the
+# ones running after it, including fips-dns and fips-gateway, which stop with
+# fips through Requires=.
+run_tarball_install() {
+    local rc=0
+    info "[tarball-install] Running the systemd tarball upgrade scenarios"
+    bash "$SCRIPT_DIR/tarball-install/test.sh" || rc=$?
+    record "tarball-install" $rc
     return $rc
 }
 

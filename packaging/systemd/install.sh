@@ -112,19 +112,20 @@ fi
 
 # --- Install systemd units ---
 
-was_active=false
-if systemctl is-active --quiet fips.service 2>/dev/null; then
-    was_active=true
-    echo "Stopping running fips service..."
-    systemctl stop fips.service
-fi
-
-dns_was_active=false
-if systemctl is-active --quiet fips-dns.service 2>/dev/null; then
-    dns_was_active=true
-    echo "Stopping running fips-dns service..."
-    systemctl stop fips-dns.service
-fi
+# fips-dns and fips-gateway carry Requires=fips.service, so stopping fips
+# stops them too. Record all three before stopping any of them.
+declare -A was_active=()
+for unit in fips fips-dns fips-gateway; do
+    if systemctl is-active --quiet "${unit}.service" 2>/dev/null; then
+        was_active[$unit]=true
+    fi
+done
+for unit in fips-gateway fips-dns fips; do
+    if [ "${was_active[$unit]:-}" = true ]; then
+        echo "Stopping running ${unit} service..."
+        systemctl stop "${unit}.service"
+    fi
+done
 
 install -m 0644 "${SCRIPT_DIR}/fips.service" "${SYSTEMD_DIR}/fips.service"
 install -m 0644 "${SCRIPT_DIR}/fips-dns.service" "${SYSTEMD_DIR}/fips-dns.service"
@@ -164,15 +165,13 @@ systemctl enable fips.service
 systemctl enable fips-dns.service
 echo "Services enabled (will start on boot)."
 
-# Restart if they were running before
-if $was_active; then
-    echo "Restarting fips service..."
-    systemctl start fips.service
-fi
-if $dns_was_active; then
-    echo "Restarting fips-dns service..."
-    systemctl start fips-dns.service
-fi
+# Restart each unit that was running before
+for unit in fips fips-dns fips-gateway; do
+    if [ "${was_active[$unit]:-}" = true ]; then
+        echo "Restarting ${unit} service..."
+        systemctl start "${unit}.service"
+    fi
+done
 
 echo ""
 echo "=== Installation complete ==="

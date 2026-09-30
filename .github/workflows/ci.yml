@@ -475,6 +475,36 @@ jobs:
         run: bash testing/openwrt/maintainer-scripts-test.sh
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Job 2f – systemd tarball upgrade scenarios
+#
+# Runs the tarball's install.sh twice in a systemd container, the second time
+# as an upgrade, with fips, fips-dns and fips-gateway in a known state, and
+# checks that the units running before the upgrade are running after it. The
+# binaries are stubs, so like the OpenWrt job it needs no FIPS build and no
+# shared test image, and has a job of its own.
+#
+# The leg keeps `suite:` because testing/check-ci-parity.sh matches it against
+# TARBALL_INSTALL_SUITES in ci-local.sh; the step below does not read it.
+# ─────────────────────────────────────────────────────────────────────────────
+  tarball-install:
+    name: systemd tarball (${{ matrix.suite }})
+    runs-on: ubuntu-latest
+    if: ${{ !inputs.skip_integration }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: tarball-install
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Run the systemd tarball upgrade scenarios
+        timeout-minutes: 10
+        run: bash testing/tarball-install/test.sh
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Job 3 – Integration tests (static mesh + chaos simulation)
 #
 # Runs only when both build and test succeed.  Each topology / scenario is a
