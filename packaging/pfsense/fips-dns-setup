@@ -13,10 +13,11 @@
 # options" box, which unbound.inc splices into the generated config
 # verbatim. It is stored base64-encoded in config.xml, which is the part
 # that makes it the right home: config.xml is what survives a reboot, a
-# firmware upgrade and a config restore, whereas everything this package
-# installs under /usr/local does not. So the .fips zone keeps resolving
-# across an upgrade that removes the daemon, which is a loud failure
-# (SERVFAIL on .fips) rather than a quiet one.
+# firmware upgrade and a config restore. What this package installs
+# under /usr/local survives a firmware upgrade too (pfSense-upgrade
+# reinstalls only pfSense-pkg-* packages), but not a removal of the
+# package. So the .fips zone can outlive the daemon, which is a loud
+# failure (SERVFAIL on .fips) rather than a quiet one.
 #
 # This edits the firewall's live configuration, so it is deliberately
 # NOT run from the package's post-install: installing a package should
