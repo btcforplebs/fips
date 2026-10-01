@@ -87,6 +87,9 @@ pub struct TcpTransport {
     /// Deadline from accept to the first complete inbound frame. Defaults to
     /// `INBOUND_FIRST_FRAME_TIMEOUT`; overridable only from tests.
     first_frame_timeout: Duration,
+    /// Longest wait for each later complete inbound frame. Defaults to
+    /// `INBOUND_IDLE_TIMEOUT`; the node sets it from its liveness timers.
+    idle_timeout: Duration,
     /// Transport statistics.
     stats: Arc<TcpStats>,
 }
@@ -111,6 +114,7 @@ impl TcpTransport {
             local_addr: None,
             node_max_connections: None,
             first_frame_timeout: INBOUND_FIRST_FRAME_TIMEOUT,
+            idle_timeout: INBOUND_IDLE_TIMEOUT,
             stats: Arc::new(TcpStats::new()),
         }
     }
@@ -124,6 +128,22 @@ impl TcpTransport {
     #[cfg(test)]
     pub(crate) fn set_first_frame_timeout(&mut self, d: Duration) {
         self.first_frame_timeout = d;
+    }
+
+    /// Set the inbound idle deadline: the longest an accepted connection may
+    /// go, after its first frame, without delivering another complete frame.
+    ///
+    /// The node derives it from its own link-liveness timers, so it never
+    /// drops a connection carrying a link the node would keep. Takes effect
+    /// at the next `start_async()`.
+    pub fn set_inbound_idle_timeout(&mut self, d: Duration) {
+        self.idle_timeout = d;
+    }
+
+    /// The inbound idle deadline the accept loop will use.
+    #[cfg(test)]
+    pub(crate) fn inbound_idle_timeout(&self) -> Duration {
+        self.idle_timeout
     }
 
     /// Set the node-wide `node.limits.max_connections` value.
@@ -214,7 +234,10 @@ impl TcpTransport {
                 keepalive_secs: self.config.keepalive_secs(),
                 recv_buf: self.config.recv_buf_size(),
                 send_buf: self.config.send_buf_size(),
-                first_frame_timeout: self.first_frame_timeout,
+                deadline: InboundDeadline {
+                    first_frame: self.first_frame_timeout,
+                    idle: self.idle_timeout,
+                },
             };
 
             let accept_task = tokio::spawn(async move {
@@ -767,6 +790,45 @@ impl Transport for TcpTransport {
 /// TOML surface.
 pub(crate) const INBOUND_FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Default deadline for each complete inbound frame after the first.
+///
+/// Without it, a remote that sends one well-formed frame and then goes
+/// silent holds its inbound slot for as long as it keeps the socket open:
+/// a frame that names no session is dropped by the node without closing
+/// the transport. The node replaces this with the bound derived from its
+/// own liveness timers (`link_silence_ms`); 64 s is that bound at stock
+/// settings, kept here so a transport built outside the node still has a
+/// deadline.
+pub(crate) const INBOUND_IDLE_TIMEOUT: Duration = Duration::from_secs(64);
+
+/// Read deadlines for an inbound connection, which holds a capped pool
+/// slot from accept.
+///
+/// Each deadline covers one complete frame, not a byte: a remote that
+/// drips a frame slower than the deadline is dropped. The idle deadline
+/// re-arms on every frame, so a connection carrying a live link, which
+/// receives at least a heartbeat per interval, is never dropped by it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct InboundDeadline {
+    /// Deadline from accept to the first complete frame.
+    pub(crate) first_frame: Duration,
+    /// Deadline for each later complete frame, from the end of the last.
+    pub(crate) idle: Duration,
+}
+
+impl InboundDeadline {
+    /// The deadline for the next read: `first` is true until a frame has
+    /// been received.
+    pub(crate) fn for_read(&self, first: bool) -> Duration {
+        if first { self.first_frame } else { self.idle }
+    }
+
+    /// The log word for an expiry of the deadline `for_read(first)` gave.
+    pub(crate) fn phase(first: bool) -> &'static str {
+        if first { "first-frame" } else { "idle" }
+    }
+}
+
 /// Socket configuration parameters passed to the accept loop.
 struct AcceptConfig {
     mtu: u16,
@@ -775,7 +837,7 @@ struct AcceptConfig {
     keepalive_secs: u64,
     recv_buf: usize,
     send_buf: usize,
-    first_frame_timeout: Duration,
+    deadline: InboundDeadline,
 }
 
 /// TCP accept loop — runs as a spawned task when bind_addr is configured.
@@ -795,7 +857,7 @@ async fn accept_loop(
         keepalive_secs,
         recv_buf,
         send_buf,
-        first_frame_timeout,
+        deadline,
     } = cfg;
     debug!(transport_id = %transport_id, "TCP accept loop starting");
 
@@ -907,7 +969,7 @@ async fn accept_loop(
                         conn_mtu,
                         recv_stats,
                         Direction::Inbound,
-                        Some(first_frame_timeout),
+                        Some(deadline),
                         Some(ready_rx),
                     )
                     .await;
@@ -967,9 +1029,10 @@ async fn accept_loop(
 /// `pool_outbound` counter regardless of whether the matching pool
 /// entry survived to be removed.
 ///
-/// `first_frame_timeout` bounds the wait for the *first* complete frame
-/// only, and is `Some` for inbound connections (which hold a capped pool
-/// slot from accept) and `None` for outbound ones. `ready_rx`, when
+/// `deadline` bounds the wait for every complete frame: the first-frame
+/// deadline until one arrives, the idle deadline for each one after. It is
+/// `Some` for inbound connections (which hold a capped pool slot from
+/// accept) and `None` for outbound ones. `ready_rx`, when
 /// present, is the accept loop's readiness barrier: the loop must not run
 /// its cleanup before the accept loop has inserted the pool entry.
 #[allow(clippy::too_many_arguments)]
@@ -982,7 +1045,7 @@ async fn tcp_receive_loop(
     mtu: u16,
     stats: Arc<TcpStats>,
     direction: Direction,
-    first_frame_timeout: Option<Duration>,
+    deadline: Option<InboundDeadline>,
     ready_rx: Option<tokio::sync::oneshot::Receiver<()>>,
 ) {
     let remote_addr = &key.remote;
@@ -1003,11 +1066,13 @@ async fn tcp_receive_loop(
     if admitted {
         let mut first = true;
         loop {
-            let read = match first_frame_timeout {
-                // Bound the first read only. A silent remote otherwise holds
-                // its inbound slot for as long as it keeps the socket open.
-                Some(d) if first => {
-                    match tokio::time::timeout(d, read_fmp_packet(&mut reader, mtu)).await {
+            let read = match deadline {
+                // Bound every read. A remote that goes silent, before or after
+                // its first frame, otherwise holds its inbound slot for as
+                // long as it keeps the socket open.
+                Some(d) => {
+                    let limit = d.for_read(first);
+                    match tokio::time::timeout(limit, read_fmp_packet(&mut reader, mtu)).await {
                         Ok(result) => result,
                         Err(_) => {
                             // Not a recv error: `record_recv_error` means
@@ -1016,14 +1081,15 @@ async fn tcp_receive_loop(
                             debug!(
                                 transport_id = %transport_id,
                                 remote_addr = %remote_addr,
-                                timeout_secs = d.as_secs_f64(),
-                                "No complete frame within the first-frame deadline, dropping inbound connection"
+                                deadline = InboundDeadline::phase(first),
+                                timeout_secs = limit.as_secs_f64(),
+                                "No complete frame within the inbound deadline, dropping inbound connection"
                             );
                             break;
                         }
                     }
                 }
-                _ => read_fmp_packet(&mut reader, mtu).await,
+                None => read_fmp_packet(&mut reader, mtu).await,
             };
             first = false;
 
@@ -1232,7 +1298,7 @@ fn read_mss_mtu(stream: &std::net::TcpStream, default_mtu: u16) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::framing::build_msg1_frame;
+    use crate::transport::framing::{build_established_frame, build_msg1_frame};
     use crate::transport::packet_channel;
     use tokio::time::{Duration, timeout};
 
@@ -2102,18 +2168,170 @@ mod tests {
         transport.stop_async().await.unwrap();
     }
 
-    /// Regression guard, not evidence that the fix works.
+    /// The smallest frame the reader accepts as established: a 16-byte
+    /// header, no payload, a 16-byte tag. The node drops one naming no
+    /// session without closing the transport, so it is what a squatter
+    /// sends to get past the first-frame deadline.
+    fn squatter_frame() -> Vec<u8> {
+        let frame = build_established_frame(0);
+        assert_eq!(frame.len(), crate::proto::fmp::wire::ENCRYPTED_MIN_SIZE);
+        frame
+    }
+
+    /// A remote that sends one well-formed frame and then goes silent must
+    /// lose its inbound slot at the idle deadline, without disconnecting.
     ///
-    /// The deadline is scoped to the first iteration, so an established
-    /// connection that then goes quiet cannot be dropped by it: this test
-    /// passes by construction under the current design. It is kept so that a
-    /// future general (every-read) idle deadline cannot silently start
-    /// reaping quiet links without a test going red.
+    /// The first-frame deadline is set far above the idle one, so the
+    /// release can only be the idle deadline's doing. Break-check: scope the
+    /// deadline back to the first read only and the count stays at 1.
     #[tokio::test]
-    async fn established_connection_survives_long_idle() {
+    async fn inbound_connection_that_goes_silent_after_one_established_frame_releases_its_slot() {
+        let (tx, mut rx) = packet_channel(100);
+        let mut transport = TcpTransport::new(TransportId::new(1), None, make_config(), tx);
+        transport.set_first_frame_timeout(Duration::from_secs(5));
+        transport.set_inbound_idle_timeout(Duration::from_millis(300));
+        transport.start_async().await.unwrap();
+        let listen = transport.local_addr().unwrap();
+
+        let mut squatter = TcpStream::connect(listen).await.unwrap();
+        squatter.write_all(&squatter_frame()).await.unwrap();
+        let packet = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timeout waiting for the squatter's frame")
+            .expect("packet channel closed");
+        assert_eq!(packet.data, squatter_frame());
+        assert_eq!(
+            transport.stats().pool_inbound_count(),
+            1,
+            "the connection should hold its slot once its first frame is in"
+        );
+
+        assert!(
+            wait_until(
+                || transport.stats().pool_inbound_count() == 0,
+                Duration::from_secs(2)
+            )
+            .await,
+            "a connection silent after its first frame should lose its slot at the idle deadline"
+        );
+        assert!(
+            transport.pool.lock().await.is_empty(),
+            "the pool entry should go with the slot"
+        );
+
+        drop(squatter);
+        transport.stop_async().await.unwrap();
+    }
+
+    /// With the cap filled by a one-frame squatter, a genuine peer is refused
+    /// until the idle deadline frees the slot, and admitted afterwards.
+    ///
+    /// Break-check: without the idle deadline the squatter never releases,
+    /// so the genuine peer's frame is never delivered.
+    #[tokio::test]
+    async fn inbound_cap_filled_by_one_frame_squatters_admits_a_genuine_peer_after_the_idle_deadline()
+     {
+        let (tx, mut rx) = packet_channel(100);
+        let mut transport = TcpTransport::new(TransportId::new(1), None, capped_config(1), tx);
+        transport.set_first_frame_timeout(Duration::from_secs(5));
+        transport.set_inbound_idle_timeout(Duration::from_secs(1));
+        transport.start_async().await.unwrap();
+        let listen = transport.local_addr().unwrap();
+
+        let mut squatter = TcpStream::connect(listen).await.unwrap();
+        squatter.write_all(&squatter_frame()).await.unwrap();
+        timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timeout waiting for the squatter's frame")
+            .expect("packet channel closed");
+        assert_eq!(transport.stats().pool_inbound_count(), 1);
+
+        // While the cap is full a genuine peer is rejected outright. The
+        // 250 ms window ends well inside the squatter's 1 s idle deadline.
+        let mut early = TcpStream::connect(listen).await.unwrap();
+        let _ = early.write_all(&build_msg1_frame()).await;
+        assert!(
+            timeout(Duration::from_millis(250), rx.recv())
+                .await
+                .is_err(),
+            "a peer arriving while the cap is full must not be admitted"
+        );
+        drop(early);
+
+        assert!(
+            wait_until(
+                || transport.stats().pool_inbound_count() == 0,
+                Duration::from_secs(3)
+            )
+            .await,
+            "the idle deadline should free the slot the squatter took"
+        );
+
+        let mut genuine = TcpStream::connect(listen).await.unwrap();
+        genuine.write_all(&build_msg1_frame()).await.unwrap();
+        let packet = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timeout waiting for the genuine peer's frame")
+            .expect("packet channel closed");
+        assert_eq!(packet.data, build_msg1_frame());
+
+        drop(squatter);
+        drop(genuine);
+        transport.stop_async().await.unwrap();
+    }
+
+    /// The healthy path: a connection that delivers a frame more often than
+    /// the idle deadline keeps its slot across many deadlines, and every
+    /// frame is delivered. This is the shape of a link kept alive only by
+    /// heartbeats.
+    ///
+    /// Break-check: a deadline that does not re-arm on each frame (a single
+    /// deadline from accept) drops the connection after the first second.
+    #[tokio::test]
+    async fn inbound_connection_sending_a_frame_every_interval_below_the_idle_deadline_is_kept() {
+        let (tx, mut rx) = packet_channel(100);
+        let mut transport = TcpTransport::new(TransportId::new(1), None, make_config(), tx);
+        transport.set_first_frame_timeout(Duration::from_secs(1));
+        transport.set_inbound_idle_timeout(Duration::from_secs(1));
+        transport.start_async().await.unwrap();
+        let listen = transport.local_addr().unwrap();
+
+        let mut peer = TcpStream::connect(listen).await.unwrap();
+        // Twelve frames 250 ms apart: 3 s, three idle deadlines, with 750 ms
+        // of slack between each frame and the deadline it re-arms.
+        for i in 0..12 {
+            peer.write_all(&squatter_frame()).await.unwrap();
+            let packet = timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap_or_else(|_| panic!("timeout waiting for frame {i}"))
+                .expect("packet channel closed");
+            assert_eq!(packet.data, squatter_frame());
+            assert_eq!(
+                transport.stats().pool_inbound_count(),
+                1,
+                "a connection delivering frames inside the idle deadline must keep its slot (frame {i})"
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        assert_eq!(transport.stats().pool_inbound_count(), 1);
+        assert!(!transport.pool.lock().await.is_empty());
+
+        drop(peer);
+        transport.stop_async().await.unwrap();
+    }
+
+    /// An established connection quiet for longer than the first-frame
+    /// deadline, but not the idle deadline, keeps its slot: once a frame is
+    /// in, the first-frame deadline no longer applies.
+    ///
+    /// Break-check: apply the first-frame deadline to every read and the
+    /// connection is dropped after 200 ms of quiet.
+    #[tokio::test]
+    async fn established_connection_quiet_past_the_first_frame_deadline_is_kept() {
         let (tx, mut rx) = packet_channel(100);
         let mut transport = TcpTransport::new(TransportId::new(1), None, make_config(), tx);
         transport.set_first_frame_timeout(Duration::from_millis(200));
+        transport.set_inbound_idle_timeout(Duration::from_secs(5));
         transport.start_async().await.unwrap();
         let listen = transport.local_addr().unwrap();
 
@@ -2125,7 +2343,7 @@ mod tests {
             .expect("packet channel closed");
         assert_eq!(packet.data, build_msg1_frame());
 
-        // Four deadlines' worth of silence after the first frame.
+        // Four first-frame deadlines' worth of silence after the first frame.
         tokio::time::sleep(Duration::from_millis(800)).await;
 
         assert_eq!(
@@ -2134,6 +2352,54 @@ mod tests {
             "an established connection must not be dropped by the first-frame deadline"
         );
         assert!(!transport.pool.lock().await.is_empty());
+
+        drop(peer);
+        transport.stop_async().await.unwrap();
+    }
+
+    /// The idle deadline covers a complete frame, not its first bytes: a
+    /// frame after the first whose prefix arrives inside the deadline and
+    /// whose remainder arrives after it is not delivered, and the slot is
+    /// released.
+    ///
+    /// Break-check: bound only the prefix read and the body read waits
+    /// forever, so the late frame is delivered.
+    #[tokio::test]
+    async fn inbound_connection_dripping_a_frame_slower_than_the_idle_deadline_is_dropped() {
+        let (tx, mut rx) = packet_channel(100);
+        let mut transport = TcpTransport::new(TransportId::new(1), None, make_config(), tx);
+        transport.set_first_frame_timeout(Duration::from_secs(5));
+        transport.set_inbound_idle_timeout(Duration::from_millis(300));
+        transport.start_async().await.unwrap();
+        let listen = transport.local_addr().unwrap();
+
+        let mut peer = TcpStream::connect(listen).await.unwrap();
+        peer.write_all(&squatter_frame()).await.unwrap();
+        timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timeout waiting for the first frame")
+            .expect("packet channel closed");
+
+        let frame = squatter_frame();
+        // Prefix inside the idle deadline, remainder well past it.
+        peer.write_all(&frame[..4]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let _ = peer.write_all(&frame[4..]).await;
+
+        assert!(
+            timeout(Duration::from_millis(500), rx.recv())
+                .await
+                .is_err(),
+            "a frame completing after the idle deadline must not be delivered"
+        );
+        assert!(
+            wait_until(
+                || transport.stats().pool_inbound_count() == 0,
+                Duration::from_secs(2)
+            )
+            .await,
+            "the dripped connection should have released its slot"
+        );
 
         drop(peer);
         transport.stop_async().await.unwrap();
@@ -2250,7 +2516,10 @@ mod tests {
             1400,
             stats.clone(),
             Direction::Inbound,
-            Some(Duration::from_millis(50)),
+            Some(InboundDeadline {
+                first_frame: Duration::from_millis(50),
+                idle: Duration::from_millis(50),
+            }),
             Some(ready_rx),
         )
         .await;

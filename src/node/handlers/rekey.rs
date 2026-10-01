@@ -96,6 +96,19 @@ pub(in crate::node) fn link_silence_ms(node: &crate::config::NodeConfig) -> u64 
         .saturating_add(after_ms)
 }
 
+/// The inbound idle deadline for stream transports: how long an accepted
+/// connection may go without delivering a complete frame once it has
+/// delivered one.
+///
+/// Set to `link_silence_ms`, so a connection carrying a link the node would
+/// keep is never dropped by it, whatever the heartbeat, link-dead, tick and
+/// resend settings are; a connection carrying no live link is reclaimed.
+pub(in crate::node) fn inbound_idle_timeout(
+    node: &crate::config::NodeConfig,
+) -> std::time::Duration {
+    std::time::Duration::from_millis(link_silence_ms(node))
+}
+
 /// How long a rekey responder holds a pending session its initiator has
 /// not adopted before retiring it.
 ///
