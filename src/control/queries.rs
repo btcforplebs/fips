@@ -3238,7 +3238,7 @@ mod tests {
     /// renders each equal their on-loop oracle byte-for-byte, and all three are
     /// served off-loop via `snapshot_dispatch`.
     #[test]
-    fn snapshot_dispatch_serves_r5_queries() {
+    fn snapshot_dispatch_serves_acl_and_stats_peer_queries_off_loop_byte_identical() {
         use super::super::protocol::Request;
         use super::super::read_handle::snapshot_dispatch;
 

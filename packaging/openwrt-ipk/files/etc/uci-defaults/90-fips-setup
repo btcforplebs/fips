@@ -18,7 +18,10 @@
 modprobe tun 2>/dev/null || true
 echo "tun" > /etc/modules.d/tun
 
-# kmod-br-netfilter makes AF_PACKET visible on bridge member ports.
+# br_netfilter is loaded with its call hooks off (fips-bridge.conf). It does
+# not make a bridge member port usable for the Ethernet transport: a lab
+# test found a member-port socket never forms a link either way, so the
+# shipped config binds the LAN bridge. Its removal waits on a router check.
 modprobe br_netfilter 2>/dev/null || true
 echo "br_netfilter" > /etc/modules.d/br-netfilter
 

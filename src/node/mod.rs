@@ -55,6 +55,7 @@ use crate::proto::fmp::wire::{
     build_established_header, prepend_inner_header,
 };
 use crate::proto::fsp::Fsp;
+use crate::proto::fsp::quorum::LinkQuorum;
 use crate::proto::lookup::{Lookup, LookupBackoff, LookupForwardRateLimiter};
 use crate::proto::mmp::Mmp;
 use crate::proto::routing::{self, Router, RoutingErrorRateLimiter};
@@ -668,6 +669,11 @@ pub struct Node {
     /// not a bound on this one, and one PathBroken drives both responses, so
     /// a shared limiter would let the coord-warmup arm pay for the release.
     path_mtu_release_limiter: RoutingErrorRateLimiter,
+    /// Distinct links that recently delivered a PathBroken naming a
+    /// destination whose coordinates a lookup verified. A verified entry is
+    /// demoted only when this reaches its quorum; any number of reports over
+    /// one link leave it in place while the lookup re-validates it.
+    broken_quorum: LinkQuorum,
 
     // === Peering Homeostasis ===
     /// Owner of the peering-reconciler state relocated off `Node`: the sans-IO
@@ -930,6 +936,7 @@ impl Node {
             path_mtu_release_limiter: RoutingErrorRateLimiter::with_interval_ms(
                 handlers::session::PATH_MTU_RELEASE_MIN_INTERVAL.as_millis() as u64,
             ),
+            broken_quorum: LinkQuorum::new(),
             probes: handlers::probe::ProbeRegistry::new(),
             lookup: Lookup::new(
                 LookupBackoff::with_params(backoff_base_secs, backoff_max_secs),
@@ -1099,6 +1106,7 @@ impl Node {
             path_mtu_release_limiter: RoutingErrorRateLimiter::with_interval_ms(
                 handlers::session::PATH_MTU_RELEASE_MIN_INTERVAL.as_millis() as u64,
             ),
+            broken_quorum: LinkQuorum::new(),
             probes: handlers::probe::ProbeRegistry::new(),
             lookup: Lookup::new(LookupBackoff::new(), LookupForwardRateLimiter::new()),
             discovery_sign_limiter: LookupSignRateLimiter::new(),
@@ -1208,10 +1216,15 @@ impl Node {
         // raising `node.limits.max_connections` actually raises the inbound
         // ceiling rather than being silently capped at the transport default.
         let node_max_connections = self.config().node.limits.max_connections;
+        // Inbound stream connections are dropped after this long without a
+        // complete frame. Derived from the node's own liveness timers so it
+        // cannot drop a connection whose link the node would keep.
+        let idle_timeout = handlers::rekey::inbound_idle_timeout(&self.config().node);
         for (name, tcp_config) in tcp_instances {
             let transport_id = self.allocate_transport_id();
             let mut tcp = TcpTransport::new(transport_id, name, tcp_config, packet_tx.clone());
             tcp.set_node_max_connections(node_max_connections);
+            tcp.set_inbound_idle_timeout(idle_timeout);
             transports.push(TransportHandle::Tcp(tcp));
         }
 
@@ -1226,7 +1239,8 @@ impl Node {
 
         for (name, tor_config) in tor_instances {
             let transport_id = self.allocate_transport_id();
-            let tor = TorTransport::new(transport_id, name, tor_config, packet_tx.clone());
+            let mut tor = TorTransport::new(transport_id, name, tor_config, packet_tx.clone());
+            tor.set_inbound_idle_timeout(idle_timeout);
             transports.push(TransportHandle::Tor(tor));
         }
 
@@ -1890,7 +1904,8 @@ impl Node {
         // advance together. What is published is data, not a rendered response,
         // and it is published only here, rather than as a monolithic per-tick
         // rebuild of every query's result. It also is not gated behind any slow
-        // I/O on the tick the way the abandoned 2edc8a1 republish was.
+        // I/O on the tick, which was the shape of an earlier, abandoned
+        // republish design.
         // Per-stats-history-peer metadata. `show_stats_peers` /
         // `show_stats_history_all_peers` need each tracked peer's live
         // membership (`is_active`), resolved npub, and display name — all

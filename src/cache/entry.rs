@@ -133,6 +133,11 @@ impl CacheEntry {
         self.path_mtu = Some(mtu);
     }
 
+    /// Forget the path MTU, as when the path it described is released.
+    pub fn clear_path_mtu(&mut self) {
+        self.path_mtu = None;
+    }
+
     /// Check if this entry has expired.
     pub fn is_expired(&self, current_time_ms: u64) -> bool {
         current_time_ms > self.expires_at

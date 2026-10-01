@@ -8,7 +8,6 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use futures::FutureExt;
 use tokio::net::TcpStream;
@@ -22,6 +21,7 @@ use tokio::io::AsyncWriteExt;
 
 use crate::transport::framing::read_fmp_packet;
 use crate::transport::stream::{ConnId, PooledConn, remove_own};
+use crate::transport::tcp::InboundDeadline;
 use crate::transport::{
     ConnectionState, PacketTx, ReceivedPacket, TransportAddr, TransportError, TransportId,
 };
@@ -238,8 +238,9 @@ pub(crate) async fn proxied_send_loop<S: ProxiedStats, M>(
 /// hoisted into each per-transport wrapper (tor carries a `direction` field
 /// nym lacks), so this loop is silent on exit.
 ///
-/// `first_frame_timeout` bounds the wait for the *first* complete frame only.
-/// It is `Some` for a connection that takes a capped inbound slot from accept
+/// `deadline` bounds the wait for every complete frame: the first-frame
+/// deadline until one arrives, the idle deadline for each one after. It is
+/// `Some` for a connection that takes a capped inbound slot from accept
 /// — today only tor's onion listener — and `None` everywhere else, which
 /// covers every outbound connection and the whole of the nym transport (nym
 /// is outbound-only and keeps no counted slots). A deadline expiry is not a
@@ -268,7 +269,7 @@ pub(crate) async fn proxied_receive_loop<S: ProxiedStats, M>(
     mtu: u16,
     stats: Arc<S>,
     label: &'static str,
-    first_frame_timeout: Option<Duration>,
+    deadline: Option<InboundDeadline>,
     ready_rx: Option<tokio::sync::oneshot::Receiver<()>>,
     on_remove: impl Fn(&S, &M),
 ) {
@@ -290,11 +291,13 @@ pub(crate) async fn proxied_receive_loop<S: ProxiedStats, M>(
     if admitted {
         let mut first = true;
         loop {
-            let read = match first_frame_timeout {
-                // Bound the first read only. A silent remote otherwise holds its
-                // inbound slot for as long as it keeps the socket open.
-                Some(d) if first => {
-                    match tokio::time::timeout(d, read_fmp_packet(&mut reader, mtu)).await {
+            let read = match deadline {
+                // Bound every read. A remote that goes silent, before or after
+                // its first frame, otherwise holds its inbound slot for as long
+                // as it keeps the socket open.
+                Some(d) => {
+                    let limit = d.for_read(first);
+                    match tokio::time::timeout(limit, read_fmp_packet(&mut reader, mtu)).await {
                         Ok(result) => result,
                         Err(_) => {
                             // Not a recv error: `record_recv_error` means framing
@@ -303,15 +306,16 @@ pub(crate) async fn proxied_receive_loop<S: ProxiedStats, M>(
                             debug!(
                                 transport_id = %transport_id,
                                 remote_addr = %remote_addr,
-                                timeout_secs = d.as_secs_f64(),
-                                "No complete frame within the first-frame deadline, dropping inbound {} connection",
+                                deadline = InboundDeadline::phase(first),
+                                timeout_secs = limit.as_secs_f64(),
+                                "No complete frame within the inbound deadline, dropping inbound {} connection",
                                 label
                             );
                             break;
                         }
                     }
                 }
-                _ => read_fmp_packet(&mut reader, mtu).await,
+                None => read_fmp_packet(&mut reader, mtu).await,
             };
             first = false;
 
@@ -372,6 +376,7 @@ mod tests {
     use crate::transport::packet_channel;
     use crate::transport::stream::{next_conn_id, park_writer};
     use portable_atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
     use tokio::io::AsyncReadExt;
     use tokio::net::TcpListener;
     use tokio::time::timeout;

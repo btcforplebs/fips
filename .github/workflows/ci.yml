@@ -79,6 +79,17 @@ jobs:
         run: bash testing/check-comment-refs.sh
       - name: Check no non-test code uses std 64-bit atomics
         run: python3 testing/check-portable-atomics.py
+      # The OpenWrt Package workflow runs this too, but only on trunk pushes,
+      # tags and pull requests; here a branch push sees a finding first.
+      # Kept in step with ci-local.sh's run_shellcheck by hand.
+      - name: Install shellcheck (if missing)
+        run: |
+          if ! command -v shellcheck >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y --no-install-recommends shellcheck
+          fi
+          shellcheck --version
+      - name: Check the OpenWrt package's shell scripts with shellcheck
+        run: bash testing/check-shellcheck.sh
       # Hermetic: synthetic ping functions, no containers, ~45s. Lives beside
       # the other two so both runners gate on it identically — putting it in
       # only one would create exactly the drift check-ci-parity.sh exists to
@@ -86,15 +97,20 @@ jobs:
       # a matrix suite.
       - name: Run convergence-gate unit tests
         run: bash testing/lib/wait-converge-test.sh
-      # Runs package-linux.yml's own version derivation on a release tag, a
-      # candidate tag and a branch. Not a matrix suite either, so it is kept in
-      # step with ci-local.sh's run_deb_version by hand.
-      - name: Check the Debian version derived for tags and branches
-        run: bash testing/check-deb-version.sh
+      # Runs the packaging workflows' own version derivations on a release
+      # tag, a candidate tag and a branch. Not a matrix suite either, so it is
+      # kept in step with ci-local.sh's run_package_versions by hand.
+      - name: Check the package versions derived for tags and branches
+        run: bash testing/check-package-versions.sh
       # The unit-test jobs' flaky-test reporter, against recorded nextest
       # reports. Kept in step with ci-local.sh's run_nextest_flaky by hand.
       - name: Check the flaky-test reporter against its fixtures
         run: bash testing/nextest-flaky/test.sh
+      # The glibc floor check's cases, built from the host's own true
+      # executable. Not a matrix suite, so it is kept in step with
+      # ci-local.sh's run_glibc_floor by hand.
+      - name: Check the glibc floor check against its cases
+        run: bash testing/glibc-floor/test.sh
 
   fmt:
     name: Format check
@@ -342,7 +358,9 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@nextest
+        uses: taiki-e/install-action@fcf5432d9f50d67e37ee6e29bdb7a224ff67b4a7 # v2
+        with:
+          tool: nextest
 
       # The cache restores target/, including the previous run's report. Remove
       # it so the flaky-test check below reads only this run's, and reports a
@@ -455,7 +473,9 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@nextest
+        uses: taiki-e/install-action@fcf5432d9f50d67e37ee6e29bdb7a224ff67b4a7 # v2
+        with:
+          tool: nextest
 
       # The Darwin half of the address-less presence contract. The Linux legs
       # pin that `getifaddrs` reports an interface with no addresses as
@@ -611,7 +631,9 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@nextest
+        uses: taiki-e/install-action@fcf5432d9f50d67e37ee6e29bdb7a224ff67b4a7 # v2
+        with:
+          tool: nextest
 
       # The cache restores target/, including the previous run's report. Remove
       # it so the flaky-test check below reads only this run's, and reports a

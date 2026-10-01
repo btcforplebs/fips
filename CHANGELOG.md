@@ -355,6 +355,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the release. The tarball, artifact and `.deb` file names keep the tag's
   `-rcN`.
 
+#### Native datagram API
+
+- An accepted native API flow that its program closes without ever sending on
+  now stays open, holding its port and a slot against
+  `node.native_api.max_flows`, until its listener is closed.
+
+#### OpenWrt
+
+- Release-candidate OpenWrt `.ipk` packages are now versioned `vX.Y.Z~rcN`, so
+  opkg sorts them below the final release and the release upgrades a router
+  that ran the candidate. The package file name keeps the tag's `-rcN`.
+
 #### Windows
 
 - `install-service.ps1` stops when `\etc\fips\fips.key` exists on the system
@@ -543,6 +555,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   through `Requires=fips.service`, then restarted only fips, so `.fips`
   resolution stayed down and the gateway stayed stopped until started by hand.
 
+#### macOS
+
+- If an encrypt worker thread exits, the daemon no longer stops once that
+  worker's send queue fills. Packets for that worker are now dropped instead
+  of blocking forever. This applies to the default sender.
+
+#### Native datagram API
+
+- On macOS, a flow accepted through the native API could arrive already
+  closed, losing the peer's first datagram, when the kernel's descriptor
+  garbage collector ran before the client read the arrival message. The same
+  exposure on connect and listen replies is closed too.
+
 #### OpenWrt
 
 - dnsmasq forwards `.fips` to fips-gateway only while the gateway is
@@ -555,6 +580,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stopped, keeps the gateway's state across an upgrade, and keeps an edited
   `/etc/fips/fips.yaml`. The SDK's package scan also no longer stops on the
   `Makefile`'s architecture check, which had kept the package out of the build.
+- The shipped config and README now agree that the LAN Ethernet transport
+  binds the LAN bridge (`br-lan`). A socket on a bridge member port does not
+  receive FIPS frames, whether or not br_netfilter is loaded. If you followed
+  the earlier README and changed the `lan` entry in `/etc/fips/fips.yaml` to a
+  member port (for example `lan1` or `eth1`), change it back to `br-lan`. Your
+  edited config is kept across upgrades, along with its old "physical port
+  names, NOT bridge names" comment, so an upgrade alone will not correct it.
 
 #### Sessions and rekey
 
@@ -596,6 +628,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+#### Links and transports
+
+- An inbound TCP or Tor onion connection is now dropped when it goes longer
+  than the node's own link-liveness bound without delivering a complete frame.
+  The bound is about 64 seconds at default settings. A remote that sends one
+  frame and then goes silent no longer holds an inbound connection slot
+  indefinitely. The bound follows `node.heartbeat_interval_secs`,
+  `node.link_dead_timeout_secs`, `node.tick_interval_secs` and the handshake
+  resend settings.
+
+#### Routing and discovery
+
+- A single forged or reflected `PathBroken` signal no longer deletes
+  coordinates a node verified by lookup. A verified entry is kept while a
+  fresh lookup re-validates it. It is demoted to an unverified hint only when
+  `PathBroken` signals naming the destination arrive over two different links
+  within 15 seconds. The vote is the authenticated link peer the signal
+  arrived over, not the reporter it names, so a sender on one link cannot
+  reach the quorum by inventing reporters. Forged reports that arrive over two
+  different links still demote the entry. The re-lookup now runs on every such
+  signal, and when the destination's identity is not cached the node first
+  caches it from the session's key so the answer can be verified. New
+  error-signal counters `broken_below_quorum`, `broken_demoted`,
+  `broken_link_mismatch` and `broken_reporter_mismatch` appear in
+  `show_routing`; the last two only count and never refuse a signal.
+
 #### Sessions and rekey
 
 - A copy of a peer's link rekey msg1 can no longer stop link key rotation. A
@@ -617,6 +675,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   address arrives. A msg1 from a node this one holds no link with, or one
   that carries a different startup epoch, still starts a new link and is
   answered at its source, as any new connection is.
+- The SHA-256 and HMAC states used by the Noise handshake are now cleared when
+  dropped. The connection's handshake slot is cleared when a handshake
+  completes, and its session slot when a rekey session is taken out. The
+  handshake keypair is erased in place on every early return from starting a
+  handshake. The security reference now states what clearing key material in
+  memory does and does not cover in a release build, including copies left
+  behind by moves and the identity loaded from a secret string.
 
 ## [0.5.2] - 2026-09-28
 

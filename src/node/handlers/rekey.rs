@@ -79,6 +79,36 @@ fn ladder_ms(rate_limit: &crate::config::RateLimitConfig) -> u64 {
     total
 }
 
+/// The longest silence, in milliseconds, the node tolerates on a link it
+/// keeps.
+///
+/// A peer's handshake resend ladder, three ticks of scheduling slack, and
+/// the longer of one heartbeat interval and the link-dead timeout. The
+/// link-dead reap is suppressed while a rekey still has msg1 resends left,
+/// which is what the ladder term covers. 64 s at stock settings.
+pub(in crate::node) fn link_silence_ms(node: &crate::config::NodeConfig) -> u64 {
+    let after_ms = node
+        .heartbeat_interval_secs
+        .max(node.link_dead_timeout_secs)
+        .saturating_mul(1000);
+    ladder_ms(&node.rate_limit)
+        .saturating_add(node.tick_interval_secs.saturating_mul(3000))
+        .saturating_add(after_ms)
+}
+
+/// The inbound idle deadline for stream transports: how long an accepted
+/// connection may go without delivering a complete frame once it has
+/// delivered one.
+///
+/// Set to `link_silence_ms`, so a connection carrying a link the node would
+/// keep is never dropped by it, whatever the heartbeat, link-dead, tick and
+/// resend settings are; a connection carrying no live link is reclaimed.
+pub(in crate::node) fn inbound_idle_timeout(
+    node: &crate::config::NodeConfig,
+) -> std::time::Duration {
+    std::time::Duration::from_millis(link_silence_ms(node))
+}
+
 /// How long a rekey responder holds a pending session its initiator has
 /// not adopted before retiring it.
 ///
@@ -92,18 +122,13 @@ fn ladder_ms(rate_limit: &crate::config::RateLimitConfig) -> u64 {
 /// interval later, and the link-dead reap if every frame from the
 /// initiator is lost. Both are allowed one more tick. Retiring before
 /// either turns a late but legitimate adoption into a split. That floor
-/// is 64 s at stock settings; the drain ceiling, which bounds residence
-/// for the same recovering-peer reason, is 120 s and is used unless the
-/// configured timers push the floor above it.
+/// is `link_silence_ms`, 64 s at stock settings; the drain ceiling, which
+/// bounds residence for the same recovering-peer reason, is 120 s and is
+/// used unless the configured timers push the floor above it.
 pub(in crate::node) fn pending_hold(node: &crate::config::NodeConfig) -> std::time::Duration {
-    let after_ms = node
-        .heartbeat_interval_secs
-        .max(node.link_dead_timeout_secs)
-        .saturating_mul(1000);
-    let floor_ms = ladder_ms(&node.rate_limit)
-        .saturating_add(node.tick_interval_secs.saturating_mul(3000))
-        .saturating_add(after_ms);
-    std::time::Duration::from_millis(drain_max_retention_ms(&node.rate_limit).max(floor_ms))
+    std::time::Duration::from_millis(
+        drain_max_retention_ms(&node.rate_limit).max(link_silence_ms(node)),
+    )
 }
 
 impl Node {

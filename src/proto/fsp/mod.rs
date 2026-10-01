@@ -17,11 +17,14 @@
 //!   `classify_epoch`, the initiation tie-break, and the pure MTU-clamp /
 //!   bounded-queue / ECN transforms. No clock/crypto/I/O/tracing.
 //! - `limits.rs` — the session-rekey timing constants.
+//! - `quorum.rs` — the distinct-link quorum that gates demoting verified
+//!   coordinates on `PathBroken`. Clock injected.
 //! - `wire.rs` — the FSP session wire codec and message types. Clock-free,
 //!   crypto-free.
 
 pub(crate) mod core;
 pub(crate) mod limits;
+pub(crate) mod quorum;
 pub(crate) mod wire;
 
 #[cfg(test)]

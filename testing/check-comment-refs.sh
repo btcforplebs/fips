@@ -1,7 +1,7 @@
 #!/bin/bash
-# ── Source comment reference guard ──────────────────────────────────────────
-# Every reference a source comment makes must resolve for a reader who has
-# only this repository.
+# ── Comment and document reference guard ────────────────────────────────────
+# Every reference a source comment or committed document makes must resolve
+# for a reader who has only this repository.
 #
 # A comment that names a private planning artifact — by identifier, by file
 # path, or in programme vocabulary that has no in-repo referent — is dead text
@@ -22,17 +22,42 @@
 #      documents nobody has thought of. Scoped to src/ because resolving the
 #      whole tree's relative documentation links against the repository root
 #      is a different checker with its own population to triage first.
-#   3. programme vocabulary, scoped to src/. Phase, rung, milestone and step
-#      labels that name a plan a reader cannot open. The pattern is shared
-#      verbatim with the sweep that produced today's clean tree, so the two
-#      cannot drift apart.
+#   3. programme vocabulary, repo-wide in two scopes. Phase, rung,
+#      milestone and step labels, and phrases such as "architectural plan",
+#      that name a plan a reader cannot open. VOCAB_PAT runs over the whole
+#      tree except this file, which would match itself. SRC_VOCAB_PAT adds
+#      two alternatives that run over src/ only, because outside src/ they
+#      are legitimate prose: "in Step N" is the documentation's own step
+#      cross-referencing, and "this PR" is how CONTRIBUTING.md and
+#      PR-REVIEW.md talk about the PR under review. This file is the only
+#      copy of both patterns.
+#
+#      The tree-wide alternatives had no hit outside src/ when the scope was
+#      widened. The one most likely to catch legitimate prose later is
+#      \b[RQ][0-9]\b, which matches "Q4" or "R2" as words. If it does,
+#      rephrase the text or move that alternative to SRC_VOCAB_PAT; do not
+#      exclude the file or directory, which drops every other alternative
+#      with it.
 #
 # Known coverage gaps, recorded rather than discovered:
 #   - a bare "milestone" in some other phrasing (the narrow alternatives keep
 #     the Tor bootstrap loop in src/transport/tor/mod.rs out of check 3);
 #   - the CATEGORY_D / CATEGORY_E code identifiers and test names, which
 #     check 3's case-sensitive Category-[A-Z] deliberately does not match;
-#   - programme vocabulary, or a document path, outside src/;
+#   - a document path outside src/. Check 2 resolves a token against the
+#     repository root, but documentation links outside src/ are relative to
+#     the citing file, so widening it means a different resolver and a
+#     triage of the links that fail it;
+#   - a private-workspace directory cited in lowercase (an issues/... or
+#     tasks/... path with no .md token). Check 1's identifier prefix is
+#     case-sensitive and check 2 only resolves *.md tokens;
+#   - programme phrasing too common to deny, such as "a later step" or
+#     "the plan": an alternative for it would red legitimate text, so it
+#     passes check 3 by design;
+#   - bare commit hashes. Whether a hash resolves depends on the clone's
+#     object database, and GitHub CI clones are shallow, so a check would
+#     read differently on different hosts. The rule applied by hand is that
+#     a comment cites a commit only if a trunk branch contains it;
 #   - a reference to a private artifact made in free prose with no marker at
 #     all, at any scope: no check here matches it;
 #   - a pathspec typo introduced after this file lands. git grep returns 1
@@ -67,23 +92,23 @@ cd "$ROOT" || exit 2
 # fires the assertion. This covers checks 2 and 3 only; check 1's pathspec is
 # "." and stays non-empty from anywhere, so its wrong-directory case is covered
 # by the --show-prefix assertion above and its mistyped-pathspec case by
-# nothing.
+# nothing. Check 3's tree-wide half uses "." with exclusions and is in the
+# same position as check 1.
 n=$(git ls-tree -r --name-only HEAD -- src/ | wc -l)
 (( n > 0 )) || { echo "check-comment-refs: pathspec src/ matched no files" >&2; exit 2; }
 
-# Deliberately a superset of the sweep's own acceptance regex: the year group
-# is optional, so the three-digit form is caught as well, and the separator is
-# optional so underscores and spaces are caught alongside hyphens. Narrowing
-# this is how a whole class goes unguarded while every break-check still
-# passes.
+# Deliberately broad: the year group is optional, so the three-digit form is
+# caught as well, and the separator is optional so underscores and spaces are
+# caught alongside hyphens. Narrowing this is how a whole class goes unguarded
+# while every break-check still passes.
 ID_PAT='(TASK|ISSUE|IDEA|QUICK|RECUR)[-_ ]?(20[0-9]{2}[-_ ])?[0-9]{3,4}'
 
-# Verbatim from the sweep's enumerating pattern. Do not edit one without the
-# other. If check 3's scope is ever widened beyond src/, this text matches
-# itself through six of its alternatives and the widening must add
-# ':(exclude)testing/check-comment-refs.sh' — never an exclusion of testing/,
-# which holds real check-1 hits a directory-wide exclusion would drop.
-VOCAB_PAT='\b[RQ][0-9]\b|Category-[A-Z]|\bumbrella\b|refactor steps?|\bpre-scopes\b|R0 stub|read-isolation|cut over yet|Cutover begins|in Step [0-9]|(the|this) milestone|Milestone-'
+# VOCAB_PAT runs tree-wide. This text matches itself, so the tree-wide run
+# excludes this one file by name; never exclude testing/, which holds real
+# hits a directory-wide exclusion would drop. SRC_VOCAB_PAT is VOCAB_PAT
+# plus the alternatives that are legitimate prose outside src/.
+VOCAB_PAT='\b[RQ][0-9]\b|Category-[A-Z]|\bumbrella\b|refactor steps?|\bpre-scopes\b|R0 stub|read-isolation|cut over yet|Cutover begins|(the|this) milestone|Milestone-|[Aa]rchitectural plan|[Ff]ollow-up wiring'
+SRC_VOCAB_PAT="$VOCAB_PAT"'|in Step [0-9]|\b[Tt]his PR\b'
 
 MD_PAT='[A-Za-z0-9_./-]+\.md\b'
 
@@ -157,22 +182,29 @@ if (( ${#CITES[@]} > 0 )); then
     done < <(printf '%s\n' "${!CITES[@]}" | sort)
 fi
 
-# ── Check 3: programme vocabulary under src/ ────────────────────────────────
-rc=0
-out=$(git grep -nEI "$VOCAB_PAT" HEAD -- src/) || rc=$?
-if (( rc > 1 )); then
-    echo "check-comment-refs: check 3 grep failed (rc=$rc)" >&2
-    exit 2
-fi
-if [[ -n "$out" ]]; then
-    printf '%s\n' "$out" \
-        | sed -E 's|^HEAD:([^:]*):([0-9]+):|\1:\2: names a plan this repository does not carry: |'
-    FAILED=1
-fi
+# ── Check 3: programme vocabulary, src/ and the rest of the tree ────────────
+vocab_check() {
+    local pat=$1
+    shift
+    local rc=0 out
+    out=$(git grep -nEI "$pat" HEAD -- "$@") || rc=$?
+    if (( rc > 1 )); then
+        echo "check-comment-refs: check 3 grep failed (rc=$rc)" >&2
+        exit 2
+    fi
+    if [[ -n "$out" ]]; then
+        printf '%s\n' "$out" \
+            | sed -E 's|^HEAD:([^:]*):([0-9]+):|\1:\2: names a plan this repository does not carry: |'
+        FAILED=1
+    fi
+    return 0
+}
+vocab_check "$SRC_VOCAB_PAT" src/
+vocab_check "$VOCAB_PAT" . ':(exclude)src/' ':(exclude)testing/check-comment-refs.sh'
 
 if (( FAILED != 0 )); then
     echo "" >&2
-    echo "check-comment-refs: a source comment references something a reader holding" >&2
+    echo "check-comment-refs: a comment or document references something a reader holding" >&2
     echo "only this repository cannot resolve. Rewrite the comment to say what the" >&2
     echo "code does, citing nothing outside the tree." >&2
     exit 1

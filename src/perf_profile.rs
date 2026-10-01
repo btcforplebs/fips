@@ -1,9 +1,3 @@
-// Some entry points (e.g. `stamp`, `record_since`) are only called from
-// paths that aren't yet wired up in this PR (FSP-pipelined dispatch,
-// per-stage worker telemetry). Keep them in tree so the follow-up wiring
-// PR is a pure call-site change.
-#![allow(dead_code)]
-
 //! Runtime perf profiler for the FMP/FSP hot path and queue handoffs.
 //!
 //! Avoids external dependencies (`perf`, samply, etc.) by instrumenting
@@ -191,19 +185,9 @@ pub(crate) fn enabled() -> bool {
     })
 }
 
-/// Capture a timestamp for a future queue-wait measurement. Returns
-/// `None` when tracing is disabled so callers can store it cheaply in
-/// packet/job structs without paying `Instant::now()` in production.
-#[inline]
-pub(crate) fn stamp() -> Option<Instant> {
-    if enabled() {
-        Some(Instant::now())
-    } else {
-        None
-    }
-}
-
 /// Record time elapsed since a previously captured stamp.
+// Unix-only because its one caller, the encrypt worker, is.
+#[cfg(unix)]
 #[inline]
 pub(crate) fn record_since(stage: Stage, start: Option<Instant>) {
     if let Some(start) = start {

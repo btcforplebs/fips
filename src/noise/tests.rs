@@ -915,3 +915,134 @@ fn test_xk_invalid_msg3_size() {
             .is_err()
     );
 }
+
+/// The `zeroize` features of `sha2` and `hmac` are on, so the SHA-256 state
+/// that hashes each Diffie-Hellman result, and the two SHA-256 cores inside
+/// the HMAC that HKDF runs on, are cleared when dropped. Without `sha2`'s
+/// feature this does not compile; `hmac`'s forwards to the same `digest`
+/// feature, so dropping it alone changes nothing while `sha2`'s is on.
+#[test]
+fn test_sha256_states_used_by_hashing_and_hkdf_are_cleared_on_drop() {
+    fn clears_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+    clears_on_drop::<sha2::Sha256>();
+    clears_on_drop::<<sha2::Sha256 as hmac::EagerHash>::Core>();
+}
+
+/// A value that counts its drops, so a test can tell a value dropped once
+/// from one dropped twice or leaked.
+struct DropCounter<'a> {
+    bytes: [u8; 48],
+    heap: Vec<u8>,
+    drops: &'a std::cell::Cell<usize>,
+}
+
+impl Drop for DropCounter<'_> {
+    fn drop(&mut self) {
+        self.drops.set(self.drops.get() + 1);
+    }
+}
+
+#[test]
+fn test_take_cleared_moves_the_value_out_intact_and_leaves_the_slot_none() {
+    let drops = std::cell::Cell::new(0);
+    let mut slot = Some(DropCounter {
+        bytes: [0xa5; 48],
+        heap: vec![7u8; 100],
+        drops: &drops,
+    });
+
+    let taken = take_cleared(&mut slot).expect("the slot held a value");
+
+    assert!(slot.is_none());
+    assert_eq!(taken.bytes, [0xa5; 48]);
+    assert_eq!(taken.heap, vec![7u8; 100]);
+    assert_eq!(drops.get(), 0, "clearing the slot must not drop the value");
+    drop(taken);
+    assert_eq!(drops.get(), 1);
+}
+
+#[test]
+fn test_take_cleared_slot_is_reusable_and_an_empty_slot_stays_empty() {
+    let drops = std::cell::Cell::new(0);
+    let mut slot: Option<DropCounter<'_>> = None;
+    assert!(take_cleared(&mut slot).is_none());
+    assert!(slot.is_none());
+
+    slot = Some(DropCounter {
+        bytes: [1; 48],
+        heap: vec![2; 3],
+        drops: &drops,
+    });
+    let first = take_cleared(&mut slot).expect("first value");
+    slot = Some(DropCounter {
+        bytes: [3; 48],
+        heap: vec![4; 5],
+        drops: &drops,
+    });
+    let second = take_cleared(&mut slot).expect("second value");
+    assert_eq!((first.bytes[0], second.bytes[0]), (1, 3));
+    assert!(slot.is_none());
+    drop((first, second));
+    assert_eq!(drops.get(), 2);
+}
+
+/// For `Option<bool>`, all-zero bytes read as `Some(false)`, not `None`.
+/// The slot must still come out as `None`, so zeroing alone is not enough.
+#[test]
+fn test_take_cleared_leaves_none_where_zero_bytes_would_read_as_some() {
+    let mut slot = Some(true);
+    assert_eq!(take_cleared(&mut slot), Some(true));
+    assert_eq!(slot, None);
+
+    let mut slot = Some((true, [9u8; 32]));
+    assert_eq!(take_cleared(&mut slot), Some((true, [9u8; 32])));
+    assert_eq!(slot, None);
+}
+
+#[test]
+fn test_take_cleared_session_still_decrypts_what_its_peer_encrypts() {
+    let initiator_keypair = generate_keypair();
+    let responder_keypair = generate_keypair();
+    let mut initiator =
+        HandshakeState::new_initiator(initiator_keypair, responder_keypair.public_key());
+    let mut responder = HandshakeState::new_responder(responder_keypair);
+    initiator.set_local_epoch(generate_epoch());
+    responder.set_local_epoch(generate_epoch());
+    let msg1 = initiator.write_message_1().unwrap();
+    responder.read_message_1(&msg1).unwrap();
+    let msg2 = responder.write_message_2().unwrap();
+
+    let mut handshake_slot = Some(initiator);
+    let mut initiator = take_cleared(&mut handshake_slot).expect("handshake in slot");
+    assert!(handshake_slot.is_none());
+    initiator.read_message_2(&msg2).unwrap();
+
+    let mut session_slot = Some(initiator.into_session().unwrap());
+    let mut sender = take_cleared(&mut session_slot).expect("session in slot");
+    assert!(session_slot.is_none());
+    let mut receiver = responder.into_session().unwrap();
+    let ciphertext = sender.encrypt(b"after the move").unwrap();
+    assert_eq!(receiver.decrypt(&ciphertext).unwrap(), b"after the move");
+}
+
+#[test]
+fn test_clear_slot_drops_a_present_value_once_and_leaves_none() {
+    let drops = std::cell::Cell::new(0);
+    let mut slot = Some(DropCounter {
+        bytes: [5; 48],
+        heap: vec![6; 7],
+        drops: &drops,
+    });
+    clear_slot(&mut slot);
+    assert!(slot.is_none());
+    assert_eq!(drops.get(), 1);
+
+    clear_slot(&mut slot);
+    assert!(slot.is_none());
+    assert_eq!(drops.get(), 1, "an empty slot has nothing to drop");
+
+    let mut flag = Some(true);
+    flag.take();
+    clear_slot(&mut flag);
+    assert_eq!(flag, None);
+}

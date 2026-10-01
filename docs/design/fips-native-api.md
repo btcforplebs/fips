@@ -133,9 +133,12 @@ and silent drops on its listeners.
 **Not a connection in the TCP sense.** A successful `connect` is a local
 registration and contacts no peer. There is no handshake, no keepalive and no
 notification that a peer went away. A flow ends when its descriptor closes, and
-in no other way. In particular **a peer cannot end your flow: it has no close to
-send.** That single fact shapes every program written against this interface,
-and the consequences are drawn out in
+in no other way. The one delay is an accepted flow never sent on, which ends
+only once its listener has closed as well (see
+[../reference/native-api.md](../reference/native-api.md#fipslistener)). In
+particular **a peer cannot end your flow: it has no close to send.** That
+single fact shapes every program written against this interface, and the
+consequences are drawn out in
 [../how-to/use-the-native-datagram-api.md](../how-to/use-the-native-datagram-api.md#four-things-that-will-bite-you).
 
 ## See also

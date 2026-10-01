@@ -4306,7 +4306,9 @@ async fn test_path_broken_releases_path_mtu_lookup_entry() {
          assertion below observes nothing"
     );
 
-    tn.node.handle_path_broken(&reporter, inner).await;
+    tn.node
+        .handle_path_broken(&reporter, &reporter, inner)
+        .await;
 
     assert_eq!(
         tn.node.path_mtu_lookup_get(&dest_fips),
@@ -4361,7 +4363,9 @@ async fn test_path_broken_resets_the_session_source_path_mtu() {
          assertion below observes nothing"
     );
 
-    tn.node.handle_path_broken(&reporter, inner).await;
+    tn.node
+        .handle_path_broken(&reporter, &reporter, inner)
+        .await;
 
     assert_eq!(
         tn.node
@@ -4699,7 +4703,8 @@ async fn test_path_broken_naming_a_dest_with_no_session_does_not_flush_cached_co
     let _ = node.coord_cache_mut().insert(dest, coords, 1000);
 
     let encoded = PathBroken::new(dest, reporter).encode();
-    node.handle_path_broken(&reporter, &encoded[5..]).await;
+    node.handle_path_broken(&reporter, &reporter, &encoded[5..])
+        .await;
 
     assert!(
         node.coord_cache().get(&dest, 1000).is_some(),
@@ -4746,7 +4751,8 @@ async fn test_path_broken_naming_a_dest_whose_entry_is_an_unauthenticated_respon
     install_halfopen(&mut node, dest);
 
     let encoded = PathBroken::new(dest, reporter).encode();
-    node.handle_path_broken(&reporter, &encoded[5..]).await;
+    node.handle_path_broken(&reporter, &reporter, &encoded[5..])
+        .await;
 
     assert!(
         node.coord_cache().get(&dest, 1000).is_some(),
@@ -4781,7 +4787,8 @@ async fn test_path_broken_for_a_session_we_initiated_still_flushes_cached_coords
     let _ = node.coord_cache_mut().insert(dest, coords, 1000);
 
     let encoded = PathBroken::new(dest, reporter).encode();
-    node.handle_path_broken(&reporter, &encoded[5..]).await;
+    node.handle_path_broken(&reporter, &reporter, &encoded[5..])
+        .await;
 
     assert!(
         node.coord_cache().get(&dest, 1000).is_none(),
@@ -6993,7 +7000,7 @@ async fn deliver_path_broken(
     let encoded = PathBroken::new(dest, reporter).encode();
     nodes[at]
         .node
-        .handle_path_broken(&reporter, &encoded[5..])
+        .handle_path_broken(&reporter, &reporter, &encoded[5..])
         .await;
 }
 
@@ -8994,7 +9001,7 @@ async fn a_path_broken_flood_releases_the_stored_path_mtu_only_once_per_interval
     let inner = &encoded[5..];
 
     node.path_mtu_lookup_insert(dest_fips, 700);
-    node.handle_path_broken(&reporter, inner).await;
+    node.handle_path_broken(&reporter, &reporter, inner).await;
     assert_eq!(
         node.path_mtu_lookup_get(&dest_fips),
         None,
@@ -9002,7 +9009,7 @@ async fn a_path_broken_flood_releases_the_stored_path_mtu_only_once_per_interval
     );
 
     node.path_mtu_lookup_insert(dest_fips, 700);
-    node.handle_path_broken(&reporter, inner).await;
+    node.handle_path_broken(&reporter, &reporter, inner).await;
     assert_eq!(
         node.path_mtu_lookup_get(&dest_fips),
         Some(700),

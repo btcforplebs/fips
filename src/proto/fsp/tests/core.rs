@@ -737,21 +737,42 @@ fn plan_coords_required_lookup_gated_on_identity() {
 }
 
 #[test]
-fn plan_path_broken_invalidates_then_lookups() {
+fn plan_path_broken_removes_an_unverified_entry_then_looks_it_up() {
+    use crate::proto::fsp::quorum::QuorumVerdict;
     let fsp = Fsp::new();
     let dest = make_node_addr(6);
-    // Cached identity: invalidate, then lookup — in that order.
+    let expected = vec![
+        FspAction::InvalidateCoords { addr: dest },
+        FspAction::InitiateLookup { dest },
+    ];
+    // The quorum is irrelevant to a hint: removed either way.
+    for quorum in [QuorumVerdict::Below { distinct: 0 }, QuorumVerdict::Reached] {
+        assert_eq!(fsp.plan_path_broken(dest, false, quorum), expected);
+    }
+}
+
+#[test]
+fn plan_path_broken_keeps_a_verified_entry_below_quorum_and_looks_it_up() {
+    use crate::proto::fsp::quorum::QuorumVerdict;
+    let fsp = Fsp::new();
+    let dest = make_node_addr(6);
     assert_eq!(
-        fsp.plan_path_broken(dest, true),
+        fsp.plan_path_broken(dest, true, QuorumVerdict::Below { distinct: 1 }),
+        vec![FspAction::InitiateLookup { dest }]
+    );
+}
+
+#[test]
+fn plan_path_broken_demotes_a_verified_entry_at_quorum_then_looks_it_up() {
+    use crate::proto::fsp::quorum::QuorumVerdict;
+    let fsp = Fsp::new();
+    let dest = make_node_addr(6);
+    assert_eq!(
+        fsp.plan_path_broken(dest, true, QuorumVerdict::Reached),
         vec![
-            FspAction::InvalidateCoords { addr: dest },
+            FspAction::DemoteCoords { addr: dest },
             FspAction::InitiateLookup { dest },
         ]
-    );
-    // No cached identity: invalidate only (still unconditional).
-    assert_eq!(
-        fsp.plan_path_broken(dest, false),
-        vec![FspAction::InvalidateCoords { addr: dest }]
     );
 }
 

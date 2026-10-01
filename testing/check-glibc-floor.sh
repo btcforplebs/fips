@@ -16,17 +16,37 @@
 #   Anything else is treated as a single ELF binary.
 #
 # Reads the floor from packaging/build-floor.env unless FIPS_GLIBC_FLOOR is set.
+#
+# Exit 0 = every input was examined and none is above the floor. Exit 1 = a
+# binary needs a newer glibc than the floor. Exit 2 = an input could not be
+# examined (missing, not an ELF object, a .deb that would not unpack or holds
+# no binaries), or the check could not run at all; never treated as a pass,
+# and never reported as a binary above the floor.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+# A missing or empty floor means the check cannot run, so it exits 2 here
+# rather than letting `set -e` or a `:?` expansion end the run with status 1,
+# which callers would read as a binary above the floor.
+FLOOR_ENV="$REPO_ROOT/packaging/build-floor.env"
 if [ -z "${FIPS_GLIBC_FLOOR:-}" ]; then
-    # shellcheck source=../packaging/build-floor.env
-    . "$REPO_ROOT/packaging/build-floor.env"
+    [ -r "$FLOOR_ENV" ] || {
+        echo "check-glibc-floor: cannot read $FLOOR_ENV and FIPS_GLIBC_FLOOR is not set;" >&2
+        echo "                   there is no floor to check against." >&2
+        exit 2
+    }
+    # shellcheck source-path=SCRIPTDIR source=../packaging/build-floor.env
+    . "$FLOOR_ENV"
 fi
-FLOOR="${FIPS_GLIBC_FLOOR:?no floor declared}"
+if [ -z "${FIPS_GLIBC_FLOOR:-}" ]; then
+    echo "check-glibc-floor: $FLOOR_ENV declares no FIPS_GLIBC_FLOOR;" >&2
+    echo "                   there is no floor to check against." >&2
+    exit 2
+fi
+FLOOR="$FIPS_GLIBC_FLOOR"
 
 for tool in readelf dpkg dpkg-deb; do
     command -v "$tool" >/dev/null 2>&1 || {
@@ -65,6 +85,18 @@ max_glibc_need() {
 
 FAILED=0
 CHECKED=0
+UNCHECKED=0
+UNCHECKED_LIST=()
+
+# unchecked <label> <reason>: records an input this run could not examine. It
+# is kept apart from FAILED because the remedy differs: an input that was never
+# read says nothing about the floor, and the above-the-floor advice would send
+# the reader to rebuild a package that may be fine.
+unchecked() {
+    echo "  UNCHECKED $1: could not check ($2)" >&2
+    UNCHECKED_LIST+=("$1: $2")
+    UNCHECKED=$((UNCHECKED + 1))
+}
 
 is_elf() { readelf -hW "$1" >/dev/null 2>&1; }
 
@@ -78,8 +110,12 @@ check_binary() {
             CHECKED=$((CHECKED + 1))
             return
         fi
-        echo "  ERROR $label is not a readable ELF object" >&2
-        FAILED=$((FAILED + 1))
+        case "$label" in
+            *.tar.gz|*.tgz|*.tar|*.tar.*)
+                unchecked "$label" "not a readable ELF object; unpack it and pass its binaries" ;;
+            *)
+                unchecked "$label" "not a readable ELF object" ;;
+        esac
         return
     fi
     CHECKED=$((CHECKED + 1))
@@ -96,11 +132,14 @@ check_deb() {
     tmp=$(mktemp -d)
     # shellcheck disable=SC2064
     trap "rm -rf '$tmp'" RETURN
-    dpkg-deb -x "$deb" "$tmp"
+    if ! dpkg-deb -x "$deb" "$tmp"; then
+        unchecked "$(basename "$deb")" "dpkg-deb could not unpack it"
+        return
+    fi
     # A package legitimately ships executable shell scripts alongside its
     # binaries -- fips-dns-setup and its teardown are two -- so filter to ELF
     # objects rather than treating a script as an unreadable binary. A .deb
-    # with no ELF object at all is still an error: it means the glob or the
+    # with no ELF object at all is still not a pass: it means the glob or the
     # layout moved and this check examined nothing.
     local found=0 f
     while IFS= read -r -d '' f; do
@@ -109,8 +148,7 @@ check_deb() {
         check_binary "$f" "$(basename "$deb"):$(basename "$f")"
     done < <(find "$tmp" -type f -perm -u+x -print0)
     if [ "$found" -eq 0 ]; then
-        echo "  ERROR $(basename "$deb") contains no ELF executables" >&2
-        FAILED=$((FAILED + 1))
+        unchecked "$(basename "$deb")" "contains no ELF executables"
     fi
 }
 
@@ -121,27 +159,53 @@ check_deb() {
 
 echo "=== glibc floor check (declared floor: $FLOOR) ==="
 for arg in "$@"; do
-    [ -e "$arg" ] || { echo "  ERROR $arg does not exist" >&2; FAILED=$((FAILED + 1)); continue; }
+    [ -e "$arg" ] || { unchecked "$arg" "does not exist"; continue; }
     case "$arg" in
         *.deb) check_deb "$arg" ;;
         *)     check_binary "$arg" "$(basename "$arg")" ;;
     esac
 done
 
-# Nothing examined is a failure, not a pass. An argument list that matched no
-# binary means the caller's glob went stale, and reporting that as green is how
-# a guard quietly stops guarding.
-if [ "$CHECKED" -eq 0 ] && [ "$FAILED" -eq 0 ]; then
-    echo "check-glibc-floor: examined no binaries; refusing to report a pass." >&2
-    exit 2
-fi
+# print_unchecked: lists the inputs this run could not examine, if any.
+print_unchecked() {
+    [ "$UNCHECKED" -gt 0 ] || return 0
+    echo "  Not checked:" >&2
+    local entry
+    for entry in "${UNCHECKED_LIST[@]}"; do
+        echo "    $entry" >&2
+    done
+}
 
+# A real floor failure is the stronger signal, so it decides the status even
+# when other inputs went unchecked; those are still listed.
 if [ "$FAILED" -ne 0 ]; then
-    echo "check-glibc-floor: $FAILED problem(s) across $CHECKED binaries." >&2
+    echo "check-glibc-floor: $FAILED binary(ies) above the floor across $CHECKED checked, $UNCHECKED input(s) not checked." >&2
     echo "  A binary above the floor installs cleanly and then fails to start." >&2
     echo "  Build through packaging/debian/build-deb-container.sh, which pins" >&2
     echo "  the build image to the oldest supported distribution." >&2
+    print_unchecked
     exit 1
+fi
+
+# An input that could not be examined is not a pass. This is also where a
+# stale caller glob lands: an unexpanded pattern such as "$UNPACK"/*/fips
+# arrives as a path that does not exist, and reporting that as green is how a
+# guard quietly stops guarding.
+if [ "$UNCHECKED" -ne 0 ]; then
+    if [ "$CHECKED" -eq 0 ]; then
+        echo "check-glibc-floor: could not check $UNCHECKED input(s) and examined no binaries." >&2
+    else
+        echo "check-glibc-floor: could not check $UNCHECKED input(s); nothing was found above the floor in the $CHECKED binaries checked." >&2
+    fi
+    print_unchecked
+    exit 2
+fi
+
+# Backstop: every argument raises CHECKED, FAILED or UNCHECKED, and an empty
+# argument list is refused above, so this is not expected to be reached.
+if [ "$CHECKED" -eq 0 ]; then
+    echo "check-glibc-floor: examined no binaries; refusing to report a pass." >&2
+    exit 2
 fi
 
 echo "=== glibc floor check passed ($CHECKED binaries, all at or below $FLOOR) ==="

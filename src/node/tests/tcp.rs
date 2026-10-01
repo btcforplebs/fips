@@ -12,7 +12,8 @@ use crate::transport::{
     ConnectionState, TransportAddr, TransportHandle, TransportId, packet_channel,
 };
 use spanning_tree::{
-    TestNode, cleanup_nodes, drain_all_packets, initiate_handshake, verify_tree_convergence,
+    TestNode, cleanup_nodes, drain_all_packets, initiate_handshake, process_available_packets,
+    verify_tree_convergence,
 };
 use std::time::Duration;
 
@@ -29,6 +30,13 @@ async fn make_test_node_tcp() -> TestNode {
 /// so immutable fields (e.g. heartbeat/link-dead timeouts) are set before the
 /// `NodeContext` is built rather than poked afterward.
 async fn make_test_node_tcp_with(config: Config) -> TestNode {
+    make_test_node_tcp_idle(config, None).await
+}
+
+/// Like `make_test_node_tcp_with`, and also sets the transport's inbound
+/// idle deadline when `idle` is given, as `create_transports` does for a
+/// node built from config.
+async fn make_test_node_tcp_idle(config: Config, idle: Option<Duration>) -> TestNode {
     let mut node = make_node_with(config);
     let transport_id = TransportId::new(1);
 
@@ -40,6 +48,9 @@ async fn make_test_node_tcp_with(config: Config) -> TestNode {
 
     let (packet_tx, packet_rx) = packet_channel(256);
     let mut transport = TcpTransport::new(transport_id, None, config, packet_tx);
+    if let Some(d) = idle {
+        transport.set_inbound_idle_timeout(d);
+    }
     transport.start_async().await.unwrap();
 
     let local_addr = transport
@@ -213,6 +224,82 @@ async fn test_tcp_connection_loss_detection() {
     assert!(
         nodes[0].node.get_peer(&addr_1).is_none(),
         "node 0 should have removed dead peer node 1"
+    );
+
+    cleanup_nodes(&mut nodes).await;
+}
+
+/// A TCP link whose only traffic is heartbeats outlives several inbound idle
+/// deadlines when the deadline is the one the node derives from its own
+/// liveness timers.
+///
+/// This is the healthy-path check for the idle deadline: it uses the real
+/// derivation (`inbound_idle_timeout`), not a hand-picked value, and
+/// short timers so three deadlines fit in a test. Break-check: give the
+/// listening node's transport an idle deadline below the heartbeat interval
+/// and its inbound connection is dropped, so the inbound count falls to 0.
+#[tokio::test]
+async fn tcp_link_kept_alive_only_by_heartbeats_survives_several_idle_deadlines() {
+    use crate::node::handlers::rekey::inbound_idle_timeout;
+
+    let mut config = Config::new();
+    config.node.heartbeat_interval_secs = 1;
+    config.node.link_dead_timeout_secs = 3;
+    config.node.rate_limit.handshake_resend_interval_ms = 100;
+    config.node.rate_limit.handshake_max_resends = 1;
+    let idle = inbound_idle_timeout(&config.node);
+    // 100 ms of ladder, three 1 s ticks, 3 s link-dead.
+    assert_eq!(idle, Duration::from_millis(6100));
+    let mut nodes = vec![
+        make_test_node_tcp_idle(config.clone(), Some(idle)).await,
+        make_test_node_tcp_idle(config, Some(idle)).await,
+    ];
+
+    // Node 0 dials node 1, so node 1 holds the inbound connection.
+    initiate_handshake(&mut nodes, 0, 1).await;
+    assert!(drain_all_packets(&mut nodes, false).await > 0);
+
+    let addr_0 = *nodes[0].node.node_addr();
+    let addr_1 = *nodes[1].node.node_addr();
+    let inbound = |nodes: &[TestNode]| match nodes[1].node.transports.get(&nodes[1].transport_id) {
+        Some(TransportHandle::Tcp(t)) => t.stats().pool_inbound_count(),
+        _ => panic!("node 1 should have its TCP transport"),
+    };
+    assert_eq!(
+        inbound(&nodes),
+        1,
+        "node 1 should hold one inbound connection"
+    );
+
+    // Heartbeats only, for three idle deadlines and a little more.
+    let start = tokio::time::Instant::now();
+    let mut processed = 0;
+    while start.elapsed() < idle * 3 + Duration::from_millis(500) {
+        nodes[0].node.check_link_heartbeats().await;
+        nodes[1].node.check_link_heartbeats().await;
+        processed += process_available_packets(&mut nodes).await;
+        assert_eq!(
+            inbound(&nodes),
+            1,
+            "the inbound connection was dropped after {:?} of heartbeat-only traffic",
+            start.elapsed()
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    // Sibling control: heartbeats were actually exchanged, so the kept
+    // connection is not an artefact of nothing having run.
+    assert!(
+        processed >= 18,
+        "expected at least one heartbeat per second each way, processed {processed}"
+    );
+    assert!(
+        nodes[0].node.get_peer(&addr_1).is_some(),
+        "node 0 lost node 1"
+    );
+    assert!(
+        nodes[1].node.get_peer(&addr_0).is_some(),
+        "node 1 lost node 0"
     );
 
     cleanup_nodes(&mut nodes).await;

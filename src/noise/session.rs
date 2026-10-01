@@ -7,6 +7,14 @@ use std::fmt;
 /// Provides bidirectional authenticated encryption with replay protection.
 /// The send counter is monotonically incremented; received counters are
 /// validated against a sliding window to prevent replay attacks.
+///
+/// The two traffic keys are cleared when their `CipherState`s are dropped,
+/// which clears only the copy being dropped. A session is moved out of
+/// `HandshakeState::into_session` and into a connection's session slot, and
+/// every move leaves both keys where the value used to be. Taking it out of
+/// that slot through `take_cleared`, as the machine's `take_session` does,
+/// clears the slot; a plain `take()`, or a move of the whole connection
+/// state out of its machine, leaves both keys there.
 pub struct NoiseSession {
     /// Our role in the original handshake.
     role: HandshakeRole,

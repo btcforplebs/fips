@@ -695,12 +695,20 @@ check_backlog_is_not_the_clients_bound() {
 }
 
 check_refusing_a_flow_frees_it() {
-    log "Refusing an accepted flow is closing its descriptor, and that frees it"
+    log "Refusing an accepted flow is closing its descriptor, and its listener's close frees it"
     # There is no reject command: Berkeley has exactly one way to refuse a
     # connection and so does this. Keeping a second would let a client refuse a
     # flow two indistinguishable ways.
     #
-    # Two things have to follow the close, and the second is what makes this
+    # The daemon keeps its own copy of an accepted flow's descriptor until the
+    # client writes on the flow or closes the listener, because on macOS the
+    # kernel can destroy a socket whose descriptor is still in an unread
+    # arrival. So a flow refused without a write outlives its close, and goes
+    # when the listener does. Both halves are asserted: a flow freed at the
+    # close would mean the daemon let its copy go early, and one that outlived
+    # the listener would be a leak.
+    #
+    # Two things have to follow the release, and the second is what makes this
     # more than a repeat of the connected-flow close: the node forgets the flow,
     # and the registry entry and its key go with it, so the very same key
     # announces a new flow afterwards rather than delivering into the dead one.
@@ -713,16 +721,22 @@ check_refusing_a_flow_frees_it() {
       {"command":"stats","params":{"flow_id":"@a"},"expect":{"status":"ok"}},
       {"fd":"a","close":true},
       {"sleep":1},
-      {"command":"stats","params":{"flow_id":"@a"},"expect":{"status":"error"}},
+      {"command":"stats","params":{"flow_id":"@a"},
+       "expect":{"status":"ok","data.closed":false}},
+      {"fd":"L","close":true},
+      {"command":"stats","params":{"flow_id":"@a"},"settle":true,
+       "expect":{"status":"error"}},
+      {"command":"listen","params":{"local_port":4304},"keep_listener":"M",
+       "expect":{"status":"ok"}},
       {"command":"arrive","params":{"peer":"'"$PEER"'","src_port":5000,"dst_port":4304,"data":"bb"},
        "expect":{"status":"ok","data.outcome":"announced"}},
-      {"accept":"L","keep_fd":"b","expect":{"local_port":4304,"remote_port":5000}},
+      {"accept":"M","keep_fd":"b","expect":{"local_port":4304,"remote_port":5000}},
       {"fd":"b","read":1,"expect_bytes":"bb"}
     ]'
     if run_client "$script"; then
-        pass "a refused flow is gone and its key is free to arrive again"
+        pass "a refused flow lasts until its listener closes, then is gone and its key is free to arrive again"
     else
-        fail "closing a refused flow did not release it"
+        fail "a refused flow did not last until its listener closed, or was not released then"
     fi
 }
 

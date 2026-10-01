@@ -15,7 +15,8 @@
 #
 # This is the most thorough test surface — it exercises:
 #   - cargo deb packaging (binary stripping, dependency declaration)
-#   - dpkg conffile placement (/etc/fips/fips.yaml)
+#   - dpkg conffile placement (/etc/fips/fips.nft) and postinst seeding
+#     of /etc/fips/fips.yaml
 #   - postinst maintainer scripts (systemd unit enablement,
 #     fips-dns.service running fips-dns-setup)
 #   - postrm purge (removing the DNS routing fips-dns-setup wrote)
@@ -141,8 +142,6 @@ wait_for_systemd() {
     return 1
 }
 
-# Start a unit without waiting for its start job to finish.
-#
 # Start a unit and wait for its start job, under a bound.
 #
 # Blocking is the right default and the call returning is what synchronises the
@@ -194,8 +193,9 @@ container_systemd_version() {
 }
 
 # ─────────────────────────────────────────────────────────────────────
-# Build the .deb once in a Debian 12 cargo-deb builder image (cached
-# between runs). Output cached at testing/deb-install/.cache/deb/.
+# Build the .deb once through packaging/debian/build-deb-container.sh,
+# whose image is set in packaging/build-floor.env (cached between
+# runs). Output cached at testing/deb-install/.cache/deb/.
 # Rebuilt if any source/Cargo/packaging file is newer than the cached
 # .deb, or if the .deb is missing.
 # ─────────────────────────────────────────────────────────────────────
@@ -542,9 +542,9 @@ DOCKERFILE
         fail "/usr/bin/fips-gateway missing"
     fi
     if docker exec "$name" test -f /etc/fips/fips.yaml; then
-        pass "/etc/fips/fips.yaml conffile installed"
+        pass "/etc/fips/fips.yaml seeded by postinst"
     else
-        fail "/etc/fips/fips.yaml conffile missing"
+        fail "/etc/fips/fips.yaml missing"
     fi
 
     # Verify fips.service is enabled (postinst enables but does not
@@ -670,7 +670,7 @@ DOCKERFILE
     fi
 
     # Get the daemon's npub via fipsctl. Works for both ephemeral
-    # and persistent identity (no need to override the conffile).
+    # and persistent identity (no need to override /etc/fips/fips.yaml).
     local npub
     npub=$(docker exec "$name" fipsctl show status 2>/dev/null \
         | grep -oE 'npub1[a-z0-9]+' | head -1)

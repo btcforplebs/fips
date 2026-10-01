@@ -195,7 +195,10 @@ That is what lets the blanket reference implementation cover `&str` and
 
 One datagram flow, and the descriptor it rides on. A flow is an exact match of
 both ends and both ports. **The descriptor is the flow**: it lives while a
-process holds that descriptor and ends when the last one closes it.
+process holds that descriptor and ends when the last one closes it. The one
+exception is an accepted flow that has never been sent on: the daemon keeps
+its own copy of that descriptor until the first `send` or until the listener
+is dropped. See `accept` below.
 
 `Send + Sync + 'static`, with no `Arc` and no borrow. There is **no `Clone` and
 no `try_clone`**. Because `send` and `recv` both take `&self`, a shared borrow
@@ -340,6 +343,15 @@ no other way to refuse one. An unparseable arrival is therefore reported only
 after the descriptor it carried has been taken into ownership, so a parse
 failure refuses the flow rather than leaking it.
 
+**A refused flow stays open until its listener is dropped**, unless the
+program sent on it first. Until the first `send` on an accepted flow, the
+daemon keeps its own copy of the flow's descriptor, because on macOS the
+kernel can otherwise destroy a socket whose descriptor is still in an unread
+arrival. That copy goes at the first `send`, when the listener is dropped, or
+when the flow ends any other way, and the flow then ends with the program's
+own close. Until then a dropped flow holds its port and its slot against
+`max_flows`.
+
 **`incoming()`** returns an `Incoming<'_>`, which borrows the listener for the
 iterator's lifetime, so the listener cannot be moved or dropped mid-iteration.
 
@@ -360,7 +372,8 @@ none either. A bounded accept is `set_nonblocking` plus a wait of the caller's
 own on the descriptor.
 
 **Dropping** closes the descriptor and unbinds the port. Flows already accepted
-from it are untouched; flows still pending on it go with it.
+from it and still held are untouched; flows still pending on it go with it, and
+so do flows accepted from it and dropped without ever being sent on.
 
 ### Incoming
 
@@ -613,6 +626,20 @@ own half non-blocking and leaves the client's half blocking. `SOCK_SEQPACKET`
 is what preserves message boundaries in both directions, which is why the
 payload needs no framing.
 
+**The daemon keeps a copy of the client's half after sending it.** While a
+descriptor sits unread in a message, the message can be its only reference,
+and the macOS kernel's descriptor collector destroys a socket in that state:
+the client then receives a flow that reads as end of file with its datagrams
+gone. So the daemon keeps its copy until one of these:
+
+- For a `connect` or `listen` reply, at the client's next command on the same
+  connection, or when that connection closes.
+- For an arrival on a listener, at the client's first write on the flow, when
+  the listener closes, or when the flow ends any other way.
+
+A flow or listener the client closes before then ends when the daemon's copy
+goes, not at the client's close.
+
 A refused `connect` leaves the port free: the socket pair is built before the
 port is claimed, so a failure to build it needs no rollback.
 
@@ -626,7 +653,11 @@ returning.
 
 **The connection owns nothing.** Closing it releases no flow and no listener,
 and a descriptor kept across the close keeps working. What owns the flow is the
-descriptor.
+descriptor. The connection does delay one thing: a descriptor from its last
+reply that the client closes while the connection is still open, with no
+further command sent, stays open until the next command or the connection's
+close (see Passing the descriptor). The shipped client closes the connection
+as soon as it has the reply, so it never meets this.
 
 ## Command reference
 

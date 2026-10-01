@@ -13,6 +13,7 @@ mod bloom_poison;
 mod bootstrap;
 mod connected_udp;
 mod control;
+mod coord_forgery;
 mod decrypt_failure;
 mod disconnect;
 mod discovery;
