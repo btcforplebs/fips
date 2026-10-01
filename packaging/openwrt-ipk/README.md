@@ -17,7 +17,7 @@ OpenWrt 22.03+ router via the standard `opkg` package system.
 | `/etc/init.d/fips-gateway` | procd service for the gateway (disabled by default) |
 | `/etc/fips/fips.yaml` | Node configuration (edit before first start) |
 | `/etc/fips/firewall.sh` | Firewall helper — accepts traffic on `fips0` |
-| `/etc/sysctl.d/fips-bridge.conf` | `br_netfilter` settings for Ethernet transport |
+| `/etc/sysctl.d/fips-bridge.conf` | Turns off `br_netfilter`'s firewall call hooks |
 | `/etc/sysctl.d/fips-gateway.conf` | `proxy_ndp` and IPv6 forwarding for the gateway |
 | `/etc/hotplug.d/net/99-fips` | Applies firewall rules when `fips0` comes up |
 | `/etc/uci-defaults/90-fips-setup` | First-boot kernel module, firewall and dnsmasq `.fips` forwarding setup |
@@ -38,7 +38,7 @@ OpenWrt 22.03+ router via the standard `opkg` package system.
 | Requirement | Notes |
 |---|---|
 | `kmod-tun` | Required for `fips0` TUN interface |
-| `kmod-br-netfilter` | Required for Ethernet transport on bridge member ports |
+| `kmod-br-netfilter` | Loaded, hooks off (`fips-bridge.conf`); see notes below |
 
 Both kernel modules are listed as package dependencies (`DEPENDS`) and will be
 installed automatically by `opkg`.
@@ -141,11 +141,23 @@ The default config enables:
 - Ethernet transport, including the `wan`, `wwan` and `lan` entries
 
 For Ethernet transport, edit the interface names in the `ethernet:` section to
-match your router. **Always use physical port names
-(`eth0`, `eth1`, or DSA port names like `wan`/`lan1`), never bridge names
-(`br-lan`).** The shipped default WAN port is `eth0` (OpenWrt 24); on OpenWrt
-25 (DSA) boards the WAN port is named `wan` — the `.apk` package ships that
-default. Run `ip link show` to confirm the names on your board.
+match your router. **For the LAN, bind the LAN bridge (`br-lan`), never one of
+its member ports** (on DSA boards `lan1`..`lanN`; on others whichever `ethN` the
+bridge holds; `bridge link` lists them). A socket on a bridge member port sends
+frames but never forms a link, because the bridge takes the frames that arrive
+on its members; loading `br_netfilter` does not change that.
+A lab test with a two-member Linux bridge found this with `br_netfilter`
+unloaded, loaded with its call hooks off, and loaded with them on, while a
+socket on `br-lan` worked both with `br_netfilter` unloaded and with it loaded
+as shipped. Ports outside any bridge bind by their own name. The shipped
+default WAN port is `eth0` (OpenWrt 24); on OpenWrt 25 (DSA) boards the WAN
+port is named `wan`, and the `.apk` package ships that default. Run
+`ip link show` to confirm the names on your board.
+
+The lab used software bridges only. A DSA switch with hardware bridge offload
+has not been checked, so confirm the LAN entry forms links on such a router.
+`kmod-br-netfilter`, `fips-bridge.conf` and the module load in `90-fips-setup`
+are kept until their removal has been checked on a router.
 
 ## Service management
 

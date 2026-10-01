@@ -90,8 +90,14 @@ transports:
     bind_addr: "0.0.0.0:8443"
     # advertise_on_nostr: true
 
-  # Ethernet transport — physical port names, NOT bridge names.
-  # Run 'ip link show' on the router to identify port names.
+  # Ethernet transport. Each entry names one interface; run 'ip link show'
+  # on the router to see the names. For the LAN, bind the LAN bridge
+  # (br-lan), never one of its member ports: a socket on a bridge member
+  # port sends frames but never forms a link, because the bridge takes the
+  # frames that arrive on its members, whether or not br_netfilter is
+  # loaded. Ports outside any bridge (the WAN port, phy0-sta0) bind by
+  # their own name. A DSA switch with hardware bridge offload has not been
+  # checked and needs a check on the router.
   ethernet:
     wan:
       interface: "eth0"
