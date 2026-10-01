@@ -1465,9 +1465,6 @@ print_summary() {
     echo ""
 }
 
-# Verify the local default suite set and the GitHub matrix still cover the
-# same work. Runs first: it takes about a second, and a divergence should be
-# reported before a half-hour suite rather than after it.
 # The OpenWrt maintainer scripts and the fips-gateway init script ship to
 # routers and run there under ash, never under bash. This runs them under ash
 # in a busybox container against stubbed init scripts, so an install, an
@@ -1493,6 +1490,9 @@ run_tarball_install() {
     return $rc
 }
 
+# Verify the local default suite set and the GitHub matrix still cover the
+# same work. Runs first: it takes about a second, and a divergence should be
+# reported before a half-hour suite rather than after it.
 run_ci_parity() {
     local rc=0
     info "[ci-parity] Comparing the local suite set against the GitHub matrix"

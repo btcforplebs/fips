@@ -4,11 +4,12 @@
 # Each scenario takes the .deb from --deb, or builds (or reuses) it
 # through packaging/debian/build-deb-container.sh, boots a systemd
 # container with TUN access for the target distro, installs the .deb
-# via `apt install ./fips_*.deb`, waits for fips.service + fips-dns.service
-# to come up, and verifies that `dig @127.0.0.53 AAAA <npub>.fips`
-# returns a non-empty AAAA answer through the resolver backend that
-# fips-dns-setup configured. Then exercises fips-gateway against the
-# same daemon to verify the gateway/daemon default-pairing. Finally it
+# via `apt-get install -y --no-install-recommends ./fips_*.deb`, waits
+# for fips.service + fips-dns.service to come up, and verifies that
+# `dig @127.0.0.53 AAAA <npub>.fips` returns a non-empty AAAA answer
+# through the resolver backend that fips-dns-setup configured. Then
+# exercises fips-gateway against the same daemon to verify the
+# gateway/daemon default-pairing. Finally it
 # purges the package with the DNS routing file planted and fips-dns
 # stopped, and checks the file is removed and systemd-resolved restarted.
 #
@@ -21,9 +22,10 @@
 #   - The fips, fips-dns, and (optionally) fips-gateway systemd units
 #   - End-to-end .fips resolution as a real user would experience it
 #
-# Usage: ./test.sh [scenario ...]
+# Usage: ./test.sh [--deb PATH] [scenario ...]
 #   No args = run all scenarios.
 #   Named args = run only those (e.g., ./test.sh ubuntu26 debian12)
+#   --deb PATH = install that package instead of building one.
 #
 # Requirements: Docker able to grant SYS_ADMIN and NET_ADMIN and an
 # unconfined AppArmor profile (the containers are not privileged; see

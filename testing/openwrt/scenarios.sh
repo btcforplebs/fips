@@ -28,8 +28,9 @@ RELEASED_PRERM="$REPO/testing/openwrt/fixtures/released-prerm"
 INIT_GATEWAY="$REPO/packaging/openwrt-ipk/files/etc/init.d/fips-gateway"
 APK_SCRIPTS="${APK_SCRIPTS:-}"
 SHIPPED_YAML="$REPO/packaging/openwrt-ipk/files/etc/fips/fips.yaml"
-# The fips.yaml every release up to 0.5.1 shipped, from before the gateway's
-# default DNS port moved.
+# The fips.yaml v0.5.0 and v0.5.1 shipped, byte for byte (from the v0.5.1 tag),
+# from before the gateway's default DNS port moved. v0.3.0 to v0.4.2 shipped an
+# older file with the same legacy listen line.
 RELEASED_YAML="$REPO/testing/openwrt/fixtures/released-fips.yaml"
 GATEWAY_RS="$REPO/src/config/gateway.rs"
 SETUP_SCRIPT="$REPO/packaging/openwrt-ipk/files/etc/uci-defaults/90-fips-setup"

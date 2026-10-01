@@ -26,11 +26,18 @@
 # drops it. The equality rule is what keeps that hand-written floor honest: if
 # the toolchain stops needing it, or starts needing a newer one, this fails.
 #
+# It also compares the package's Recommends with the recommends Cargo.toml's
+# [package.metadata.deb] declares, entry for entry and in any order. Nothing
+# else in the tree reads that field (deb-install installs with
+# --no-install-recommends), so without this a packaging change that dropped or
+# altered it would ship unnoticed.
+#
 # Run it inside the build image (build-deb-container.sh does), so the symbols
 # files and the C library it reads are the ones cargo-deb read. On a host of a
 # different distribution a difference could come from the host instead.
 #
 # Usage: check-deb-depends.sh <package.deb>...
+# Cargo.toml is read from the checkout this script sits in.
 # Exit: 0 every package matches, 1 a mismatch, 2 could not establish a result.
 
 set -euo pipefail
@@ -48,6 +55,32 @@ done
     exit 2
 }
 
+CARGO_TOML="$(cd "$(dirname "$0")/.." && pwd)/Cargo.toml"
+
+# The recommends value of Cargo.toml's [package.metadata.deb], or empty when
+# the section declares none. Fails when the file or the section cannot be read,
+# or the key is not a one-line string, so an unreadable declaration is never
+# compared as an empty one.
+declared_recommends() {
+    awk '
+        /^\[/ { insec = ($0 == "[package.metadata.deb]"); if (insec) found = 1; next }
+        insec && /^recommends[[:space:]]*=/ {
+            if (match($0, /^recommends[[:space:]]*=[[:space:]]*"[^"]*"[[:space:]]*$/)) {
+                sub(/^recommends[[:space:]]*=[[:space:]]*"/, ""); sub(/"[[:space:]]*$/, "")
+                print; done = 1; exit 0
+            }
+            bad = 1; exit 0
+        }
+        END { if (!found || bad) exit 1 }
+    ' "$CARGO_TOML"
+}
+
+if ! DECLARED_RECOMMENDS=$(declared_recommends 2>/dev/null); then
+    echo "check-deb-depends: cannot read a one-line recommends from [package.metadata.deb] in $CARGO_TOML." >&2
+    echo "                   Refusing to report a pass I did not establish." >&2
+    exit 2
+fi
+
 FAILED=0
 UNKNOWN=0
 CHECKED=0
@@ -59,6 +92,7 @@ SIMPLE_RE='^([a-z0-9][a-z0-9+.-]*)( \(>= ([^)]+)\))?$'
 # Split a Depends value on commas into one trimmed entry per line.
 split_deps() {
     printf '%s\n' "$1" | tr ',' '\n' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | sed '/^$/d'
+    return 0
 }
 
 check_deb() {
@@ -178,11 +212,22 @@ check_deb() {
         echo "    hand-declared $e"
     done < <(split_deps "$shipped")
 
+    # Recommends: the same entries as Cargo.toml declares, order aside.
+    local recommends want got
+    recommends=$(dpkg-deb -f "$deb" Recommends)
+    echo "    recommends shipped: ${recommends:-(none)}; declared: ${DECLARED_RECOMMENDS:-(none)}"
+    want=$(split_deps "$DECLARED_RECOMMENDS" | sort)
+    got=$(split_deps "$recommends" | sort)
+    if [ "$want" != "$got" ]; then
+        echo "  FAIL $label: Recommends '${recommends}' differs from Cargo.toml's recommends '${DECLARED_RECOMMENDS}'" >&2
+        bad=1
+    fi
+
     CHECKED=$((CHECKED + 1))
     [ "$bad" -eq 0 ] || FAILED=$((FAILED + 1))
 }
 
-echo "=== Depends check (shipped Depends against dpkg-shlibdeps) ==="
+echo "=== Depends check (shipped Depends against dpkg-shlibdeps, Recommends against Cargo.toml) ==="
 for arg in "$@"; do
     if [ ! -f "$arg" ]; then
         echo "  ERROR $arg does not exist" >&2
@@ -193,9 +238,11 @@ for arg in "$@"; do
 done
 
 if [ "$FAILED" -ne 0 ]; then
-    echo "check-deb-depends: $FAILED of $CHECKED package(s) declare Depends that differ from what their binaries need." >&2
-    echo "  A missing or low entry installs where the binaries cannot run; a high one" >&2
+    echo "check-deb-depends: $FAILED of $CHECKED package(s) declare Depends that differ from what their binaries need," >&2
+    echo "  or Recommends that differ from what Cargo.toml declares." >&2
+    echo "  A missing or low Depends entry installs where the binaries cannot run; a high one" >&2
     echo "  is a hand-written floor that no longer tracks them. Fix Cargo.toml's depends." >&2
+    echo "  A Recommends difference means the packaging did not carry Cargo.toml's recommends." >&2
     exit 1
 fi
 
