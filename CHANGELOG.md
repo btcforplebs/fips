@@ -17,6 +17,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the release. The tarball, artifact and `.deb` file names keep the tag's
   `-rcN`.
 
+#### Windows
+
+- `install-service.ps1` stops when `\etc\fips\fips.key` exists on the system
+  drive and `C:\ProgramData\fips\fips.key` does not. A service that an
+  earlier release ran from `\etc\fips` reads only `C:\ProgramData\fips`
+  after the installer runs, and came up with a new identity with no warning.
+  Move the key and the settings it needs into `C:\ProgramData\fips`, or
+  delete it if you did not put it there, then run the installer again.
+- The daemon warns when `fips.yaml` or `fips.key` in `\etc\fips` is present
+  but not used by the run, since a node that ran from them before an upgrade
+  now runs on another config or identity.
+
 ### Deprecated
 
 #### Sessions and rekey
@@ -24,6 +36,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Setting `node.rekey.enabled: false`. The disabled path is less tested and is
   not supported, and the option is removed in v2. It still works as before;
   the configuration reference and the mesh-layer design now say so.
+
+#### Windows
+
+- The config search's probe of `\etc\fips\fips.yaml` on the current drive.
+  The search still reads that file first and merges it under
+  `C:\ProgramData\fips\fips.yaml`, but any local user can create it, so the
+  daemon now warns when it loads a config from there, and from v0.6.0 the
+  search no longer looks there. Move the settings you need into
+  `C:\ProgramData\fips\fips.yaml`.
 
 ### Fixed
 
@@ -49,6 +70,81 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   leaked one descriptor each time.
 - TCP connections try the remaining addresses for a hostname after a
   connection fails, within the existing overall connection timeout.
+
+#### OpenWrt
+
+- dnsmasq forwards `.fips` to fips-gateway only while the gateway is
+  listening, and back to the daemon's resolver whenever the gateway exits. A
+  gateway that failed to start, on a config it could not parse or on an error
+  after binding its DNS port, left every LAN client's `.fips` lookups going to
+  a port nothing held until the gateway was started by hand.
+- A package built from the OpenWrt SDK feed `Makefile` carries the released
+  packages' maintainer scripts. It installs with fips-gateway disabled and
+  stopped, keeps the gateway's state across an upgrade, and keeps an edited
+  `/etc/fips/fips.yaml`. The SDK's package scan also no longer stops on the
+  `Makefile`'s architecture check, which had kept the package out of the build.
+
+#### Sessions and rekey
+
+- A link rekey whose msg2 is lost now completes on the initiator's next msg1
+  resend. The responder refused every resend while it held the session it had
+  answered with, so the initiator abandoned its cycles and the link went
+  without rekeying until the responder's 120 s hold retired that session. The
+  responder now keeps the msg2 it sent and answers a resend of the same msg1
+  with it, on the peer's established address only; any other msg1 is still
+  refused while the session is held. The wire format is unchanged.
+- Link quality estimates no longer freeze after a link rekey. Frames the peer
+  sent on the old session just before it switched were counted into the new
+  session's MMP state, so one node's loss estimate, or the other's SRTT and
+  loss estimate, could stay fixed for most of a rekey interval, and link cost
+  and parent selection used the stale values. Those frames are still
+  delivered, but no longer feed MMP, and a ReceiverReport they carry is
+  dropped. They also no longer hold the link alive: after a rekey the
+  link-dead timer runs from the switch until a frame on the new session
+  arrives.
+- A forged FSP SessionMsg3 or SessionSetup can no longer split a session's
+  key epochs during a rekey. Either one, delivered under the peer's address
+  after the peer had read this node's SessionAck, discarded the handshake the
+  peer's genuine msg3 needed; the peer then cut over to keys this node never
+  derived, and frames from it stopped decoding until a later rekey. An
+  unreadable msg3 now leaves the handshake in place, and a setup arriving
+  while a handshake the peer armed awaits its msg3 is dropped and counted as
+  `rekey_held`. A genuine retry that meets such a handshake completes one
+  handshake timeout later.
+- An unreadable SessionMsg3 no longer discards the half-open session of an
+  initial handshake, which left the initiator's genuine msg3 to an unknown
+  session.
+
+#### Windows
+
+- The ZIP's `README.txt` lists `\etc\fips\fips.yaml` as the first file a
+  foreground run reads, which it omitted, and says to stop the service before
+  rerunning `install-service.ps1` to upgrade: with the service running, the
+  installer fails copying `fips.exe`.
+
+### Security
+
+#### Sessions and rekey
+
+- A copy of a peer's link rekey msg1 can no longer stop link key rotation. A
+  msg1 carries nothing that ties it to one rekey, so one captured off the
+  network and replayed after its rekey had completed was taken as a new
+  request: the node held a session nobody could adopt, refused the peer's
+  genuine rekeys and skipped its own until the 120 s hold expired, and one
+  replay per hold kept rotation stopped. The node now remembers the msg1s of
+  the last 256 rekeys it answered for each peer and refuses a copy of one. A
+  msg1 from an older rekey, or one captured before the peering last formed
+  while the peer kept running, is not recognized; closing that needs a wire
+  change.
+- A msg1 from an established peer is answered at the peer's established
+  address, not at the address it came from. This covers the rekey msg2 and
+  the link setup msg2 resent for a duplicate msg1 in the 30 s after a link is
+  formed or rekeyed. Anyone holding a copy of a peer's msg1 could have the
+  node send a msg2 to an address of their choosing. A peer whose address
+  changed is answered at the old one until its next frame from the new
+  address arrives. A msg1 from a node this one holds no link with, or one
+  that carries a different startup epoch, still starts a new link and is
+  answered at its source, as any new connection is.
 
 ## [0.5.2] - 2026-09-28
 
