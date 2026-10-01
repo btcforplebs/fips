@@ -11,7 +11,7 @@
 //! The remaining families (session, handshake, mmp, transport) stay on
 //! `NodeStats`.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use portable_atomic::{AtomicU64, Ordering};
 
 use crate::cache::HintOutcome;
 use crate::node::reject::{BloomReject, DiscoveryReject, ForwardingReject, TreeReject};

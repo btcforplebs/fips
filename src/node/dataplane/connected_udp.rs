@@ -34,7 +34,7 @@ use crate::node::Node;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::transport::TransportHandle;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use portable_atomic::{AtomicU64, Ordering::Relaxed};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use tracing::{debug, warn};
 

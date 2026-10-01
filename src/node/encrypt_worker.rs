@@ -513,8 +513,7 @@ impl EncryptWorkerPool {
         match self.senders[idx].try_push(job) {
             Ok(()) => {}
             Err(MacWorkerTryPushError::Full(job)) => {
-                static FULL_COUNT: std::sync::atomic::AtomicU64 =
-                    std::sync::atomic::AtomicU64::new(0);
+                static FULL_COUNT: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
                 let n = FULL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if n < 8 || n.is_multiple_of(10000) {
                     warn!(
@@ -538,8 +537,7 @@ impl EncryptWorkerPool {
         match self.senders[idx].try_send(job) {
             Ok(()) => {}
             Err(TrySendError::Full(job)) => {
-                static FULL_COUNT: std::sync::atomic::AtomicU64 =
-                    std::sync::atomic::AtomicU64::new(0);
+                static FULL_COUNT: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
                 let n = FULL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if n < 8 || n.is_multiple_of(10000) {
                     warn!(
@@ -571,7 +569,7 @@ struct MacSendFlowKey {
 #[derive(Default)]
 struct MacSequencedSendFlows {
     flows: Mutex<HashMap<MacSendFlowKey, Arc<MacSequencedSendFlow>>>,
-    last_prune_ms: std::sync::atomic::AtomicU64,
+    last_prune_ms: portable_atomic::AtomicU64,
 }
 
 #[cfg(target_os = "macos")]
@@ -719,8 +717,8 @@ struct MacSequencedSendFlow {
     socket: AsyncUdpSocket,
     connected_socket: Option<std::sync::Arc<crate::transport::udp::ConnectedPeerSocket>>,
     dest_addr: SocketAddr,
-    next_seq: std::sync::atomic::AtomicU64,
-    last_used_ms: std::sync::atomic::AtomicU64,
+    next_seq: portable_atomic::AtomicU64,
+    last_used_ms: portable_atomic::AtomicU64,
     state: Mutex<MacSendFlowState>,
     ready_cv: Condvar,
     space_cv: Condvar,
@@ -763,8 +761,8 @@ impl MacSequencedSendFlow {
             socket,
             connected_socket,
             dest_addr,
-            next_seq: std::sync::atomic::AtomicU64::new(0),
-            last_used_ms: std::sync::atomic::AtomicU64::new(now_ms),
+            next_seq: portable_atomic::AtomicU64::new(0),
+            last_used_ms: portable_atomic::AtomicU64::new(now_ms),
             state: Mutex::new(MacSendFlowState::default()),
             ready_cv: Condvar::new(),
             space_cv: Condvar::new(),
@@ -1386,8 +1384,8 @@ impl SendBackpressurePacer {
             return false;
         }
 
-        static SEND_BACKPRESSURE_COUNT: std::sync::atomic::AtomicU64 =
-            std::sync::atomic::AtomicU64::new(0);
+        static SEND_BACKPRESSURE_COUNT: portable_atomic::AtomicU64 =
+            portable_atomic::AtomicU64::new(0);
         let n = SEND_BACKPRESSURE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if n < 8 || n.is_multiple_of(100_000) {
             warn!(
@@ -1493,8 +1491,8 @@ fn default_send_backpressure_drop_after() -> u32 {
 
 #[cfg(all(unix, not(target_os = "linux")))]
 fn record_udp_send_backpressure_drop(err: &std::io::Error) {
-    static SEND_BACKPRESSURE_DROP_COUNT: std::sync::atomic::AtomicU64 =
-        std::sync::atomic::AtomicU64::new(0);
+    static SEND_BACKPRESSURE_DROP_COUNT: portable_atomic::AtomicU64 =
+        portable_atomic::AtomicU64::new(0);
     let n = SEND_BACKPRESSURE_DROP_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if n < 8 || n.is_multiple_of(100_000) {
         warn!(

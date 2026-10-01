@@ -77,6 +77,8 @@ jobs:
         run: bash testing/check-action-pins.sh
       - name: Check every source comment resolves in-repo
         run: bash testing/check-comment-refs.sh
+      - name: Check no non-test code uses std 64-bit atomics
+        run: python3 testing/check-portable-atomics.py
       # Hermetic: synthetic ping functions, no containers, ~45s. Lives beside
       # the other two so both runners gate on it identically — putting it in
       # only one would create exactly the drift check-ci-parity.sh exists to

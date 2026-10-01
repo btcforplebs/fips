@@ -1554,6 +1554,16 @@ run_comment_refs() {
     record "comment-refs" $rc
 }
 
+# No non-test code may use std's 64-bit atomics. They do not exist on 32-bit
+# MIPS, so one such use stops the crate building for the OpenWrt MIPS targets,
+# and no leg builds for MIPS to notice. Static, and it needs nothing built.
+run_portable_atomics() {
+    local rc=0
+    info "[portable-atomics] Checking that no non-test code uses std 64-bit atomics"
+    python3 "$SCRIPT_DIR/check-portable-atomics.py" || rc=$?
+    record "portable-atomics" $rc
+}
+
 # Every daemon log string a test matches on must still be emitted by src/.
 # A stale one does not fail — it stops observing, and an expect-zero assertion
 # built on it then passes for the wrong reason.
@@ -1636,6 +1646,7 @@ main() {
     run_image_scoping
     run_action_pins
     run_comment_refs
+    run_portable_atomics
     run_wait_converge
     run_deb_version
     run_nextest_flaky
