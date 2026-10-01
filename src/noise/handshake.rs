@@ -1098,9 +1098,13 @@ impl Drop for HandshakeState {
     /// where clearing them matters most. `Keypair` is `Copy` and so cannot
     /// clear itself on drop; `HandshakeState` is not, so it does it for both.
     ///
-    /// This clears the copies this crate owns, not every copy that ever
-    /// existed: `secp256k1` names its erase non-secure because the compiler
-    /// may duplicate or move the bytes to places no code here can name.
+    /// This clears the copy being dropped, not every copy that ever existed.
+    /// Each erase is a volatile write, so the optimiser keeps it, but a
+    /// `HandshakeState` is built on the stack and moved several times before
+    /// it is dropped, and every move leaves the old bytes, both private keys
+    /// included, where the value used to be. Taking it out of an `Option`
+    /// with `take()` leaves its full contents in the slot it came from, which
+    /// for a connection's handshake slot is heap memory.
     fn drop(&mut self) {
         self.static_keypair.non_secure_erase();
         if let Some(ephemeral) = self.ephemeral_keypair.as_mut() {

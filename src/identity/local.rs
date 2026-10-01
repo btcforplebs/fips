@@ -16,9 +16,11 @@ use super::{FipsAddress, IdentityError, NodeAddr, sha256};
 /// The keypair is the node's long-term private key. It is erased when the
 /// identity is dropped, and every constructor below erases the intermediate
 /// secret it built the identity from. All of that clears the copies this
-/// crate owns, not every copy that ever existed: `secp256k1` names its erase
-/// non-secure because the compiler may duplicate or move the bytes to places
-/// no code here can name.
+/// crate owns, not every copy that ever existed. Each erase is a volatile
+/// write, so the optimiser keeps it, but it reaches only the place it is
+/// called on: a copy made before it runs is not cleared, and that includes
+/// the bytes a move leaves behind wherever the value used to be, such as
+/// the frame of the constructor that built it.
 #[derive(Clone)]
 pub struct Identity {
     keypair: Keypair,
@@ -149,9 +151,10 @@ impl Drop for Identity {
 /// written at each one, and a missed path is invisible. Holding the copy here
 /// instead makes the clearing structural.
 ///
-/// This clears the copy this guard owns, not every copy that ever existed:
-/// `secp256k1` names its erase non-secure because the compiler may duplicate
-/// or move the bytes to places no code here can name.
+/// This clears the copy this guard owns, not every copy that ever existed.
+/// The erase is a volatile write, so the optimiser keeps it, but it reaches
+/// only the guard's final location: moving the guard, including out of
+/// [`ErasingKeypair::take`], leaves the bytes behind where it used to be.
 pub(crate) struct ErasingKeypair(Keypair);
 
 impl ErasingKeypair {

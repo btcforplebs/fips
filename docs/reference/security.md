@@ -1,9 +1,10 @@
 # Security Reference
 
 Consolidated security reference covering the nftables baseline, peer
-ACL file format, cryptographic primitives, rekey defaults, replay
-window, filesystem permissions, threat-resistance matrix, and default
-network exposures per transport. For the threat-model design and
+ACL file format, cryptographic primitives, key material in memory,
+rekey defaults, replay window, filesystem permissions,
+threat-resistance matrix, and default network exposures per
+transport. For the threat-model design and
 rationale, see [../design/fips-security.md](../design/fips-security.md).
 For the operator activation steps and drop-in recipes, see
 [../how-to/enable-mesh-firewall.md](../how-to/enable-mesh-firewall.md).
@@ -85,6 +86,59 @@ Domain separation and DH binding survive through the chaining key `ck`, which
 `SymmetricState::initialize` (`src/noise/handshake.rs`). The handshake hash
 `h` is maintained at every step and is never fed to the AEAD, so it binds
 nothing.
+
+## Key Material in Memory
+
+The daemon clears the copies of secret material that its own code
+holds once they are no longer needed: the node's long-term private
+key when the identity is dropped, the static and ephemeral keypairs a
+Noise handshake holds, the chaining key and handshake hash, the
+per-message Diffie-Hellman results, the key-derivation outputs and the
+two session keys derived from them, the retained key on each cipher
+state, the bech32 and hex encodings of a secret, and the configuration
+text that carries `node.identity.nsec`. A completed session keeps its
+own copy of the handshake hash and does not clear it, on purpose:
+nothing derives a key from it, and the session hands it out to any
+caller.
+
+Each erase is a volatile write followed by a compiler fence, so the
+optimiser cannot remove it as a dead store. This was checked against
+generated code rather than assumed: in an x86_64 release build (Rust
+1.94.1, `secp256k1` 0.30.0, `zeroize` 1.9.0), every erase in the Noise
+handshake and identity code that is linked into the daemon is present
+as stores in the machine code.
+
+An erase reaches only the place it is called on. What it does not
+reach:
+
+- **Copies left by moves.** Moving a value copies its bytes and leaves
+  the old bytes where they were. A handshake state is built on the
+  stack and moved several times between being created and being
+  dropped. Each of those moves leaves behind, in a stack frame that is
+  no longer in use, a copy of the node's long-term private key and,
+  once the handshake has started, of its ephemeral key and chaining
+  key. When a completed handshake is taken out of the connection slot
+  that held it, the slot keeps the handshake's full contents in heap
+  memory until that memory is reused. The session that comes out of
+  the handshake is left the same way: it is moved out of the handshake
+  and into the connection's session slot, and taking it out of that
+  slot leaves both of its traffic keys behind in heap memory.
+- **Registers and spilled temporaries**, which no code in the daemon
+  can name.
+- **Library state.** The SHA-256 state that hashes each
+  Diffie-Hellman result and the HMAC states inside HKDF are not
+  cleared: `sha2` and `hmac` offer an opt-in `zeroize` feature that
+  clears them on drop, and the daemon does not enable it. The cipher
+  keys cached inside `ring`'s `LessSafeKey` have no clearing route. The
+  daemon cannot clear the internal temporaries of the `libsecp256k1` C
+  library either; the library clears some of its own, such as the
+  nonce and secret scalar used in signing, on a best-effort basis.
+
+Clearing therefore shortens how long secret material stays in memory
+and removes it from the places the daemon's own code keeps it; it does
+not guarantee that a secret is gone from the process. Reading what
+remains requires access to the daemon's memory, or to a core dump or
+swap image of it.
 
 ## Rekey Defaults
 
