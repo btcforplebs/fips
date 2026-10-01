@@ -5,11 +5,32 @@ use crate::noise::NoiseError;
 use crate::proto::fmp::wire::{
     EncryptedHeader, FLAG_CE, FLAG_KEY_EPOCH, FLAG_SP, strip_inner_header,
 };
+use crate::proto::link::LinkMessageType;
 use crate::transport::ReceivedPacket;
 use tracing::{debug, trace, warn};
 
 /// Force-remove a peer after this many consecutive decryption failures.
 const DECRYPT_FAILURE_THRESHOLD: u32 = 20;
+
+/// Which of a peer's link sessions authenticated an inbound frame.
+///
+/// After a rekey cutover the previous session still decrypts during the
+/// drain, so frames the peer sealed before it moved are delivered. They
+/// describe the session the cutover retired, though, and the new session's
+/// MMP state was reset at the cutover: a previous-session frame is not
+/// counted by the MMP receiver or the spin bit, and a ReceiverReport it
+/// carries is not processed. A frame authenticated by a pending session is
+/// promoted to current before it is processed, so it is `Current`.
+///
+/// The link-dead check reads the MMP receiver's last-received time, which the
+/// cutover clears, so previous-session frames no longer hold the link alive:
+/// after a cutover the link-dead timer runs from the cutover until a frame on
+/// the new session arrives. Peer `touch` and link statistics still see them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::node) enum LinkSlot {
+    Current,
+    Previous,
+}
 
 impl Node {
     /// Handle an encrypted frame (phase 0x0).
@@ -137,6 +158,7 @@ impl Node {
                     let sp_flag = header.flags & FLAG_SP != 0;
                     self.process_authentic_fmp_plaintext(
                         &node_addr,
+                        LinkSlot::Current,
                         packet.transport_id,
                         &packet.remote_addr,
                         packet.timestamp_ms,
@@ -195,7 +217,7 @@ impl Node {
 
         // Decrypt: try current session first, then previous (drain fallback)
         let ciphertext = &packet.data[header.ciphertext_offset()..];
-        let plaintext = {
+        let (plaintext, slot) = {
             let peer = self.peers.get_mut(&node_addr).unwrap();
             let session = match peer.noise_session_mut() {
                 Some(s) => s,
@@ -215,7 +237,7 @@ impl Node {
             ) {
                 Ok(p) => {
                     peer.reset_decrypt_failures();
-                    p
+                    (p, LinkSlot::Current)
                 }
                 Err(e) => {
                     // Current session failed — try previous session (drain window)
@@ -227,7 +249,7 @@ impl Node {
                         ) {
                             Ok(p) => {
                                 peer.reset_decrypt_failures();
-                                p
+                                (p, LinkSlot::Previous)
                             }
                             Err(_) => {
                                 self.log_decrypt_failure(&node_addr, &header, &e);
@@ -266,7 +288,9 @@ impl Node {
 
         let mut address_changed = false;
         if let Some(peer) = self.peers.get_mut(&node_addr) {
-            if let Some(mmp) = peer.mmp_mut() {
+            if slot == LinkSlot::Current
+                && let Some(mmp) = peer.mmp_mut()
+            {
                 mmp.receiver.record_recv(
                     header.counter,
                     timestamp,
@@ -299,7 +323,32 @@ impl Node {
         let _ = address_changed;
 
         // Dispatch to link message handler
-        self.dispatch_link_message(&node_addr, link_message, ce_flag)
+        self.dispatch_authentic(&node_addr, slot, link_message, ce_flag)
+            .await;
+    }
+
+    /// Dispatch the link message of an authenticated frame. A ReceiverReport
+    /// on the previous session reports on this node's traffic in the session
+    /// a cutover retired, and is dropped rather than judged against the new
+    /// session's metrics; every other message is dispatched whichever session
+    /// carried it.
+    async fn dispatch_authentic(
+        &mut self,
+        node_addr: &crate::NodeAddr,
+        slot: LinkSlot,
+        link_message: &[u8],
+        ce_flag: bool,
+    ) {
+        if slot == LinkSlot::Previous
+            && link_message.first() == Some(&(LinkMessageType::ReceiverReport as u8))
+        {
+            trace!(
+                peer = %self.peer_display_name(node_addr),
+                "Dropping a ReceiverReport carried on the previous link session"
+            );
+            return;
+        }
+        self.dispatch_link_message(node_addr, link_message, ce_flag)
             .await;
     }
 
@@ -353,6 +402,7 @@ impl Node {
     pub(in crate::node) async fn process_authentic_fmp_plaintext(
         &mut self,
         node_addr: &crate::NodeAddr,
+        slot: LinkSlot,
         transport_id: crate::transport::TransportId,
         remote_addr: &crate::transport::TransportAddr,
         packet_timestamp_ms: u64,
@@ -381,7 +431,9 @@ impl Node {
             peer.link_stats_mut()
                 .record_recv(packet_len, packet_timestamp_ms);
             peer.touch(packet_timestamp_ms);
-            if let Some(mmp) = peer.mmp_mut() {
+            if slot == LinkSlot::Current
+                && let Some(mmp) = peer.mmp_mut()
+            {
                 mmp.receiver
                     .record_recv(fmp_counter, inner_ts, packet_len, ce_flag, now_ms);
                 let _spin_rtt = mmp.spin_bit.rx_observe(sp_flag, fmp_counter, now_ms);
@@ -399,7 +451,7 @@ impl Node {
             let _ = address_changed;
         }
         let link_message = &fmp_plaintext[INNER_TIMESTAMP_LEN..];
-        self.dispatch_link_message(node_addr, link_message, ce_flag)
+        self.dispatch_authentic(node_addr, slot, link_message, ce_flag)
             .await;
     }
 
@@ -414,8 +466,23 @@ impl Node {
         let sp_flag = fallback.fmp_flags & FLAG_SP != 0;
         let plaintext = &fallback.packet_data[fallback.fmp_plaintext_offset
             ..fallback.fmp_plaintext_offset + fallback.fmp_plaintext_len];
+        // The worker decrypted with the session registered under the
+        // frame's receiver index. Only the current session's index is
+        // current; any other is the previous session draining, or one
+        // already gone by the time the bounce is processed.
+        let current = self
+            .peers
+            .get(&fallback.source_node_addr)
+            .and_then(|p| p.our_index())
+            .is_some_and(|idx| idx.as_u32() == fallback.receiver_idx);
+        let slot = if current {
+            LinkSlot::Current
+        } else {
+            LinkSlot::Previous
+        };
         self.process_authentic_fmp_plaintext(
             &fallback.source_node_addr,
+            slot,
             fallback.transport_id,
             &fallback.remote_addr,
             fallback.timestamp_ms,

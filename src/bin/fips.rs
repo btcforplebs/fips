@@ -145,6 +145,11 @@ async fn run_daemon(
     #[cfg(windows)]
     fips::config::warn_legacy(&loaded_paths);
 
+    // Earlier releases could run a Windows node from \etc\fips, where any
+    // local user can create files; flag a config the search loaded there.
+    #[cfg(windows)]
+    fips::config::warn_legacy_etc_config(&loaded_paths);
+
     // Identity provisioning: config nsec > key file > generate ephemeral
     let mut resolved = match resolve_identity(&config, &loaded_paths) {
         Ok(r) => r,
@@ -163,6 +168,11 @@ async fn run_daemon(
         }
         IdentitySource::Ephemeral => info!("Using ephemeral identity (new keypair each start)"),
     }
+
+    // Flag a config or key left in \etc\fips that this run did not use. After
+    // identity resolution, which decides whether that key was used.
+    #[cfg(windows)]
+    fips::config::warn_legacy_etc_unused(&loaded_paths, &resolved.source);
 
     // Create node with resolved identity
     let mut config = config;

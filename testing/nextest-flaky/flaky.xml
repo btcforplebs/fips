@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="nextest-run" tests="4" skipped="0" failures="0" errors="0" uuid="3a0fa717-c76b-4698-8d37-2a9d18fce812" timestamp="2026-10-01T03:24:08.148+00:00" time="0.029">
+    <testsuite name="flakydemo" tests="4" skipped="0" errors="0" failures="0">
+        <testcase name="tests::always_fails" classname="flakydemo" timestamp="2026-10-01T03:24:08.148+00:00" time="0.012"/>
+        <testcase name="tests::steady" classname="flakydemo" timestamp="2026-10-01T03:24:08.148+00:00" time="0.013"/>
+        <testcase name="tests::flips_once" classname="flakydemo" timestamp="2026-10-01T03:24:08.162+00:00" time="0.014">
+            <flakyFailure timestamp="2026-10-01T03:24:08.148+00:00" time="0.013" message="thread &apos;tests::flips_once&apos; (174785) panicked at src/lib.rs:10:13" type="test failure with exit code 101">thread &apos;tests::flips_once&apos; (174785) panicked at src/lib.rs:10:13:
+first attempt fails
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+                <system-out>
+running 1 test
+test tests::flips_once ... FAILED
+
+failures:
+
+failures:
+    tests::flips_once
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+</system-out>
+                <system-err>
+thread &apos;tests::flips_once&apos; (174785) panicked at src/lib.rs:10:13:
+first attempt fails
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+</system-err>
+            </flakyFailure>
+        </testcase>
+        <testcase name="tests::also_flips" classname="flakydemo" timestamp="2026-10-01T03:24:08.168+00:00" time="0.009">
+            <flakyFailure timestamp="2026-10-01T03:24:08.148+00:00" time="0.019" message="thread &apos;tests::also_flips&apos; (174790) panicked at src/lib.rs:18:13" type="test failure with exit code 101">thread &apos;tests::also_flips&apos; (174790) panicked at src/lib.rs:18:13:
+first attempt fails &lt;&amp;&gt; &quot;quoted&quot;
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+                <system-out>
+running 1 test
+test tests::also_flips ... FAILED
+
+failures:
+
+failures:
+    tests::also_flips
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+</system-out>
+                <system-err>
+thread &apos;tests::also_flips&apos; (174790) panicked at src/lib.rs:18:13:
+first attempt fails &lt;&amp;&gt; &quot;quoted&quot;
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+</system-err>
+            </flakyFailure>
+        </testcase>
+    </testsuite>
+</testsuites>

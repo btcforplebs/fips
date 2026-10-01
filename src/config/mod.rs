@@ -172,6 +172,128 @@ pub fn warn_legacy(loaded: &[PathBuf]) {
     }
 }
 
+/// A file in the drive-relative `\etc\fips` that a Windows run reports.
+///
+/// Earlier releases could run a Windows node from `\etc\fips`, a directory
+/// any local user can create files in, and the config search still probes
+/// `fips.yaml` there.
+#[cfg(any(windows, test))]
+#[derive(Debug, PartialEq, Eq)]
+enum EtcFile {
+    /// `fips.yaml` there was loaded, found by the config search or named
+    /// with `-c` or `FIPS_CONFIG`.
+    Loaded(PathBuf),
+    /// `fips.yaml` or `fips.key` is there and this run did not use it, so a
+    /// node that used to run from it now runs on another config or identity.
+    Unused(PathBuf),
+}
+
+/// Whether two paths name the same file in the way Windows compares them:
+/// either separator, any case, and with any drive prefix ignored.
+///
+/// The drive-relative `/etc/fips\fips.yaml` the config search probes and an
+/// explicit `C:\etc\fips\fips.yaml` given with `-c` or `FIPS_CONFIG` are
+/// different `Path`s, since one has a drive prefix, and `Path` comparison is
+/// case-sensitive while Windows file names are not. Comparing the text lets
+/// the rule run on every platform.
+#[cfg(any(windows, test))]
+fn same_windows_path(a: &Path, b: &Path) -> bool {
+    fn key(path: &Path) -> String {
+        let text = path.to_string_lossy().replace('/', "\\");
+        let text = text.strip_prefix(r"\\?\").unwrap_or(&text);
+        let text = match text.as_bytes() {
+            [drive, b':', ..] if drive.is_ascii_alphabetic() => &text[2..],
+            _ => text,
+        };
+        text.to_ascii_lowercase()
+    }
+    key(a) == key(b)
+}
+
+/// Decide what to report about `fips.yaml` and `fips.key` in `etc`.
+///
+/// `loaded` is the list of config files the daemon loaded, and `key_used`
+/// the key file its identity came from, if any. `present` reports whether a
+/// file exists; nothing else about the files is looked at, and the key is
+/// never read.
+#[cfg(any(windows, test))]
+fn etc_files(
+    loaded: &[PathBuf],
+    key_used: Option<&Path>,
+    etc: &Path,
+    present: impl Fn(&Path) -> bool,
+) -> Vec<EtcFile> {
+    let config = etc.join(CONFIG_FILENAME);
+    let key = etc.join(KEY_FILENAME);
+    let mut found = Vec::new();
+    if let Some(path) = loaded.iter().find(|p| same_windows_path(p, &config)) {
+        found.push(EtcFile::Loaded(path.clone()));
+    } else if present(config.as_path()) {
+        found.push(EtcFile::Unused(config));
+    }
+    if !key_used.is_some_and(|k| same_windows_path(k, &key)) && present(key.as_path()) {
+        found.push(EtcFile::Unused(key));
+    }
+    found
+}
+
+/// The key file this run's identity is held in: the one it loaded, or the one
+/// it generated and saved. An identity from the config, or an ephemeral one,
+/// uses no key file.
+#[cfg(any(windows, test))]
+fn key_in_use(identity: &IdentitySource) -> Option<&Path> {
+    match identity {
+        IdentitySource::KeyFile(path) | IdentitySource::Generated(path) => Some(path),
+        IdentitySource::Config | IdentitySource::Ephemeral => None,
+    }
+}
+
+/// Warn about a config loaded from the drive-relative `\etc\fips`.
+///
+/// Any local user may have written it, whether the config search found it or
+/// it was named explicitly, and from v0.6.0 the search no longer looks
+/// there. Called before identity resolution, so the warning is logged even
+/// when a key the file supplies fails to resolve.
+#[cfg(windows)]
+pub fn warn_legacy_etc_config(loaded: &[PathBuf]) {
+    let etc = Path::new(LEGACY_SYSTEM_CONFIG_DIR);
+    // With nothing reported present, only a loaded config can be found.
+    for file in etc_files(loaded, None, etc, |_| false) {
+        if let EtcFile::Loaded(path) = file {
+            tracing::warn!(
+                path = %path.display(),
+                current = %Path::new(SYSTEM_CONFIG_DIR).join(CONFIG_FILENAME).display(),
+                "Config loaded from \\etc\\fips, where any local user can create files; \
+                 from v0.6.0 the config search no longer looks there. Move the settings \
+                 this node needs into C:\\ProgramData\\fips\\fips.yaml and delete the file"
+            );
+        }
+    }
+}
+
+/// Warn about `fips.yaml` or `fips.key` left in the drive-relative
+/// `\etc\fips` and not used by this run.
+///
+/// A node that ran from them before an upgrade now has a different config,
+/// and possibly a different identity. Called after identity resolution,
+/// which decides which key file the run uses.
+#[cfg(windows)]
+pub fn warn_legacy_etc_unused(loaded: &[PathBuf], identity: &IdentitySource) {
+    let etc = Path::new(LEGACY_SYSTEM_CONFIG_DIR);
+    for file in etc_files(loaded, key_in_use(identity), etc, Path::exists) {
+        if let EtcFile::Unused(path) = file {
+            tracing::warn!(
+                path = %path.display(),
+                current = %Path::new(SYSTEM_CONFIG_DIR).display(),
+                "File in \\etc\\fips is not used by this run; a node that ran from it \
+                 before now runs on another config or identity. If it is this node's, \
+                 move fips.yaml and fips.key into C:\\ProgramData\\fips and run \
+                 install-service.ps1 again; if not, delete it"
+            );
+        }
+    }
+}
+
 /// Find an identity key stranded at the legacy system config directory.
 ///
 /// Adding a second system config directory to the search path moves the
@@ -1065,7 +1187,7 @@ impl Config {
 
         // System config — /etc/fips is always probed so existing installs
         // keep working after an upgrade.
-        paths.push(PathBuf::from("/etc/fips").join(CONFIG_FILENAME));
+        paths.push(PathBuf::from(LEGACY_SYSTEM_CONFIG_DIR).join(CONFIG_FILENAME));
 
         // macOS and FreeBSD packaging install config under /usr/local/etc/fips,
         // and the Windows service installer under C:\ProgramData\fips; probe
@@ -1971,6 +2093,153 @@ node:
             stranded_config(&[PathBuf::from("./fips.yaml")], system, legacy),
             None
         );
+    }
+
+    /// A presence check that reports exactly `files` as existing.
+    fn only(files: &[&Path]) -> impl Fn(&Path) -> bool {
+        let files: Vec<PathBuf> = files.iter().map(|f| f.to_path_buf()).collect();
+        move |p| files.iter().any(|f| f == p)
+    }
+
+    #[test]
+    fn etc_files_reports_a_config_the_search_loaded_from_etc_fips() {
+        let etc = Path::new("/etc-legacy/fips");
+        let planted = etc.join(CONFIG_FILENAME);
+        let system = Path::new("/sys-cfg/fips").join(CONFIG_FILENAME);
+
+        assert_eq!(
+            etc_files(
+                &[planted.clone(), system.clone()],
+                None,
+                etc,
+                only(&[&planted])
+            ),
+            [EtcFile::Loaded(planted.clone())],
+            "a config loaded from \\etc\\fips under the real one must be reported as loaded"
+        );
+        assert_eq!(
+            etc_files(
+                std::slice::from_ref(&planted),
+                Some(&etc.join(KEY_FILENAME)),
+                etc,
+                only(&[&planted, &etc.join(KEY_FILENAME)])
+            ),
+            [EtcFile::Loaded(planted)],
+            "a node running from \\etc\\fips is told the config goes away, and its key, \
+             which it uses, is not reported"
+        );
+    }
+
+    #[test]
+    fn etc_files_reports_a_config_and_key_left_in_etc_fips_that_the_run_did_not_use() {
+        let etc = Path::new("/etc-legacy/fips");
+        let old_config = etc.join(CONFIG_FILENAME);
+        let old_key = etc.join(KEY_FILENAME);
+        let system = Path::new("/sys-cfg/fips");
+        let loaded = [system.join(CONFIG_FILENAME)];
+
+        assert_eq!(
+            etc_files(&loaded, None, etc, only(&[&old_config, &old_key])),
+            [
+                EtcFile::Unused(old_config.clone()),
+                EtcFile::Unused(old_key.clone())
+            ],
+            "after an upgrade to FIPS_CONFIG the old config and key must both be reported"
+        );
+        assert_eq!(
+            etc_files(
+                &loaded,
+                Some(&system.join(KEY_FILENAME)),
+                etc,
+                only(&[&old_key])
+            ),
+            [EtcFile::Unused(old_key)],
+            "a key left in \\etc\\fips while the identity comes from another key file \
+             must be reported"
+        );
+        assert_eq!(
+            etc_files(&loaded, None, etc, only(&[&old_config])),
+            [EtcFile::Unused(old_config)],
+            "a config left in \\etc\\fips and not loaded must be reported"
+        );
+    }
+
+    #[test]
+    fn same_windows_path_ignores_the_drive_the_separator_and_case() {
+        let probed = PathBuf::from("/etc/fips").join(CONFIG_FILENAME);
+        for explicit in [
+            r"C:\etc\fips\fips.yaml",
+            r"c:/ETC/Fips/FIPS.yaml",
+            r"\\?\C:\etc\fips\fips.yaml",
+            r"\etc\fips\fips.yaml",
+        ] {
+            assert!(
+                same_windows_path(&probed, Path::new(explicit)),
+                "{explicit} must match the probed /etc/fips\\fips.yaml"
+            );
+        }
+        for other in [
+            r"C:\ProgramData\fips\fips.yaml",
+            r"C:\etc\fips\fips.key",
+            r"C:etc\fips\fips.yaml",
+            r"etc\fips\fips.yaml",
+            r"C:\x\etc\fips\fips.yaml",
+        ] {
+            assert!(
+                !same_windows_path(&probed, Path::new(other)),
+                "{other} must not match the probed /etc/fips\\fips.yaml"
+            );
+        }
+    }
+
+    #[test]
+    fn etc_files_reports_an_explicit_drive_path_to_etc_fips_as_loaded_and_its_key_as_used() {
+        let etc = PathBuf::from("/etc/fips");
+        let explicit = PathBuf::from(r"C:\etc\fips\fips.yaml");
+        let key = PathBuf::from(r"C:\etc\fips\fips.key");
+
+        assert_eq!(
+            etc_files(std::slice::from_ref(&explicit), Some(&key), &etc, |_| true),
+            [EtcFile::Loaded(explicit)],
+            "a config named as C:\\etc\\fips\\fips.yaml is the legacy file, loaded, and \
+             the key beside it is in use"
+        );
+    }
+
+    #[test]
+    fn key_in_use_counts_a_key_generated_this_run_as_well_as_one_loaded() {
+        let key = PathBuf::from("/etc-legacy/fips").join(KEY_FILENAME);
+        assert_eq!(
+            key_in_use(&IdentitySource::KeyFile(key.clone())),
+            Some(key.as_path())
+        );
+        assert_eq!(
+            key_in_use(&IdentitySource::Generated(key.clone())),
+            Some(key.as_path()),
+            "a key generated and saved this run is the one in use, not an unused leftover"
+        );
+        assert_eq!(key_in_use(&IdentitySource::Config), None);
+        assert_eq!(key_in_use(&IdentitySource::Ephemeral), None);
+    }
+
+    #[test]
+    fn etc_files_reports_nothing_when_etc_fips_holds_neither_file() {
+        let etc = Path::new("/etc-legacy/fips");
+        let system = Path::new("/sys-cfg/fips");
+        let config = system.join(CONFIG_FILENAME);
+        let key = system.join(KEY_FILENAME);
+
+        assert_eq!(
+            etc_files(
+                std::slice::from_ref(&config),
+                Some(&key),
+                etc,
+                only(&[&config, &key])
+            ),
+            Vec::new(),
+            "files present only in the current directory must not be reported"
+        );
+        assert_eq!(etc_files(&[], None, etc, only(&[])), Vec::new());
     }
 
     #[test]

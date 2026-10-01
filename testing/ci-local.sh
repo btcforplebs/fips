@@ -32,7 +32,7 @@
 #   chaos-churn-mixed-10, chaos-ethernet-mesh,
 #   chaos-ethernet-only, chaos-ethernet-churn, chaos-tcp-mesh,
 #   chaos-congestion-stress,
-#   sidecar, dns-resolver, deb-install, medium-change
+#   sidecar, native-api, mdns, dns-resolver, deb-install, medium-change
 #
 # Opt-in (require --with-tor; depend on live Tor network):
 #   tor-socks5, tor-directory
@@ -220,6 +220,7 @@ STUN_FAULTS_SUITES=(stun-faults)
 DNS_RESOLVER_SUITES=(dns-resolver)
 NATIVE_API_SUITES=(native-api)
 MEDIUM_CHANGE_SUITES=(medium-change)
+MDNS_SUITES=(mdns)
 DEB_INSTALL_SUITES=(deb-install)
 TOR_SUITES=(tor-socks5 tor-directory)
 
@@ -285,6 +286,8 @@ list_suites() {
     echo ""
     echo "  Medium change:"
     for s in "${MEDIUM_CHANGE_SUITES[@]}"; do echo "    $s"; done
+    echo "  mDNS LAN discovery:"
+    for s in "${MDNS_SUITES[@]}"; do echo "    $s"; done
     echo ""
     echo "  DNS resolver:"
     for s in "${DNS_RESOLVER_SUITES[@]}"; do echo "    $s"; done
@@ -1250,6 +1253,18 @@ run_medium_change() {
     ci_release_mc_networks
 }
 
+# Run the mDNS LAN discovery harness: two nodes on a user-defined bridge that
+# must find and peer with each other by mDNS alone. Reads FIPS_TEST_IMAGE, and
+# creates and removes its own network.
+run_mdns() {
+    info "[mdns] Running mDNS LAN discovery test"
+    if FIPS_TEST_IMAGE="$CI_IMAGE_TEST" bash testing/mdns/test.sh 2>&1; then
+        record "mdns" 0
+    else
+        record "mdns" 1
+    fi
+}
+
 # Run dns-resolver harness (multi-distro + e2e scenarios)
 #
 # Its e2e scenarios run the fips binaries from the package build_ci_deb
@@ -1552,6 +1567,9 @@ run_integration() {
     # Native datagram API (light — one single-node run plus a two-node pair)
     run_native_api
 
+    # mDNS LAN discovery (light — one two-node pair, seconds when healthy)
+    run_mdns
+
     # DNS resolver multi-distro suite (heavy — per-distro systemd images)
     run_dns_resolver
 
@@ -1616,6 +1634,8 @@ run_suite() {
             run_native_api ;;
         medium-change)
             run_medium_change ;;
+        mdns)
+            run_mdns ;;
         deb-install)
             run_deb_install ;;
         tor-socks5)
@@ -1661,9 +1681,6 @@ print_summary() {
     echo ""
 }
 
-# Verify the local default suite set and the GitHub matrix still cover the
-# same work. Runs first: it takes about a second, and a divergence should be
-# reported before a half-hour suite rather than after it.
 # The OpenWrt maintainer scripts and the fips-gateway init script ship to
 # routers and run there under ash, never under bash. This runs them under ash
 # in a busybox container against stubbed init scripts, so an install, an
@@ -1689,6 +1706,9 @@ run_tarball_install() {
     return $rc
 }
 
+# Verify the local default suite set and the GitHub matrix still cover the
+# same work. Runs first: it takes about a second, and a divergence should be
+# reported before a half-hour suite rather than after it.
 run_ci_parity() {
     local rc=0
     info "[ci-parity] Comparing the local suite set against the GitHub matrix"
@@ -1727,6 +1747,16 @@ run_comment_refs() {
     info "[comment-refs] Checking that every source comment resolves in-repo"
     "$SCRIPT_DIR/check-comment-refs.sh" || rc=$?
     record "comment-refs" $rc
+}
+
+# No non-test code may use std's 64-bit atomics. They do not exist on 32-bit
+# MIPS, so one such use stops the crate building for the OpenWrt MIPS targets,
+# and no leg builds for MIPS to notice. Static, and it needs nothing built.
+run_portable_atomics() {
+    local rc=0
+    info "[portable-atomics] Checking that no non-test code uses std 64-bit atomics"
+    python3 "$SCRIPT_DIR/check-portable-atomics.py" || rc=$?
+    record "portable-atomics" $rc
 }
 
 # Every daemon log string a test matches on must still be emitted by src/.
@@ -1779,6 +1809,18 @@ run_deb_version() {
     record "deb-version" $rc
 }
 
+# The GitHub unit-test jobs run check-nextest-flaky.sh after nextest to
+# surface tests that passed only on retry. Nothing local runs nextest under the
+# retrying ci profile, so the checker itself never runs here; its fixture tests
+# do, so a checker that stopped seeing flaky tests fails here rather than going
+# quiet on GitHub. Static, about a second, and needs nothing built.
+run_nextest_flaky() {
+    local rc=0
+    info "[nextest-flaky] Checking the flaky-test reporter against its fixtures"
+    bash "$SCRIPT_DIR/nextest-flaky/test.sh" || rc=$?
+    record "nextest-flaky" $rc
+}
+
 # ── Main ───────────────────────────────────────────────────────────────────
 
 main() {
@@ -1799,8 +1841,10 @@ main() {
     run_image_scoping
     run_action_pins
     run_comment_refs
+    run_portable_atomics
     run_wait_converge
     run_deb_version
+    run_nextest_flaky
 
     if [[ "$TEST_ONLY" == true ]]; then
         run_tests

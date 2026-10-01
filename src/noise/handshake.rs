@@ -15,9 +15,10 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 ///
 /// Maintains the chaining key (ck), handshake hash (h), and current cipher.
 ///
-/// `Clone` exists for [`HandshakeState::try_read_message_2`] and
-/// [`HandshakeState::try_read_xk_message_2`], which have to put the pre-read
-/// state back after a message that mixed material in before failing to
+/// `Clone` exists for [`HandshakeState::try_read_message_2`],
+/// [`HandshakeState::try_read_xk_message_2`] and
+/// [`HandshakeState::try_read_xk_message_3`], which have to put the pre-read
+/// state back after a message that advanced it before failing to
 /// authenticate.
 ///
 /// `ck` and `h` are cleared on drop, including on the clone above once it
@@ -1016,6 +1017,40 @@ impl HandshakeState {
         self.progress = HandshakeProgress::Complete;
 
         Ok(())
+    }
+
+    /// Read XK message 3, leaving the handshake untouched when the message
+    /// does not authenticate.
+    ///
+    /// `read_xk_message_3` advances the symmetric state's nonce before the
+    /// first AEAD opens, and a message that fails later has already mixed a
+    /// DH result into the key, so a failed read leaves a handshake that can
+    /// never read the genuine msg3 afterwards. A responder that keeps its
+    /// handshake across a failed read, because the message may be a forgery
+    /// rather than the initiator's corrupt msg3, needs the pre-read state
+    /// back.
+    ///
+    /// The saved set is exactly what `read_xk_message_3` writes:
+    /// `symmetric`, `remote_static`, `remote_epoch` and `progress`. **That
+    /// mirror is manual.** A later edit that adds a write to
+    /// `read_xk_message_3` without adding it here silently reintroduces the
+    /// poisoning, and no caller can detect it.
+    pub fn try_read_xk_message_3(&mut self, message: &[u8]) -> Result<(), NoiseError> {
+        let symmetric = self.symmetric.clone();
+        let remote_static = self.remote_static;
+        let remote_epoch = self.remote_epoch;
+        let progress = self.progress;
+
+        match self.read_xk_message_3(message) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.symmetric = symmetric;
+                self.remote_static = remote_static;
+                self.remote_epoch = remote_epoch;
+                self.progress = progress;
+                Err(e)
+            }
+        }
     }
 
     /// Complete the handshake and return a NoiseSession.

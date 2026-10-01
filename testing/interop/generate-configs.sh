@@ -307,7 +307,10 @@ COMPOSE_FILE="$OUT_DIR/docker-compose.generated.yml"
     echo "    - net.ipv6.conf.all.disable_ipv6=0"
     echo "  restart: \"no\""
     echo "  environment:"
-    echo "    - RUST_LOG=info,fips::node::handlers::rekey=debug,fips::node::handlers::handshake=debug"
+    # handlers::mmp at debug so the driver's "MMP link teardown" scan, which
+    # catches a peer removed at any point of the run, can match: the line is
+    # a debug! in that module.
+    echo "    - RUST_LOG=info,fips::node::handlers::rekey=debug,fips::node::handlers::handshake=debug,fips::node::handlers::mmp=debug"
     echo ""
     echo "services:"
     for nid in "${NODE_IDS[@]}"; do

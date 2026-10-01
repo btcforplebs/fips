@@ -5,9 +5,10 @@ use super::util::{
     wire_outcome,
 };
 use crate::NodeAddr;
+use crate::proto::fmp::core::ENDED_MSG1_RECORD;
 use crate::proto::fmp::{
-    ConnAction, Fmp, InboundDecision, InboundReject, OutboundDecision, OutboundSnapshot, RekeyCfg,
-    RekeyRole, cross_connection_winner,
+    AnsweredMsg1s, ConnAction, Fmp, InboundDecision, InboundReject, Msg1Digest, OutboundDecision,
+    OutboundSnapshot, RekeyAnswer, RekeyCfg, RekeyRole, cross_connection_winner,
 };
 use crate::testutil::make_node_addr;
 use crate::transport::LinkId;
@@ -493,6 +494,158 @@ fn establish_inbound_pending_session_rejects() {
             reason: InboundReject::PendingSession
         }
     ));
+}
+
+/// An aged existing peer holding a responder pending armed by the msg1 whose
+/// wire bytes are `armed_by`, answered with msg2 `[0x02; 4]`.
+fn snapshot_holding_an_answer(armed_by: &[u8]) -> crate::proto::fmp::EstablishSnapshot {
+    let mut snap = establish_snapshot();
+    snap.has_existing_peer = true;
+    snap.existing_peer_epoch = Some([7u8; 8]);
+    snap.has_session = true;
+    snap.existing_session_age_secs = 31;
+    snap.pending_new_session = true;
+    snap.held_answer = Some(RekeyAnswer {
+        msg1: Msg1Digest::of(armed_by),
+        msg2: vec![0x02; 4],
+    });
+    snap
+}
+
+#[test]
+fn a_resent_msg1_matching_the_held_answer_resends_its_msg2() {
+    // The msg2 answering a held pending was lost and the initiator resent the
+    // same msg1: answer it again with the same msg2, for the same peer.
+    let fmp = Fmp::new();
+    let snap = snapshot_holding_an_answer(b"the msg1 that armed it");
+    let mut wire = wire_outcome(Some([7u8; 8]));
+    wire.msg1_digest = Msg1Digest::of(b"the msg1 that armed it");
+    let peer = *wire.peer_identity.node_addr();
+    match fmp.establish_inbound(&snap, &wire) {
+        InboundDecision::ResendRekeyMsg2 { peer: p, msg2 } => {
+            assert_eq!(p, peer);
+            assert_eq!(msg2, vec![0x02; 4]);
+        }
+        other => panic!("expected ResendRekeyMsg2, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_different_msg1_is_refused_while_an_answered_pending_is_held() {
+    // Only the msg1 that armed the pending draws its answer; a new msg1 from
+    // the same peer must not, and must not replace the pending either.
+    let fmp = Fmp::new();
+    let snap = snapshot_holding_an_answer(b"the msg1 that armed it");
+    let mut wire = wire_outcome(Some([7u8; 8]));
+    wire.msg1_digest = Msg1Digest::of(b"a fresh msg1");
+    assert!(matches!(
+        fmp.establish_inbound(&snap, &wire),
+        InboundDecision::Reject {
+            reason: InboundReject::PendingSession
+        }
+    ));
+}
+
+#[test]
+fn a_pending_this_node_initiated_answers_no_msg1() {
+    // A pending this node initiated has no answer recorded, so every msg1 is
+    // refused while it is held, as before.
+    let fmp = Fmp::new();
+    let mut snap = snapshot_holding_an_answer(b"msg1");
+    snap.held_answer = None;
+    let mut wire = wire_outcome(Some([7u8; 8]));
+    wire.msg1_digest = Msg1Digest::of(b"msg1");
+    assert!(matches!(
+        fmp.establish_inbound(&snap, &wire),
+        InboundDecision::Reject {
+            reason: InboundReject::PendingSession
+        }
+    ));
+}
+
+#[test]
+fn a_msg1_from_an_ended_cycle_is_refused_and_arms_nothing() {
+    // A copy of a msg1 whose cycle has ended must not arm a new pending, even
+    // with no pending held and the session aged past the rekey floor.
+    let fmp = Fmp::new();
+    let mut snap = snapshot_holding_an_answer(b"msg1");
+    snap.pending_new_session = false;
+    snap.held_answer = None;
+    snap.msg1_answered_before = true;
+    let wire = wire_outcome(Some([7u8; 8]));
+    assert!(matches!(
+        fmp.establish_inbound(&snap, &wire),
+        InboundDecision::Reject {
+            reason: InboundReject::AnsweredBefore
+        }
+    ));
+}
+
+#[test]
+fn a_msg1_from_an_ended_cycle_does_not_make_us_abandon_our_own_rekey() {
+    // Mid-rekey and on the losing side of the tie-break, a fresh msg1 makes
+    // us abandon ours and respond; a copy of an ended cycle's msg1 must not.
+    let fmp = Fmp::new();
+    let mut snap = snapshot_holding_an_answer(b"msg1");
+    snap.pending_new_session = false;
+    snap.held_answer = None;
+    snap.rekey_in_progress = true;
+    snap.our_node_addr = max_node_addr();
+    let wire = wire_outcome(Some([7u8; 8]));
+    assert!(matches!(
+        fmp.establish_inbound(&snap, &wire),
+        InboundDecision::RekeyRespond {
+            abandon_first: true,
+            ..
+        }
+    ));
+    snap.msg1_answered_before = true;
+    assert!(matches!(
+        fmp.establish_inbound(&snap, &wire),
+        InboundDecision::Reject {
+            reason: InboundReject::AnsweredBefore
+        }
+    ));
+}
+
+#[test]
+fn the_answered_record_holds_the_armed_answer_then_remembers_its_msg1_once_ended() {
+    let mut record = AnsweredMsg1s::default();
+    let first = Msg1Digest::of(b"first");
+    record.arm(RekeyAnswer {
+        msg1: first,
+        msg2: vec![0x02; 4],
+    });
+    assert_eq!(record.held().map(|a| a.msg1), Some(first));
+    assert!(!record.ended(&first), "a held cycle has not ended");
+
+    record.end();
+    assert!(record.held().is_none());
+    assert!(record.ended(&first));
+    assert!(!record.ended(&Msg1Digest::of(b"never answered")));
+
+    // Ending with nothing held records nothing.
+    record.end();
+    assert!(record.ended(&first));
+}
+
+#[test]
+fn the_answered_record_keeps_the_most_recent_ended_cycles_up_to_its_bound() {
+    let mut record = AnsweredMsg1s::default();
+    let digest = |i: usize| Msg1Digest::of(&i.to_le_bytes());
+    for i in 0..=ENDED_MSG1_RECORD {
+        record.arm(RekeyAnswer {
+            msg1: digest(i),
+            msg2: Vec::new(),
+        });
+        record.end();
+    }
+    assert!(
+        !record.ended(&digest(0)),
+        "the oldest beyond the bound is forgotten"
+    );
+    assert!(record.ended(&digest(1)));
+    assert!(record.ended(&digest(ENDED_MSG1_RECORD)));
 }
 
 #[test]

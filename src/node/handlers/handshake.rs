@@ -14,8 +14,8 @@ use crate::peer::machine::{
 };
 use crate::proto::fmp::wire::{Msg1Header, Msg2Header, build_msg2};
 use crate::proto::fmp::{
-    EstablishSnapshot, EstablishView, InboundDecision, InboundReject, OutboundSnapshot,
-    PromotionResult, WireOutcome, cross_connection_winner,
+    EstablishSnapshot, EstablishView, InboundDecision, InboundReject, Msg1Digest, OutboundSnapshot,
+    PromotionResult, RekeyAnswer, WireOutcome, cross_connection_winner,
 };
 use crate::transport::{Link, LinkDirection, LinkId, ReceivedPacket};
 use crate::utils::index::SessionIndex;
@@ -69,7 +69,7 @@ pub(in crate::node) enum Msg1Waiver {
 }
 
 impl EstablishView for Node {
-    fn establish_snapshot(&self, peer_addr: &NodeAddr) -> EstablishSnapshot {
+    fn establish_snapshot(&self, peer_addr: &NodeAddr, msg1: &Msg1Digest) -> EstablishSnapshot {
         let existing = self.peers.get(peer_addr);
         let max_peers = self.max_peers();
         EstablishSnapshot {
@@ -83,6 +83,8 @@ impl EstablishView for Node {
                 .map(|p| p.pending_new_session().is_some())
                 .unwrap_or(false),
             rekey_in_progress: existing.map(|p| p.rekey_in_progress()).unwrap_or(false),
+            held_answer: existing.and_then(|p| p.rekey_answer().cloned()),
+            msg1_answered_before: existing.is_some_and(|p| p.answered_before(msg1)),
             existing_msg2: existing.and_then(|p| p.handshake_msg2().map(|m| m.to_vec())),
             at_max_peers: max_peers > 0 && self.peers.len() >= max_peers,
             has_pending_outbound_to_peer: self.connections().any(|(_, machine)| {
@@ -308,6 +310,19 @@ impl Node {
         self.transports
             .get(&transport_id)
             .is_none_or(|t| t.accept_connections())
+    }
+
+    /// The transport and address of `peer`'s established link, where a rekey
+    /// msg2 is sent whatever address its msg1 arrived from.
+    fn established_link(
+        &self,
+        peer: &NodeAddr,
+    ) -> Option<(
+        crate::transport::TransportId,
+        crate::transport::TransportAddr,
+    )> {
+        let p = self.peers.get(peer)?;
+        Some((p.transport_id()?, p.current_addr()?.clone()))
     }
 
     /// Handle handshake message 1 (phase 0x1).
@@ -552,6 +567,7 @@ impl Node {
             remote_epoch: machine.conn_remote_epoch(),
             their_index: header.sender_idx,
             msg2_payload: msg2_response,
+            msg1_digest: Msg1Digest::of(&packet.data),
         };
 
         // === PHASE C input ===
@@ -560,7 +576,7 @@ impl Node {
         // session age resolved here, the max-peers cap, our own address for the
         // tie-break). Taken before this connection is inserted into the
         // registry, matching the pre-refactor read points.
-        let est = self.establish_snapshot(&peer_node_addr);
+        let est = self.establish_snapshot(&peer_node_addr, &wire.msg1_digest);
 
         // === PHASE C: structured classification ===
         // Evaluate the inbound decision once on a local establish leg and route
@@ -598,7 +614,10 @@ impl Node {
                     .record_reject(RejectReason::Handshake(HandshakeReject::BadState));
             }
             InboundDecision::Reject {
-                reason: reason @ (InboundReject::PendingSession | InboundReject::DualRekeyWon),
+                reason:
+                    reason @ (InboundReject::PendingSession
+                    | InboundReject::DualRekeyWon
+                    | InboundReject::AnsweredBefore),
             } => {
                 // Existing-peer rekey rejects: the classification took the
                 // fresh-context fail path (no actions) and the local machine is
@@ -613,6 +632,11 @@ impl Node {
                         peer = %self.peer_display_name(&peer_node_addr),
                         "Dual rekey initiation: we win (smaller addr), dropping their msg1"
                     ),
+                    InboundReject::AnsweredBefore => debug!(
+                        peer = %self.peer_display_name(&peer_node_addr),
+                        remote_addr = %packet.remote_addr,
+                        "Rekey msg1 answered in an ended cycle, dropping the copy"
+                    ),
                     InboundReject::AtMaxPeers => unreachable!(),
                 }
                 // `conn`/`link_id` were never inserted into the registry, so the
@@ -623,12 +647,16 @@ impl Node {
             InboundDecision::ResendMsg2 { msg2 } => {
                 // Duplicate msg1 at the same epoch: the decision carries the
                 // stored msg2 bytes and the inline resend below owns the send;
-                // the classification touched no state.
+                // the classification touched no state. It goes on the peer's
+                // established link, as a rekey msg2 does: a genuine duplicate
+                // comes from the address the peering was just formed with,
+                // while a copy can come from anywhere.
                 debug_assert!(actions.is_empty());
                 if let Some(msg2) = msg2.as_deref()
-                    && let Some(transport) = self.transports.get(&packet.transport_id)
+                    && let Some((tid, addr)) = self.established_link(&peer_node_addr)
+                    && let Some(transport) = self.transports.get(&tid)
                 {
-                    match transport.send(&packet.remote_addr, msg2).await {
+                    match transport.send(&addr, msg2).await {
                         Ok(_) => debug!(
                             peer = %self.peer_display_name(&peer_node_addr),
                             "Resent msg2 for duplicate msg1 (same epoch)"
@@ -639,6 +667,32 @@ impl Node {
                             "Failed to resend msg2"
                         ),
                     }
+                }
+            }
+            InboundDecision::ResendRekeyMsg2 { peer, msg2 } => {
+                // A resend of the msg1 that armed the pending we hold: our
+                // msg2 was lost, so give the same answer again, on the peer's
+                // established link as the first answer went.
+                debug_assert!(actions.is_empty());
+                if let Some((tid, addr)) = self.established_link(&peer)
+                    && let Some(transport) = self.transports.get(&tid)
+                {
+                    match transport.send(&addr, &msg2).await {
+                        Ok(_) => debug!(
+                            peer = %self.peer_display_name(&peer),
+                            "Resent rekey msg2 for a resent msg1"
+                        ),
+                        Err(e) => debug!(
+                            peer = %self.peer_display_name(&peer),
+                            error = %e,
+                            "Failed to resend rekey msg2"
+                        ),
+                    }
+                } else {
+                    debug!(
+                        peer = %self.peer_display_name(&peer),
+                        "No established link to resend rekey msg2 on"
+                    );
                 }
             }
             InboundDecision::RekeyRespond {
@@ -691,42 +745,64 @@ impl Node {
                     }
                 };
 
-                // Send msg2 response using the new handshake.
+                // Send msg2 response using the new handshake, on the peer's
+                // established link rather than to the msg1's source. A copy
+                // of a msg1 authenticates as the peer from any address, so
+                // answering its source would reflect to an address the
+                // sender chose. A peer whose address changed is answered at
+                // the old one until a frame from the new address moves it.
                 let wire_msg2 = build_msg2(our_new_index, wire.their_index, &wire.msg2_payload);
-                if let Some(transport) = self.transports.get(&packet.transport_id) {
-                    match transport.send(&packet.remote_addr, &wire_msg2).await {
-                        Ok(_) => {
-                            debug!(
-                                peer = %self.peer_display_name(&peer),
-                                new_our_index = %our_new_index,
-                                "Sent rekey msg2 response"
-                            );
-                        }
-                        Err(e) => {
-                            warn!(
-                                peer = %self.peer_display_name(&peer),
-                                error = %e,
-                                "Failed to send rekey msg2"
-                            );
-                            let _ = self.index_allocator.free(our_new_index);
-                            self.stats_mut()
-                                .record_reject(RejectReason::Handshake(HandshakeReject::BadState));
-                            return;
-                        }
+                let sent = match self.established_link(&peer) {
+                    Some((tid, addr)) => match self.transports.get(&tid) {
+                        Some(transport) => transport
+                            .send(&addr, &wire_msg2)
+                            .await
+                            .map(|_| tid)
+                            .map_err(|e| e.to_string()),
+                        None => Err("no transport for the peer's link".to_string()),
+                    },
+                    None => Err("the peer has no established link".to_string()),
+                };
+                let link_transport = match sent {
+                    Ok(tid) => tid,
+                    Err(e) => {
+                        warn!(
+                            peer = %self.peer_display_name(&peer),
+                            error = %e,
+                            "Failed to send rekey msg2"
+                        );
+                        let _ = self.index_allocator.free(our_new_index);
+                        self.stats_mut()
+                            .record_reject(RejectReason::Handshake(HandshakeReject::BadState));
+                        return;
                     }
-                }
+                };
+                debug!(
+                    peer = %self.peer_display_name(&peer),
+                    new_our_index = %our_new_index,
+                    "Sent rekey msg2 response"
+                );
 
                 // Store the new session as the responder's pending session. It
                 // is promoted by the initiator's first new-epoch frame, not by
                 // our own tick.
+                // The answer is kept with it, so a resend of this msg1 draws
+                // the same msg2 if this one is lost.
                 if let Some(existing) = self.peers.get_mut(&peer) {
-                    existing.answer_rekey(noise_session, our_new_index, wire.their_index);
+                    let answer = RekeyAnswer {
+                        msg1: wire.msg1_digest,
+                        msg2: wire_msg2,
+                    };
+                    existing.answer_rekey(noise_session, our_new_index, wire.their_index, answer);
                     existing.record_peer_rekey();
                 }
 
-                // Register new index in peers_by_index.
+                // Register new index in peers_by_index, under the transport
+                // the msg2 went out on: the peer's frames on the new session
+                // arrive there, and retirement removes the entry by the
+                // peer's transport, not the one the msg1 came in on.
                 self.peers_by_index
-                    .insert((packet.transport_id, our_new_index.as_u32()), peer);
+                    .insert((link_transport, our_new_index.as_u32()), peer);
 
                 // Do NOT touch addr_to_link — the entry must keep pointing at the
                 // original link so future msg1s from this address are recognized

@@ -12,6 +12,10 @@ USE_PROCD=1
 START=96
 STOP=09
 
+# procd runs "supervise" (below) rather than the gateway itself.
+EXTRA_COMMANDS="supervise"
+EXTRA_HELP="\tsupervise       Run the gateway, pointing dnsmasq at it while it listens (run by procd)\n"
+
 PROG=/usr/bin/fips-gateway
 CONFIG=/etc/fips/fips.yaml
 
@@ -21,6 +25,17 @@ CONFIG=/etc/fips/fips.yaml
 GW_DNS_DEFAULT=5365
 # Port the FIPS daemon DNS listens on.
 DAEMON_DNS_PORT=5354
+# Held while dnsmasq's .fips upstream is changed, so a stopping gateway's swap
+# back to the daemon and a starting gateway's swap to itself cannot interleave.
+DNS_LOCK=/var/lock/fips-gateway-dns.lock
+# The pid of the gateway the current supervise runs, so an exiting instance
+# can tell its successor's socket from anything else holding the port.
+GW_PIDFILE=/var/run/fips-gateway.pid
+# Seconds a stopping gateway gets after SIGTERM before it is killed; under
+# procd's own 5 s, after which procd kills only the supervise shell.
+GW_KILL_AFTER=3
+# Left by the package's preinst when the gateway is not enabled; see below.
+INSTALL_HOLD=/var/run/fips-gateway-install-hold
 
 # Global-scope IPv6 prefix assigned to br-lan so Android/Chrome clients
 # believe they have full IPv6 and actually send AAAA queries.
@@ -28,6 +43,18 @@ DAEMON_DNS_PORT=5354
 GLOBAL_PREFIX="2001:2:f1b5::1/64"
 
 start_service() {
+	# OpenWrt's generic postinst enables and starts every init script a
+	# package ships. A package built from the SDK feed Makefile runs it, and
+	# its preinst leaves this hold unless the gateway was enabled, so that
+	# installing or upgrading the package does not switch the gateway on.
+	# Honoured once.
+	if [ -e "$INSTALL_HOLD" ]; then
+		rm -f "$INSTALL_HOLD"
+		disable
+		logger -t fips-gateway "left disabled and stopped by the package installation"
+		return 0
+	fi
+
 	# The gateway daemon exits when gateway.enabled is not true, so without
 	# this check starting a disabled gateway would still take dnsmasq's .fips
 	# upstream away from the daemon and point it at a port nothing listens on.
@@ -42,13 +69,6 @@ start_service() {
 	# Load conntrack module for /proc/net/nf_conntrack.
 	modprobe nf_conntrack 2>/dev/null || true
 
-	# Redirect dnsmasq .fips forwarding from the daemon (5354) to the port the
-	# gateway listens on, so LAN clients get virtual IPs instead of raw mesh
-	# addresses. Done early and synchronously so dnsmasq is ready before the
-	# gateway starts accepting DNS queries.
-	dnsmasq_swap_fips_upstream "$(gateway_dns_port)"
-	sleep 1
-
 	# Add a global-scope IPv6 prefix to br-lan so Android/Chrome clients
 	# send AAAA queries (they suppress AAAA when only ULA addresses exist).
 	# Also set ra_default=2 so odhcpd advertises a default route even
@@ -59,8 +79,12 @@ start_service() {
 	# learn a route to the pool automatically.
 	gateway_add_ra_route
 
+	# dnsmasq's .fips forwarding moves to the gateway only once the gateway
+	# holds its DNS port, and back to the daemon (5354) whenever the gateway
+	# exits, so a gateway that fails to start, before or after binding, does
+	# not leave LAN clients' .fips lookups going to a dead port. See supervise.
 	procd_open_instance
-	procd_set_param command "$PROG" --config "$CONFIG"
+	procd_set_param command /etc/init.d/fips-gateway supervise
 	procd_set_param respawn 3600 5 5
 	procd_set_param stdout 1
 	procd_set_param stderr 1
@@ -69,7 +93,7 @@ start_service() {
 
 stop_service() {
 	# Restore dnsmasq .fips forwarding back to the daemon.
-	dnsmasq_swap_fips_upstream "$DAEMON_DNS_PORT"
+	dns_locked dnsmasq_swap_fips_upstream "$DAEMON_DNS_PORT"
 
 	# Remove the RA route for the virtual IP pool.
 	gateway_remove_ra_route
@@ -80,6 +104,119 @@ stop_service() {
 
 reload_service() {
 	restart
+}
+
+# Run the gateway as procd's instance. dnsmasq's .fips upstream is pointed at
+# the gateway's DNS port once the gateway itself has that port bound, and back
+# at the daemon's port when the gateway exits for any reason: a config it
+# cannot parse, a port it cannot bind, a failure after binding, a crash, or the
+# SIGTERM procd sends to stop it. That SIGTERM is passed on so the gateway can
+# remove its NAT table and routes, and a gateway still running $GW_KILL_AFTER
+# seconds later is killed, because procd kills only this shell. The exit
+# status is the gateway's, so procd's respawn sees the gateway's failures.
+supervise() {
+	local port pid="" watcher rc stopping="" killer=""
+
+	port="$(gateway_dns_port)"
+	# Set before the gateway starts, so a stop that arrives first still
+	# reaches it.
+	trap 'stopping=1; gateway_stop' TERM INT
+	"$PROG" --config "$CONFIG" &
+	pid=$!
+	mkdir -p "${GW_PIDFILE%/*}" 2>/dev/null
+	echo "$pid" > "$GW_PIDFILE"
+	[ -n "$stopping" ] && gateway_stop
+
+	# Polled from a child of its own so this shell sits in wait and reaps the
+	# gateway the moment it exits; a polling loop here would see an unreaped
+	# gateway as still alive.
+	(
+		while kill -0 "$pid" 2>/dev/null; do
+			dns_locked gateway_dns_claim "$port" "$pid" && exit 0
+			sleep 1
+		done
+		exit 0
+	) &
+	watcher=$!
+
+	# A trapped signal ends wait early, so wait until the gateway is gone.
+	rc=0
+	wait "$pid" || rc=$?
+	while kill -0 "$pid" 2>/dev/null; do
+		rc=0
+		wait "$pid" || rc=$?
+	done
+	[ -n "$killer" ] && kill "$killer" 2>/dev/null
+	# The watcher has nothing left to do, and would otherwise sleep out its
+	# poll; any change it is part way through finishes under the lock first.
+	kill "$watcher" 2>/dev/null
+	wait "$watcher"
+
+	dns_locked gateway_dns_release "$port" "$pid"
+	[ "$(cat "$GW_PIDFILE" 2>/dev/null)" = "$pid" ] && rm -f "$GW_PIDFILE"
+	logger -t fips-gateway "gateway exited with status $rc"
+	return "$rc"
+}
+
+# supervise's stop: SIGTERM to the gateway now, SIGKILL if it is still running
+# $GW_KILL_AFTER seconds later. Reads and sets supervise's pid and killer.
+gateway_stop() {
+	[ -n "$pid" ] || return 0
+	kill -TERM "$pid" 2>/dev/null
+	if [ -z "$killer" ]; then
+		( sleep "$GW_KILL_AFTER"; kill -KILL "$pid" 2>/dev/null ) &
+		killer=$!
+	fi
+	return 0
+}
+
+# Run "$@" holding $DNS_LOCK. The lock is released when the subshell, and
+# every process that inherited its descriptor, has exited.
+dns_locked() {
+	mkdir -p "${DNS_LOCK%/*}" 2>/dev/null
+	(
+		flock 9 || logger -t fips-gateway "could not lock $DNS_LOCK; changing dnsmasq anyway"
+		"$@"
+	) 9>"$DNS_LOCK"
+}
+
+# Succeed when process $2 itself holds a UDP socket bound to port $1, on any
+# address, IPv4 or IPv6: a socket inode from /proc/net/udp{,6} for that port
+# is among the process's open descriptors. Another process holding the port,
+# such as an mDNS responder on 5353, does not count.
+gateway_dns_held_by() {
+	local hex inode fd
+	[ -n "$2" ] || return 1
+	hex="$(printf '%04X' "$1")"
+	for inode in $(cat /proc/net/udp /proc/net/udp6 2>/dev/null |
+		awk -v want=":$hex" 'substr($2, length($2) - 4) == want { print $10 }'); do
+		for fd in /proc/"$2"/fd/*; do
+			[ "$(readlink "$fd" 2>/dev/null)" = "socket:[$inode]" ] && return 0
+		done
+	done
+	return 1
+}
+
+# Point dnsmasq at the gateway's port $1 once gateway $2 holds it. Fails,
+# changing nothing, until then.
+gateway_dns_claim() {
+	gateway_dns_held_by "$1" "$2" || return 1
+	dnsmasq_swap_fips_upstream "$1"
+	logger -t fips-gateway "gateway DNS is listening on port $1; dnsmasq forwards .fips to it"
+	return 0
+}
+
+# Point dnsmasq back at the daemon after gateway $2 on port $1 has exited,
+# unless the gateway procd started in its place (the pid in $GW_PIDFILE) holds
+# the port already; that one claims dnsmasq itself.
+gateway_dns_release() {
+	local next
+	next="$(cat "$GW_PIDFILE" 2>/dev/null)"
+	if [ -n "$next" ] && [ "$next" != "$2" ] && gateway_dns_held_by "$1" "$next"; then
+		return 0
+	fi
+	dnsmasq_swap_fips_upstream "$DAEMON_DNS_PORT"
+	return 0
 }
 
 # Extract the gateway "enabled" flag from fips.yaml.

@@ -8,9 +8,9 @@
 # exercised is the scripts' behaviour given that contract, not opkg itself.
 # A real `opkg upgrade` on a router image stays uncovered.
 #
-# POSTINST and PRERM may be pointed at other files. That is the seam used to
-# see a scenario red against the previously released scripts, and to re-break
-# the fixed ones during a break-check.
+# PREINST, POSTINST, PRERM and INIT_GATEWAY may be pointed at other files. That is the
+# seam used to see a scenario red against the previously released scripts, and
+# to re-break the fixed ones during a break-check.
 #
 # APK_SCRIPTS names a directory holding the four scripts the .apk registers
 # (post-install, pre-upgrade, post-upgrade, pre-deinstall), as captured from
@@ -23,13 +23,15 @@ set -u
 
 REPO="${REPO:-/src}"
 POSTINST="${POSTINST:-$REPO/packaging/openwrt-ipk/scripts/postinst}"
+PREINST="${PREINST:-$REPO/packaging/openwrt-ipk/scripts/preinst}"
 PRERM="${PRERM:-$REPO/packaging/openwrt-ipk/scripts/prerm}"
 RELEASED_PRERM="$REPO/testing/openwrt/fixtures/released-prerm"
-INIT_GATEWAY="$REPO/packaging/openwrt-ipk/files/etc/init.d/fips-gateway"
+INIT_GATEWAY="${INIT_GATEWAY:-$REPO/packaging/openwrt-ipk/files/etc/init.d/fips-gateway}"
 APK_SCRIPTS="${APK_SCRIPTS:-}"
 SHIPPED_YAML="$REPO/packaging/openwrt-ipk/files/etc/fips/fips.yaml"
-# The fips.yaml every release up to 0.5.1 shipped, from before the gateway's
-# default DNS port moved.
+# The fips.yaml v0.5.0 and v0.5.1 shipped, byte for byte (from the v0.5.1 tag),
+# from before the gateway's default DNS port moved. v0.3.0 to v0.4.2 shipped an
+# older file with the same legacy listen line.
 RELEASED_YAML="$REPO/testing/openwrt/fixtures/released-fips.yaml"
 GATEWAY_RS="$REPO/src/config/gateway.rs"
 SETUP_SCRIPT="$REPO/packaging/openwrt-ipk/files/etc/uci-defaults/90-fips-setup"
@@ -440,41 +442,44 @@ YAML
 # ── 7. start_service refuses to touch dnsmasq for a disabled gateway ────────
 # The init script's helpers are redefined after sourcing it, so start_service
 # runs its own decision against recorded stubs instead of uci, procd and the
-# network.
+# network. Where dnsmasq ends up while the gateway runs is scenario 15's.
+stub_start_service_helpers() {
+    # stub_start_service_helpers [keep-swap]: keep-swap leaves the real
+    # dnsmasq_swap_fips_upstream in place, for a caller with the uci stub.
+    if [ "${1:-}" != "keep-swap" ]; then
+        dnsmasq_swap_fips_upstream() { echo "dnsmasq_swap $1" >> "$CALLS"; return 0; }
+    fi
+    sysctl() { return 0; }
+    modprobe() { return 0; }
+    logger() { return 0; }
+    procd_set_param() {
+        if [ "$1" = "command" ]; then
+            echo "$*" >> "$CALLS"
+        fi
+        return 0
+    }
+    procd_close_instance() { return 0; }
+    gateway_add_global_prefix() { echo "add_global_prefix" >> "$CALLS"; return 0; }
+    gateway_add_ra_route() { echo "add_ra_route" >> "$CALLS"; return 0; }
+    procd_open_instance() { echo "procd_open_instance" >> "$CALLS"; return 0; }
+    return 0
+}
+
 scenario_start_service_guard() {
     note "scenario 7: start_service guard"
 
     # shellcheck source=/dev/null
     . "$INIT_GATEWAY"
-
-    sysctl() { return 0; }
-    modprobe() { return 0; }
-    logger() { return 0; }
-    sleep() { return 0; }
-    procd_set_param() { return 0; }
-    procd_close_instance() { return 0; }
-    dnsmasq_swap_fips_upstream() { echo "dnsmasq_swap $1" >> "$CALLS"; return 0; }
-    gateway_add_global_prefix() { echo "add_global_prefix" >> "$CALLS"; return 0; }
-    gateway_add_ra_route() { echo "add_ra_route" >> "$CALLS"; return 0; }
-    procd_open_instance() { echo "procd_open_instance" >> "$CALLS"; return 0; }
+    stub_start_service_helpers
 
     reset_state
     CONFIG="$SHIPPED_YAML"
     start_service >/dev/null 2>&1
-    assert_called "dnsmasq_swap 5365" "an enabled gateway redirects dnsmasq to the default port"
+    assert_none_called_with_prefix "dnsmasq_swap " \
+        "an enabled gateway does not point dnsmasq at a gateway that is not yet listening"
     assert_called "procd_open_instance" "an enabled gateway still starts the daemon"
-
-    reset_state
-    CONFIG="$WORK/explicit-5353.yaml"
-    cat > "$CONFIG" <<'YAML'
-gateway:
-  enabled: true
-  pool: "fd01::/112"
-  dns:
-    listen: "[::1]:5353"
-YAML
-    start_service >/dev/null 2>&1
-    assert_called "dnsmasq_swap 5353" "dnsmasq follows an explicit gateway.dns.listen"
+    assert_called "command /etc/init.d/fips-gateway supervise" \
+        "procd runs the gateway through the init script's supervise command"
 
     reset_state
     CONFIG="$WORK/disabled.yaml"
@@ -833,9 +838,507 @@ scenario_listen_migration() {
     return 0
 }
 
+# ── 15. dnsmasq points at the gateway only while it listens ───────────────
+# start_service runs against recorded procd stubs, and the command it hands
+# procd is then executed as procd would execute it: the real init script is
+# installed at /etc/init.d/fips-gateway, whose #! line runs a stand-in
+# /etc/rc.common, and /usr/bin/fips-gateway is a stub gateway. A stub that
+# binds does so by becoming nc, so the socket is the stub's own, as the real
+# gateway's is. dnsmasq's loopback .fips forward lives in the uci stub and
+# starts on the daemon's port, as it is while the gateway is stopped. However
+# the gateway exits, it must end there.
+
+GW_STUB=/tmp/fips-gw-stub
+
+install_supervise_env() {
+    # install_supervise_env <gateway DNS listen port>
+    install_uci_stub
+    printf '#!/bin/sh\nexit 0\n' > "$STUB_BIN/logger"
+    chmod 0755 "$STUB_BIN/logger"
+
+    rm -rf "$GW_STUB"
+    mkdir -p "$GW_STUB" /etc/fips /usr/bin
+    rm -f /var/run/fips-gateway.pid
+    echo "$1" > "$GW_STUB/port"
+    cat > /etc/fips/fips.yaml <<YAML
+gateway:
+  enabled: true
+  pool: "fd01::/112"
+  dns:
+    listen: "[::1]:$1"
+YAML
+
+    cp "$INIT_GATEWAY" /etc/init.d/fips-gateway
+    chmod 0755 /etc/init.d/fips-gateway
+
+    cat > /etc/rc.common <<'SHIM'
+#!/bin/sh
+# Stand-in for OpenWrt's rc.common: runs one of the init script's commands.
+initscript="$1"
+action="$2"
+shift 2
+. "$initscript"
+case " ${EXTRA_COMMANDS:-} " in
+*" $action "*) "$action" "$@" ;;
+*) echo "rc.common stand-in: $action is not a command of $initscript" >&2; exit 2 ;;
+esac
+SHIM
+    chmod 0755 /etc/rc.common
+
+    cat > /usr/bin/fips-gateway <<'STUB'
+#!/bin/sh
+# Stub gateway, by $GW_STUB/mode:
+#   parse     exits 1 at once, as on a config it cannot parse;
+#   taken     exits 1 after two seconds without binding, as when another
+#             process holds its port;
+#   bind      becomes nc listening on the port, until signalled;
+#   stubborn  ignores SIGTERM and runs until killed, binding nothing itself.
+d=/tmp/fips-gw-stub
+echo $$ > "$d/pid"
+port="$(cat "$d/port")"
+case "$(cat "$d/mode")" in
+parse) exit 1 ;;
+taken) sleep 2; exit 1 ;;
+stubborn)
+    trap '' TERM
+    while :; do sleep 1; done
+    ;;
+esac
+exec nc -u -l -p "$port" -s ::1 </dev/null >/dev/null 2>&1
+STUB
+    chmod 0755 /usr/bin/fips-gateway
+
+    uci_seed "$DNSMASQ_OPT" "/fips/::1#5354" "/lan/192.168.1.2"
+    return 0
+}
+
+remove_supervise_env() {
+    rm -f /etc/rc.common /usr/bin/fips-gateway /var/run/fips-gateway.pid
+    rm -rf /etc/fips "$GW_STUB" "$STUB_BIN"
+    return 0
+}
+
+fips_upstream() {
+    # The loopback .fips forwards dnsmasq has, sorted, on one line.
+    "$STUB_BIN/uci" -q get "$DNSMASQ_OPT" | tr ' ' '\n' | grep '^/fips/' | sort | tr '\n' ' '
+    return 0
+}
+
+wait_for_upstream() {
+    # wait_for_upstream <port> <tenths of a second>: succeeds once dnsmasq
+    # forwards .fips to ::1#<port> and nowhere else on loopback.
+    n=0
+    while [ "$n" -lt "$2" ]; do
+        [ "$(fips_upstream)" = "/fips/::1#$1 " ] && return 0
+        sleep 0.1
+        n=$((n + 1))
+    done
+    return 1
+}
+
+start_gateway_service() {
+    # Runs start_service and then, in the background, the command it gave
+    # procd, with the uci and logger stubs first on PATH. Sets CMD_PID.
+    (
+        PATH="$STUB_BIN:$PATH"
+        # shellcheck source=/dev/null
+        . "$INIT_GATEWAY"
+        stub_start_service_helpers keep-swap
+        CONFIG=/etc/fips/fips.yaml
+        start_service >/dev/null 2>&1
+    )
+    sed -n 's/^command //p' "$CALLS" > "$WORK/command"
+    # shellcheck disable=SC2046
+    set -- $(cat "$WORK/command")
+    if [ $# -eq 0 ]; then
+        CMD_PID=""
+        bad "start_service gave procd no command: $(calls_oneline)"
+        return 1
+    fi
+    ( PATH="$STUB_BIN:$PATH" exec "$@" ) > "$WORK/command.out" 2>&1 &
+    CMD_PID=$!
+    return 0
+}
+
+wait_command() {
+    # wait_command: waits up to 20 s for the procd command; sets CMD_RC.
+    ( sleep 20; kill -KILL "$CMD_PID" 2>/dev/null ) &
+    dog=$!
+    CMD_RC=0
+    wait "$CMD_PID" || CMD_RC=$?
+    kill "$dog" 2>/dev/null
+    wait "$dog" 2>/dev/null
+    return 0
+}
+
+stub_pid() {
+    # stub_pid: the stub gateway's pid once it has started, else empty.
+    n=0
+    while [ ! -s "$GW_STUB/pid" ] && [ "$n" -lt 100 ]; do sleep 0.1; n=$((n + 1)); done
+    cat "$GW_STUB/pid" 2>/dev/null
+    return 0
+}
+
+assert_gone() {
+    # assert_gone <pid> <what it means>
+    if [ -n "$1" ] && kill -0 "$1" 2>/dev/null; then
+        bad "$2 — pid $1 is still running"
+        kill -KILL "$1" 2>/dev/null
+    else
+        ok "$2"
+    fi
+    return 0
+}
+
+assert_on_daemon() {
+    # assert_on_daemon <what it means>
+    assert_equals "$(fips_upstream)" "/fips/::1#5354 " "$1"
+    return 0
+}
+
+hold_port() {
+    # hold_port <port>: an unrelated process binds the port. Sets HOLDER.
+    nc -u -l -p "$1" -s ::1 </dev/null >/dev/null 2>&1 &
+    HOLDER=$!
+    n=0
+    while ! grep -q ":$(printf '%04X' "$1") " /proc/net/udp6 && [ "$n" -lt 50 ]; do
+        sleep 0.1
+        n=$((n + 1))
+    done
+    return 0
+}
+
+scenario_supervise() {
+    note "scenario 15: dnsmasq follows the gateway's life"
+    unset -f sleep logger sysctl modprobe 2>/dev/null
+
+    # 1. The gateway exits before binding, as on a config it cannot parse.
+    reset_state
+    install_supervise_env 5365
+    echo parse > "$GW_STUB/mode"
+    if start_gateway_service; then
+        wait_command
+        assert_on_daemon "a gateway that exits before binding leaves dnsmasq on the daemon"
+        if [ "$CMD_RC" -ne 0 ]; then
+            ok "the gateway's failure is the exit status procd sees"
+        else
+            bad "the procd command exited 0 although the gateway failed"
+        fi
+    fi
+    remove_supervise_env
+
+    # 2. Another process holds the gateway's port, as an mDNS responder holds
+    #    5353, so the gateway cannot bind it and exits.
+    reset_state
+    install_supervise_env 5365
+    echo taken > "$GW_STUB/mode"
+    hold_port 5365
+    if start_gateway_service; then
+        if wait_for_upstream 5365 15; then
+            bad "dnsmasq was pointed at a port the gateway does not hold"
+        else
+            ok "dnsmasq is not pointed at a port another process holds"
+        fi
+        wait_command
+        assert_on_daemon "a gateway whose port is taken leaves dnsmasq on the daemon"
+    fi
+    kill "$HOLDER" 2>/dev/null
+    wait "$HOLDER" 2>/dev/null
+    remove_supervise_env
+
+    # 3. The gateway binds, then fails, as on a NAT or route setup error.
+    reset_state
+    install_supervise_env 5365
+    echo bind > "$GW_STUB/mode"
+    if start_gateway_service; then
+        if wait_for_upstream 5365 100; then
+            ok "dnsmasq forwards .fips to the gateway once it is listening"
+        else
+            bad "dnsmasq never moved to the listening gateway: $(fips_upstream)"
+        fi
+        kill -USR1 "$(stub_pid)" 2>/dev/null
+        wait_command
+        assert_on_daemon "a gateway that fails after binding hands dnsmasq back to the daemon"
+        assert_equals "$(uci_sorted "$DNSMASQ_OPT")" \
+            "$(sorted_words /lan/192.168.1.2 /fips/::1#5354)" \
+            "the swaps keep dnsmasq's other servers"
+    fi
+    remove_supervise_env
+
+    # 4. procd stops a running gateway with SIGTERM, here on its own (as when
+    #    procd restarts an instance), without stop_service. Port from the config.
+    reset_state
+    install_supervise_env 5400
+    echo bind > "$GW_STUB/mode"
+    if start_gateway_service; then
+        if wait_for_upstream 5400 100; then
+            ok "dnsmasq follows an explicit gateway.dns.listen"
+        else
+            bad "dnsmasq never moved to the gateway's port 5400: $(fips_upstream)"
+        fi
+        gw="$(stub_pid)"
+        kill -TERM "$CMD_PID" 2>/dev/null
+        wait_command
+        assert_equals "$CMD_RC" "143" "procd's SIGTERM reaches the gateway, which exits on it"
+        assert_gone "$gw" "the gateway does not outlive the procd command"
+        assert_on_daemon "a gateway stopped by SIGTERM hands dnsmasq back to the daemon"
+    fi
+    remove_supervise_env
+
+    # 5. A gateway that ignores SIGTERM is killed before procd's own timeout,
+    #    after which procd would kill only the supervise shell.
+    reset_state
+    install_supervise_env 5365
+    echo stubborn > "$GW_STUB/mode"
+    if start_gateway_service; then
+        gw="$(stub_pid)"
+        kill -TERM "$CMD_PID" 2>/dev/null
+        # Tenths of a second until the gateway is gone; the supervise shell
+        # reaps it at once, so kill -0 fails as soon as it dies.
+        tenths=0
+        while [ -n "$gw" ] && kill -0 "$gw" 2>/dev/null && [ "$tenths" -lt 100 ]; do
+            sleep 0.1
+            tenths=$((tenths + 1))
+        done
+        wait_command
+        assert_equals "$CMD_RC" "137" "a gateway that ignores SIGTERM is killed"
+        assert_gone "$gw" "a gateway that ignores SIGTERM does not outlive the procd command"
+        if [ "$tenths" -lt 45 ]; then
+            ok "it is killed inside procd's 5 s stop timeout (after ${tenths} tenths of a second)"
+        else
+            bad "it was killed after ${tenths} tenths of a second, too close to or past procd's 5 s"
+        fi
+        assert_on_daemon "a killed gateway hands dnsmasq back to the daemon"
+    fi
+    remove_supervise_env
+
+    # 6. The swap back after a gateway exits is skipped only when the gateway
+    #    procd started in its place, named in the pid file, holds the port.
+    reset_state
+    install_uci_stub
+    (
+        PATH="$STUB_BIN:$PATH"
+        # shellcheck source=/dev/null
+        . "$INIT_GATEWAY"
+        mkdir -p /var/run
+        hold_port 5365
+        uci_seed "$DNSMASQ_OPT" "/fips/::1#5365"
+        echo "$HOLDER" > "$GW_PIDFILE"
+        gateway_dns_release 5365 99999 >/dev/null 2>&1
+        fips_upstream > "$WORK/successor"
+        echo 99998 > "$GW_PIDFILE"
+        gateway_dns_release 5365 99999 >/dev/null 2>&1
+        fips_upstream > "$WORK/other"
+        kill "$HOLDER"
+        wait "$HOLDER" 2>/dev/null
+        rm -f "$GW_PIDFILE"
+    )
+    assert_file_is "$WORK/successor" "/fips/::1#5365 " \
+        "the swap back is skipped while the successor gateway holds the port"
+    assert_file_is "$WORK/other" "/fips/::1#5354 " \
+        "the swap back happens while only some other process holds the port"
+    rm -rf "$STUB_BIN"
+    return 0
+}
+
+# ── 16. A package built from the SDK feed Makefile ─────────────────────────
+# OpenWrt generates that package's postinst and prerm around default_postinst
+# and default_prerm (package/base-files/files/lib/functions.sh, read at OpenWrt
+# main and openwrt-24.10). After its own steps, default_postinst runs a loop
+# over the package's init scripts: "enable" unless PKG_UPGRADE is 1, then
+# "start". Under opkg the package's postinst body is sourced before that loop;
+# under apk it is appended to the generated script and runs after it.
+# default_prerm sources the prerm body with the generated script's own path as
+# $1, then disables (on a removal) and stops each init script. The preinst is
+# the package's own, run as opkg runs it ("install" or "upgrade <old>") or as
+# apk runs it (versions only, PKG_UPGRADE=1 exported on an upgrade).
+#
+# /etc/init.d/fips is the recording stub. /etc/init.d/fips-gateway is the real
+# script, run through a stand-in rc.common that keeps enablement as the
+# /etc/rc.d links OpenWrt's does and records whether start_service opened a
+# procd instance, which is what starting the gateway means.
+
+install_sdk_env() {
+    install_uci_stub
+    printf '#!/bin/sh\nexit 0\n' > "$STUB_BIN/logger"
+    chmod 0755 "$STUB_BIN/logger"
+    rm -rf /etc/rc.d
+    mkdir -p /etc/rc.d /etc/fips /var/run
+    cp "$SHIPPED_YAML" /etc/fips/fips.yaml
+    cp "$INIT_GATEWAY" /etc/init.d/fips-gateway
+    chmod 0755 /etc/init.d/fips-gateway
+    rm -f /var/run/fips-gateway-install-hold
+    cat > /etc/rc.common <<'SHIM'
+#!/bin/sh
+# Stand-in for OpenWrt's rc.common: enablement as /etc/rc.d links, and start
+# runs start_service with procd's calls recorded instead of made.
+initscript="$1"
+action="$2"
+shift 2
+name="${initscript##*/}"
+enable() { ln -sf "../init.d/$name" "/etc/rc.d/S${START}$name"; ln -sf "../init.d/$name" "/etc/rc.d/K${STOP}$name"; }
+disable() { rm -f /etc/rc.d/S??"$name" /etc/rc.d/K??"$name"; }
+enabled() { [ -L "/etc/rc.d/S${START}$name" ]; }
+procd_open_instance() { echo "$name instance" >> "$CALLS"; }
+procd_set_param() { :; }
+procd_close_instance() { :; }
+stop_service() { :; }
+. "$initscript"
+sysctl() { :; }
+modprobe() { :; }
+gateway_add_global_prefix() { :; }
+gateway_add_ra_route() { :; }
+stop_service() { :; }
+echo "$name $action" >> "$CALLS"
+case "$action" in
+start) start_service ;;
+stop) stop_service ;;
+*) "$action" "$@" ;;
+esac
+SHIM
+    chmod 0755 /etc/rc.common
+    return 0
+}
+
+remove_sdk_env() {
+    rm -rf /etc/rc.d /etc/fips "$STUB_BIN"
+    rm -f /etc/rc.common /var/run/fips-gateway-install-hold
+    return 0
+}
+
+sdk_loop() {
+    # The init-script loop of default_postinst.
+    for i in /etc/init.d/fips /etc/init.d/fips-gateway; do
+        if [ "${PKG_UPGRADE:-0}" != "1" ]; then
+            "$i" enable
+        fi
+        "$i" start
+    done
+    return 0
+}
+
+sdk_postinst() {
+    # sdk_postinst ipk|apk
+    if [ "$1" = "ipk" ]; then
+        ( set -- /usr/lib/opkg/info/fips.postinst configure; . "$POSTINST" ) >/dev/null 2>&1
+        sdk_loop >/dev/null 2>&1
+    else
+        sdk_loop >/dev/null 2>&1
+        sh "$POSTINST" 2.0-r1 >/dev/null 2>&1
+    fi
+    return 0
+}
+
+sdk_prerm_upgrade_ipk() {
+    # default_prerm for the outgoing SDK-built package on an opkg upgrade.
+    ( set -- /usr/lib/opkg/info/fips.prerm upgrade 2.0-r1; . "$PRERM" ) >/dev/null 2>&1
+    for i in /etc/init.d/fips /etc/init.d/fips-gateway; do
+        "$i" stop >/dev/null 2>&1
+    done
+    return 0
+}
+
+sdk_preinst() {
+    # sdk_preinst <args...>, run as a script, as opkg and apk run it.
+    if [ ! -f "$PREINST" ]; then
+        bad "there is no preinst at $PREINST"
+        return 0
+    fi
+    sh "$PREINST" "$@" >/dev/null 2>&1
+    return 0
+}
+
+assert_gateway() {
+    # assert_gateway <enabled|disabled> <started|stopped> <case>
+    if [ -L /etc/rc.d/S96fips-gateway ]; then got=enabled; else got=disabled; fi
+    assert_equals "$got" "$1" "$3: fips-gateway ends $1"
+    if grep -qxF "fips-gateway instance" "$CALLS"; then got=started; else got=stopped; fi
+    assert_equals "$got" "$2" "$3: fips-gateway is $2"
+    assert_absent /var/run/fips-gateway-install-hold "$3: no install hold is left behind"
+    return 0
+}
+
+scenario_sdk_package() {
+    note "scenario 16: SDK feed package, default_postinst and default_prerm"
+    saved_path="$PATH"
+    PATH="$STUB_BIN:$PATH"
+    export PATH
+
+    for fmt in ipk apk; do
+        reset_state
+        install_sdk_env
+        if [ "$fmt" = "ipk" ]; then
+            PKG_UPGRADE=0 sdk_preinst install
+            PKG_UPGRADE=0 sdk_postinst ipk
+        else
+            sdk_preinst 2.0-r1
+            sdk_postinst apk
+        fi
+        assert_called "fips start" "$fmt fresh install: the daemon is started"
+        assert_file_is "$FIPS_STATE" "1" "$fmt fresh install: the daemon is enabled"
+        assert_gateway disabled stopped "$fmt fresh install"
+        remove_sdk_env
+
+        for gw in enabled disabled; do
+            reset_state
+            install_sdk_env
+            echo 1 > "$FIPS_STATE"
+            [ "$gw" = "enabled" ] && /etc/init.d/fips-gateway enable >/dev/null 2>&1
+            : > "$CALLS"
+            if [ "$fmt" = "ipk" ]; then
+                PKG_UPGRADE=1 sdk_prerm_upgrade_ipk
+                PKG_UPGRADE=1 sdk_preinst upgrade 1.0-r1
+                PKG_UPGRADE=1 sdk_postinst ipk
+            else
+                PKG_UPGRADE=1 sdk_preinst 2.0-r1 1.0-r1
+                PKG_UPGRADE=1 sdk_postinst apk
+            fi
+            if [ "$gw" = "enabled" ]; then
+                assert_gateway enabled started "$fmt upgrade, gateway enabled"
+            else
+                assert_gateway disabled stopped "$fmt upgrade, gateway disabled"
+            fi
+            assert_absent "$UPGRADE_MARKER" "$fmt upgrade, gateway $gw: the upgrade marker is removed"
+            remove_sdk_env
+        done
+    done
+
+    # An opkg upgrade from a released package, whose prerm disabled the
+    # gateway and left no marker: the postinst body re-enables and starts it,
+    # as with build-ipk.sh, which needs it to clear the hold first.
+    reset_state
+    install_sdk_env
+    echo 1 > "$FIPS_STATE"
+    /etc/init.d/fips-gateway enable >/dev/null 2>&1
+    : > "$CALLS"
+    PKG_UPGRADE=1 sh "$RELEASED_PRERM" upgrade 2.0-r1 >/dev/null 2>&1
+    PKG_UPGRADE=1 sdk_preinst upgrade 0.5.1
+    PKG_UPGRADE=1 sdk_postinst ipk
+    assert_gateway enabled started "ipk upgrade from a released package"
+    remove_sdk_env
+
+    # An image build runs the scripts on the build host, with IPKG_INSTROOT
+    # naming the image root: they must not touch the host at all.
+    reset_state
+    rm -f /var/run/fips-gateway-install-hold "$UPGRADE_MARKER"
+    for pkg_upgrade in 0 1; do
+        IPKG_INSTROOT=/tmp/fips-image-root PKG_UPGRADE=$pkg_upgrade sh "$PREINST" install >/dev/null 2>&1
+        IPKG_INSTROOT=/tmp/fips-image-root PKG_UPGRADE=$pkg_upgrade sh "$POSTINST" configure >/dev/null 2>&1
+        IPKG_INSTROOT=/tmp/fips-image-root PKG_UPGRADE=$pkg_upgrade sh "$PRERM" upgrade 2.0-r1 >/dev/null 2>&1
+        IPKG_INSTROOT=/tmp/fips-image-root PKG_UPGRADE=$pkg_upgrade sh "$PRERM" remove >/dev/null 2>&1
+    done
+    assert_equals "$(calls_oneline)" "" "image build: no script touches the build host's services"
+    assert_absent /var/run/fips-gateway-install-hold "image build: the preinst leaves no hold on the build host"
+    assert_absent "$UPGRADE_MARKER" "image build: the prerm leaves no marker on the build host"
+
+    PATH="$saved_path"
+    return 0
+}
+
 echo "OpenWrt maintainer-script scenarios (shell: $(readlink -f /proc/$$/exe 2>/dev/null || echo sh))"
 echo "  postinst: $POSTINST"
 echo "  prerm:    $PRERM"
+echo "  preinst:  $PREINST"
 echo "  apk:      ${APK_SCRIPTS:-(not set)}"
 
 scenario_fresh_install
@@ -852,6 +1355,8 @@ scenario_dns_port_reader
 scenario_default_port_parity
 scenario_swap_cleanup
 scenario_listen_migration
+scenario_supervise
+scenario_sdk_package
 
 echo ""
 if [ "$FAILURES" -eq 0 ]; then

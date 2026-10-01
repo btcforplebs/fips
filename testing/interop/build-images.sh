@@ -144,7 +144,9 @@ build_one() {
     local slot="$1"
     local ref="$2"
     local sha
-    sha="$(git -C "$REPO_ROOT" rev-parse --short "$ref")"
+    # Peel to the commit: an annotated tag's own name resolves to the tag
+    # object, which is not what was built.
+    sha="$(git -C "$REPO_ROOT" rev-parse --short "${ref}^{commit}")"
 
     echo ""
     echo "=== Building slot '$slot'  ref='$ref'  sha=$sha ==="
@@ -224,7 +226,7 @@ MANIFEST="$WORK_BASE/refs.env"
     for i in 0 1 2; do
         slot="${SLOTS[$i]}"
         ref="${REFS[$i]}"
-        sha="$(git -C "$REPO_ROOT" rev-parse --short "$ref")"
+        sha="$(git -C "$REPO_ROOT" rev-parse --short "${ref}^{commit}")"
         upper="$(echo "$slot" | tr '[:lower:]' '[:upper:]')"
         echo "INTEROP_REF_${upper}=$ref"
         echo "INTEROP_SHA_${upper}=$sha"

@@ -700,6 +700,110 @@ fn windows_installer_restricts_config_dir_before_any_path_inside_it() {
     }
 }
 
+/// Guards what install-service.ps1's ACL grants and who it makes owner, not
+/// only the order of the steps.
+///
+/// The ACL must allow SYSTEM and Administrators full control and grant no one
+/// else anything: granting Users read would expose the identity key and make
+/// an unelevated `fipsctl address` work again. Both `/setowner` calls must
+/// name Administrators. The PowerShell 7 `FileSystemAclExtensions` type must
+/// be used only on Core, since Windows PowerShell 5.1's .NET Framework lacks
+/// it.
+#[test]
+fn windows_installer_acl_allows_only_system_and_administrators_and_makes_administrators_owner() {
+    let lines = ps_lines(&repo_file("packaging/windows/install-service.ps1"));
+
+    let sid_loops: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.starts_with("foreach ($sid in "))
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(
+        sid_loops.len(),
+        1,
+        "install-service.ps1: expected one loop over the SIDs the ACL allows"
+    );
+    let sid_loop = sid_loops[0];
+    assert_eq!(
+        lines[sid_loop], r#"foreach ($sid in @("S-1-5-18", "S-1-5-32-544")) {"#,
+        "install-service.ps1: the ACL must allow exactly SYSTEM and Administrators"
+    );
+    let body = &lines[sid_loop + 1..block_end(&lines, sid_loop)];
+    for (what, want) in [
+        (
+            "the rule's account",
+            "[System.Security.Principal.SecurityIdentifier]::new($sid),",
+        ),
+        (
+            "the rule's rights",
+            "[System.Security.AccessControl.FileSystemRights]::FullControl,",
+        ),
+        (
+            "the rule's type",
+            "[System.Security.AccessControl.AccessControlType]::Allow)",
+        ),
+        ("the rule's addition to $acl", "$acl.AddAccessRule($rule)"),
+    ] {
+        assert!(
+            body.iter().any(|l| l == want),
+            "install-service.ps1: the SID loop does not have {what} as {want}"
+        );
+    }
+    for needle in [
+        "FileSystemAccessRule",
+        "FileSystemRights]::",
+        "AccessControlType]::",
+        "AccessRule(",
+    ] {
+        let uses = lines.iter().filter(|l| l.contains(needle)).count();
+        let inside = body.iter().filter(|l| l.contains(needle)).count();
+        assert!(
+            uses == 1 && inside == 1,
+            "install-service.ps1: expected {needle} exactly once, inside the SID loop; \
+             found {uses}, {inside} inside"
+        );
+    }
+
+    let setowners: Vec<&String> = lines.iter().filter(|l| l.contains("/setowner")).collect();
+    assert!(
+        !setowners.is_empty(),
+        "install-service.ps1: no /setowner line"
+    );
+    for l in setowners {
+        assert!(
+            l.contains(r#"/setowner "*S-1-5-32-544" "#),
+            "install-service.ps1: /setowner must make Administrators the owner: {l}"
+        );
+    }
+
+    let editions: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.contains("PSEdition"))
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(
+        editions.len(),
+        1,
+        "install-service.ps1: expected one PSEdition test"
+    );
+    let at = editions[0];
+    let want = [
+        r#"if ($PSVersionTable.PSEdition -eq "Core") {"#,
+        "[System.IO.FileSystemAclExtensions]::CreateDirectory($acl, $ConfigDir) | Out-Null",
+        "} else {",
+        "[System.IO.Directory]::CreateDirectory($ConfigDir, $acl) | Out-Null",
+        "}",
+    ];
+    assert_eq!(
+        lines.get(at..at + want.len()).unwrap_or_default(),
+        want,
+        "install-service.ps1: FileSystemAclExtensions must be used only when PSEdition is \
+         Core, and Directory.CreateDirectory otherwise"
+    );
+}
+
 /// Guards the conditions under which install-service.ps1 refuses its config
 /// directory, not only their position.
 ///
@@ -729,17 +833,33 @@ fn windows_installer_refusal_conditions_stop_the_install() {
     let trusted = find("list of trusted owners", &|l| {
         l.starts_with("$trustedOwners = @(")
     });
-    for needle in [
-        "\"S-1-5-18\"",
-        "\"S-1-5-32-544\"",
-        "WindowsIdentity]::GetCurrent().User.Value",
-    ] {
-        assert!(
-            lines[trusted[0]].contains(needle),
-            "install-service.ps1: the trusted owners do not include {needle}: {}",
-            lines[trusted[0]]
-        );
-    }
+    assert_eq!(
+        trusted.len(),
+        1,
+        "install-service.ps1: expected one list of trusted owners"
+    );
+    let owners: Vec<&str> = lines[trusted[0]]
+        .strip_prefix("$trustedOwners = @(")
+        .and_then(|l| l.strip_suffix(')'))
+        .unwrap_or_else(|| {
+            panic!(
+                "install-service.ps1: the trusted owners are not one @( ) list: {}",
+                lines[trusted[0]]
+            )
+        })
+        .split(',')
+        .map(str::trim)
+        .collect();
+    assert_eq!(
+        owners,
+        [
+            "\"S-1-5-18\"",
+            "\"S-1-5-32-544\"",
+            "[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value",
+        ],
+        "install-service.ps1: the trusted owners must be exactly SYSTEM, Administrators \
+         and the installing account"
+    );
     for i in find("owner refusal", &|l| {
         l == "if ($trustedOwners -notcontains $ownerSid) {"
     }) {
@@ -874,11 +994,9 @@ fn windows_installer_creates_empty_peer_acl_files_and_refuses_legacy_ones() {
             .unwrap_or_else(|| panic!("install-service.ps1: no line {what}"))
     };
 
-    let legacy_dir = first("assigning $legacyAclDir", &|l| {
-        l.starts_with("$legacyAclDir = ")
-    });
+    let legacy_dir = first("assigning $legacyDir", &|l| l.starts_with("$legacyDir = "));
     assert_eq!(
-        lines[legacy_dir], r#"$legacyAclDir = "$env:SystemDrive\etc\fips""#,
+        lines[legacy_dir], r#"$legacyDir = "$env:SystemDrive\etc\fips""#,
         "install-service.ps1: the legacy peer ACL directory is not \\etc\\fips on the \
          system drive"
     );
@@ -906,7 +1024,7 @@ fn windows_installer_creates_empty_peer_acl_files_and_refuses_legacy_ones() {
     let creation_body = creation + 1..creation_end;
 
     for text in [
-        "$legacy = Join-Path $legacyAclDir $name",
+        "$legacy = Join-Path $legacyDir $name",
         r#"$current = "$ConfigDir\$name""#,
     ] {
         assert!(
@@ -967,7 +1085,7 @@ fn windows_installer_creates_empty_peer_acl_files_and_refuses_legacy_ones() {
     let is_check = |l: &str| l == "& $refuseEntries";
     let order = [
         ("check after the reset", all(&is_check).get(2).copied()),
-        ("$legacyAclDir", Some(legacy_dir)),
+        ("$legacyDir", Some(legacy_dir)),
         ("refusal loop", Some(refusal)),
         ("refusal of a legacy file", Some(check)),
         ("end of the refusal loop", Some(refusal_end)),
@@ -981,6 +1099,93 @@ fn windows_installer_creates_empty_peer_acl_files_and_refuses_legacy_ones() {
         (
             "service registration",
             all(&|l| l.contains("--install-service")).first().copied(),
+        ),
+    ];
+    for pair in order.windows(2) {
+        let [(a, ia), (b, ib)] = pair else {
+            unreachable!("windows(2) yields pairs")
+        };
+        let (ia, ib) = (
+            ia.unwrap_or_else(|| panic!("install-service.ps1: no {a}")),
+            ib.unwrap_or_else(|| panic!("install-service.ps1: no {b}")),
+        );
+        assert!(
+            ia < ib,
+            "install-service.ps1: {a} (code line {ia}) must come before {b} (code line {ib})"
+        );
+    }
+}
+
+/// Guards install-service.ps1's refusal of an identity key left in
+/// `\etc\fips`.
+///
+/// A service that earlier releases ran from `\etc\fips` reads only
+/// `C:\ProgramData\fips` once the installer sets `FIPS_CONFIG`, so a key left
+/// in `\etc\fips` with none in the config directory means the node would
+/// come up with a new identity. The installer must stop in exactly that case,
+/// and must decide it before it creates any file in the config directory,
+/// copies the binaries or registers the service, so a refusal leaves an
+/// existing install as it was.
+#[test]
+fn windows_installer_refuses_a_legacy_identity_key_with_none_in_the_config_dir() {
+    let lines = ps_lines(&repo_file("packaging/windows/install-service.ps1"));
+    let first = |what: &str, pred: &dyn Fn(&str) -> bool| -> usize {
+        lines
+            .iter()
+            .position(|l| pred(l))
+            .unwrap_or_else(|| panic!("install-service.ps1: no line {what}"))
+    };
+
+    let dir = first("assigning $legacyDir", &|l| l.starts_with("$legacyDir = "));
+    let key = first("assigning $legacyKey", &|l| l.starts_with("$legacyKey = "));
+    assert_eq!(
+        lines[key], r#"$legacyKey = Join-Path $legacyDir "fips.key""#,
+        "install-service.ps1: the legacy key is not fips.key in $legacyDir"
+    );
+    let checks: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.starts_with("if (") && l.contains("$legacyKey"))
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(
+        checks.len(),
+        1,
+        "install-service.ps1: expected one test of the legacy key, found {}",
+        checks.len()
+    );
+    let check = checks[0];
+    assert_eq!(
+        lines[check],
+        r#"if ((Test-Path -LiteralPath $legacyKey) -and -not (Test-Path -LiteralPath "$ConfigDir\fips.key")) {"#,
+        "install-service.ps1: the refusal must hold only when the legacy key exists and \
+         the config directory has none"
+    );
+    refuses_at(&lines, check, "refusal of a legacy identity key");
+
+    let order = [
+        ("$legacyDir", Some(dir)),
+        ("$legacyKey", Some(key)),
+        ("refusal of a legacy identity key", Some(check)),
+        (
+            "creation of a peer ACL file",
+            lines
+                .iter()
+                .position(|l| l.contains("New-Item") && l.contains("-ItemType File")),
+        ),
+        (
+            "binary copy",
+            lines.iter().position(|l| l.contains("$Binaries")),
+        ),
+        (
+            "default config copy",
+            lines
+                .iter()
+                .position(|l| l.contains("Copy-Item") && l.contains("$ConfigDir\\fips.yaml")),
+        ),
+        (
+            "service registration",
+            lines.iter().position(|l| l.contains("--install-service")),
         ),
     ];
     for pair in order.windows(2) {

@@ -134,14 +134,25 @@ Write-Host "  Restricted $ConfigDir to SYSTEM and Administrators"
 # the system drive, where any local user can create files, and the service
 # still reads a file there when it is missing from the config directory.
 # Stop rather than enforce, or silently drop, a list nobody has reviewed.
-$legacyAclDir = "$env:SystemDrive\etc\fips"
+$legacyDir = "$env:SystemDrive\etc\fips"
 foreach ($name in @("peers.allow", "peers.deny")) {
-    $legacy = Join-Path $legacyAclDir $name
+    $legacy = Join-Path $legacyDir $name
     $current = "$ConfigDir\$name"
     if ((Test-Path -LiteralPath $legacy) -and -not (Test-Path -LiteralPath $current)) {
         Write-Error "$legacy exists and $current does not, so the service would enforce the old file. Earlier releases read it, and any local user can write there. Review it, then move it to $current or delete it, and run install-service.ps1 again."
         exit 1
     }
+}
+
+# A service that earlier releases ran from \etc\fips reads only $ConfigDir
+# once FIPS_CONFIG is set below, and would come up with a new identity. Stop
+# until the key is moved into $ConfigDir or deleted. The installer does not
+# move it itself: any local user can write \etc\fips, so a key there may not
+# be this node's.
+$legacyKey = Join-Path $legacyDir "fips.key"
+if ((Test-Path -LiteralPath $legacyKey) -and -not (Test-Path -LiteralPath "$ConfigDir\fips.key")) {
+    Write-Error "$legacyKey exists and $ConfigDir\fips.key does not, so a service that ran from \etc\fips would come up with a new identity. If that key is this node's, move it to $ConfigDir\fips.key and carry the settings you need from \etc\fips\fips.yaml, node.identity.persistent: true among them, into $ConfigDir\fips.yaml, then delete \etc\fips\fips.yaml, which the service warns about on every start until it is gone. If you did not put the key there, delete it: any local user can write to \etc\fips. Then run install-service.ps1 again."
+    exit 1
 }
 
 # Empty peer ACL files allow every peer. Having them here means the service

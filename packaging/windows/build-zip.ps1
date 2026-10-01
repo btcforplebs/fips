@@ -83,6 +83,13 @@ Windows Service:
   # Install (requires Administrator)
   powershell -File install-service.ps1
 
+  # Upgrade: stop the service first, or the installer fails
+  # copying fips.exe after it has already changed the config
+  # directory. Then rerun the installer and start the service.
+  sc stop fips
+  powershell -File install-service.ps1
+  sc start fips
+
   # Manage
   sc start fips
   sc stop fips
@@ -125,10 +132,26 @@ Configuration:
   saying so, or may fail with an access error.
 
   A foreground run takes -c <file>, or reads
+  \etc\fips\fips.yaml on the current drive, then
   C:\ProgramData\fips\fips.yaml and then, as per-user overrides
   the service does not read, %APPDATA%\fips\fips.yaml,
   %USERPROFILE%\.fips.yaml and .\fips.yaml. The key file sits
-  beside the last config loaded.
+  beside the last config loaded. \etc\fips\fips.yaml was the
+  system config of earlier releases, and any local user can
+  create it; the daemon warns when it loads it, and from v0.6.0
+  the search no longer looks there. Move what you need from it
+  into C:\ProgramData\fips\fips.yaml and delete it.
+
+  A service that earlier releases ran from \etc\fips reads
+  only C:\ProgramData\fips once install-service.ps1 has run,
+  so it loses that config and may come up with a new identity.
+  The installer stops if it finds \etc\fips\fips.key with no
+  fips.key in C:\ProgramData\fips. If the key is this node's,
+  move it there, carry the settings you need from
+  \etc\fips\fips.yaml, node.identity.persistent: true among
+  them, into C:\ProgramData\fips\fips.yaml, delete
+  \etc\fips\fips.yaml, and run the installer again. If you did
+  not put the key there, delete it.
 
   fipsctl keygen writes to C:\ProgramData\fips by default and
   needs an elevated prompt. Run install-service.ps1 before it:

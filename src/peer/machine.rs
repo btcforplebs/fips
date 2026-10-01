@@ -1257,6 +1257,9 @@ impl PeerMachine {
             // The decision carries the stored msg2 bytes; the driver's inline
             // resend owns the send. No machine state is touched.
             InboundDecision::ResendMsg2 { .. } => Vec::new(),
+            // Decision-only: the driver resends the held rekey msg2 on the
+            // peer's established link. No machine state is touched.
+            InboundDecision::ResendRekeyMsg2 { .. } => Vec::new(),
             // Decision-only: the driver's inline body owns the abandon, the
             // index allocation, the framed msg2 send, the pending-session
             // store, and the dampening stamp. The machine mutates nothing.
@@ -1865,7 +1868,7 @@ fn disconnect_frame(reason: CloseReason) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proto::fmp::PromotionResult;
+    use crate::proto::fmp::{Msg1Digest, PromotionResult};
     use crate::{Identity, PeerIdentity};
 
     fn peer_identity() -> PeerIdentity {
@@ -1892,6 +1895,7 @@ mod tests {
             remote_epoch: epoch,
             their_index: SessionIndex::new(their),
             msg2_payload: vec![0xAB; 8],
+            msg1_digest: Msg1Digest::of(&[0xCD; 8]),
         }
     }
 
@@ -1903,6 +1907,8 @@ mod tests {
             has_session: false,
             pending_new_session: false,
             rekey_in_progress: false,
+            held_answer: None,
+            msg1_answered_before: false,
             existing_msg2: None,
             at_max_peers: false,
             has_pending_outbound_to_peer: false,

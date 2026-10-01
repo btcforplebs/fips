@@ -41,6 +41,11 @@
 # Phase 5b), and MESH-SIZE estimate convergence across versions
 # (Phase 7).
 #
+# A link lost at any point of a run turns it red: the ping phases cover
+# Phases 1 to 5, Phase 7 checks every node's direct peers on each poll
+# round of its warmup and settle loops, and Phase 8 scans the whole run's
+# logs for peer removals and the other global failure signatures.
+#
 # Environment:
 #   FIPS_INTEROP_NETEM     tc-netem arg string applied to every container's
 #                          eth0, e.g. "delay 10ms 5ms 25% loss 1%". Unset =
@@ -537,7 +542,14 @@ count_log_pattern() {
     return 0
 }
 
-# Count completed FMP initiator rekey cutovers across all node logs.
+# Count completed FMP rekey cutovers across all node logs.
+#
+# The line says "(initiator)", but it does not show direction in a mixed
+# mesh: builds before v0.5.2 also log it as a responder, on the self-cutover
+# one tick after sending msg2. So this counts cutovers of either role, and
+# every caller reports it as a role-blind count. None needs direction: the
+# control window wants any cutover, and the rekey phases want proof that
+# rekeys completed.
 #
 # The pattern is a literal argument so the log-string guard can check it
 # against the daemon source. Prints the count, or `unreadable:<ctr>` with
@@ -595,6 +607,114 @@ mesh_estimate() {
     docker exec "${CONTAINER[$1]}" fipsctl show status 2>/dev/null \
         | python3 -c "import sys,json; v=json.load(sys.stdin).get('estimated_mesh_size'); print(v if v is not None else 'null')" 2>/dev/null \
         || echo null
+}
+
+# The direct neighbours <node> does not list in `fipsctl show peers`, as
+# space-separated node ids (empty when all are listed). Prints `unreadable`
+# with status 1 when the node cannot be asked or its answer cannot be
+# parsed, so a dead reader is never taken for a full peer list.
+missing_peers() {
+    local n="$1" out listed m missing=""
+    if ! out="$(docker exec "${CONTAINER[$n]}" fipsctl show peers 2>/dev/null)" \
+        || ! listed="$(python3 -c 'import sys,json; print(" ".join(p["npub"] for p in json.load(sys.stdin)["peers"]))' <<<"$out" 2>/dev/null)"; then
+        echo "unreadable"
+        return 1
+    fi
+    for m in "${NODES[@]}"; do
+        pair_is_direct "$n" "$m" || continue
+        case " $listed " in
+            *" ${NPUB_OF[$m]} "*) ;;
+            *) missing+=" $m" ;;
+        esac
+    done
+    echo "${missing# }"
+    return 0
+}
+
+# One link-continuity round over every node: record each direct neighbour
+# a node has stopped listing, and each node that could not be asked. A
+# peer drops out of `show peers` only when its link is removed (a stale
+# but live link stays listed), so a miss here is a lost link, not loss
+# noise. Phase 7 runs no pings, so without this a link lost during its
+# warmup would pass the run.
+#
+# A node that cannot be asked is a different matter: one failed
+# `docker exec` says nothing about its links. An isolated unreadable round
+# is counted and reported but tolerated; two in a row, or an unreadable
+# final round, fail the node, because then the harness has stopped
+# observing it. A link lost and re-established inside the unread gap
+# still leaves an "MMP link teardown" line for Phase 8 to find.
+declare -A LINK_LOST_AT LINK_LOST_ROUNDS LINK_UNREADABLE LINK_UNREAD_RUN LINK_UNREAD_WORST
+LINK_ROUNDS=0
+check_links_round() {
+    local n m missing at=$(( SECONDS - MESH_UP_AT ))
+    LINK_ROUNDS=$((LINK_ROUNDS + 1))
+    for n in "${NODES[@]}"; do
+        if ! missing="$(missing_peers "$n")"; then
+            LINK_UNREADABLE[$n]=$(( ${LINK_UNREADABLE[$n]:-0} + 1 ))
+            LINK_UNREAD_RUN[$n]=$(( ${LINK_UNREAD_RUN[$n]:-0} + 1 ))
+            if [ "${LINK_UNREAD_RUN[$n]}" -gt "${LINK_UNREAD_WORST[$n]:-0}" ]; then
+                LINK_UNREAD_WORST[$n]="${LINK_UNREAD_RUN[$n]}"
+            fi
+            echo "    UNREADABLE  $n: show peers could not be read (${at}s after mesh start)"
+            continue
+        fi
+        LINK_UNREAD_RUN[$n]=0
+        for m in $missing; do
+            if [ -z "${LINK_LOST_AT[$n|$m]:-}" ]; then
+                LINK_LOST_AT[$n|$m]="$at"
+                echo "    LINK LOST  $n no longer lists direct peer $m (${at}s after mesh start)"
+            fi
+            LINK_LOST_ROUNDS[$n|$m]=$(( ${LINK_LOST_ROUNDS[$n|$m]:-0} + 1 ))
+        done
+    done
+    return 0
+}
+
+# Global negative checks — these must be zero on EVERY node regardless
+# of version pairing. A non-zero count is attributed to the node and,
+# where the count is asymmetric across versions, flagged as interop.
+# Every pattern must be live at the level generate-configs.sh sets.
+declare -A GLOBAL_PATTERNS=(
+    ["PANIC|panicked"]="panics"
+    ["ERROR"]="error-level log lines"
+    ["unknown FMP version|Unknown FMP version"]="unknown-FMP-version drops"
+    ["MMP link teardown"]="MMP link teardowns (a peer removed)"
+    ["Excessive decryption failures"]="excessive-decryption-failure removals"
+    ["Session AEAD decryption failed"]="FSP AEAD decrypt failures"
+    ["Rekey msg2 processing failed"]="rekey msg2 failures"
+    ["Handshake failed|handshake failed"]="handshake failures"
+)
+
+scan_global_patterns() {
+    local pat desc total n c s u
+    for pat in "${!GLOBAL_PATTERNS[@]}"; do
+        desc="${GLOBAL_PATTERNS[$pat]}"
+        if ! total="$(count_log_pattern "$pat")"; then
+            echo "    FAIL  $desc: node logs unreadable ($total), zero not established"
+            FAILED=$((FAILED + 1))
+            INTEROP_FAILURES+=("[log] $desc: node logs unreadable ($total)")
+            continue
+        fi
+        if [ "$total" -eq 0 ]; then
+            echo "    PASS  $desc: 0"
+            PASSED=$((PASSED + 1))
+        else
+            echo "    FAIL  $desc: $total (expected 0)"
+            FAILED=$((FAILED + 1))
+            # Per-node breakdown so the count can be attributed to a build.
+            for n in "${NODES[@]}"; do
+                c="$(count_node_pattern "$n" "$pat")"
+                if [ "$c" -gt 0 ]; then
+                    s="${SLOT_OF[$n]}"
+                    u="$(echo "$s" | tr '[:lower:]' '[:upper:]')"
+                    echo "          $n [$u ${SLOT_REF[$s]}@${SLOT_SHA[$s]}]: $c"
+                    INTEROP_FAILURES+=("[log] node $n ($u ${SLOT_REF[$s]}@${SLOT_SHA[$s]}): $c x '$desc'")
+                fi
+            done
+        fi
+    done
+    return 0
 }
 
 # ── Data-plane continuity streams ────────────────────────────────────
@@ -876,7 +996,7 @@ if ! fmp_cutovers="$(count_log_pattern 'Rekey cutover complete \(initiator\), K-
     FAILED=$((FAILED + 1))
     INTEROP_FAILURES+=("[log] FMP rekey cutovers: node logs unreadable ($fmp_cutovers)")
 elif [ "$fmp_cutovers" -ge 1 ]; then
-    echo "  PASS  FMP rekey initiator cutovers: $fmp_cutovers"
+    echo "  PASS  FMP rekey cutovers (either role; see fmp_cutover_count): $fmp_cutovers"
     PASSED=$((PASSED + 1))
 else
     echo "  FAIL  no FMP rekey cutover observed within ${FIRST_REKEY_TIMEOUT}s"
@@ -983,49 +1103,9 @@ PASSED=0; FAILED=0
 # at least one cutover before the final assertions.
 wait_for_log_pattern_count "FSP rekey cutover complete" 1 "$REKEY_SETTLE" || true
 
-# Global negative checks — these must be zero on EVERY node regardless
-# of version pairing. A non-zero count is attributed to the node and,
-# where the count is asymmetric across versions, flagged as interop.
-echo ""
-echo "  -- Global health (all $NUM_NODES nodes) --"
-
-declare -A GLOBAL_PATTERNS=(
-    ["PANIC|panicked"]="panics"
-    ["ERROR"]="error-level log lines"
-    ["unknown FMP version|Unknown FMP version"]="unknown-FMP-version drops"
-    ["MMP link teardown"]="MMP link teardowns"
-    ["Excessive decryption failures"]="excessive-decryption-failure removals"
-    ["Session AEAD decryption failed"]="FSP AEAD decrypt failures"
-    ["Rekey msg2 processing failed"]="rekey msg2 failures"
-    ["Handshake failed|handshake failed"]="handshake failures"
-)
-
-for pat in "${!GLOBAL_PATTERNS[@]}"; do
-    desc="${GLOBAL_PATTERNS[$pat]}"
-    if ! total="$(count_log_pattern "$pat")"; then
-        echo "    FAIL  $desc: node logs unreadable ($total), zero not established"
-        FAILED=$((FAILED + 1))
-        INTEROP_FAILURES+=("[log] $desc: node logs unreadable ($total)")
-        continue
-    fi
-    if [ "$total" -eq 0 ]; then
-        echo "    PASS  $desc: 0"
-        PASSED=$((PASSED + 1))
-    else
-        echo "    FAIL  $desc: $total (expected 0)"
-        FAILED=$((FAILED + 1))
-        # Per-node breakdown so the count can be attributed to a build.
-        for n in "${NODES[@]}"; do
-            c="$(count_node_pattern "$n" "$pat")"
-            if [ "$c" -gt 0 ]; then
-                s="${SLOT_OF[$n]}"
-                u="$(echo "$s" | tr '[:lower:]' '[:upper:]')"
-                echo "          $n [$u ${SLOT_REF[$s]}@${SLOT_SHA[$s]}]: $c"
-                INTEROP_FAILURES+=("[log] node $n ($u ${SLOT_REF[$s]}@${SLOT_SHA[$s]}): $c x '$desc'")
-            fi
-        done
-    fi
-done
+# The global negative checks (panics, errors, link teardowns, ...) run
+# after Phase 7 instead, so they cover the whole run including the
+# mesh-size warmup; see Phase 8.
 
 # Positive checks — the rekey machinery actually exercised both layers.
 echo ""
@@ -1036,7 +1116,7 @@ if ! fmp_total="$(count_log_pattern 'Rekey cutover complete \(initiator\), K-bit
     echo "    FAIL  FMP rekey cutovers: node logs unreadable ($fmp_total), not established"
     FAILED=$((FAILED + 1))
 elif [ "$fmp_total" -ge 1 ]; then
-    echo "    PASS  FMP rekey cutovers across mesh: $fmp_total"
+    echo "    PASS  FMP rekey cutovers across mesh (either role): $fmp_total"
     PASSED=$((PASSED + 1))
 else
     echo "    FAIL  FMP rekey cutovers: $fmp_total (expected >= 1)"
@@ -1056,8 +1136,9 @@ else
 fi
 
 # Per-pair summary: classify each unordered pair and report whether it
-# stayed healthy through the run. "Healthy" = no connectivity failure
-# recorded for either direction of the pair.
+# stayed healthy through Phases 1 to 6. "Healthy" = no connectivity
+# failure recorded for either direction of the pair. Phase 7's link
+# checks and Phase 8's log scan run later and record their own failures.
 echo ""
 echo "  -- Per-pair interop summary --"
 for p in "${PAIRS[@]}"; do
@@ -1074,10 +1155,10 @@ for p in "${PAIRS[@]}"; do
         done
     fi
     if [ "$pair_failed" -eq 0 ]; then
-        echo "    PASS  $kind pair $label: stayed healthy"
+        echo "    PASS  $kind pair $label: healthy through Phase 6"
         PASSED=$((PASSED + 1))
     else
-        echo "    FAIL  $kind pair $label: connectivity failed during the run"
+        echo "    FAIL  $kind pair $label: connectivity failed by Phase 6"
         FAILED=$((FAILED + 1))
     fi
 done
@@ -1109,21 +1190,28 @@ declare -A MS_EST MS_OK MS_INBAND_SINCE
 ms_accept_after=$(( MESH_UP_AT + MESH_SIZE_WARMUP ))
 echo "  band [$ms_lo, $ms_hi], warmup ends $(( ms_accept_after - SECONDS ))s from now, then ${MESH_SIZE_SETTLE}s settled, poll up to ${MESH_SIZE_TIMEOUT}s beyond that"
 
-# Poll through the warmup as well. Nothing here is asserted on — it is
-# the trajectory the phase has never recorded, and it is what an
-# undercount that never recovers would show up in.
+# Poll through the warmup as well. The estimates are not asserted on here —
+# they are the trajectory the phase has never recorded, and what an
+# undercount that never recovers would show up in — but every round
+# checks that each node still lists all its direct peers.
+ms_next_print=$SECONDS
 while [ "$SECONDS" -lt "$ms_accept_after" ]; do
-    ms_line=""
-    for n in "${NODES[@]}"; do
-        MS_EST[$n]="$(mesh_estimate "$n")"
-        ms_line+=" $n=${MS_EST[$n]}"
-    done
-    echo "    warmup, $(( ms_accept_after - SECONDS ))s to go:$ms_line"
-    sleep 30
+    check_links_round
+    if [ "$SECONDS" -ge "$ms_next_print" ]; then
+        ms_line=""
+        for n in "${NODES[@]}"; do
+            MS_EST[$n]="$(mesh_estimate "$n")"
+            ms_line+=" $n=${MS_EST[$n]}"
+        done
+        echo "    warmup, $(( ms_accept_after - SECONDS ))s to go:$ms_line"
+        ms_next_print=$(( SECONDS + 30 ))
+    fi
+    sleep "$MESH_SIZE_POLL"
 done
 
 ms_deadline=$(( SECONDS + MESH_SIZE_SETTLE + MESH_SIZE_TIMEOUT ))
 while :; do
+    check_links_round
     all_ok=1
     for n in "${NODES[@]}"; do
         est="$(mesh_estimate "$n")"
@@ -1165,7 +1253,44 @@ done
 # that the nodes agreed. Print the spread so nobody has to infer it.
 ms_spread="$(printf '%s\n' "${MS_EST[@]}" | sort -n | awk '/^[0-9]+$/{ if (lo=="") lo=$1; hi=$1 } END{ if (lo=="") print "no numeric estimates"; else if (lo==hi) print "all nodes agree on " lo; else print "nodes disagree: " lo " to " hi }')"
 echo "    NOTE: final estimates — $ms_spread (agreement is reported, not asserted)"
-phase_result "Mesh-size estimate convergence"
+
+# Link continuity across Phase 7, one check per node.
+for n in "${NODES[@]}"; do
+    s="${SLOT_OF[$n]}"; u="$(echo "$s" | tr '[:lower:]' '[:upper:]')"
+    node_ok=1
+    if [ "${LINK_UNREAD_WORST[$n]:-0}" -ge 2 ] || [ "${LINK_UNREAD_RUN[$n]:-0}" -ge 1 ]; then
+        node_ok=0
+        echo "    FAIL  $n [$u]: show peers unreadable in ${LINK_UNREADABLE[$n]} of $LINK_ROUNDS rounds (longest run ${LINK_UNREAD_WORST[$n]}, final round $([ "${LINK_UNREAD_RUN[$n]:-0}" -ge 1 ] && echo unreadable || echo read)); link continuity not established"
+        INTEROP_FAILURES+=("[link] node $n ($u ${SLOT_REF[$s]}@${SLOT_SHA[$s]}): show peers unreadable in ${LINK_UNREADABLE[$n]} of $LINK_ROUNDS Phase 7 rounds")
+    elif [ -n "${LINK_UNREADABLE[$n]:-}" ]; then
+        echo "    NOTE  $n [$u]: show peers unreadable in ${LINK_UNREADABLE[$n]} isolated round(s) of $LINK_ROUNDS; tolerated"
+    fi
+    for m in "${NODES[@]}"; do
+        [ -n "${LINK_LOST_AT[$n|$m]:-}" ] || continue
+        node_ok=0
+        echo "    FAIL  $n [$u]: lost direct peer $m (first ${LINK_LOST_AT[$n|$m]}s after mesh start, missing in ${LINK_LOST_ROUNDS[$n|$m]} of $LINK_ROUNDS rounds)"
+        # NOTE: keep "$kind pair" contiguous — interop-stress.sh greps it.
+        INTEROP_FAILURES+=("[link] $(pair_kind "$n" "$m") pair $(pair_label "$n" "$m") [$(hop_label "$n" "$m")]: $n lost $m during Phase 7 (first ${LINK_LOST_AT[$n|$m]}s after mesh start)")
+    done
+    if [ "$node_ok" -eq 1 ]; then
+        echo "    PASS  $n [$u]: listed every direct peer in every readable round of $LINK_ROUNDS Phase 7 rounds"
+        PASSED=$((PASSED + 1))
+    else
+        FAILED=$((FAILED + 1))
+    fi
+done
+phase_result "Mesh-size estimate convergence and link continuity"
+echo ""
+
+# ── Phase 8: whole-run log health ────────────────────────────────────
+#
+# The global negative checks, run last so they cover every phase. A
+# link lost and re-established inside the Phase 7 warmup leaves an
+# "MMP link teardown" line even if no poll round caught it missing.
+echo "Phase 8: Whole-run log health (all $NUM_NODES nodes)"
+PASSED=0; FAILED=0
+scan_global_patterns
+phase_result "Whole-run log health"
 echo ""
 
 # ── Summary ──────────────────────────────────────────────────────────

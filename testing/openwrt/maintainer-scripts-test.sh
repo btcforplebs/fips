@@ -17,9 +17,12 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
-# Pinned rather than :latest so the shell under test does not change under a
-# run. Overridable for trying another ash build.
-IMAGE="${OPENWRT_ASH_IMAGE:-busybox:1.37}"
+# Pinned by digest so the shell under test does not change under a run: the
+# 1.37 tag moves with every 1.37.x rebuild. This is the multi-arch index digest
+# of busybox:1.37.0 as of 2026-10-01. Bump it deliberately, reading the new
+# digest with `docker buildx imagetools inspect busybox:<version>`.
+# Overridable for trying another ash build.
+IMAGE="${OPENWRT_ASH_IMAGE:-busybox:1.37.0@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e}"
 
 if ! command -v docker >/dev/null 2>&1; then
     echo "openwrt-scripts: docker not found; cannot run the ash scenarios" >&2
@@ -54,6 +57,8 @@ docker run --rm --network none \
     -e APK_SCRIPTS=/apk \
     -e "POSTINST=${POSTINST:-}" \
     -e "PRERM=${PRERM:-}" \
+    -e "PREINST=${PREINST:-}" \
+    -e "INIT_GATEWAY=${INIT_GATEWAY:-}" \
     "$IMAGE" sh /src/testing/openwrt/scenarios.sh
 rc=$?
 

@@ -281,7 +281,8 @@ for path in ./postinst ./prerm; do
 done
 
 # ── P4. No source still names the drop-in ───────────────────────────────────
-# This is the only check on the SDK feed Makefile, which nothing here builds.
+# With P5, one of the two checks on the SDK feed Makefile, which nothing here
+# builds.
 # grep exits 1 when nothing matches and 2 when it could not read a path; only
 # the first is a pass.
 (cd "$PROJECT_ROOT" && grep -rlF 'dnsmasq.d/fips.conf' \
@@ -299,6 +300,31 @@ if [[ -e "$PROJECT_ROOT/packaging/openwrt-ipk/files/etc/dnsmasq.d/fips.conf" ]];
     bad "P4 packaging/openwrt-ipk/files/etc/dnsmasq.d/fips.conf still exists"
 else
     ok "P4 the drop-in source file is gone"
+fi
+
+# ── P5. The SDK feed Makefile ships the same maintainer scripts ─────────────
+# Read, not built: building it needs the OpenWrt SDK. Each script must be the
+# file in scripts/ that the scenarios run, and fips.yaml must be a conffile.
+MAKEFILE="$PROJECT_ROOT/packaging/openwrt-ipk/Makefile"
+[[ -r "$MAKEFILE" ]] || harness_fail "cannot read $MAKEFILE"
+for script in preinst postinst prerm; do
+    if awk -v want="define Package/fips/$script" -v body="\$(file < \$(CURDIR)/scripts/$script)" '
+        $0 == want { inside = 1; next }
+        inside && $0 == body { found = 1 }
+        inside && $0 == "endef" { inside = 0 }
+        END { exit !found }' "$MAKEFILE"; then
+        ok "P5 the SDK Makefile's $script is scripts/$script"
+    else
+        bad "P5 the SDK Makefile does not define Package/fips/$script as scripts/$script"
+    fi
+done
+if awk '$0 == "define Package/fips/conffiles" { inside = 1; next }
+        inside && $0 == "/etc/fips/fips.yaml" { found = 1 }
+        inside && $0 == "endef" { inside = 0 }
+        END { exit !found }' "$MAKEFILE"; then
+    ok "P5 the SDK Makefile lists /etc/fips/fips.yaml as a conffile"
+else
+    bad "P5 the SDK Makefile does not list /etc/fips/fips.yaml as a conffile"
 fi
 
 # ── Hand the scripts to the ash scenarios ───────────────────────────────────
