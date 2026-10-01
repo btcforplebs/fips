@@ -1564,6 +1564,17 @@ run_portable_atomics() {
     record "portable-atomics" $rc
 }
 
+# The shell scripts the OpenWrt packages ship, and the nak installer. The
+# OpenWrt Package workflow lints them on GitHub, but only for trunk pushes,
+# tags and pull requests, so this is where a branch first sees a finding.
+# Mirrored in ci.yml's ci-parity job by hand. Static, about a second.
+run_shellcheck() {
+    local rc=0
+    info "[shellcheck] Linting the OpenWrt package's shell scripts"
+    bash "$SCRIPT_DIR/check-shellcheck.sh" || rc=$?
+    record "shellcheck" $rc
+}
+
 # Every daemon log string a test matches on must still be emitted by src/.
 # A stale one does not fail — it stops observing, and an expect-zero assertion
 # built on it then passes for the wrong reason.
@@ -1647,6 +1658,7 @@ main() {
     run_action_pins
     run_comment_refs
     run_portable_atomics
+    run_shellcheck
     run_wait_converge
     run_deb_version
     run_nextest_flaky

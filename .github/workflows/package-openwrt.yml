@@ -341,52 +341,12 @@ jobs:
           fi
           shellcheck --version
 
-      # Its own step, and its own shell dialect. The shipped-scripts lint below
-      # runs --shell=sh with the OpenWrt rc.common exclude set, which misfires
-      # on a bash script; install-nak.sh is also not shipped in the package.
-      - name: Lint install-nak.sh
+      # The scripts this package ships, as sh, and install-nak.sh, as bash.
+      # The guard is the one copy of the lint; ci.yml and ci-local.sh run it
+      # too, so a branch push sees a finding before it reaches a trunk.
+      - name: Lint shell scripts
         shell: bash
-        run: shellcheck --shell=bash .github/scripts/install-nak.sh
-
-      - name: Lint shipped shell scripts
-        shell: bash
-        run: |
-          set -euo pipefail
-          FILES_DIR=packaging/openwrt-ipk/files
-          # Scripts shipped inside the .ipk. The init scripts use the OpenWrt
-          # `#!/bin/sh /etc/rc.common` shebang; tell shellcheck to treat them
-          # as POSIX sh and silence the unrecognized-shebang warning (SC1008).
-          # SC2317 (unreachable command) fires on rc.common's externally-invoked
-          # start_service/stop_service/reload_service hooks.
-          TARGETS=(
-            "$FILES_DIR/etc/init.d/fips"
-            "$FILES_DIR/etc/init.d/fips-gateway"
-            "$FILES_DIR/etc/fips/firewall.sh"
-            "$FILES_DIR/etc/hotplug.d/net/99-fips"
-            "$FILES_DIR/etc/uci-defaults/90-fips-setup"
-            "$FILES_DIR/usr/bin/fips-mesh-setup"
-            "$FILES_DIR/usr/bin/fips-ap-setup"
-          )
-          fail=0
-          for f in "${TARGETS[@]}"; do
-            if [ ! -f "$f" ]; then
-              echo "FAIL: missing $f"
-              fail=1
-              continue
-            fi
-            echo "==> shellcheck $f"
-            if shellcheck --shell=sh --exclude=SC1008,SC2317,SC2034,SC3043,SC2086,SC2089,SC2090 "$f"; then
-              echo "    PASS"
-            else
-              echo "    FAIL"
-              fail=1
-            fi
-          done
-          if [ "$fail" -ne 0 ]; then
-            echo "shellcheck FAILED"
-            exit 1
-          fi
-          echo "shellcheck PASS (${#TARGETS[@]} scripts)"
+        run: bash testing/check-shellcheck.sh
 
       - name: Sysctl drop-in syntax check
         shell: bash
