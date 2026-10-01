@@ -176,7 +176,10 @@ Behind that single command, the init script
    the LAN's port 53 are forwarded to the gateway's loopback
    listener on port 5365 instead of going straight to the daemon's
    resolver on port 5354. (Dnsmasq still owns 53; the gateway sits
-   in front of the daemon for `.fips` only.)
+   in front of the daemon for `.fips` only.) The switch happens once
+   the gateway is listening, and dnsmasq goes back to port 5354
+   whenever the gateway exits, so a gateway that fails to start
+   leaves `.fips` resolving through the daemon.
 3. **Adds a global-scope IPv6 prefix** to `br-lan`. Without a
    non-ULA address on the local interface, Android and Chrome
    suppress AAAA queries entirely — they assume the LAN has no
