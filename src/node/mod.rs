@@ -52,6 +52,7 @@ use crate::proto::fmp::wire::{
     build_established_header, prepend_inner_header,
 };
 use crate::proto::fsp::Fsp;
+use crate::proto::fsp::quorum::LinkQuorum;
 use crate::proto::lookup::{Lookup, LookupBackoff, LookupForwardRateLimiter};
 use crate::proto::mmp::Mmp;
 use crate::proto::routing::{self, Router, RoutingErrorRateLimiter};
@@ -600,6 +601,11 @@ pub struct Node {
     /// not a bound on this one, and one PathBroken drives both responses, so
     /// a shared limiter would let the coord-warmup arm pay for the release.
     path_mtu_release_limiter: RoutingErrorRateLimiter,
+    /// Distinct links that recently delivered a PathBroken naming a
+    /// destination whose coordinates a lookup verified. A verified entry is
+    /// demoted only when this reaches its quorum; any number of reports over
+    /// one link leave it in place while the lookup re-validates it.
+    broken_quorum: LinkQuorum,
 
     // === Peering Homeostasis ===
     /// Owner of the peering-reconciler state relocated off `Node`: the sans-IO
@@ -860,6 +866,7 @@ impl Node {
             path_mtu_release_limiter: RoutingErrorRateLimiter::with_interval_ms(
                 handlers::session::PATH_MTU_RELEASE_MIN_INTERVAL.as_millis() as u64,
             ),
+            broken_quorum: LinkQuorum::new(),
             probes: handlers::probe::ProbeRegistry::new(),
             lookup: Lookup::new(
                 LookupBackoff::with_params(backoff_base_secs, backoff_max_secs),
@@ -1020,6 +1027,7 @@ impl Node {
             path_mtu_release_limiter: RoutingErrorRateLimiter::with_interval_ms(
                 handlers::session::PATH_MTU_RELEASE_MIN_INTERVAL.as_millis() as u64,
             ),
+            broken_quorum: LinkQuorum::new(),
             probes: handlers::probe::ProbeRegistry::new(),
             lookup: Lookup::new(LookupBackoff::new(), LookupForwardRateLimiter::new()),
             discovery_sign_limiter: LookupSignRateLimiter::new(),

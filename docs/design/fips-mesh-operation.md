@@ -372,9 +372,26 @@ source.
 
 1. Immediately send a standalone CoordsWarmup (0x14) message (rate-limited,
    same per-destination interval as CoordsRequired response)
-2. Remove stale coordinates from cache
-3. Initiate discovery for the destination
+2. Handle the cached coordinates by where they came from. Unverified
+   coordinates (a hint copied off a passing packet, or a lookup result
+   whose verification has aged out) are removed. Coordinates a lookup
+   verified are kept while discovery re-validates them, because the signal
+   is unauthenticated and removing them would let the next forged warm
+   replace them. They are demoted to an unverified hint, keeping their value,
+   only when PathBroken signals naming the destination arrive over two
+   different links within 15 seconds. The vote is the authenticated link
+   peer, not the reporter the signal names, which the sender chooses. A node
+   whose signals all arrive over one link never demotes this way; its
+   verified coordinates last until discovery replaces them or their
+   verification ages out after 300 seconds.
+3. Initiate discovery for the destination, whether or not its identity is
+   cached
 4. Reset CP warmup counter
+
+The source also counts, without refusing anything, a PathBroken that
+arrives over a link other than its forward link to the destination, and one
+whose reporter is not closer to the destination than the source is. Both
+have a non-zero healthy floor.
 
 ### MtuExceeded
 

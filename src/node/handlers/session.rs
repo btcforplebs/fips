@@ -18,6 +18,7 @@ use crate::noise::{
 use crate::proto::fmp::wire::{
     ESTABLISHED_HEADER_SIZE, FLAG_KEY_EPOCH, FLAG_SP, build_established_header,
 };
+use crate::proto::fsp::quorum::QuorumVerdict;
 use crate::proto::fsp::wire::{
     FSP_COMMON_PREFIX_SIZE, FSP_FLAG_CP, FSP_FLAG_K, FSP_HEADER_SIZE, FSP_PHASE_ESTABLISHED,
     FSP_PHASE_MSG1, FSP_PHASE_MSG2, FSP_PHASE_MSG3, FSP_PORT_HEADER_SIZE, FSP_PORT_IPV6_SHIM,
@@ -193,7 +194,8 @@ impl Node {
                         self.handle_coords_required(src_addr, error_body).await;
                     }
                     Some(RoutingSignalType::PathBroken) => {
-                        self.handle_path_broken(src_addr, error_body).await;
+                        self.handle_path_broken(src_addr, link_peer, error_body)
+                            .await;
                     }
                     Some(RoutingSignalType::MtuExceeded) => {
                         self.handle_mtu_exceeded(src_addr, error_body).await;
@@ -1919,12 +1921,28 @@ impl Node {
     /// Handle a PathBroken error signal from a transit router.
     ///
     /// The router has coordinates but still can't route to the destination.
-    /// Send a standalone CoordsWarmup immediately (rate-limited), invalidate
-    /// cached coordinates, trigger re-discovery, and reset the warmup counter.
+    /// Send a standalone CoordsWarmup immediately (rate-limited), re-validate
+    /// the destination's coordinates by lookup, release its path MTU, and
+    /// reset the warmup counter.
+    ///
+    /// Cached coordinates that are only a hint are removed. Coordinates a
+    /// lookup verified are kept while the lookup re-validates them, and are
+    /// demoted to a hint only once reports arriving over distinct links reach
+    /// the quorum: the signal is unauthenticated, and deleting a verified
+    /// entry on one report is what let the next forged warm replace it.
     ///
     /// `src_addr` is the datagram's claimed source and is not
-    /// end-to-end authenticated; see `signal_verdict`.
-    pub(in crate::node) async fn handle_path_broken(&mut self, src_addr: &NodeAddr, inner: &[u8]) {
+    /// end-to-end authenticated; see `signal_verdict`. `link_peer` is the
+    /// authenticated peer the datagram arrived over. It is the report's vote
+    /// in the quorum, because the body's reporter is whatever the sender
+    /// wrote, and it is compared with the forward path to count mismatches;
+    /// it never refuses the signal.
+    pub(in crate::node) async fn handle_path_broken(
+        &mut self,
+        src_addr: &NodeAddr,
+        link_peer: &NodeAddr,
+        inner: &[u8],
+    ) {
         self.metrics().errors.path_broken.inc();
 
         let msg = match PathBroken::decode(inner) {
@@ -1936,11 +1954,10 @@ impl Node {
         };
 
         // The premise: this signal carries no end-to-end authentication, so
-        // the body's `dest_addr` is attacker-chosen. `plan_path_broken` emits
-        // its coord-cache invalidation unconditionally, and the path-MTU
-        // release below is likewise unguarded, so both act on whatever address
-        // the body names unless the gate refuses it here, in the shell, which
-        // is the only layer that knows who sent the datagram.
+        // the body's `dest_addr` is attacker-chosen. The coord-cache action,
+        // the lookup and the path-MTU release below all act on whatever
+        // address the body names unless the gate refuses it here, in the
+        // shell, which is the only layer that knows who sent the datagram.
         let verdict = self.signal_verdict(src_addr, &msg.dest_addr);
         if verdict != SignalVerdict::Admit {
             debug!(src = %src_addr, dest = %msg.dest_addr, reporter = %msg.reporter,
@@ -1960,6 +1977,7 @@ impl Node {
             reporter = %msg.reporter,
             "PathBroken: transit router reports routing failure"
         );
+        self.count_path_broken_mismatches(link_peer, &msg);
 
         // Send standalone CoordsWarmup immediately (rate-limited)
         if self
@@ -1978,18 +1996,32 @@ impl Node {
                 "PathBroken response rate-limited, skipping standalone CoordsWarmup");
         }
 
-        // Invalidate stale cached coordinates, then (only if the target's
-        // identity is cached — else the LookupResponse proof cannot be verified,
-        // e.g. when the XK responder receives PathBroken before msg3 completes)
-        // trigger re-discovery. The core emits invalidate-then-lookup in order.
-        let has_cached_identity = self.has_cached_identity(&msg.dest_addr);
-        let actions = self
-            .fsp
-            .plan_path_broken(msg.dest_addr, has_cached_identity);
+        // Only a live verified entry has anything for the quorum to protect,
+        // so only a report against one is recorded; that also bounds the
+        // quorum's keys by the destinations this node has looked up. The vote
+        // is the link the report arrived over, so a sender on one link counts
+        // once however many reporters it names.
+        let now = Self::now_ms();
+        let verified = self
+            .coord_cache
+            .get_entry(&msg.dest_addr)
+            .is_some_and(|e| e.is_verified(now));
+        let quorum = if verified {
+            self.broken_quorum.record(msg.dest_addr, *link_peer, now)
+        } else {
+            QuorumVerdict::Below { distinct: 0 }
+        };
+        let actions = self.fsp.plan_path_broken(msg.dest_addr, verified, quorum);
         for action in actions {
             match action {
                 FspAction::InvalidateCoords { addr } => {
                     self.coord_cache.remove(&addr);
+                }
+                FspAction::DemoteCoords { addr } => {
+                    self.coord_cache.demote(&addr);
+                    self.metrics().errors.broken_demoted.inc();
+                    debug!(dest = %addr,
+                        "PathBroken quorum reached; demoted verified coordinates to a hint");
                 }
                 FspAction::InitiateLookup { dest } => {
                     self.maybe_initiate_lookup(&dest).await;
@@ -1997,25 +2029,33 @@ impl Node {
                 _ => {}
             }
         }
+        if let QuorumVerdict::Below { distinct } = quorum
+            && verified
+        {
+            self.metrics().errors.broken_below_quorum.inc();
+            debug!(dest = %msg.dest_addr, distinct,
+                "PathBroken below quorum; keeping verified coordinates pending the lookup");
+        }
+
         // The path this destination's stored MTU described is gone, so release
         // it rather than carrying it onto whatever path replaces it. Rate
         // limited per destination on its own budget: PathBroken is
         // unauthenticated, and an unlimited release discards a genuinely
         // learned bottleneck as fast as it is relearned. The budget is not
         // shared with any other signal, so nothing else can spend it.
+        //
+        // A cache entry kept above still carries the MTU the lookup stored
+        // with it, which describes the same path; clear it with the map so
+        // the two do not disagree.
         if self
             .path_mtu_release_limiter
             .should_send(&msg.dest_addr, Self::now_ms())
         {
             self.path_mtu_lookup_release(&msg.dest_addr);
+            self.coord_cache.clear_path_mtu(&msg.dest_addr);
         } else {
             trace!(dest = %msg.dest_addr,
                 "PathBroken path MTU release rate-limited, keeping the stored value");
-        }
-
-        if !has_cached_identity {
-            debug!(dest = %msg.dest_addr,
-                "Skipping discovery after PathBroken: no cached identity for target");
         }
 
         // Reset coords warmup counter so the next N packets include
@@ -2028,6 +2068,58 @@ impl Node {
                 warmup_packets = n,
                 "Reset coords warmup counter after PathBroken"
             );
+        }
+    }
+
+    /// Count, without acting on, the two ways an admitted PathBroken can
+    /// disagree with this node's own view of the path.
+    ///
+    /// Advisory only: both checks read state an attacker can influence and
+    /// both have a non-zero healthy floor, so they size the problem rather
+    /// than refuse anything.
+    ///
+    /// - Link: the signal arrived over a link other than the one this node
+    ///   would forward to the destination on. A genuine report can also do
+    ///   this when the reverse path differs from the forward one.
+    /// - Reporter: the reporter is this node or the destination, or its known
+    ///   coordinates are not strictly closer to the destination than this
+    ///   node's. Forwarding makes strict progress under each forwarder's own
+    ///   view of the destination, and a PathBroken arises exactly where that
+    ///   view may differ from this node's, so a genuine report can count here
+    ///   too. A reporter's coordinates are rarely known unless it is a direct
+    ///   peer, so this mostly reads as unknown and is not counted.
+    fn count_path_broken_mismatches(&self, link_peer: &NodeAddr, msg: &PathBroken) {
+        let now = Self::now_ms();
+        let dest = &msg.dest_addr;
+        let reporter = &msg.reporter;
+
+        if let (Some(hop), _) = self.preview_next_hop(dest, now)
+            && hop.node_addr != *link_peer
+        {
+            self.metrics().errors.broken_link_mismatch.inc();
+            debug!(dest = %dest, link_peer = %link_peer, next_hop = %hop.node_addr,
+                "PathBroken arrived off the forward link");
+        }
+
+        let implausible = if reporter == self.node_addr() || reporter == dest {
+            true
+        } else {
+            let dest_coords = self.coord_cache.get(dest, now);
+            let reporter_coords = self
+                .tree_state
+                .peer_coords(reporter)
+                .or_else(|| self.coord_cache.get(reporter, now));
+            match (dest_coords, reporter_coords) {
+                (Some(d), Some(r)) => {
+                    r.distance_to(d) >= self.tree_state.my_coords().distance_to(d)
+                }
+                _ => false,
+            }
+        };
+        if implausible {
+            self.metrics().errors.broken_reporter_mismatch.inc();
+            debug!(dest = %dest, reporter = %reporter,
+                "PathBroken reporter is not closer to the destination than this node");
         }
     }
 

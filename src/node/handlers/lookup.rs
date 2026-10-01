@@ -375,6 +375,9 @@ impl Node {
                     now_ms,
                     path_mtu,
                 } => {
+                    // Reports about the path this verified value replaces are
+                    // not evidence against it.
+                    self.broken_quorum.clear(&target);
                     // The annotation is unsigned and accumulates hop by hop, so
                     // any forwarder on the reverse path can lower it. A value
                     // below the actionable floor cannot describe a usable path,

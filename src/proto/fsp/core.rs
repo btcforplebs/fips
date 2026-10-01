@@ -15,6 +15,7 @@
 //! the plain-data [`DecryptSlot`] mirror before it reaches [`Fsp::classify_epoch`].
 
 use super::limits::FSP_CUTOVER_DELAY_MS;
+use super::quorum::QuorumVerdict;
 use crate::proto::stp::TreeCoordinate;
 use crate::{FipsAddress, NodeAddr};
 
@@ -95,12 +96,17 @@ pub(crate) enum FspAction {
     /// Invalidate the shared cached coordinates for `addr`
     /// (`coord_cache.remove`).
     InvalidateCoords { addr: NodeAddr },
+    /// Mark the shared cached coordinates for `addr` as an unverified hint,
+    /// keeping the value (`coord_cache.demote`). The entry goes on routing,
+    /// but no longer refuses a hint that replaces it.
+    DemoteCoords { addr: NodeAddr },
     /// Write `mtu` into the shared `FipsAddress`-keyed path-MTU lookup, keeping
     /// the tighter of existing-or-new (the shell applies the write under the
     /// `path_mtu_lookup` guard).
     TightenPathMtuLookup { fips_addr: FipsAddress, mtu: u16 },
-    /// Trigger discovery toward `dest` (`maybe_initiate_lookup`); emitted only
-    /// when the target's identity is cached.
+    /// Trigger discovery toward `dest` (`maybe_initiate_lookup`). The
+    /// `CoordsRequired` decision emits it only when the target's identity is
+    /// cached; the `PathBroken` decision emits it always.
     InitiateLookup { dest: NodeAddr },
 }
 
@@ -445,20 +451,35 @@ impl Fsp {
         }
     }
 
-    /// Decide the reaction to a `PathBroken` signal: unconditionally invalidate
-    /// the stale cached coordinates for `dest`, then (only when the identity is
-    /// cached) trigger re-discovery. Order is invalidate-then-lookup, matching
-    /// the pre-refactor handler. The warmup send and counter reset stay shell.
+    /// Decide the reaction to an admitted `PathBroken` signal for `dest`.
+    ///
+    /// The signal is unauthenticated, so it may not discard coordinates a
+    /// lookup verified on its own say-so. `verified` is whether the cached
+    /// entry for `dest` is verified and still within its verification window;
+    /// `quorum` is what this report did to the destination's link quorum
+    /// (ignored when the entry is not verified).
+    ///
+    /// - Not verified: remove the entry, as a hint can be replaced by any warm
+    ///   anyway, then look it up.
+    /// - Verified, quorum reached: demote the entry to a hint, keeping the
+    ///   value, then look it up.
+    /// - Verified, below quorum: leave the entry alone and look it up. A
+    ///   successful lookup replaces the value whatever it was.
+    ///
+    /// The lookup is emitted in every case. The warmup send, path-MTU release
+    /// and warmup-counter reset stay shell-side.
     pub(crate) fn plan_path_broken(
         &self,
         dest: NodeAddr,
-        has_cached_identity: bool,
+        verified: bool,
+        quorum: QuorumVerdict,
     ) -> Vec<FspAction> {
-        let mut actions = vec![FspAction::InvalidateCoords { addr: dest }];
-        if has_cached_identity {
-            actions.push(FspAction::InitiateLookup { dest });
+        let lookup = FspAction::InitiateLookup { dest };
+        match (verified, quorum) {
+            (false, _) => vec![FspAction::InvalidateCoords { addr: dest }, lookup],
+            (true, QuorumVerdict::Reached) => vec![FspAction::DemoteCoords { addr: dest }, lookup],
+            (true, QuorumVerdict::Below { .. }) => vec![lookup],
         }
-        actions
     }
 
     /// Decide whether a path-MTU update should tighten the shared lookup: emit

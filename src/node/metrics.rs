@@ -536,6 +536,31 @@ pub struct ErrorMetrics {
     /// rising count is a forged or stale reactive signal.
     pub mtu_exceeded_uncorroborated: Counter,
     pub unbound: UnboundSignals,
+    /// Admitted `PathBroken` signals against coordinates a lookup verified
+    /// that left them in place, because reports over distinct links had not
+    /// yet reached the quorum. The lookup still ran. A genuine failure's
+    /// reports usually arrive over one link, so this is the ordinary outcome
+    /// of a real broken path as well as of signals forged or reflected
+    /// through one neighbour.
+    pub broken_below_quorum: Counter,
+    /// Verified coordinates demoted to a hint because reports arriving over
+    /// distinct links reached the quorum. A genuine failure reported from two
+    /// directions produces this. Forged reports produce it only when they
+    /// arrive over two different links.
+    pub broken_demoted: Counter,
+    /// Admitted `PathBroken` signals that arrived over a link other than the
+    /// one this node would forward to the destination on. Counted, never
+    /// refused. The healthy floor is not zero: 4 to 10 percent of genuine
+    /// reports arrived off the forward link in a loopback measurement, and a
+    /// real topology with asymmetric paths will see more.
+    pub broken_link_mismatch: Counter,
+    /// Admitted `PathBroken` signals whose reporter is this node, the
+    /// destination, or a node whose known coordinates are no closer to the
+    /// destination than this node's. Counted, never refused. The healthy
+    /// floor is not zero, since the reporter's view of the destination can
+    /// differ from this node's, and most reporters' coordinates are unknown
+    /// here and are not counted at all.
+    pub broken_reporter_mismatch: Counter,
     /// Routing errors this node declined to emit because the authenticated
     /// link peer that induced them had spent its budget. A rising count is
     /// either a peer flooding unroutable traffic or a hub relaying more
@@ -565,6 +590,10 @@ impl ErrorMetrics {
             unbound_broken: self.unbound.broken.get(),
             unbound_mtu: self.unbound.mtu.get(),
             unbound_forged: self.unbound.forged.get(),
+            broken_below_quorum: self.broken_below_quorum.get(),
+            broken_demoted: self.broken_demoted.get(),
+            broken_link_mismatch: self.broken_link_mismatch.get(),
+            broken_reporter_mismatch: self.broken_reporter_mismatch.get(),
             emit_over_peer_budget: self.emit_over_peer_budget.get(),
             emit_over_dest_interval: self.emit_over_dest_interval.get(),
             emit_limiter_at_capacity: self.emit_limiter_at_capacity.get(),
