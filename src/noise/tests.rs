@@ -915,3 +915,15 @@ fn test_xk_invalid_msg3_size() {
             .is_err()
     );
 }
+
+/// The `zeroize` features of `sha2` and `hmac` are on, so the SHA-256 state
+/// that hashes each Diffie-Hellman result, and the two SHA-256 cores inside
+/// the HMAC that HKDF runs on, are cleared when dropped. Without `sha2`'s
+/// feature this does not compile; `hmac`'s forwards to the same `digest`
+/// feature, so dropping it alone changes nothing while `sha2`'s is on.
+#[test]
+fn test_sha256_states_used_by_hashing_and_hkdf_are_cleared_on_drop() {
+    fn clears_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+    clears_on_drop::<sha2::Sha256>();
+    clears_on_drop::<<sha2::Sha256 as hmac::EagerHash>::Core>();
+}
