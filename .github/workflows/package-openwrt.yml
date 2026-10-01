@@ -25,6 +25,7 @@ jobs:
     outputs:
       package_version: ${{ steps.version.outputs.package_version }}
       apk_version: ${{ steps.version.outputs.apk_version }}
+      ipk_version: ${{ steps.version.outputs.ipk_version }}
       release_channel: ${{ steps.channel.outputs.release_channel }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -41,15 +42,28 @@ jobs:
           # in the .apk metadata. apk_version is built directly from the same
           # structured inputs (tag, or commit height) — no reparse of the
           # flattened package_version. See packaging/openwrt-apk/apk-version.sh.
+          #
+          # ipk_version is the .ipk control Version. opkg compares versions as
+          # dpkg does, so it reads a tag's vX.Y.Z-rcN as revision rcN and sorts
+          # it above the release; vX.Y.Z~rcN sorts below it. git refuses '~' in
+          # a ref name, so the tag carries '-' and this maps it. The leading 'v'
+          # stays: every released .ipk carries it, and under opkg 0.5.4 sorts
+          # below v0.5.3. testing/check-package-versions.sh runs this step's text.
           if [[ "$GITHUB_REF" == refs/tags/* ]]; then
             echo "package_version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
             echo "apk_version=$(sh packaging/openwrt-apk/apk-version.sh tag "${GITHUB_REF_NAME}")" >> "$GITHUB_OUTPUT"
+            IPK_VERSION="${GITHUB_REF_NAME}"
+            if [[ "$GITHUB_REF_NAME" =~ ^(v[0-9]+\.[0-9]+\.[0-9]+)-((alpha|beta|pre|rc)[0-9]*)$ ]]; then
+              IPK_VERSION="${BASH_REMATCH[1]}~${BASH_REMATCH[2]}"
+            fi
+            echo "ipk_version=${IPK_VERSION}" >> "$GITHUB_OUTPUT"
           else
             BRANCH=$(echo "$GITHUB_REF_NAME" | sed 's|/|-|g')
             HEIGHT=$(git rev-list --count HEAD)
             HASH=$(git rev-parse --short HEAD)
             echo "package_version=${BRANCH}.${HEIGHT}.${HASH}" >> "$GITHUB_OUTPUT"
             echo "apk_version=$(sh packaging/openwrt-apk/apk-version.sh dev "${HEIGHT}")" >> "$GITHUB_OUTPUT"
+            echo "ipk_version=${BRANCH}.${HEIGHT}.${HASH}" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Determine release channel
@@ -332,6 +346,7 @@ jobs:
       - name: Build .ipk
         env:
           PKG_VERSION: ${{ needs.determine-versioning.outputs.package_version }}
+          IPK_VERSION: ${{ needs.determine-versioning.outputs.ipk_version }}
         run: ./packaging/openwrt-ipk/build-ipk.sh --arch ${{ matrix.build_arch }} --bin-dir "$GITHUB_WORKSPACE/bins"
 
       - name: Install shellcheck (if missing)

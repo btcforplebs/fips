@@ -47,7 +47,7 @@ fi
 PKG_VERSION="pkgtest.$$"
 TMP="$(mktemp -d)" || { echo "package-test: mktemp failed" >&2; exit 2; }
 
-trap 'rm -rf "$TMP"; rm -f "$PROJECT_ROOT/dist/fips_${PKG_VERSION}_"*' EXIT
+trap 'rm -rf "$TMP"; rm -f "$PROJECT_ROOT/dist/fips_${PKG_VERSION}"[_~]*' EXIT
 
 harness_fail() {
     echo "package-test: $*" >&2
@@ -227,7 +227,9 @@ done
 # ── Build the .ipk ──────────────────────────────────────────────────────────
 
 echo "==> build-ipk.sh"
-if ! PKG_VERSION="$PKG_VERSION" \
+# The first build is V1's "IPK_VERSION unset" case, so it must not inherit an
+# IPK_VERSION from the caller's environment.
+if ! env -u IPK_VERSION PKG_VERSION="$PKG_VERSION" \
     bash "$PROJECT_ROOT/packaging/openwrt-ipk/build-ipk.sh" --arch x86_64 --bin-dir "$BINS" \
     > "$TMP/build-ipk.log" 2>&1; then
     cat "$TMP/build-ipk.log" >&2
@@ -239,6 +241,44 @@ tar -xzf "$IPK" -O ./data.tar.gz | tar -tzf - > "$TMP/ipk-data" \
     || harness_fail "cannot list data.tar.gz in $IPK"
 tar -xzf "$IPK" -O ./control.tar.gz | tar -tzf - > "$TMP/ipk-control" \
     || harness_fail "cannot list control.tar.gz in $IPK"
+
+# Print the Version field of an .ipk's control file.
+ipk_version() {
+    tar -xzf "$1" -O ./control.tar.gz | tar -xzOf - ./control \
+        | sed -n 's/^Version: //p'
+}
+
+# ── V1 and V2. The control Version comes from IPK_VERSION ───────────────────
+# The workflow passes a candidate's opkg-sortable version (vX.Y.Z~rcN) as
+# IPK_VERSION and keeps the tag's form in PKG_VERSION for the file name, since
+# a GitHub release renames an asset with '~' in its name. Unset, IPK_VERSION
+# falls back to PKG_VERSION, as a local build expects.
+got="$(ipk_version "$IPK")" || harness_fail "cannot read the control file in $IPK"
+if [[ "$got" == "$PKG_VERSION" ]]; then
+    ok "V1 with IPK_VERSION unset the control Version is PKG_VERSION ($got)"
+else
+    bad "V1 with IPK_VERSION unset the control Version is '$got', want $PKG_VERSION"
+fi
+# The first build's package is removed so a second build that names its file
+# from anything but PKG_VERSION cannot be passed by reading the stale one.
+RC_VERSION="${PKG_VERSION}~rc1"
+rm -f "$IPK" || harness_fail "cannot remove $IPK before the second build"
+if ! PKG_VERSION="$PKG_VERSION" IPK_VERSION="$RC_VERSION" \
+    bash "$PROJECT_ROOT/packaging/openwrt-ipk/build-ipk.sh" --arch x86_64 --bin-dir "$BINS" \
+    > "$TMP/build-ipk-rc.log" 2>&1; then
+    cat "$TMP/build-ipk-rc.log" >&2
+    harness_fail "build-ipk.sh failed with IPK_VERSION set"
+fi
+if [[ ! -f "$IPK" ]]; then
+    bad "V2 with IPK_VERSION set build-ipk.sh wrote no $IPK; the file name must come from PKG_VERSION"
+else
+    got="$(ipk_version "$IPK")" || harness_fail "cannot read the control file in $IPK"
+    if [[ "$got" == "$RC_VERSION" ]]; then
+        ok "V2 with IPK_VERSION set the control Version is IPK_VERSION ($got), file named from PKG_VERSION"
+    else
+        bad "V2 with IPK_VERSION set the control Version is '$got', want $RC_VERSION"
+    fi
+fi
 
 # ── P1 and P2. Neither package ships the dnsmasq drop-in ────────────────────
 # OpenWrt's dnsmasq builds its config from UCI and reads no directory under

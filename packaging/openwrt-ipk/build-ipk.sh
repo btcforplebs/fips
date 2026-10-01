@@ -14,7 +14,13 @@
 #   arm       32-bit ARM routers (Cortex-A7)
 #   x86_64    x86 routers / VMs
 #
-# Output: dist/fips_<version>_<openwrt-arch>.ipk
+# Output: dist/fips_<PKG_VERSION>_<openwrt-arch>.ipk
+#
+# Environment:
+#   PKG_VERSION  label for the file name (default: git describe)
+#   IPK_VERSION  control file Version (default: PKG_VERSION). CI passes a
+#                release candidate as vX.Y.Z~rcN, which opkg sorts below the
+#                release, while PKG_VERSION keeps the tag's vX.Y.Z-rcN.
 #
 # Prerequisites:
 #   cargo install cargo-zigbuild
@@ -86,8 +92,13 @@ DIST_DIR="$PROJECT_ROOT/dist"
 
 PKG_NAME="fips"
 PKG_VERSION="${PKG_VERSION:-$(cd "$PROJECT_ROOT" && git describe --tags --always --dirty 2>/dev/null || echo "0.1.0")}"
+IPK_VERSION="${IPK_VERSION:-$PKG_VERSION}"
 
-echo "==> Building $PKG_NAME $PKG_VERSION for $OPENWRT_ARCH ($RUST_TARGET)"
+if [ "$IPK_VERSION" = "$PKG_VERSION" ]; then
+    echo "==> Building $PKG_NAME $PKG_VERSION for $OPENWRT_ARCH ($RUST_TARGET)"
+else
+    echo "==> Building $PKG_NAME $PKG_VERSION (control Version $IPK_VERSION) for $OPENWRT_ARCH ($RUST_TARGET)"
+fi
 
 # ---------------------------------------------------------------------------
 # 1. Obtain binaries
@@ -192,7 +203,7 @@ PKG_SIZE=$(du -sk "$DATA_DIR" | cut -f1)
 
 cat > "$CONTROL_DIR/control" <<EOF
 Package: $PKG_NAME
-Version: $PKG_VERSION
+Version: $IPK_VERSION
 Architecture: $OPENWRT_ARCH
 Maintainer: FIPS Network
 Section: net

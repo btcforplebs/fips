@@ -23,6 +23,26 @@
 # would leave checksums-linux.txt naming a file the release does not have).
 # Those three are read from the text, not executed.
 #
+# OpenWrt's opkg compares versions with dpkg's algorithm (libopkg/pkg.c
+# verrevcmp in openwrt/opkg-lede, read at 80503d94) and splits a revision at
+# the last '-', so the .ipk has the same defect. package-openwrt.yml's "Derive
+# package version" step maps the tag for the .ipk control Version, keeping the
+# leading 'v' every released .ipk carries: under opkg, 0.5.4 sorts below
+# v0.5.3, so dropping it would stop releases upgrading. dpkg stands in for
+# opkg as the ordering oracle; it warns about the 'v' and still compares.
+#
+# ipk cases:
+#   refs/tags/v0.5.3      package_version and ipk_version v0.5.3
+#   refs/tags/v0.5.3-rc1  ipk_version v0.5.3~rc1, package_version (the file
+#                         label) v0.5.3-rc1, and v0.5.2 < v0.5.3~rc1 < v0.5.3
+#                         < v0.5.4
+#   refs/tags/v0.5.3-beta1  ipk_version v0.5.3~beta1, which sorts between
+#                         v0.5.2 and v0.5.3~rc1
+#   refs/heads/maint      ipk_version equals package_version
+# and the wiring: the job declares ipk_version, and the "Build .ipk" step
+# passes it as IPK_VERSION. build-ipk.sh's use of IPK_VERSION is executed by
+# testing/openwrt/package-test.sh.
+#
 # Exit 0 = clean. Exit 1 = a case or a wiring check failed, including a
 # derivation that ran but did not write a declared output. Exit 2 = the check
 # could not run (no dpkg, no PyYAML, a step not found, the derivation failed,
@@ -199,6 +219,46 @@ expect_text "$WORK/deb.build.sh" \
     "the .deb build passes deb_package_version as --version"
 expect_text "$WORK/deb.build.sh" "tr '~' '-'" \
     "the .deb build renames a '~' in the package file name"
+
+# ── OpenWrt .ipk, package-openwrt.yml ─────────────────────────────────────
+extract ipk package-openwrt.yml determine-versioning "Derive package version" \
+    build "Build .ipk"
+
+echo "ipk: release tag refs/tags/v0.5.3"
+derive ipk refs/tags/v0.5.3 package_version ipk_version
+expect_eq "package_version" "${OUT[package_version]}" "v0.5.3"
+expect_eq "ipk_version" "${OUT[ipk_version]}" "v0.5.3"
+
+echo "ipk: candidate tag refs/tags/v0.5.3-rc1"
+derive ipk refs/tags/v0.5.3-rc1 package_version ipk_version
+expect_eq "package_version" "${OUT[package_version]}" "v0.5.3-rc1"
+expect_eq "ipk_version" "${OUT[ipk_version]}" "v0.5.3~rc1"
+expect_order "${OUT[ipk_version]}" lt v0.5.3
+expect_order "${OUT[ipk_version]}" gt v0.5.2
+expect_order v0.5.4 gt "${OUT[ipk_version]}"
+RC1_IPK="${OUT[ipk_version]}"
+
+echo "ipk: candidate tag refs/tags/v0.5.3-beta1"
+derive ipk refs/tags/v0.5.3-beta1 package_version ipk_version
+expect_eq "package_version" "${OUT[package_version]}" "v0.5.3-beta1"
+expect_eq "ipk_version" "${OUT[ipk_version]}" "v0.5.3~beta1"
+expect_order "${OUT[ipk_version]}" lt "$RC1_IPK"
+expect_order "${OUT[ipk_version]}" gt v0.5.2
+
+echo "ipk: branch refs/heads/maint"
+derive ipk refs/heads/maint package_version ipk_version
+expect_eq "package_version" "${OUT[package_version]}" "maint.${HEIGHT}.${HASH}"
+expect_eq "ipk_version" "${OUT[ipk_version]}" "${OUT[package_version]}"
+
+echo "ipk: wiring"
+# shellcheck disable=SC2016  # the ${{ }} expressions are workflow text, not shell
+expect_text -x "$WORK/ipk.outputs" \
+    'ipk_version=${{ steps.version.outputs.ipk_version }}' \
+    "determine-versioning declares ipk_version from the derivation step"
+# shellcheck disable=SC2016
+expect_text -x "$WORK/ipk.build.sh" \
+    'IPK_VERSION: ${{ needs.determine-versioning.outputs.ipk_version }}' \
+    "the .ipk build passes ipk_version as IPK_VERSION"
 
 echo
 if [ "$FAILED" -eq 0 ]; then
