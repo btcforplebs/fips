@@ -700,6 +700,110 @@ fn windows_installer_restricts_config_dir_before_any_path_inside_it() {
     }
 }
 
+/// Guards what install-service.ps1's ACL grants and who it makes owner, not
+/// only the order of the steps.
+///
+/// The ACL must allow SYSTEM and Administrators full control and grant no one
+/// else anything: granting Users read would expose the identity key and make
+/// an unelevated `fipsctl address` work again. Both `/setowner` calls must
+/// name Administrators. The PowerShell 7 `FileSystemAclExtensions` type must
+/// be used only on Core, since Windows PowerShell 5.1's .NET Framework lacks
+/// it.
+#[test]
+fn windows_installer_acl_allows_only_system_and_administrators_and_makes_administrators_owner() {
+    let lines = ps_lines(&repo_file("packaging/windows/install-service.ps1"));
+
+    let sid_loops: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.starts_with("foreach ($sid in "))
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(
+        sid_loops.len(),
+        1,
+        "install-service.ps1: expected one loop over the SIDs the ACL allows"
+    );
+    let sid_loop = sid_loops[0];
+    assert_eq!(
+        lines[sid_loop], r#"foreach ($sid in @("S-1-5-18", "S-1-5-32-544")) {"#,
+        "install-service.ps1: the ACL must allow exactly SYSTEM and Administrators"
+    );
+    let body = &lines[sid_loop + 1..block_end(&lines, sid_loop)];
+    for (what, want) in [
+        (
+            "the rule's account",
+            "[System.Security.Principal.SecurityIdentifier]::new($sid),",
+        ),
+        (
+            "the rule's rights",
+            "[System.Security.AccessControl.FileSystemRights]::FullControl,",
+        ),
+        (
+            "the rule's type",
+            "[System.Security.AccessControl.AccessControlType]::Allow)",
+        ),
+        ("the rule's addition to $acl", "$acl.AddAccessRule($rule)"),
+    ] {
+        assert!(
+            body.iter().any(|l| l == want),
+            "install-service.ps1: the SID loop does not have {what} as {want}"
+        );
+    }
+    for needle in [
+        "FileSystemAccessRule",
+        "FileSystemRights]::",
+        "AccessControlType]::",
+        "AccessRule(",
+    ] {
+        let uses = lines.iter().filter(|l| l.contains(needle)).count();
+        let inside = body.iter().filter(|l| l.contains(needle)).count();
+        assert!(
+            uses == 1 && inside == 1,
+            "install-service.ps1: expected {needle} exactly once, inside the SID loop; \
+             found {uses}, {inside} inside"
+        );
+    }
+
+    let setowners: Vec<&String> = lines.iter().filter(|l| l.contains("/setowner")).collect();
+    assert!(
+        !setowners.is_empty(),
+        "install-service.ps1: no /setowner line"
+    );
+    for l in setowners {
+        assert!(
+            l.contains(r#"/setowner "*S-1-5-32-544" "#),
+            "install-service.ps1: /setowner must make Administrators the owner: {l}"
+        );
+    }
+
+    let editions: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.contains("PSEdition"))
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(
+        editions.len(),
+        1,
+        "install-service.ps1: expected one PSEdition test"
+    );
+    let at = editions[0];
+    let want = [
+        r#"if ($PSVersionTable.PSEdition -eq "Core") {"#,
+        "[System.IO.FileSystemAclExtensions]::CreateDirectory($acl, $ConfigDir) | Out-Null",
+        "} else {",
+        "[System.IO.Directory]::CreateDirectory($ConfigDir, $acl) | Out-Null",
+        "}",
+    ];
+    assert_eq!(
+        lines.get(at..at + want.len()).unwrap_or_default(),
+        want,
+        "install-service.ps1: FileSystemAclExtensions must be used only when PSEdition is \
+         Core, and Directory.CreateDirectory otherwise"
+    );
+}
+
 /// Guards the conditions under which install-service.ps1 refuses its config
 /// directory, not only their position.
 ///
@@ -729,17 +833,33 @@ fn windows_installer_refusal_conditions_stop_the_install() {
     let trusted = find("list of trusted owners", &|l| {
         l.starts_with("$trustedOwners = @(")
     });
-    for needle in [
-        "\"S-1-5-18\"",
-        "\"S-1-5-32-544\"",
-        "WindowsIdentity]::GetCurrent().User.Value",
-    ] {
-        assert!(
-            lines[trusted[0]].contains(needle),
-            "install-service.ps1: the trusted owners do not include {needle}: {}",
-            lines[trusted[0]]
-        );
-    }
+    assert_eq!(
+        trusted.len(),
+        1,
+        "install-service.ps1: expected one list of trusted owners"
+    );
+    let owners: Vec<&str> = lines[trusted[0]]
+        .strip_prefix("$trustedOwners = @(")
+        .and_then(|l| l.strip_suffix(')'))
+        .unwrap_or_else(|| {
+            panic!(
+                "install-service.ps1: the trusted owners are not one @( ) list: {}",
+                lines[trusted[0]]
+            )
+        })
+        .split(',')
+        .map(str::trim)
+        .collect();
+    assert_eq!(
+        owners,
+        [
+            "\"S-1-5-18\"",
+            "\"S-1-5-32-544\"",
+            "[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value",
+        ],
+        "install-service.ps1: the trusted owners must be exactly SYSTEM, Administrators \
+         and the installing account"
+    );
     for i in find("owner refusal", &|l| {
         l == "if ($trustedOwners -notcontains $ownerSid) {"
     }) {
