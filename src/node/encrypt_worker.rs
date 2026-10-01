@@ -56,15 +56,17 @@ use crate::transport::udp::io::AsyncUdpSocket;
 #[cfg(not(target_os = "macos"))]
 use crossbeam_channel::{Receiver, SendError, Sender, TrySendError, bounded};
 use ring::aead::{Aad, LessSafeKey, Nonce};
+#[cfg(any(target_os = "macos", test))]
+use std::collections::VecDeque;
 #[cfg(target_os = "macos")]
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
 use std::sync::OnceLock;
-#[cfg(target_os = "macos")]
-use std::sync::{Condvar, Mutex};
+#[cfg(any(target_os = "macos", test))]
+use std::sync::{Condvar, Mutex, PoisonError};
 use tracing::{debug, trace, warn};
 
 /// A pre-cooked FMP-encrypt-and-send job. All state-touching work
@@ -218,43 +220,42 @@ impl QueuedFmpSendJob {
 /// same rationale as the bounded endpoint_commands channel upstream.
 const WORKER_CHANNEL_CAP: usize = 1024;
 
-#[cfg(target_os = "macos")]
-struct MacWorkerSender {
-    inner: Arc<MacWorkerQueueInner>,
+#[cfg(any(target_os = "macos", test))]
+struct MacWorkerSender<T> {
+    inner: Arc<MacWorkerQueueInner<T>>,
 }
 
-#[cfg(target_os = "macos")]
-struct MacWorkerReceiver {
-    inner: Arc<MacWorkerQueueInner>,
+#[cfg(any(target_os = "macos", test))]
+struct MacWorkerReceiver<T> {
+    inner: Arc<MacWorkerQueueInner<T>>,
 }
 
-#[cfg(target_os = "macos")]
-struct MacWorkerQueueInner {
-    state: Mutex<MacWorkerQueueState>,
+#[cfg(any(target_os = "macos", test))]
+struct MacWorkerQueueInner<T> {
+    state: Mutex<MacWorkerQueueState<T>>,
     not_empty: Condvar,
     not_full: Condvar,
     cap: usize,
 }
 
-#[cfg(target_os = "macos")]
-#[derive(Default)]
-struct MacWorkerQueueState {
-    queue: VecDeque<QueuedFmpSendJob>,
+#[cfg(any(target_os = "macos", test))]
+struct MacWorkerQueueState<T> {
+    queue: VecDeque<T>,
     waiting: bool,
     closed: bool,
 }
 
-#[cfg(target_os = "macos")]
-enum MacWorkerTryPushError {
-    Full(Box<QueuedFmpSendJob>),
+#[cfg(any(target_os = "macos", test))]
+enum MacWorkerTryPushError<T> {
+    Full(Box<T>),
     Closed,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 struct MacWorkerPushError;
 
-#[cfg(target_os = "macos")]
-fn mac_worker_channel(cap: usize) -> (MacWorkerSender, MacWorkerReceiver) {
+#[cfg(any(target_os = "macos", test))]
+fn mac_worker_channel<T>(cap: usize) -> (MacWorkerSender<T>, MacWorkerReceiver<T>) {
     let inner = Arc::new(MacWorkerQueueInner {
         state: Mutex::new(MacWorkerQueueState {
             queue: VecDeque::with_capacity(cap),
@@ -273,9 +274,9 @@ fn mac_worker_channel(cap: usize) -> (MacWorkerSender, MacWorkerReceiver) {
     )
 }
 
-#[cfg(target_os = "macos")]
-impl MacWorkerSender {
-    fn try_push(&self, job: QueuedFmpSendJob) -> Result<(), MacWorkerTryPushError> {
+#[cfg(any(target_os = "macos", test))]
+impl<T> MacWorkerSender<T> {
+    fn try_push(&self, job: T) -> Result<(), MacWorkerTryPushError<T>> {
         let mut state = self
             .inner
             .state
@@ -298,7 +299,7 @@ impl MacWorkerSender {
         Ok(())
     }
 
-    fn push_blocking(&self, job: QueuedFmpSendJob) -> Result<(), MacWorkerPushError> {
+    fn push_blocking(&self, job: T) -> Result<(), MacWorkerPushError> {
         let mut state = self
             .inner
             .state
@@ -328,8 +329,8 @@ impl MacWorkerSender {
     }
 }
 
-#[cfg(target_os = "macos")]
-impl Drop for MacWorkerSender {
+#[cfg(any(target_os = "macos", test))]
+impl<T> Drop for MacWorkerSender<T> {
     fn drop(&mut self) {
         let mut state = self
             .inner
@@ -343,9 +344,34 @@ impl Drop for MacWorkerSender {
     }
 }
 
-#[cfg(target_os = "macos")]
-impl MacWorkerReceiver {
-    fn recv_batch(&self, batch: &mut Vec<QueuedFmpSendJob>, max: usize) -> bool {
+/// Closing from the receiver side matters because a sender waiting in
+/// `push_blocking` on a full queue sleeps on `not_full`, and only the
+/// receiver draining the queue wakes it. If the worker thread exits (a
+/// panic unwinding included), nothing else would, and the rx_loop behind
+/// that sender would block forever.
+#[cfg(any(target_os = "macos", test))]
+impl<T> Drop for MacWorkerReceiver<T> {
+    fn drop(&mut self) {
+        // This can run while the worker thread unwinds from a panic, where
+        // a second panic would abort the process, so tolerate poisoning.
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        state.closed = true;
+        let queued = std::mem::take(&mut state.queue);
+        drop(state);
+        // Queued jobs hold key copies and sockets; free them outside the lock.
+        drop(queued);
+        self.inner.not_full.notify_all();
+        self.inner.not_empty.notify_all();
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl<T> MacWorkerReceiver<T> {
+    fn recv_batch(&self, batch: &mut Vec<T>, max: usize) -> bool {
         debug_assert!(batch.is_empty());
         let mut state = self
             .inner
@@ -378,7 +404,7 @@ impl MacWorkerReceiver {
 }
 
 #[cfg(target_os = "macos")]
-type WorkerSender = MacWorkerSender;
+type WorkerSender = MacWorkerSender<QueuedFmpSendJob>;
 
 #[cfg(not(target_os = "macos"))]
 type WorkerSender = Sender<QueuedFmpSendJob>;
@@ -955,7 +981,7 @@ fn run_worker(idx: usize, rx: Receiver<QueuedFmpSendJob>) {
 }
 
 #[cfg(target_os = "macos")]
-fn run_worker_macos(idx: usize, rx: MacWorkerReceiver) {
+fn run_worker_macos(idx: usize, rx: MacWorkerReceiver<QueuedFmpSendJob>) {
     trace!(worker = idx, "FMP encrypt worker thread starting");
 
     let batch_size = macos_worker_batch_size();
@@ -2400,5 +2426,155 @@ fn send_one_raw(
         Err(std::io::Error::last_os_error())
     } else {
         Ok(r as usize)
+    }
+}
+
+/// Tests for the bounded worker queue the macOS encrypt pool uses. The
+/// queue is generic, so these run on every platform against small item
+/// types. Every wait is bounded so a regression fails instead of hanging.
+#[cfg(test)]
+mod mac_queue_tests {
+    use super::*;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    const WAIT: Duration = Duration::from_secs(5);
+
+    /// Run `push_blocking(item)` on a helper thread and return a channel
+    /// that yields its result.
+    fn spawn_pusher<T: Send + 'static>(
+        tx: MacWorkerSender<T>,
+        item: T,
+    ) -> mpsc::Receiver<Result<(), MacWorkerPushError>> {
+        let (done_tx, done_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let result = tx.push_blocking(item);
+            let _ = done_tx.send(result);
+        });
+        done_rx
+    }
+
+    #[test]
+    fn push_blocking_returns_error_when_worker_thread_panics_with_full_queue() {
+        let (tx, rx) = mac_worker_channel::<u32>(2);
+        assert!(tx.try_push(1).is_ok());
+        assert!(tx.try_push(2).is_ok());
+        match tx.try_push(9) {
+            Err(MacWorkerTryPushError::Full(job)) => assert_eq!(*job, 9),
+            _ => panic!("try_push on a full queue should hand the job back"),
+        }
+
+        // The worker owns the receiver and dies without draining, once the
+        // pusher below has had time to start waiting for space.
+        let (die_tx, die_rx) = mpsc::channel::<()>();
+        let worker = thread::spawn(move || {
+            let _rx = rx;
+            let _ = die_rx.recv();
+            panic!("simulated encrypt worker panic");
+        });
+        let done = spawn_pusher(tx, 3);
+        thread::sleep(Duration::from_millis(200));
+        assert!(
+            matches!(done.try_recv(), Err(mpsc::TryRecvError::Empty)),
+            "push_blocking returned while the queue was full and the worker alive"
+        );
+        die_tx
+            .send(())
+            .expect("worker thread gone before its signal");
+
+        let result = done
+            .recv_timeout(WAIT)
+            .expect("push_blocking still blocked after the worker thread died");
+        assert!(matches!(result, Err(MacWorkerPushError)));
+        assert!(worker.join().is_err(), "worker thread should have panicked");
+    }
+
+    #[test]
+    fn try_push_returns_closed_after_receiver_dropped() {
+        let (tx, rx) = mac_worker_channel::<u32>(2);
+        drop(rx);
+        assert!(matches!(tx.try_push(1), Err(MacWorkerTryPushError::Closed)));
+        let done = spawn_pusher(tx, 2);
+        let result = done
+            .recv_timeout(WAIT)
+            .expect("push_blocking blocked on a queue whose receiver is gone");
+        assert!(matches!(result, Err(MacWorkerPushError)));
+    }
+
+    #[test]
+    fn receiver_drop_releases_queued_items() {
+        let marker = Arc::new(());
+        let (tx, rx) = mac_worker_channel::<Arc<()>>(4);
+        assert!(tx.try_push(Arc::clone(&marker)).is_ok());
+        assert!(tx.try_push(Arc::clone(&marker)).is_ok());
+        assert_eq!(Arc::strong_count(&marker), 3);
+        drop(rx);
+        assert_eq!(
+            Arc::strong_count(&marker),
+            1,
+            "queued items must be freed when the receiver goes away"
+        );
+        drop(tx);
+    }
+
+    #[test]
+    fn push_blocking_completes_when_worker_drains_full_queue() {
+        let (tx, rx) = mac_worker_channel::<u32>(2);
+        assert!(tx.try_push(1).is_ok());
+        assert!(tx.try_push(2).is_ok());
+        let done = spawn_pusher(tx, 3);
+        thread::sleep(Duration::from_millis(100));
+        assert!(
+            matches!(done.try_recv(), Err(mpsc::TryRecvError::Empty)),
+            "push_blocking returned while the queue was still full"
+        );
+
+        let mut batch = Vec::new();
+        assert!(rx.recv_batch(&mut batch, 16));
+        assert_eq!(batch, vec![1, 2]);
+        let result = done
+            .recv_timeout(WAIT)
+            .expect("push_blocking not woken after the worker drained");
+        assert!(result.is_ok());
+
+        batch.clear();
+        assert!(rx.recv_batch(&mut batch, 16));
+        assert_eq!(batch, vec![3]);
+    }
+
+    #[test]
+    fn recv_batch_drains_then_reports_closed_after_sender_drop() {
+        let (tx, rx) = mac_worker_channel::<u32>(4);
+        for i in 1..=3 {
+            assert!(tx.try_push(i).is_ok());
+        }
+        drop(tx);
+        let mut batch = Vec::new();
+        assert!(rx.recv_batch(&mut batch, 16));
+        assert_eq!(batch, vec![1, 2, 3]);
+        batch.clear();
+        assert!(!rx.recv_batch(&mut batch, 16));
+        assert!(batch.is_empty());
+    }
+
+    #[test]
+    fn receiver_drop_does_not_panic_on_poisoned_lock() {
+        let (tx, rx) = mac_worker_channel::<u32>(2);
+        // The sender's own Drop still expects an unpoisoned lock, so it must
+        // never run here: a panic there while a failed assertion unwinds
+        // would abort the whole test binary.
+        let _tx = std::mem::ManuallyDrop::new(tx);
+        let inner = Arc::clone(&rx.inner);
+        let poisoner = thread::spawn(move || {
+            let _guard = inner.state.lock().unwrap();
+            panic!("poison the queue lock");
+        });
+        assert!(poisoner.join().is_err());
+        assert!(rx.inner.state.is_poisoned());
+
+        let dropped = catch_unwind(AssertUnwindSafe(move || drop(rx)));
+        assert!(dropped.is_ok(), "receiver drop panicked on a poisoned lock");
     }
 }
