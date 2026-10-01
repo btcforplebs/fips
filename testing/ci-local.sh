@@ -31,7 +31,7 @@
 #   nat-lan, nostr-publish-consume, stun-faults,
 #   chaos-churn-mixed-10, chaos-ethernet-mesh,
 #   chaos-ethernet-only, chaos-tcp-mesh, chaos-congestion-stress,
-#   sidecar, dns-resolver, deb-install
+#   sidecar, native-api, mdns, dns-resolver, deb-install
 #
 # Opt-in (require --with-tor; depend on live Tor network):
 #   tor-socks5, tor-directory
@@ -216,6 +216,7 @@ NOSTR_RELAY_SUITES=(nostr-publish-consume)
 STUN_FAULTS_SUITES=(stun-faults)
 DNS_RESOLVER_SUITES=(dns-resolver)
 NATIVE_API_SUITES=(native-api)
+MDNS_SUITES=(mdns)
 DEB_INSTALL_SUITES=(deb-install)
 TOR_SUITES=(tor-socks5 tor-directory)
 
@@ -275,6 +276,9 @@ list_suites() {
     echo ""
     echo "  Native API:"
     for s in "${NATIVE_API_SUITES[@]}"; do echo "    $s"; done
+    echo ""
+    echo "  mDNS LAN discovery:"
+    for s in "${MDNS_SUITES[@]}"; do echo "    $s"; done
     echo ""
     echo "  DNS resolver:"
     for s in "${DNS_RESOLVER_SUITES[@]}"; do echo "    $s"; done
@@ -1069,6 +1073,18 @@ run_native_api() {
     fi
 }
 
+# Run the mDNS LAN discovery harness: two nodes on a user-defined bridge that
+# must find and peer with each other by mDNS alone. Reads FIPS_TEST_IMAGE, and
+# creates and removes its own network.
+run_mdns() {
+    info "[mdns] Running mDNS LAN discovery test"
+    if FIPS_TEST_IMAGE="$CI_IMAGE_TEST" bash testing/mdns/test.sh 2>&1; then
+        record "mdns" 0
+    else
+        record "mdns" 1
+    fi
+}
+
 # Run dns-resolver harness (multi-distro + e2e scenarios)
 #
 # Its e2e scenarios run the fips binaries from the package build_ci_deb
@@ -1360,6 +1376,9 @@ run_integration() {
     # Native datagram API (light — one single-node run plus a two-node pair)
     run_native_api
 
+    # mDNS LAN discovery (light — one two-node pair, seconds when healthy)
+    run_mdns
+
     # DNS resolver multi-distro suite (heavy — per-distro systemd images)
     run_dns_resolver
 
@@ -1420,6 +1439,8 @@ run_suite() {
             run_dns_resolver ;;
         native-api)
             run_native_api ;;
+        mdns)
+            run_mdns ;;
         deb-install)
             run_deb_install ;;
         tor-socks5)
