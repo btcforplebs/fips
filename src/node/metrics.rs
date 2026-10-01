@@ -1,10 +1,10 @@
 //! Lock-free metric counters backed by atomics.
 //!
 //! Mirrors the `NodeStats` counter surface (`stats.rs`) but stores each
-//! counter in an `AtomicU64`, so it can be bumped through `&self` and, in
-//! a later step, sampled without dispatching through the rx_loop task. The
-//! hottest counters are cache-line padded to avoid false sharing once
-//! reads move off-thread.
+//! counter in an `AtomicU64`, so it can be bumped through `&self` and read
+//! off the rx_loop task (the control read handle serves `show_metrics` from
+//! it directly). The hottest counters are cache-line padded to avoid false
+//! sharing between the writer and off-thread readers.
 //!
 //! The forwarding, discovery, tree, bloom, congestion, and error families
 //! live here exclusively and are both written and served from the registry.
@@ -43,11 +43,10 @@ impl Counter {
 
 /// Cache-line padding wrapper for the hottest counters.
 ///
-/// Padding keeps a hot counter off shared cache lines so that concurrent
-/// reads (introduced when metric sampling moves off the rx_loop task) do
-/// not false-share with the writer. With a single writer today the padding
-/// is forward-looking insurance. Derefs to the inner counter so the call
-/// sites are identical to an unpadded one.
+/// Padding keeps a hot counter off shared cache lines so that reads from
+/// off the rx_loop task (the control read handle) do not false-share with
+/// the single writer. Derefs to the inner counter so the call sites are
+/// identical to an unpadded one.
 #[repr(align(64))]
 #[derive(Default)]
 pub struct Padded<T>(pub T);

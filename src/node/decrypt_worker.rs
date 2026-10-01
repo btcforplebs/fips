@@ -1,11 +1,10 @@
 //! Off-task FMP + FSP decrypt + delivery worker.
 //!
-//! First incremental step of the data-plane shard restructure (per the
-//! architectural plan): each worker now **owns its session state
-//! directly** in a local `HashMap`, with no `Arc<RwLock<HashMap>>`
-//! cache on the Node side and no `Arc<Mutex<ReplayWindow>>` shared
-//! with the rx_loop. The worker is the sole authority over the replay
-//! window and the recv-side ciphers for every session it owns.
+//! Each worker **owns its session state directly** in a local
+//! `HashMap`, with no `Arc<RwLock<HashMap>>` cache on the Node side and
+//! no `Arc<Mutex<ReplayWindow>>` shared with the rx_loop. The worker is
+//! the sole authority over the replay window and the recv-side ciphers
+//! for every session it owns.
 //!
 //! Dispatch is **deterministic by session key**: rx_loop computes
 //! `worker_idx = hash(cache_key) % N` and routes both
@@ -484,8 +483,8 @@ fn handle_job(
     // **decrypted-in-place** FMP plaintext back to rx_loop.
     //
     // Two problems with that path:
-    //   1. After the shard-owned-sessions refactor (01f6c62), the FSP
-    //      replay window is owned by **this worker thread**. Once we
+    //   1. Since sessions became shard-owned, the FSP replay
+    //      window is owned by **this worker thread**. Once we
     //      `state.fsp_replay.accept(fsp_counter)`, the rx_loop's
     //      `noise::Session::replay_window` is stale — it still has
     //      old counters. When rx_loop tries to FSP-decrypt the
@@ -511,11 +510,9 @@ fn handle_job(
     // still offloads the FMP AEAD (~half the per-packet decrypt
     // CPU). Correctness over micro-optimisation.
     //
-    // The DataShard end-state (per the architectural plan) re-
-    // introduces the EndpointData fast path correctly by having the
-    // shard worker also own the rx_loop side for its sessions — at
-    // that point there's no "rx_loop legacy path" for the worker to
-    // conflict with.
+    // A worker that also owned the rx_loop side of its sessions could
+    // restore the EndpointData fast path correctly: there would then
+    // be no "rx_loop legacy path" for the worker to conflict with.
     // Pass the buffer through by ownership + offset/length. No
     // per-packet allocation; rx_loop slices into `packet_data`.
     let _ = link_msg; // sanity-check borrow before sending buffer onward

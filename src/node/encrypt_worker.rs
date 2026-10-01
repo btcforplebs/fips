@@ -423,7 +423,7 @@ type WorkerSender = Sender<QueuedFmpSendJob>;
 ///
 /// **Ordering: hash-by-destination** so single-flow TCP keeps its
 /// FIFO ordering (round-robin caused 8000 retransmits in an earlier
-/// experiment — see the git log for the 56e0ca8 fix). Multi-peer /
+/// experiment, which is why dispatch hashes by destination). Multi-peer /
 /// multi-flow benches still get parallelism since different
 /// destinations hash to different workers.
 #[derive(Clone)]

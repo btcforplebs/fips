@@ -1766,7 +1766,8 @@ impl Node {
         // advance together. What is published is data, not a rendered response,
         // and it is published only here, rather than as a monolithic per-tick
         // rebuild of every query's result. It also is not gated behind any slow
-        // I/O on the tick the way the abandoned 2edc8a1 republish was.
+        // I/O on the tick, which was the shape of an earlier, abandoned
+        // republish design.
         // Per-stats-history-peer metadata. `show_stats_peers` /
         // `show_stats_history_all_peers` need each tracked peer's live
         // membership (`is_active`), resolved npub, and display name — all
