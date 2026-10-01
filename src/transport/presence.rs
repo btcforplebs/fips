@@ -29,7 +29,8 @@
 //! rather than steering it. See
 //! the ethernet transport's `interface_present` for why.
 
-use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
+use portable_atomic::AtomicU64;
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 use std::sync::{PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
