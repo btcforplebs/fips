@@ -21,6 +21,7 @@ use super::state::Fmp;
 use crate::transport::LinkId;
 use crate::utils::index::SessionIndex;
 use crate::{NodeAddr, PeerIdentity};
+use std::collections::VecDeque;
 
 /// Determine winner of cross-connection tie-breaker.
 ///
@@ -172,6 +173,67 @@ pub(crate) struct RekeyAnswer {
     pub msg2: Vec<u8>,
 }
 
+/// How many msg1s of ended cycles one peer's [`AnsweredMsg1s`] remembers.
+///
+/// A msg1 is answered as a rekey only on a session at least
+/// [`REKEY_MIN_SESSION_AGE_SECS`] old, so this covers at least two hours of
+/// the peer's cycles, and eight and a half at the default 120 s interval when
+/// the message-count trigger does not fire first. 32 bytes each, so 8 KiB per
+/// peer at most.
+pub(crate) const ENDED_MSG1_RECORD: usize = 256;
+
+/// The rekey msg1s this node answered as the link-rekey responder for one
+/// peer, by digest.
+///
+/// A link msg1 carries nothing that ties it to one cycle, so a copy taken off
+/// the wire still authenticates as the peer, in the peer's current epoch,
+/// after the cycle it started has ended. This record is how a copy is told
+/// from a fresh msg1. The answer that armed the pending session this node
+/// holds is kept whole, so a resend of that msg1 draws the same msg2. When
+/// the pending leaves (adopted, retired or abandoned) its digest moves to the
+/// ended list, and a msg1 matching an ended cycle is refused instead of arming
+/// a new pending.
+///
+/// Retention is bounded: the ended list keeps the last
+/// [`ENDED_MSG1_RECORD`] digests, so a msg1 from an older cycle of the same
+/// epoch is not recognized. The record lives with the peer, so it starts empty
+/// whenever the peering is established again while the peer's epoch stays the
+/// same, as after this node restarts or the link is torn down and re-formed.
+#[derive(Debug, Default)]
+pub(crate) struct AnsweredMsg1s {
+    held: Option<RekeyAnswer>,
+    ended: VecDeque<Msg1Digest>,
+}
+
+impl AnsweredMsg1s {
+    /// Record the answer that armed a new responder pending.
+    pub(crate) fn arm(&mut self, answer: RekeyAnswer) {
+        self.end();
+        self.held = Some(answer);
+    }
+
+    /// The pending the held answer armed has left: keep only its digest.
+    pub(crate) fn end(&mut self) {
+        if let Some(answer) = self.held.take() {
+            if self.ended.len() == ENDED_MSG1_RECORD {
+                self.ended.pop_front();
+            }
+            self.ended.push_back(answer.msg1);
+        }
+    }
+
+    /// The answer that armed the pending this node holds, if it holds one it
+    /// answered.
+    pub(crate) fn held(&self) -> Option<&RekeyAnswer> {
+        self.held.as_ref()
+    }
+
+    /// Whether `msg1` armed a cycle that has since ended.
+    pub(crate) fn ended(&self, msg1: &Msg1Digest) -> bool {
+        self.ended.contains(msg1)
+    }
+}
+
 /// A snapshot of one active peer's rekey-relevant state, taken by the shell.
 ///
 /// Every clock read is resolved shell-side into a plain `u64`/`bool` before the
@@ -287,6 +349,9 @@ pub(crate) struct EstablishSnapshot {
     /// responder, the answer that armed it. `None` with no pending, or with a
     /// pending this node initiated.
     pub held_answer: Option<RekeyAnswer>,
+    /// This msg1 armed a responder cycle of this peer's that has since ended
+    /// (pre-evaluated shell-side against the peer's [`AnsweredMsg1s`]).
+    pub msg1_answered_before: bool,
     /// The existing peer's stored msg2 wire bytes (an opaque blob), resent on a
     /// same-epoch duplicate msg1. `None` when there is no existing peer or it
     /// has no stored msg2.
@@ -447,7 +512,7 @@ pub(crate) enum InboundDecision {
 }
 
 /// Why an inbound msg1 was rejected. Distinguishes only the diagnostic log
-/// message; all three reject identically (BadState stat, rate-limiter complete,
+/// message; all four reject identically (BadState stat, rate-limiter complete,
 /// the local not-yet-registered connection dropped).
 #[derive(Debug)]
 pub(crate) enum InboundReject {
@@ -461,6 +526,9 @@ pub(crate) enum InboundReject {
     /// Dual rekey initiation and we are the tie-break *winner* (smaller
     /// NodeAddr): drop the peer's msg1 and keep driving our own rekey.
     DualRekeyWon,
+    /// The msg1 armed a rekey cycle with this peer that has already ended: a
+    /// copy, not a fresh request, and it must not arm a pending.
+    AnsweredBefore,
 }
 
 /// The classification outcome for one outbound `handle_msg2` completion, decided
@@ -507,7 +575,9 @@ pub(crate) trait EstablishView {
     /// `peer_addr`: the existing peer's epoch/session/rekey state (with the
     /// session age resolved shell-side), the max-peers cap, and this node's own
     /// address for the tie-break.
-    fn establish_snapshot(&self, peer_addr: &NodeAddr) -> EstablishSnapshot;
+    /// `msg1` is the digest of the msg1 being classified, checked against the
+    /// peer's record of answered msg1s.
+    fn establish_snapshot(&self, peer_addr: &NodeAddr, msg1: &Msg1Digest) -> EstablishSnapshot;
 
     /// Snapshot the registry state relevant to classifying an outbound msg2
     /// completion for `peer_addr`: whether the identity is already an active
@@ -722,6 +792,14 @@ impl Fmp {
                         }
                         return InboundDecision::Reject {
                             reason: InboundReject::PendingSession,
+                        };
+                    }
+                    if snap.msg1_answered_before {
+                        // A copy of a msg1 whose cycle has ended: refuse it
+                        // before it can arm a pending, or, on a tie-break we
+                        // lose, abandon our own rekey.
+                        return InboundDecision::Reject {
+                            reason: InboundReject::AnsweredBefore,
                         };
                     }
                     if snap.rekey_in_progress {

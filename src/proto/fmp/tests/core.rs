@@ -5,8 +5,9 @@ use super::util::{
     wire_outcome,
 };
 use crate::NodeAddr;
+use crate::proto::fmp::core::ENDED_MSG1_RECORD;
 use crate::proto::fmp::{
-    ConnAction, Fmp, InboundDecision, InboundReject, Msg1Digest, OutboundDecision,
+    AnsweredMsg1s, ConnAction, Fmp, InboundDecision, InboundReject, Msg1Digest, OutboundDecision,
     OutboundSnapshot, RekeyAnswer, RekeyCfg, RekeyRole, cross_connection_winner,
 };
 use crate::testutil::make_node_addr;
@@ -566,6 +567,91 @@ fn a_pending_this_node_initiated_answers_no_msg1() {
             reason: InboundReject::PendingSession
         }
     ));
+}
+
+#[test]
+fn a_msg1_from_an_ended_cycle_is_refused_and_arms_nothing() {
+    // A copy of a msg1 whose cycle has ended must not arm a new pending, even
+    // with no pending held and the session aged past the rekey floor.
+    let fmp = Fmp::new();
+    let mut snap = snapshot_holding_an_answer(b"msg1");
+    snap.pending_new_session = false;
+    snap.held_answer = None;
+    snap.msg1_answered_before = true;
+    let wire = wire_outcome(Some([7u8; 8]));
+    assert!(matches!(
+        fmp.establish_inbound(&snap, &wire),
+        InboundDecision::Reject {
+            reason: InboundReject::AnsweredBefore
+        }
+    ));
+}
+
+#[test]
+fn a_msg1_from_an_ended_cycle_does_not_make_us_abandon_our_own_rekey() {
+    // Mid-rekey and on the losing side of the tie-break, a fresh msg1 makes
+    // us abandon ours and respond; a copy of an ended cycle's msg1 must not.
+    let fmp = Fmp::new();
+    let mut snap = snapshot_holding_an_answer(b"msg1");
+    snap.pending_new_session = false;
+    snap.held_answer = None;
+    snap.rekey_in_progress = true;
+    snap.our_node_addr = max_node_addr();
+    let wire = wire_outcome(Some([7u8; 8]));
+    assert!(matches!(
+        fmp.establish_inbound(&snap, &wire),
+        InboundDecision::RekeyRespond {
+            abandon_first: true,
+            ..
+        }
+    ));
+    snap.msg1_answered_before = true;
+    assert!(matches!(
+        fmp.establish_inbound(&snap, &wire),
+        InboundDecision::Reject {
+            reason: InboundReject::AnsweredBefore
+        }
+    ));
+}
+
+#[test]
+fn the_answered_record_holds_the_armed_answer_then_remembers_its_msg1_once_ended() {
+    let mut record = AnsweredMsg1s::default();
+    let first = Msg1Digest::of(b"first");
+    record.arm(RekeyAnswer {
+        msg1: first,
+        msg2: vec![0x02; 4],
+    });
+    assert_eq!(record.held().map(|a| a.msg1), Some(first));
+    assert!(!record.ended(&first), "a held cycle has not ended");
+
+    record.end();
+    assert!(record.held().is_none());
+    assert!(record.ended(&first));
+    assert!(!record.ended(&Msg1Digest::of(b"never answered")));
+
+    // Ending with nothing held records nothing.
+    record.end();
+    assert!(record.ended(&first));
+}
+
+#[test]
+fn the_answered_record_keeps_the_most_recent_ended_cycles_up_to_its_bound() {
+    let mut record = AnsweredMsg1s::default();
+    let digest = |i: usize| Msg1Digest::of(&i.to_le_bytes());
+    for i in 0..=ENDED_MSG1_RECORD {
+        record.arm(RekeyAnswer {
+            msg1: digest(i),
+            msg2: Vec::new(),
+        });
+        record.end();
+    }
+    assert!(
+        !record.ended(&digest(0)),
+        "the oldest beyond the bound is forgotten"
+    );
+    assert!(record.ended(&digest(1)));
+    assert!(record.ended(&digest(ENDED_MSG1_RECORD)));
 }
 
 #[test]

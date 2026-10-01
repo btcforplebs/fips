@@ -86,6 +86,7 @@ pub(super) fn establish_snapshot() -> EstablishSnapshot {
         pending_new_session: false,
         rekey_in_progress: false,
         held_answer: None,
+        msg1_answered_before: false,
         existing_msg2: None,
         at_max_peers: false,
         has_pending_outbound_to_peer: false,
