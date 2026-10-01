@@ -56,6 +56,12 @@ pub struct SessionStats {
     /// abandoned our own rekey and answered as responder. A sustained
     /// rate here means local key rotation is being suppressed.
     pub rekey_yielded: u64,
+    /// A setup message named an established peer while a handshake that
+    /// peer armed was still waiting for its msg3, so the message was dropped
+    /// and the handshake kept. A genuine retry lands here when the peer
+    /// abandoned a rekey this node answered; a sustained rate means setups
+    /// are being sprayed at the session.
+    pub rekey_held: u64,
     /// A setup message named an established peer that already holds a
     /// completed rekey awaiting cut-over, so the message was dropped
     /// rather than arming a second handshake.
@@ -105,6 +111,7 @@ impl SessionStats {
             rekey_armed: self.rekey_armed,
             rekey_tiebreak: self.rekey_tiebreak,
             rekey_yielded: self.rekey_yielded,
+            rekey_held: self.rekey_held,
             rekey_pending: self.rekey_pending,
             rekey_expired: self.rekey_expired,
             rekey_unanswered: self.rekey_unanswered,
@@ -124,6 +131,7 @@ impl SessionStats {
             SessionReject::RekeyKeyMismatch => self.rekey_key_mismatch += 1,
             SessionReject::RekeyTiebreak => self.rekey_tiebreak += 1,
             SessionReject::RekeyYielded => self.rekey_yielded += 1,
+            SessionReject::RekeyHeld => self.rekey_held += 1,
             SessionReject::RekeyPending => self.rekey_pending += 1,
             SessionReject::AckHandshakeFailed => self.ack_handshake_failed += 1,
             SessionReject::SetupRateLimited => self.setup_rate_limited += 1,
@@ -411,6 +419,7 @@ pub struct SessionStatsSnapshot {
     pub rekey_armed: u64,
     pub rekey_tiebreak: u64,
     pub rekey_yielded: u64,
+    pub rekey_held: u64,
     pub rekey_pending: u64,
     pub rekey_expired: u64,
     pub rekey_unanswered: u64,
@@ -538,14 +547,18 @@ mod tests {
     }
 
     #[test]
-    fn session_stats_record_reject_separates_the_three_rekey_arming_refusals() {
+    fn session_stats_record_reject_separates_the_four_rekey_arming_refusals() {
         let mut stats = SessionStats::default();
         stats.record_reject(SessionReject::RekeyTiebreak);
         stats.record_reject(SessionReject::RekeyYielded);
         stats.record_reject(SessionReject::RekeyYielded);
+        stats.record_reject(SessionReject::RekeyHeld);
+        stats.record_reject(SessionReject::RekeyHeld);
+        stats.record_reject(SessionReject::RekeyHeld);
         stats.record_reject(SessionReject::RekeyPending);
         assert_eq!(stats.rekey_tiebreak, 1);
         assert_eq!(stats.rekey_yielded, 2);
+        assert_eq!(stats.rekey_held, 3);
         assert_eq!(stats.rekey_pending, 1);
         assert_eq!(stats.rekey_armed, 0);
     }
@@ -554,11 +567,13 @@ mod tests {
     fn session_stats_snapshot_carries_the_rekey_arming_counters() {
         let mut stats = SessionStats::default();
         stats.record_reject(SessionReject::RekeyTiebreak);
+        stats.record_reject(SessionReject::RekeyHeld);
         stats.rekey_armed = 7;
         stats.rekey_expired = 3;
         stats.pending_replaced = 2;
         let snap = stats.snapshot();
         assert_eq!(snap.rekey_tiebreak, 1);
+        assert_eq!(snap.rekey_held, 1);
         assert_eq!(snap.rekey_armed, 7);
         assert_eq!(snap.rekey_expired, 3);
         assert_eq!(snap.pending_replaced, 2);

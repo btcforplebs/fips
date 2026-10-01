@@ -251,6 +251,11 @@ pub enum SessionReject {
     /// is being suppressed. Tracked via
     /// [`SessionStats::rekey_yielded`](crate::node::stats::SessionStats).
     RekeyYielded,
+    /// A setup message named an established peer while a handshake that
+    /// peer armed was still waiting for its msg3, so the message was dropped
+    /// and the handshake kept. Tracked via
+    /// [`SessionStats::rekey_held`](crate::node::stats::SessionStats).
+    RekeyHeld,
     /// A setup message named an established peer that already holds a
     /// completed rekey awaiting cut-over, so the message was dropped
     /// rather than arming a second handshake. Tracked via

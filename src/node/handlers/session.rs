@@ -684,14 +684,29 @@ impl Node {
                 // the veto returns without touching them, and the
                 // fall-through only arms a handshake beside them. Adopting
                 // them is still an authenticated msg3's job alone. No arm
-                // below drops one either: the dual-initiation arm did until
-                // it was narrowed to abandon only the handshake, for the
-                // reason recorded at that site.
+                // below drops one either.
                 let pending_outranks = existing.pending_new_session().is_some()
                     && !existing.pending_stale(
                         Self::now_ms(),
                         self.config().node.session.idle_timeout_secs * 1000,
                     );
+
+                // A handshake the peer armed is held until its msg3 or its
+                // timeout. Once the peer has read our SessionAck it holds the
+                // new keys, so this handshake is the only one its msg3 can
+                // complete, and discarding it for an unauthenticated setup
+                // splits the session's epochs. A genuine retry that meets a
+                // stale handshake here completes one handshake timeout
+                // later, once the handshake has expired.
+                if rekey_in_progress && !existing.is_rekey_initiator() {
+                    debug!(
+                        src = %self.peer_display_name(src_addr),
+                        "FSP rekey msg1 received while the peer's handshake awaits msg3, dropping"
+                    );
+                    self.stats_mut()
+                        .record_reject(RejectReason::Session(SessionReject::RekeyHeld));
+                    return;
+                }
 
                 // Dual-initiation detection: both sides sent SessionSetup
                 // simultaneously. Apply tie-breaker — smaller NodeAddr
@@ -707,22 +722,16 @@ impl Node {
                             .record_reject(RejectReason::Session(SessionReject::RekeyTiebreak));
                         return;
                     }
-                    // We lose — abandon the armed handshake, become responder
-                    // below.
+                    // We lose — abandon our armed handshake, become
+                    // responder below.
                     //
-                    // `abandon_handshake`, not `abandon_rekey`: the gate
-                    // above is `has_rekey_in_progress`, which says only that
-                    // *some* handshake is armed, not that we armed it. A
-                    // handshake the peer armed carries `rekey_initiator ==
-                    // false` and can sit beside a completed epoch that a
-                    // stale `pending_outranks` no longer vetoes, so a
-                    // stranger reaches this line with two unauthenticated
-                    // setup messages: one to arm the handshake, one to lose
-                    // the tie-break against it. Dropping the pending session
-                    // there kills the epoch the peer may already have cut
-                    // over to. Only the handshake is ours to discard, and
-                    // discarding it costs nothing, since an armed handshake
-                    // holds no key material either endpoint is using.
+                    // `abandon_handshake`, not `abandon_rekey`, although the
+                    // arm above leaves only handshakes this node initiated,
+                    // and an initiator handshake never sits beside a pending
+                    // session (see the SessionAck handler). Only the handshake
+                    // is ours to discard, and discarding it costs nothing:
+                    // the peer has not answered it, so it holds no key
+                    // material either endpoint is using.
                     debug!(
                         src = %self.peer_display_name(src_addr),
                         "Dual FSP rekey initiation: we lose (larger addr), abandoning ours"
@@ -1132,15 +1141,18 @@ impl Node {
 
         // Rekey path: entry is Established with rekey_state (responder side)
         //
-        // Every failure below abandons only the handshake. Nothing in a msg3
-        // is authenticated until `read_xk_message_3` has both succeeded and
-        // produced a static key matching this session's peer, so a failure
-        // here proves nothing about the sender and must not cost the entry
-        // anything it would miss. A `pending_new_session` beside the
-        // handshake is the epoch the real peer may already have cut over to,
-        // and dropping it kills the reverse direction on two unauthenticated
-        // messages: a forged msg1 to arm the handshake, then any garbage
-        // msg3. `abandon_handshake` keeps it; `abandon_rekey` does not.
+        // Nothing in a msg3 is authenticated until the read has both
+        // succeeded and produced a static key matching this session's peer,
+        // so a failure here proves nothing about the sender and must not cost
+        // the entry anything it would miss. An unreadable msg3 therefore
+        // costs nothing at all: the handshake goes back, rolled back, for the
+        // genuine msg3. Every later failure follows a read that
+        // authenticated its sender and abandons only the handshake. A
+        // `pending_new_session` beside the handshake is the epoch the real
+        // peer may already have cut over to, and dropping it kills the
+        // reverse direction on two unauthenticated messages: a forged msg1 to
+        // arm the handshake, then any garbage msg3. `abandon_handshake` keeps
+        // it; `abandon_rekey` does not.
         //
         // What `abandon_handshake` leaves behind, and why each is safe here:
         // `rekey_completed_ms` must survive, since `pending_stale` reads it
@@ -1158,14 +1170,23 @@ impl Node {
                 }
             };
 
-            // Process XK msg3
-            if let Err(e) = handshake.read_xk_message_3(&msg3.handshake_payload) {
+            // Process XK msg3. The only tie between this msg3 and the
+            // handshake is the datagram's source address, which the sender
+            // chooses, and the peer that read our SessionAck may already hold
+            // the new keys. Abandoning here would let anyone able to name the
+            // session discard the handshake the peer's genuine msg3 needs,
+            // splitting the session's epochs. So the handshake goes back,
+            // rolled back to its pre-read state, because the read advances
+            // the cipher nonce before it authenticates. The restore leaves
+            // the deadline alone, which runs from the peer's setup, so a
+            // spray cannot hold the handshake open.
+            if let Err(e) = handshake.try_read_xk_message_3(&msg3.handshake_payload) {
                 debug!(
                     src = %self.peer_display_name(src_addr),
                     error = %e,
-                    "Failed to process rekey XK msg3"
+                    "Failed to process rekey XK msg3, keeping the handshake"
                 );
-                entry.abandon_handshake();
+                entry.set_rekey_state(handshake, false);
                 self.sessions.insert(*src_addr, entry);
                 return;
             }
@@ -1252,10 +1273,23 @@ impl Node {
             _ => unreachable!("checked is_awaiting_msg3 above"),
         };
 
-        // Process XK msg3: read_xk_message_3 (extracts initiator's static key and epoch)
-        if let Err(e) = handshake.read_xk_message_3(&msg3.handshake_payload) {
-            debug!(error = %e, "Failed to process Noise XK msg3");
-            return; // Entry was already removed
+        // Process XK msg3 (extracts the initiator's static key and epoch).
+        //
+        // Nothing here has been authenticated: the only tie to this half-open
+        // entry is the datagram's source address, which the sender chooses,
+        // and the initiator considers the session established once it has
+        // sent msg3. Dropping the entry would let anyone able to name the
+        // initiator discard the handshake its genuine msg3 and resends need,
+        // so the entry goes back with the handshake rolled back to its
+        // pre-read state, as the SessionAck arm does. `touch()` is
+        // deliberately not called, so a spray cannot push the handshake
+        // sweep's deadline out. The drops below stay drops: each follows a
+        // read that authenticated the sender.
+        if let Err(e) = handshake.try_read_xk_message_3(&msg3.handshake_payload) {
+            debug!(error = %e, "Failed to process Noise XK msg3, keeping the handshake");
+            entry.set_state(EndToEndState::AwaitingMsg3(handshake));
+            self.sessions.insert(*src_addr, entry);
+            return;
         }
 
         // Extract the initiator's static public key (now available after msg3)
