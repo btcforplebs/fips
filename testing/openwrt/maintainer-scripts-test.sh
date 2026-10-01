@@ -57,6 +57,7 @@ docker run --rm --network none \
     -e APK_SCRIPTS=/apk \
     -e "POSTINST=${POSTINST:-}" \
     -e "PRERM=${PRERM:-}" \
+    -e "PREINST=${PREINST:-}" \
     -e "INIT_GATEWAY=${INIT_GATEWAY:-}" \
     "$IMAGE" sh /src/testing/openwrt/scenarios.sh
 rc=$?

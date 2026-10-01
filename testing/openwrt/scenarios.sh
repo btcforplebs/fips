@@ -8,7 +8,7 @@
 # exercised is the scripts' behaviour given that contract, not opkg itself.
 # A real `opkg upgrade` on a router image stays uncovered.
 #
-# POSTINST, PRERM and INIT_GATEWAY may be pointed at other files. That is the
+# PREINST, POSTINST, PRERM and INIT_GATEWAY may be pointed at other files. That is the
 # seam used to see a scenario red against the previously released scripts, and
 # to re-break the fixed ones during a break-check.
 #
@@ -23,6 +23,7 @@ set -u
 
 REPO="${REPO:-/src}"
 POSTINST="${POSTINST:-$REPO/packaging/openwrt-ipk/scripts/postinst}"
+PREINST="${PREINST:-$REPO/packaging/openwrt-ipk/scripts/preinst}"
 PRERM="${PRERM:-$REPO/packaging/openwrt-ipk/scripts/prerm}"
 RELEASED_PRERM="$REPO/testing/openwrt/fixtures/released-prerm"
 INIT_GATEWAY="${INIT_GATEWAY:-$REPO/packaging/openwrt-ipk/files/etc/init.d/fips-gateway}"
@@ -1140,9 +1141,204 @@ scenario_supervise() {
     return 0
 }
 
+# ── 16. A package built from the SDK feed Makefile ─────────────────────────
+# OpenWrt generates that package's postinst and prerm around default_postinst
+# and default_prerm (package/base-files/files/lib/functions.sh, read at OpenWrt
+# main and openwrt-24.10). After its own steps, default_postinst runs a loop
+# over the package's init scripts: "enable" unless PKG_UPGRADE is 1, then
+# "start". Under opkg the package's postinst body is sourced before that loop;
+# under apk it is appended to the generated script and runs after it.
+# default_prerm sources the prerm body with the generated script's own path as
+# $1, then disables (on a removal) and stops each init script. The preinst is
+# the package's own, run as opkg runs it ("install" or "upgrade <old>") or as
+# apk runs it (versions only, PKG_UPGRADE=1 exported on an upgrade).
+#
+# /etc/init.d/fips is the recording stub. /etc/init.d/fips-gateway is the real
+# script, run through a stand-in rc.common that keeps enablement as the
+# /etc/rc.d links OpenWrt's does and records whether start_service opened a
+# procd instance, which is what starting the gateway means.
+
+install_sdk_env() {
+    install_uci_stub
+    printf '#!/bin/sh\nexit 0\n' > "$STUB_BIN/logger"
+    chmod 0755 "$STUB_BIN/logger"
+    rm -rf /etc/rc.d
+    mkdir -p /etc/rc.d /etc/fips /var/run
+    cp "$SHIPPED_YAML" /etc/fips/fips.yaml
+    cp "$INIT_GATEWAY" /etc/init.d/fips-gateway
+    chmod 0755 /etc/init.d/fips-gateway
+    rm -f /var/run/fips-gateway-install-hold
+    cat > /etc/rc.common <<'SHIM'
+#!/bin/sh
+# Stand-in for OpenWrt's rc.common: enablement as /etc/rc.d links, and start
+# runs start_service with procd's calls recorded instead of made.
+initscript="$1"
+action="$2"
+shift 2
+name="${initscript##*/}"
+enable() { ln -sf "../init.d/$name" "/etc/rc.d/S${START}$name"; ln -sf "../init.d/$name" "/etc/rc.d/K${STOP}$name"; }
+disable() { rm -f /etc/rc.d/S??"$name" /etc/rc.d/K??"$name"; }
+enabled() { [ -L "/etc/rc.d/S${START}$name" ]; }
+procd_open_instance() { echo "$name instance" >> "$CALLS"; }
+procd_set_param() { :; }
+procd_close_instance() { :; }
+stop_service() { :; }
+. "$initscript"
+sysctl() { :; }
+modprobe() { :; }
+gateway_add_global_prefix() { :; }
+gateway_add_ra_route() { :; }
+stop_service() { :; }
+echo "$name $action" >> "$CALLS"
+case "$action" in
+start) start_service ;;
+stop) stop_service ;;
+*) "$action" "$@" ;;
+esac
+SHIM
+    chmod 0755 /etc/rc.common
+    return 0
+}
+
+remove_sdk_env() {
+    rm -rf /etc/rc.d /etc/fips "$STUB_BIN"
+    rm -f /etc/rc.common /var/run/fips-gateway-install-hold
+    return 0
+}
+
+sdk_loop() {
+    # The init-script loop of default_postinst.
+    for i in /etc/init.d/fips /etc/init.d/fips-gateway; do
+        if [ "${PKG_UPGRADE:-0}" != "1" ]; then
+            "$i" enable
+        fi
+        "$i" start
+    done
+    return 0
+}
+
+sdk_postinst() {
+    # sdk_postinst ipk|apk
+    if [ "$1" = "ipk" ]; then
+        ( set -- /usr/lib/opkg/info/fips.postinst configure; . "$POSTINST" ) >/dev/null 2>&1
+        sdk_loop >/dev/null 2>&1
+    else
+        sdk_loop >/dev/null 2>&1
+        sh "$POSTINST" 2.0-r1 >/dev/null 2>&1
+    fi
+    return 0
+}
+
+sdk_prerm_upgrade_ipk() {
+    # default_prerm for the outgoing SDK-built package on an opkg upgrade.
+    ( set -- /usr/lib/opkg/info/fips.prerm upgrade 2.0-r1; . "$PRERM" ) >/dev/null 2>&1
+    for i in /etc/init.d/fips /etc/init.d/fips-gateway; do
+        "$i" stop >/dev/null 2>&1
+    done
+    return 0
+}
+
+sdk_preinst() {
+    # sdk_preinst <args...>, run as a script, as opkg and apk run it.
+    if [ ! -f "$PREINST" ]; then
+        bad "there is no preinst at $PREINST"
+        return 0
+    fi
+    sh "$PREINST" "$@" >/dev/null 2>&1
+    return 0
+}
+
+assert_gateway() {
+    # assert_gateway <enabled|disabled> <started|stopped> <case>
+    if [ -L /etc/rc.d/S96fips-gateway ]; then got=enabled; else got=disabled; fi
+    assert_equals "$got" "$1" "$3: fips-gateway ends $1"
+    if grep -qxF "fips-gateway instance" "$CALLS"; then got=started; else got=stopped; fi
+    assert_equals "$got" "$2" "$3: fips-gateway is $2"
+    assert_absent /var/run/fips-gateway-install-hold "$3: no install hold is left behind"
+    return 0
+}
+
+scenario_sdk_package() {
+    note "scenario 16: SDK feed package, default_postinst and default_prerm"
+    saved_path="$PATH"
+    PATH="$STUB_BIN:$PATH"
+    export PATH
+
+    for fmt in ipk apk; do
+        reset_state
+        install_sdk_env
+        if [ "$fmt" = "ipk" ]; then
+            PKG_UPGRADE=0 sdk_preinst install
+            PKG_UPGRADE=0 sdk_postinst ipk
+        else
+            sdk_preinst 2.0-r1
+            sdk_postinst apk
+        fi
+        assert_called "fips start" "$fmt fresh install: the daemon is started"
+        assert_file_is "$FIPS_STATE" "1" "$fmt fresh install: the daemon is enabled"
+        assert_gateway disabled stopped "$fmt fresh install"
+        remove_sdk_env
+
+        for gw in enabled disabled; do
+            reset_state
+            install_sdk_env
+            echo 1 > "$FIPS_STATE"
+            [ "$gw" = "enabled" ] && /etc/init.d/fips-gateway enable >/dev/null 2>&1
+            : > "$CALLS"
+            if [ "$fmt" = "ipk" ]; then
+                PKG_UPGRADE=1 sdk_prerm_upgrade_ipk
+                PKG_UPGRADE=1 sdk_preinst upgrade 1.0-r1
+                PKG_UPGRADE=1 sdk_postinst ipk
+            else
+                PKG_UPGRADE=1 sdk_preinst 2.0-r1 1.0-r1
+                PKG_UPGRADE=1 sdk_postinst apk
+            fi
+            if [ "$gw" = "enabled" ]; then
+                assert_gateway enabled started "$fmt upgrade, gateway enabled"
+            else
+                assert_gateway disabled stopped "$fmt upgrade, gateway disabled"
+            fi
+            assert_absent "$UPGRADE_MARKER" "$fmt upgrade, gateway $gw: the upgrade marker is removed"
+            remove_sdk_env
+        done
+    done
+
+    # An opkg upgrade from a released package, whose prerm disabled the
+    # gateway and left no marker: the postinst body re-enables and starts it,
+    # as with build-ipk.sh, which needs it to clear the hold first.
+    reset_state
+    install_sdk_env
+    echo 1 > "$FIPS_STATE"
+    /etc/init.d/fips-gateway enable >/dev/null 2>&1
+    : > "$CALLS"
+    PKG_UPGRADE=1 sh "$RELEASED_PRERM" upgrade 2.0-r1 >/dev/null 2>&1
+    PKG_UPGRADE=1 sdk_preinst upgrade 0.5.1
+    PKG_UPGRADE=1 sdk_postinst ipk
+    assert_gateway enabled started "ipk upgrade from a released package"
+    remove_sdk_env
+
+    # An image build runs the scripts on the build host, with IPKG_INSTROOT
+    # naming the image root: they must not touch the host at all.
+    reset_state
+    rm -f /var/run/fips-gateway-install-hold "$UPGRADE_MARKER"
+    for pkg_upgrade in 0 1; do
+        IPKG_INSTROOT=/tmp/fips-image-root PKG_UPGRADE=$pkg_upgrade sh "$PREINST" install >/dev/null 2>&1
+        IPKG_INSTROOT=/tmp/fips-image-root PKG_UPGRADE=$pkg_upgrade sh "$POSTINST" configure >/dev/null 2>&1
+        IPKG_INSTROOT=/tmp/fips-image-root PKG_UPGRADE=$pkg_upgrade sh "$PRERM" upgrade 2.0-r1 >/dev/null 2>&1
+        IPKG_INSTROOT=/tmp/fips-image-root PKG_UPGRADE=$pkg_upgrade sh "$PRERM" remove >/dev/null 2>&1
+    done
+    assert_equals "$(calls_oneline)" "" "image build: no script touches the build host's services"
+    assert_absent /var/run/fips-gateway-install-hold "image build: the preinst leaves no hold on the build host"
+    assert_absent "$UPGRADE_MARKER" "image build: the prerm leaves no marker on the build host"
+
+    PATH="$saved_path"
+    return 0
+}
+
 echo "OpenWrt maintainer-script scenarios (shell: $(readlink -f /proc/$$/exe 2>/dev/null || echo sh))"
 echo "  postinst: $POSTINST"
 echo "  prerm:    $PRERM"
+echo "  preinst:  $PREINST"
 echo "  apk:      ${APK_SCRIPTS:-(not set)}"
 
 scenario_fresh_install
@@ -1160,6 +1356,7 @@ scenario_default_port_parity
 scenario_swap_cleanup
 scenario_listen_migration
 scenario_supervise
+scenario_sdk_package
 
 echo ""
 if [ "$FAILURES" -eq 0 ]; then

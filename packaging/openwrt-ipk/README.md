@@ -95,11 +95,12 @@ make package/fips/compile V=s
 
 The resulting `.ipk` is placed in `bin/packages/<arch>/`.
 
-A package built from this `Makefile` carries none of the maintainer scripts in
-`scripts/`. Those scripts enable and start `fips` on install and implement the
-gateway-enablement and upgrade behavior described below, so that description
-does not cover a package built this way. Released packages are built by
-`build-ipk.sh` (and `../openwrt-apk/build-apk.sh`), which install those scripts.
+Installed on a router, the package enables and starts `fips` and leaves
+`fips-gateway` disabled. Built into a firmware image, it is different: the
+maintainer scripts do nothing at image build time, and the image build enables
+every init script a package ships, `fips-gateway` included. To build an image
+with the gateway off, pass `DISABLED_SERVICES="fips-gateway"` to the image
+builder's `make image`.
 
 ### 4. Pin the source version
 

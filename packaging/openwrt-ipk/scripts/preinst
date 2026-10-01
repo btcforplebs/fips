@@ -1,0 +1,43 @@
+#!/bin/sh
+# Maintainer script run before the FIPS package's files are unpacked.
+#
+# Used only by the OpenWrt SDK feed Makefile, as the package's preinst under
+# opkg and its pre-install and pre-upgrade scripts under apk. build-ipk.sh and
+# build-apk.sh ship a postinst of their own and do not need it.
+#
+# A package built in the SDK gets OpenWrt's generated postinst, whose
+# default_postinst enables every init script the package installs on a fresh
+# install and starts every one on every install and upgrade. The package's own
+# postinst body runs before that loop under opkg and after it under apk, so the
+# body cannot keep the gateway off by itself. Instead, unless the gateway is
+# enabled now, this leaves a hold that init.d/fips-gateway honours once: its
+# start_service removes the hold, disables the service and starts nothing. A
+# fresh install therefore leaves the gateway disabled and stopped, and an
+# upgrade does not start a gateway the operator disabled.
+#
+# An apk upgrade runs no script of the outgoing package, so nothing else stops
+# the services or tells the postinst body that enablement survived the upgrade.
+# This does what the outgoing package's prerm does on an opkg upgrade.
+
+# An image build (OpenWrt's image builder or buildroot) runs this on the build
+# host with IPKG_INSTROOT naming the image's root. Nothing here may touch the
+# host, so it does nothing there; see the README for the gateway in images.
+
+[ -n "${IPKG_INSTROOT:-}" ] && exit 0
+
+INSTALL_HOLD=/var/run/fips-gateway-install-hold
+UPGRADE_MARKER=/tmp/fips-prerm-upgrade
+
+# opkg passes "install" or "upgrade <old-version>"; apk passes versions only.
+if [ "${PKG_UPGRADE:-0}" = "1" ] && [ "${1:-}" != "upgrade" ]; then
+    : > "$UPGRADE_MARKER" 2>/dev/null || true
+    /etc/init.d/fips-gateway stop 2>/dev/null || true
+    /etc/init.d/fips stop         2>/dev/null || true
+fi
+
+if ! /etc/init.d/fips-gateway enabled 2>/dev/null; then
+    mkdir -p "${INSTALL_HOLD%/*}" 2>/dev/null
+    : > "$INSTALL_HOLD" 2>/dev/null || true
+fi
+
+exit 0

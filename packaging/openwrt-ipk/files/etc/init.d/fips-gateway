@@ -34,6 +34,8 @@ GW_PIDFILE=/var/run/fips-gateway.pid
 # Seconds a stopping gateway gets after SIGTERM before it is killed; under
 # procd's own 5 s, after which procd kills only the supervise shell.
 GW_KILL_AFTER=3
+# Left by the package's preinst when the gateway is not enabled; see below.
+INSTALL_HOLD=/var/run/fips-gateway-install-hold
 
 # Global-scope IPv6 prefix assigned to br-lan so Android/Chrome clients
 # believe they have full IPv6 and actually send AAAA queries.
@@ -41,6 +43,18 @@ GW_KILL_AFTER=3
 GLOBAL_PREFIX="2001:2:f1b5::1/64"
 
 start_service() {
+	# OpenWrt's generic postinst enables and starts every init script a
+	# package ships. A package built from the SDK feed Makefile runs it, and
+	# its preinst leaves this hold unless the gateway was enabled, so that
+	# installing or upgrading the package does not switch the gateway on.
+	# Honoured once.
+	if [ -e "$INSTALL_HOLD" ]; then
+		rm -f "$INSTALL_HOLD"
+		disable
+		logger -t fips-gateway "left disabled and stopped by the package installation"
+		return 0
+	fi
+
 	# The gateway daemon exits when gateway.enabled is not true, so without
 	# this check starting a disabled gateway would still take dnsmasq's .fips
 	# upstream away from the daemon and point it at a port nothing listens on.
