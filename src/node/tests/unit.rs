@@ -3462,6 +3462,110 @@ async fn a_node_without_ble_config_draws_no_ble_warning() {
     );
 }
 
+/// The inbound idle deadline is the node's link-silence bound: 64 s at stock
+/// settings, moving one for one with the link-dead timeout, and never below
+/// the link-dead timeout plus a tick, the shortest silence after which the
+/// node itself would reap the link.
+#[test]
+fn the_inbound_idle_deadline_is_the_link_silence_bound_and_tracks_the_link_dead_timeout() {
+    use crate::node::handlers::rekey::inbound_idle_timeout;
+    use crate::transport::tcp::INBOUND_IDLE_TIMEOUT;
+
+    // 31 s of msg1 ladder (1+2+4+8+16), three 1 s ticks, 30 s link-dead.
+    let stock = crate::config::NodeConfig::default();
+    assert_eq!(inbound_idle_timeout(&stock), Duration::from_secs(64));
+    // The transport default a TCP or Tor instance holds before the node sets
+    // it must be the same stock value, so the two cannot drift apart.
+    assert_eq!(inbound_idle_timeout(&stock), INBOUND_IDLE_TIMEOUT);
+
+    let raised = crate::config::NodeConfig {
+        link_dead_timeout_secs: 300,
+        ..Default::default()
+    };
+    assert_eq!(
+        inbound_idle_timeout(&raised),
+        inbound_idle_timeout(&stock) + Duration::from_secs(270)
+    );
+
+    for node in [
+        stock,
+        raised,
+        crate::config::NodeConfig {
+            heartbeat_interval_secs: 90,
+            ..Default::default()
+        },
+        crate::config::NodeConfig {
+            tick_interval_secs: 5,
+            link_dead_timeout_secs: 10,
+            ..Default::default()
+        },
+    ] {
+        let floor = Duration::from_secs(
+            node.link_dead_timeout_secs
+                .max(node.heartbeat_interval_secs)
+                + node.tick_interval_secs,
+        );
+        assert!(
+            inbound_idle_timeout(&node) > floor,
+            "idle deadline {:?} must exceed {:?} for heartbeat {} s, link-dead {} s, tick {} s",
+            inbound_idle_timeout(&node),
+            floor,
+            node.heartbeat_interval_secs,
+            node.link_dead_timeout_secs,
+            node.tick_interval_secs,
+        );
+    }
+}
+
+/// `create_transports` hands every TCP and Tor instance the idle deadline
+/// derived from the node's own liveness timers, not the transport default.
+///
+/// Break-check: remove either `set_inbound_idle_timeout` call and that
+/// transport keeps `INBOUND_IDLE_TIMEOUT`, which the non-default timers here
+/// are chosen to differ from.
+#[tokio::test]
+async fn create_transports_sets_the_inbound_idle_deadline_from_the_node_liveness_timers() {
+    use crate::node::handlers::rekey::inbound_idle_timeout;
+    use crate::transport::tcp::INBOUND_IDLE_TIMEOUT;
+
+    let mut config = crate::Config::new();
+    config.node.control.enabled = false;
+    config.node.heartbeat_interval_secs = 5;
+    config.node.link_dead_timeout_secs = 120;
+    config.transports.tcp =
+        crate::config::TransportInstances::Single(crate::config::TcpConfig::default());
+    config.transports.tor =
+        crate::config::TransportInstances::Single(crate::config::TorConfig::default());
+    let expected = inbound_idle_timeout(&config.node);
+    // 31 s of ladder, three 1 s ticks, 120 s link-dead.
+    assert_eq!(expected, Duration::from_secs(154));
+    assert_ne!(expected, INBOUND_IDLE_TIMEOUT);
+
+    let mut node = make_node_with(config);
+    let (tx, _rx) = packet_channel(8);
+    let transports = node.create_transports(&tx).await;
+
+    let mut seen = (0, 0);
+    for handle in &transports {
+        match handle {
+            crate::transport::TransportHandle::Tcp(t) => {
+                assert_eq!(t.inbound_idle_timeout(), expected, "TCP idle deadline");
+                seen.0 += 1;
+            }
+            crate::transport::TransportHandle::Tor(t) => {
+                assert_eq!(t.inbound_idle_timeout(), expected, "Tor idle deadline");
+                seen.1 += 1;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(
+        seen,
+        (1, 1),
+        "one TCP and one Tor transport should be built"
+    );
+}
+
 #[cfg(all(ble_available, any(target_os = "android", test)))]
 mod test_radio {
     use crate::transport::ble::addr::BleAddr;

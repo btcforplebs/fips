@@ -634,3 +634,31 @@ fn test_identity_debug() {
     assert!(!debug.contains("keypair"));
     assert!(debug.contains(".."));
 }
+
+/// Hold a guard over `keypair` and return early or normally, the way the
+/// handshake entry points do.
+fn guarded_secret(keypair: &mut Keypair, fail: bool) -> Result<[u8; 32], ()> {
+    let guard = ErasingKeypair::new(keypair);
+    if fail {
+        return Err(());
+    }
+    Ok(guard.get().secret_bytes())
+}
+
+#[test]
+fn test_erasing_keypair_erases_the_callers_binding_in_place_on_every_exit() {
+    let identity = Identity::generate();
+    let original = identity.keypair().secret_bytes();
+    // `non_secure_erase` overwrites a keypair with a fixed dummy whose
+    // secret is 32 bytes of 0x01.
+    let erased = [1u8; 32];
+    assert_ne!(original, erased);
+
+    let mut keypair = identity.keypair();
+    assert_eq!(guarded_secret(&mut keypair, false), Ok(original));
+    assert_eq!(keypair.secret_bytes(), erased);
+
+    let mut keypair = identity.keypair();
+    assert_eq!(guarded_secret(&mut keypair, true), Err(()));
+    assert_eq!(keypair.secret_bytes(), erased);
+}

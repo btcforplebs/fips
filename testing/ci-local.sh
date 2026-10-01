@@ -1773,6 +1773,17 @@ run_portable_atomics() {
     record "portable-atomics" $rc
 }
 
+# The shell scripts the OpenWrt packages ship, and the nak installer. The
+# OpenWrt Package workflow lints them on GitHub, but only for trunk pushes,
+# tags and pull requests, so this is where a branch first sees a finding.
+# Mirrored in ci.yml's ci-parity job by hand. Static, about a second.
+run_shellcheck() {
+    local rc=0
+    info "[shellcheck] Linting the OpenWrt package's shell scripts"
+    bash "$SCRIPT_DIR/check-shellcheck.sh" || rc=$?
+    record "shellcheck" $rc
+}
+
 # Every daemon log string a test matches on must still be emitted by src/.
 # A stale one does not fail — it stops observing, and an expect-zero assertion
 # built on it then passes for the wrong reason.
@@ -1812,15 +1823,16 @@ run_wait_converge() {
     record "wait-converge" $rc
 }
 
-# The .deb version package-linux.yml derives for a release tag, a candidate
-# tag and a branch. A candidate must sort below its release under dpkg, which
-# the tag's -rcN does not, so the workflow maps it to ~rcN; this runs the
-# workflow's own step text. Static, about a second, and needs nothing built.
-run_deb_version() {
+# The package versions the packaging workflows derive for a release tag, a
+# candidate tag and a branch. A candidate must sort below its release under the
+# package manager, which the tag's -rcN does not, so the workflows map it to
+# ~rcN; this runs the workflows' own step text. Static, a few seconds, and
+# needs nothing built.
+run_package_versions() {
     local rc=0
-    info "[deb-version] Checking the Debian version derived for tags and branches"
-    bash "$SCRIPT_DIR/check-deb-version.sh" || rc=$?
-    record "deb-version" $rc
+    info "[package-versions] Checking the package versions derived for tags and branches"
+    bash "$SCRIPT_DIR/check-package-versions.sh" || rc=$?
+    record "package-versions" $rc
 }
 
 # The GitHub unit-test jobs run check-nextest-flaky.sh after nextest to
@@ -1833,6 +1845,17 @@ run_nextest_flaky() {
     info "[nextest-flaky] Checking the flaky-test reporter against its fixtures"
     bash "$SCRIPT_DIR/nextest-flaky/test.sh" || rc=$?
     record "nextest-flaky" $rc
+}
+
+# check-glibc-floor.sh's cases: an input it cannot examine reports "could not
+# check" with exit 2, and only a binary above the floor gets exit 1 and the
+# rebuild advice. Static, a few seconds, and builds its inputs from the host's
+# own true executable.
+run_glibc_floor() {
+    local rc=0
+    info "[glibc-floor] Checking the glibc floor check against its cases"
+    bash "$SCRIPT_DIR/glibc-floor/test.sh" || rc=$?
+    record "glibc-floor" $rc
 }
 
 # ── Main ───────────────────────────────────────────────────────────────────
@@ -1856,9 +1879,11 @@ main() {
     run_action_pins
     run_comment_refs
     run_portable_atomics
+    run_shellcheck
     run_wait_converge
-    run_deb_version
+    run_package_versions
     run_nextest_flaky
+    run_glibc_floor
 
     if [[ "$TEST_ONLY" == true ]]; then
         run_tests

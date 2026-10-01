@@ -603,6 +603,95 @@ fn classify_request_drops_our_own_request_looped_back_to_us() {
 }
 
 #[test]
+fn classify_request_records_our_own_id_as_transit_once_its_lookup_has_timed_out() {
+    // The own-request guard reaches only as far as the pending lookup. Once
+    // the ladder times out and the entry is dropped, a late copy of our own
+    // request is indistinguishable from transit: it is recorded and forwarded,
+    // and a later copy of it is a duplicate.
+    let mut lookup = empty_lookup();
+    let looping_peer = make_node_addr(0x01);
+    let my_addr = make_node_addr(0x99);
+    let target = make_node_addr(0xAA);
+    let t0 = 1000u64;
+    let mut pending = PendingLookup::new(t0);
+    pending.record(77);
+    lookup.pending_lookups.insert(target, pending);
+
+    // A one-rung ladder of 1s: the entry times out at t0 + 1000.
+    let now = t0 + 1000;
+    let outcome = poll_pending(&mut lookup, now, &[1]);
+    assert_eq!(outcome.timeouts.len(), 1, "the lookup must time out");
+
+    let request = make_request_id(77, target, 3);
+    let first = classify_request(
+        &mut lookup,
+        &request,
+        &looping_peer,
+        &my_addr,
+        now,
+        5000,
+        4096,
+        1,
+    );
+    assert!(matches!(first.outcome, RequestOutcome::Forward));
+    assert!(lookup.recent_requests.contains_key(&77));
+
+    let second = classify_request(
+        &mut lookup,
+        &request,
+        &looping_peer,
+        &my_addr,
+        now,
+        5000,
+        4096,
+        1,
+    );
+    assert!(matches!(second.outcome, RequestOutcome::Duplicate));
+}
+
+#[test]
+fn classify_request_records_an_own_id_older_than_the_recorded_window_as_transit() {
+    // A pending lookup keeps only the last MAX_RECORDED_IDS (eight) ids its
+    // ladder issued. A returning copy of an earlier attempt is outside the
+    // guard's reach and goes through as transit; a recent one is still caught.
+    let mut lookup = empty_lookup();
+    let looping_peer = make_node_addr(0x01);
+    let my_addr = make_node_addr(0x99);
+    let target = make_node_addr(0xAA);
+    let mut pending = PendingLookup::new(1000);
+    for id in 1..=9 {
+        pending.record(id);
+    }
+    lookup.pending_lookups.insert(target, pending);
+
+    let oldest = classify_request(
+        &mut lookup,
+        &make_request_id(1, target, 3),
+        &looping_peer,
+        &my_addr,
+        1000,
+        5000,
+        4096,
+        1,
+    );
+    assert!(matches!(oldest.outcome, RequestOutcome::Forward));
+    assert!(lookup.recent_requests.contains_key(&1));
+
+    let newest = classify_request(
+        &mut lookup,
+        &make_request_id(9, target, 3),
+        &looping_peer,
+        &my_addr,
+        1000,
+        5000,
+        4096,
+        1,
+    );
+    assert!(matches!(newest.outcome, RequestOutcome::OwnRequestLooped));
+    assert!(!lookup.recent_requests.contains_key(&9));
+}
+
+#[test]
 fn classify_request_still_transits_a_foreign_id_for_a_target_we_are_looking_up() {
     // The guard keys on the id, not the target: another node's lookup for the
     // same target must still be transited normally while ours is outstanding.

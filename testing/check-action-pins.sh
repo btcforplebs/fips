@@ -14,8 +14,7 @@
 #
 # What counts as a violation: any `uses:` reference that is not
 #   * `owner/repo@<40 hex> # <tag>` — the required form, comment mandatory; or
-#   * a local action, `./path` or `docker://...`; or
-#   * one of the individually justified references listed below.
+#   * a local action, `./path` or `docker://...`.
 #
 # WHAT THIS GUARD DOES NOT COVER, so a green run is not read as "the workflows
 # fetch nothing unverified":
@@ -43,19 +42,13 @@ REPO_ROOT="$SCRIPT_DIR/.."
 # it cannot describe, and a pin nobody can read is a pin nobody updates.
 PINNED_RE='^[^@]+@[0-9a-f]{40} +#.*$'
 
-# Individually justified unpinned references. Each entry is the exact ref text.
-#
-# Both of these actions read the tool they install from the ref name itself
-# (`github.action_ref`), so replacing the ref with a SHA hands them a 40-hex
-# string where a toolchain or tool name belongs and the step fails outright.
-# They are not pinnable without also moving the selection into `with:`, which
-# changes which toolchain resolves, and that is a separate decision from
-# pinning. Note what stays exposed: both remain repointable by their upstream
-# owners.
-ALLOWED_REFS=(
-    'dtolnay/rust-toolchain@nightly'
-    'taiki-e/install-action@nextest'
-)
+# There are no exceptions. Some actions select what they install from the ref
+# they are called at: a per-tool `taiki-e/install-action` tag, or a
+# `dtolnay/rust-toolchain` channel branch, sets the selection input's default
+# in that ref's action.yml. Pin such an action by SHA and pass the selection as
+# an explicit `with:` input (`tool:`, `toolchain:`). That form works at a SHA
+# from any of the action's refs; a bare SHA does not, because their `v2` and
+# `master` trees declare the input required with no default.
 
 if ! command -v git >/dev/null 2>&1; then
     echo "check-action-pins: git not available, cannot sweep" >&2
@@ -83,15 +76,6 @@ if [[ ${#files[@]} -eq 0 ]]; then
     exit 2
 fi
 
-# True when this ref is one of the justified references above.
-allowed_ref() {
-    local ref="$1" entry
-    for entry in "${ALLOWED_REFS[@]}"; do
-        [[ "$ref" == "$entry" ]] && return 0
-    done
-    return 1
-}
-
 violations=0
 checked=0
 
@@ -117,7 +101,6 @@ for f in "${files[@]}"; do
         [[ "$ref" == ./* ]] && continue
         [[ "$ref" == docker://* ]] && continue
         [[ "$ref" =~ $PINNED_RE ]] && continue
-        allowed_ref "$ref" && continue
 
         echo "$f:$n: $ref"
         violations=$((violations + 1))
@@ -141,5 +124,5 @@ if [[ $violations -gt 0 ]]; then
     exit 1
 fi
 
-echo "check-action-pins: all $checked action reference(s) pinned or justified"
+echo "check-action-pins: all $checked action reference(s) pinned"
 exit 0

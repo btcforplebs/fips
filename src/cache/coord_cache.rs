@@ -247,6 +247,27 @@ impl CoordCache {
         self.entries.remove(addr)
     }
 
+    /// Demote an entry to an unverified hint, keeping its coordinates and TTL.
+    ///
+    /// The entry goes on routing, but a hint may now replace it. Returns
+    /// whether an entry existed.
+    pub fn demote(&mut self, addr: &NodeAddr) -> bool {
+        match self.entries.get_mut(addr) {
+            Some(entry) => {
+                entry.mark_hint();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Forget the path MTU stored with an entry, keeping the entry.
+    pub fn clear_path_mtu(&mut self, addr: &NodeAddr) {
+        if let Some(entry) = self.entries.get_mut(addr) {
+            entry.clear_path_mtu();
+        }
+    }
+
     /// Check if an address is cached (and not expired).
     pub fn contains(&self, addr: &NodeAddr, current_time_ms: u64) -> bool {
         self.get(addr, current_time_ms).is_some()
@@ -843,5 +864,53 @@ mod tests {
         );
         assert!(cache.contains(&make_node_addr(1), 10));
         assert!(cache.contains(&make_node_addr(2), 10));
+    }
+
+    #[test]
+    fn demote_keeps_the_value_and_lets_a_hint_replace_it() {
+        let mut cache = CoordCache::new(100, 1000);
+        let addr = make_node_addr(1);
+        let real = make_coords(&[1, 0]);
+        cache.insert_verified_with_path_mtu(addr, real.clone(), 10, 1400);
+        assert_eq!(
+            cache.insert(addr, make_coords(&[1, 2, 0]), 10),
+            HintOutcome::Rejected
+        );
+
+        assert!(cache.demote(&addr));
+
+        let entry = cache.get_entry(&addr).unwrap();
+        assert_eq!(entry.coords(), &real);
+        assert_eq!(entry.source(), crate::cache::CoordSource::Hint);
+        assert!(!entry.is_verified(10));
+        assert_eq!(
+            entry.path_mtu(),
+            Some(1400),
+            "demote leaves the path MTU to its caller"
+        );
+        assert_eq!(
+            cache.insert(addr, make_coords(&[1, 2, 0]), 11),
+            HintOutcome::Changed
+        );
+    }
+
+    #[test]
+    fn demote_of_an_absent_entry_reports_none() {
+        let mut cache = CoordCache::new(100, 1000);
+        assert!(!cache.demote(&make_node_addr(1)));
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn clear_path_mtu_keeps_the_entry() {
+        let mut cache = CoordCache::new(100, 1000);
+        let addr = make_node_addr(1);
+        cache.insert_verified_with_path_mtu(addr, make_coords(&[1, 0]), 10, 1400);
+
+        cache.clear_path_mtu(&addr);
+
+        let entry = cache.get_entry(&addr).unwrap();
+        assert_eq!(entry.path_mtu(), None);
+        assert!(entry.is_verified(10));
     }
 }

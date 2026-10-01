@@ -373,7 +373,10 @@ fn expired(error: io::Error) -> io::Error {
 ///
 /// The protocol has no close command. Dropping the stream closes its
 /// descriptor, and that is what releases the flow and its local port at the
-/// daemon.
+/// daemon. An accepted flow that was never sent on is the exception: the daemon
+/// keeps its own copy of its descriptor until the first [`FipsStream::send`] or
+/// until the listener is dropped, so dropping the stream before either releases
+/// nothing yet.
 #[derive(Debug)]
 pub struct FipsStream {
     fd: OwnedFd,
@@ -627,8 +630,9 @@ impl AsFd for FipsStream {
 /// **The listener is a descriptor**, which is what makes it pollable: it joins
 /// an existing `poll`, `select` or `epoll` loop with no new mechanism, and
 /// [`FipsListener::accept`] is one `recvmsg` on it. Dropping the listener closes
-/// that descriptor, which unbinds the port; flows already accepted from it are
-/// untouched.
+/// that descriptor, which unbinds the port; flows already accepted from it and
+/// still held are untouched, and those accepted and dropped without ever being
+/// sent on end with it.
 #[derive(Debug)]
 pub struct FipsListener {
     fd: OwnedFd,
@@ -676,7 +680,10 @@ impl FipsListener {
     /// Refusing a flow is dropping the stream, which closes its descriptor.
     /// There is no other way to refuse one, which is why an unreadable arrival
     /// message is reported after the descriptor it carried has been taken: the
-    /// flow is then refused rather than leaked.
+    /// flow is then refused rather than leaked. A refused flow that was never
+    /// sent on still holds its port and its slot against the node's flow limit
+    /// until this listener is dropped, because the daemon keeps its own copy of
+    /// the descriptor until then.
     pub fn accept(&self) -> io::Result<(FipsStream, FipsAddr)> {
         let mut buf = [0u8; CHUNK];
         let chunk = fdpass::recv(self.fd.as_raw_fd(), &mut buf)?;

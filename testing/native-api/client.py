@@ -7,7 +7,9 @@ connection owns nothing — a flow lives until its own descriptor is closed, and
 listener until its own is — so the single connection is a convenience for the
 checks rather than a lifetime the daemon respects. Descriptors are what keep
 things alive, and this tool holds them until the step that closes them or until
-it exits.
+it exits. The daemon does keep its own copy of the descriptor in its last reply
+until the next command arrives, so a check that closes one must send a command
+before it expects the close to have taken effect.
 
 Kinds of step:
 

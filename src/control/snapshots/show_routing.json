@@ -36,6 +36,10 @@
       "resp_unsolicited": 0
     },
     "error_signals": {
+      "broken_below_quorum": 0,
+      "broken_demoted": 0,
+      "broken_link_mismatch": 0,
+      "broken_reporter_mismatch": 0,
       "coords_required": 0,
       "emit_limiter_at_capacity": 0,
       "emit_over_dest_interval": 0,

@@ -170,13 +170,19 @@ pub(crate) fn plan_initiate(request: &LookupRequest, rv: &impl RoutingView) -> V
 
 /// Classification of an inbound LookupRequest, decided from Lookup state.
 pub(crate) enum RequestOutcome {
-    /// request_id already in the dedup cache — drop.
+    /// request_id already in the dedup cache — drop. The test is on the id
+    /// alone, so one flood reaching this node through two neighbours lands
+    /// here just as a request sent twice does; it does not identify the peer
+    /// that delivered the copy.
     Duplicate,
     /// A request this node originated, looped back to it — drop without
-    /// recording. Kept separate from `Duplicate`, which means another node
-    /// resent a request, so the two do not share a rejection counter: this
-    /// one has a nonzero floor in healthy operation and says nothing about
-    /// the peer that delivered it.
+    /// recording. Kept apart from `Duplicate` by cause: this is the node's
+    /// own fan-out returning, while `Duplicate` is a request id the node has
+    /// already recorded, seen again. Neither identifies the delivering peer.
+    /// Recognised only while the lookup is outstanding and the id is among
+    /// the last `MAX_RECORDED_IDS` it issued; an own copy outside that reach
+    /// is recorded and forwarded as transit, and a later copy of it is
+    /// dropped as a duplicate.
     OwnRequestLooped,
     /// We are the lookup target — the shell generates + sends the response.
     RespondAsTarget,

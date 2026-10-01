@@ -18,7 +18,20 @@
 //! replies and then has no further part in anything it opened. A flow lives
 //! until its own descriptor reaches end of file and a listener until its own
 //! does, whichever task holds them, which is what makes a descriptor this API
-//! hands back behave like one a syscall would have.
+//! hands back behave like one a syscall would have. The one exception: the
+//! connection keeps a copy of the descriptor in its last reply until the
+//! client's next command or its close, for the same reason a listener keeps a
+//! copy of a flow it hands over (below). The shipped client closes the
+//! connection as soon as it has the reply, so for it the copy is gone at once.
+//!
+//! **A listener keeps a copy of a flow it handed over.** While a flow's
+//! descriptor sits unread in an arrival message, the message can be the only
+//! reference to it, and xnu's descriptor collector flushes a socket in that
+//! state. So `hand_over` keeps the daemon's copy until the client has written
+//! on the flow or closed the listener, and a flow then reaches end of file once
+//! both the client and that copy have let go. The cost is that a client which
+//! accepts a flow and closes it without writing leaves it open until the
+//! listener closes. See `dgram_probe.rs` for the measurement.
 //!
 //! **The wire is connected.** A datagram a client writes leaves this node over
 //! FSP, and one arriving on a held port reaches its flow. `max_payload` is the
@@ -233,6 +246,15 @@ mod unix_impl {
         /// writes into.
         sock: Arc<Seqpacket>,
         counts: Arc<Counts>,
+        /// The daemon's copy of the client's half, kept while that half may
+        /// still be in flight to a listener's client.
+        ///
+        /// Holding it keeps the socket reachable from outside the message that
+        /// carries it, which is what stops xnu's collector flushing it before
+        /// the client reads the arrival. `None` once released, and always for
+        /// a connected flow, whose descriptor went back in an RPC reply and is
+        /// held by the connection that sent it instead; see `Connection::run`.
+        pin: Option<OwnedFd>,
     }
 
     /// What `stats` reports about one flow.
@@ -281,6 +303,31 @@ mod unix_impl {
         /// Forget a flow whose descriptor has closed.
         fn forget(&self, id: u64) {
             self.table().remove(&id);
+        }
+
+        /// Let go of the daemon's copy of a flow's client half.
+        ///
+        /// The copy is dropped after the lock is released: if the client has
+        /// already closed its own, this is the last reference, and the close it
+        /// causes is the flow's end of file.
+        fn unpin(&self, id: u64) {
+            let pin = self.table().get_mut(&id).and_then(|flow| flow.pin.take());
+            drop(pin);
+        }
+
+        /// Let go of the daemon's copy of every flow on a local port.
+        ///
+        /// Called when a listener ends. Every pinned flow on its port came from
+        /// it: a connected flow carries no pin, and no later listener can hold
+        /// the port until this one's release has been served.
+        fn unpin_port(&self, port: u16) {
+            let pins: Vec<OwnedFd> = self
+                .table()
+                .values_mut()
+                .filter(|flow| flow.local == port)
+                .filter_map(|flow| flow.pin.take())
+                .collect();
+            drop(pins);
         }
 
         /// What the debug `stats` command reports, or `None` for a flow this
@@ -503,6 +550,7 @@ mod unix_impl {
                 key,
                 peer,
                 wiring,
+                None,
                 &self.outbound,
                 &self.node,
                 &self.flows,
@@ -700,6 +748,19 @@ mod unix_impl {
 
     #[cfg(test)]
     impl Connection {
+        /// Another connection to the same node, sharing its flow table, as a
+        /// second client of one daemon has.
+        pub(super) fn sibling(&self) -> Self {
+            Self::new(
+                self.node.clone(),
+                self.outbound.clone(),
+                Arc::clone(&self.flows),
+                self.limits,
+                Arc::clone(&self.npub),
+                self.debug,
+            )
+        }
+
         /// Build a connection wired to a channel a test serves.
         pub(super) fn for_test(
             node: mpsc::Sender<NativeMessage>,
@@ -730,14 +791,24 @@ mod unix_impl {
             }
         }
 
-        /// Wait until a flow's reader task has observed the client's close.
+        /// Wait until a flow's reader task has observed the client's close,
+        /// failing by name if it never does.
+        ///
+        /// A flow the node no longer holds counts as closed: the reader sets
+        /// the flag and forgets the flow in the same turn, so the flag alone is
+        /// almost never there to be seen. Bounded by the clock rather than by
+        /// turns of the runtime, for the reason given at `CLOSE_WAIT`.
         pub(super) async fn settle_closed(&self, flow: u64) {
-            for _ in 0..1000 {
-                match self.flows.stats(flow) {
-                    Some(stats) if stats.closed => return,
-                    _ => tokio::task::yield_now().await,
-                }
-            }
+            let seen = super::tests::eventually(async || match self.flows.stats(flow) {
+                Some(stats) if !stats.closed => None,
+                _ => Some(()),
+            })
+            .await;
+            assert!(
+                seen.is_some(),
+                "the reader never saw flow {flow} close within {:?}",
+                super::tests::CLOSE_WAIT
+            );
         }
     }
 
@@ -780,35 +851,48 @@ mod unix_impl {
     /// The reader cannot start any earlier: it stamps every datagram it
     /// forwards with the flow's key and the peer's address, and the local port
     /// is not known until the registry has answered.
+    ///
+    /// The flow is recorded before the reader is spawned. A handed-over client
+    /// can already have written, and on a multi-thread runtime the reader can
+    /// run at once, so recording afterwards would let its unpin find no flow
+    /// and leave the pin in place for the flow's whole life.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one hand-off of plumbing to two tasks, with no state to group"
+    )]
     fn start(
         id: u64,
         key: FlowKey,
         peer: XOnlyPublicKey,
         wiring: Wiring,
+        pin: Option<OwnedFd>,
         outbound: &mpsc::Sender<Outbound>,
         node: &mpsc::Sender<NativeMessage>,
         flows: &Arc<Flows>,
     ) {
         let counts = Arc::new(Counts::default());
+        let pinned = pin.is_some();
+        flows.record(
+            id,
+            Flow {
+                local: key.local,
+                sock: Arc::clone(&wiring.sock),
+                counts: Arc::clone(&counts),
+                pin,
+            },
+        );
         tokio::spawn(drain(
             id,
             key,
             peer,
             Arc::clone(&wiring.sock),
-            Arc::clone(&counts),
+            counts,
+            pinned,
             outbound.clone(),
             node.clone(),
             Arc::clone(flows),
         ));
-        tokio::spawn(feed(Arc::clone(&wiring.sock), wiring.inbound));
-        flows.record(
-            id,
-            Flow {
-                local: key.local,
-                sock: wiring.sock,
-                counts,
-            },
-        );
+        tokio::spawn(feed(wiring.sock, wiring.inbound));
     }
 
     /// Serve one listener until its client closes the descriptor.
@@ -872,6 +956,15 @@ mod unix_impl {
         }
 
         debug!(port, "Native API listener closed by its client");
+        // Before the release, so the port cannot have passed to another
+        // listener whose flows this would also let go of. When the client has
+        // closed the listener, an arrival it never read went with the
+        // listener's receive queue, so no descriptor from this port is still
+        // in flight to it. The other two ways out of the loop, the node going
+        // away and a failed read, can leave the client's half open with
+        // arrivals unread on it. Both are teardown, and the hold goes with the
+        // listener rather than outliving it.
+        flows.unpin_port(port);
         let _ = node
             .send(NativeMessage::Release {
                 flows: Vec::new(),
@@ -891,6 +984,15 @@ mod unix_impl {
     /// Both writes are try-sends. They go onto a socket pair whose client half
     /// has not been sent yet, so no process can read either one and a task that
     /// parked on one would stop serving this listener entirely.
+    ///
+    /// The daemon keeps its copy of the client's half after the arrival is
+    /// written, until the client writes on the flow or closes the listener.
+    /// Until the client reads the arrival, the message carrying the descriptor
+    /// is otherwise its only reference, and xnu's collector flushes a socket in
+    /// that state: the client then receives a flow that reads as end of file,
+    /// with its held datagrams gone. Nothing in the protocol says when the
+    /// client has read the arrival, so a client that closes the flow without
+    /// writing leaves it open until the listener closes.
     async fn hand_over(
         arrival: Arrival,
         listener: &Seqpacket,
@@ -968,13 +1070,11 @@ mod unix_impl {
             accepted.key,
             accepted.peer,
             wiring,
+            Some(theirs),
             outbound,
             node,
             flows,
         );
-        // Dropping our copy leaves the client holding the only reference to its
-        // half, so its close tears the flow down.
-        drop(theirs);
     }
 
     /// What a failed hand-off write says about the client, for the counter.
@@ -1098,6 +1198,11 @@ mod unix_impl {
     /// Counting continues alongside the forwarding: `stats` is how a check
     /// observes that a datagram reached the daemon, independently of whether it
     /// then reached a peer.
+    ///
+    /// `pinned` says the daemon still holds a copy of the client's half. The
+    /// first datagram the client writes proves it holds the descriptor, so the
+    /// copy is let go then, once, and the client's close ends the flow from
+    /// there on.
     #[allow(
         clippy::too_many_arguments,
         reason = "one hand-off of plumbing to a task, with no state to group"
@@ -1108,6 +1213,7 @@ mod unix_impl {
         peer: XOnlyPublicKey,
         sock: Arc<Seqpacket>,
         counts: Arc<Counts>,
+        mut pinned: bool,
         outbound: mpsc::Sender<Outbound>,
         node: mpsc::Sender<NativeMessage>,
         flows: Arc<Flows>,
@@ -1116,6 +1222,10 @@ mod unix_impl {
         loop {
             match sock.recv(&mut buf).await {
                 Ok(Received::Datagram(len)) => {
+                    if pinned {
+                        flows.unpin(id);
+                        pinned = false;
+                    }
                     counts.datagrams.fetch_add(1, Ordering::Relaxed);
                     counts.bytes.fetch_add(len as u64, Ordering::Relaxed);
                     let sent = outbound
@@ -1210,21 +1320,42 @@ mod unix_impl {
         npub: Arc<str>,
         debug: bool,
     ) -> Result<(), std::io::Error> {
-        let mut connection = Connection::new(node, outbound, flows, limits, npub, debug);
-        let mut reader = BufReader::new(stream);
-        let mut line = Vec::new();
+        Connection::new(node, outbound, flows, limits, npub, debug)
+            .run(stream)
+            .await
+    }
 
-        while read_command(&mut reader, &mut line).await? {
-            let (response, fd) = connection.answer(&line).await;
-            let mut json = serde_json::to_vec(&response)?;
-            json.push(b'\n');
-            fdpass::reply(reader.get_ref(), &json, fd.as_ref().map(AsFd::as_fd)).await?;
-            // Dropping our copy leaves the client holding the only reference to
-            // its half, so its close tears the flow or the listener down.
-            drop(fd);
+    impl Connection {
+        /// Answer the commands on one client connection, in order, until it
+        /// closes or misbehaves.
+        ///
+        /// **The daemon keeps its copy of the descriptor in the last reply**
+        /// until the client's next command arrives or the connection ends.
+        /// Until the client reads the reply, the message carrying the
+        /// descriptor can be its only reference, and xnu's collector flushes a
+        /// socket in that state, as it does an unread arrival's. A client that
+        /// sends another command has read the reply first, unless it pipelined,
+        /// which the shipped client never does. Once the copy is gone the
+        /// client holds the only reference, so its close tears the flow or the
+        /// listener down; until then a close it makes waits for the copy.
+        pub(super) async fn run(mut self, stream: UnixStream) -> Result<(), std::io::Error> {
+            let mut reader = BufReader::new(stream);
+            let mut line = Vec::new();
+            let mut kept: Option<OwnedFd> = None;
+
+            while read_command(&mut reader, &mut line).await? {
+                drop(kept.take());
+                let (response, fd) = self.answer(&line).await;
+                let mut json = serde_json::to_vec(&response)?;
+                json.push(b'\n');
+                fdpass::reply(reader.get_ref(), &json, fd.as_ref().map(AsFd::as_fd)).await?;
+                kept = fd;
+            }
+
+            // End of file, or an early return above: either way `kept` goes
+            // with this frame, and with it the last copy the daemon holds.
+            Ok(())
         }
-
-        Ok(())
     }
 
     /// Read one newline-terminated command into `line`, refusing an oversized
@@ -1363,6 +1494,47 @@ mod tests {
         sock.set_read_timeout(Some(DEADLINE))
             .expect("the descriptor is open");
         sock
+    }
+
+    /// How long a test waits for the daemon to notice that a client closed a
+    /// descriptor.
+    ///
+    /// On Linux the close wakes the task reading the daemon's half, so a wait
+    /// that will succeed does so within a few turns of the runtime. On macOS
+    /// and FreeBSD nothing wakes it: the reader sees the close only when its
+    /// bounded wait expires and it retries the read, as much as one
+    /// `CLOSE_RETRY` interval (`seqpacket.rs`) after the close, and a
+    /// listener's close that ends a flow's hold costs two of those in a row.
+    /// Counting turns of the runtime bounds nothing there: a thousand of them
+    /// ran out well inside one interval on a macOS runner. A wait that is
+    /// going to succeed still returns as soon as it does; this is how long one
+    /// that is not takes to say so.
+    pub(super) const CLOSE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    // Four times the longest run of unnoticed closes a test waits through, so
+    // that lengthening `CLOSE_RETRY` cannot quietly use up the margin.
+    const _: () = assert!(
+        CLOSE_WAIT.as_millis() >= 8 * super::seqpacket::CLOSE_LATENCY.as_millis(),
+        "CLOSE_WAIT no longer covers two unnoticed closes four times over"
+    );
+
+    /// Retry `attempt` until it produces a value, for up to [`CLOSE_WAIT`].
+    ///
+    /// `None` means the bound ran out. Attempts are a millisecond apart rather
+    /// than a yield apart, so a wait that lasts a quarter second on macOS is
+    /// not spent spinning, which for [`rebind`] would mean opening and closing
+    /// a socket pair on every turn.
+    pub(super) async fn eventually<T>(mut attempt: impl AsyncFnMut() -> Option<T>) -> Option<T> {
+        tokio::time::timeout(CLOSE_WAIT, async {
+            loop {
+                if let Some(value) = attempt().await {
+                    return value;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .ok()
     }
 
     /// Send one command that opens a flow, returning the reply and descriptor.
@@ -1726,6 +1898,332 @@ mod tests {
         assert_eq!(&buf[..3], &[0x00, 0xff, 0x10]);
     }
 
+    /// Wait until a listener descriptor has an arrival to read.
+    ///
+    /// Polled without blocking and yielding in between, because the arrival is
+    /// written by the listener's task on this same runtime and a blocking wait
+    /// would stop the task it is waiting for. A readable listener means
+    /// `hand_over` has finished: it writes the arrival and settles what happens
+    /// to the daemon's copy of the descriptor in one synchronous step.
+    async fn readable(listener: &StdUnixStream) {
+        for _ in 0..1000 {
+            let mut poll = libc::pollfd {
+                fd: listener.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: `poll` points at one live pollfd and the call cannot block.
+            let rc = unsafe { libc::poll(&mut poll, 1, 0) };
+            if rc > 0 && (poll.revents & libc::POLLIN) != 0 {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("no arrival became readable on the listener");
+    }
+
+    /// Wait until the node no longer holds a flow, failing if it never lets go.
+    ///
+    /// The reader marks a flow closed before it gives the registry entry back
+    /// and forgets the flow, so `stats` can still find a closed flow for a few
+    /// turns of the runtime, and on macOS and FreeBSD the reader notices the
+    /// close itself only when it next retries. Bounded by [`CLOSE_WAIT`], so a
+    /// flow that is never released names itself.
+    async fn forgotten(connection: &mut Connection, flow: u64) {
+        let line = format!(r#"{{"command":"stats","params":{{"flow_id":{flow}}}}}"#);
+        let mut last = serde_json::Value::Null;
+        let gone = eventually(async || {
+            last = ask(connection, &line).await;
+            (last["data"]["errno"] == "ENOENT").then_some(())
+        })
+        .await;
+        assert!(
+            gone.is_some(),
+            "the node still holds flow {flow} after {CLOSE_WAIT:?}: {last}"
+        );
+    }
+
+    /// Bind a listener on a port a closed one held, retrying until the closed
+    /// one has given it back.
+    ///
+    /// The release reaches the registry from the closed listener's own task
+    /// once that task has noticed the close, which takes a few turns of the
+    /// runtime, or on macOS and FreeBSD up to a retry interval. Bounded by
+    /// [`CLOSE_WAIT`], so a port that is never given back fails here by name.
+    async fn rebind(connection: &mut Connection, port: u16) -> OwnedFd {
+        let line = format!(r#"{{"command":"listen","params":{{"local_port":{port}}}}}"#);
+        eventually(async || {
+            let (response, fd) = connection.answer(line.as_bytes()).await;
+            (serde_json::to_value(response).unwrap()["status"] == "ok")
+                .then(|| fd.expect("a rebound listener still gets a descriptor"))
+        })
+        .await
+        .unwrap_or_else(|| {
+            panic!("the closed listener never gave port {port} back within {CLOSE_WAIT:?}")
+        })
+    }
+
+    /// Bind a listener on 4242, deliver one datagram to it from a new peer,
+    /// and accept the flow that announced, returning everything a test needs.
+    async fn arrive_and_accept(
+        connection: &mut Connection,
+    ) -> (StdUnixStream, u64, serde_json::Value, StdUnixStream) {
+        let (_value, listener) = listen(connection, 4242).await;
+        let value = ask(connection, &arrival(5000, 4242, "00ff10")).await;
+        assert_eq!(value["data"]["outcome"], "announced", "{value}");
+        let flow = value["data"]["flow_id"].as_u64().unwrap();
+        let (message, client) = accept(&listener);
+        (listener, flow, message, client)
+    }
+
+    #[tokio::test]
+    async fn an_arrival_survives_a_kernel_collection_before_its_client_reads_it() {
+        // The macOS failure, made deterministic. Between the daemon writing the
+        // arrival and the client reading it, the flow's descriptor exists only
+        // inside the arrival message. xnu's descriptor collector flushes a
+        // socket in that state, so unless the daemon still holds its own copy,
+        // the client receives a flow that reads as end of file with its held
+        // datagram gone. On Linux the kernel keeps the socket either way, so
+        // this test can only fail on macOS.
+        let (mut connection, _outbound) = connect();
+        let (_value, listener) = listen(&mut connection, 4242).await;
+        let value = ask(&mut connection, &arrival(5000, 4242, "00ff10")).await;
+        assert_eq!(value["data"]["outcome"], "announced", "{value}");
+
+        readable(&listener).await;
+        super::dgram_probe::provoke_collection();
+
+        let (message, mut client) = accept(&listener);
+        assert_eq!(message["held"], 1);
+        let mut buf = [0u8; 64];
+        assert_eq!(
+            client.read(&mut buf).unwrap(),
+            3,
+            "the accepted flow lost its held datagram to the kernel's collector"
+        );
+        assert_eq!(&buf[..3], &[0x00, 0xff, 0x10]);
+    }
+
+    #[tokio::test]
+    async fn a_handed_over_flow_outlives_its_dropped_descriptor_until_its_listener_closes() {
+        // The daemon keeps its copy of a handed-over descriptor until the
+        // client has shown it holds one, because dropping it is what exposes
+        // the descriptor to the macOS collector. On Linux the hold is
+        // observable this way: a client that closes the flow without ever
+        // writing does not end it while the listener that produced it is open.
+        let (mut connection, _outbound) = connect();
+        let (listener, flow, _message, client) = arrive_and_accept(&mut connection).await;
+
+        drop(client);
+        still_open(
+            &mut connection,
+            flow,
+            "the flow ended while the daemon should still hold its descriptor",
+        )
+        .await;
+
+        // Closing the listener ends the hold: whatever the client did with the
+        // arrival, the descriptor is no longer in flight in a live socket.
+        drop(listener);
+        forgotten(&mut connection, flow).await;
+    }
+
+    #[tokio::test]
+    async fn a_handed_over_flow_closes_with_its_descriptor_once_its_client_has_written() {
+        // A datagram from the client proves it holds the descriptor, so the
+        // daemon lets its copy go and the client's close ends the flow at once,
+        // with the listener still open.
+        let (mut connection, _outbound) = connect();
+        let (listener, flow, _message, mut client) = arrive_and_accept(&mut connection).await;
+
+        client.write_all(b"x").unwrap();
+        connection.settle(flow, 1).await;
+        drop(client);
+        forgotten(&mut connection, flow).await;
+        drop(listener);
+    }
+
+    #[tokio::test]
+    async fn a_handed_over_flow_its_client_still_holds_outlives_its_listener_and_closes_with_its_descriptor()
+     {
+        // Closing the listener lets the daemon's copy go, and the client's own
+        // copy then carries the flow by itself: it keeps working after the
+        // listener has gone, and the client's close ends it with no write ever
+        // made. Letting the copy go must not end a flow the client still holds.
+        let (mut connection, _outbound) = connect();
+        let (listener, flow, _message, mut client) = arrive_and_accept(&mut connection).await;
+
+        drop(listener);
+        // The port comes back only after the listener's task has let its
+        // flows' copies go, so a rebound port means that has happened.
+        let _rebound = rebind(&mut connection, 4242).await;
+
+        let mut buf = [0u8; 64];
+        assert_eq!(client.read(&mut buf).unwrap(), 3);
+        let value = ask(
+            &mut connection,
+            &format!(r#"{{"command":"inject","params":{{"flow_id":{flow},"data":"ab"}}}}"#),
+        )
+        .await;
+        assert_eq!(value["status"], "ok", "{value}");
+        assert_eq!(client.read(&mut buf).unwrap(), 1);
+        assert_eq!(buf[0], 0xab);
+
+        drop(client);
+        forgotten(&mut connection, flow).await;
+    }
+
+    /// Serve a sibling of `connection` over a real socket, the way the daemon
+    /// serves a client, returning the client's end and the serving task.
+    ///
+    /// Through `run` rather than `answer`, because what these tests observe is
+    /// what the serving loop does with the descriptor in a reply it has sent.
+    fn serve_socket(
+        connection: &Connection,
+    ) -> (StdUnixStream, tokio::task::JoinHandle<std::io::Result<()>>) {
+        let (ours, theirs) = StdUnixStream::pair().expect("AF_UNIX socketpair");
+        ours.set_nonblocking(true).expect("the socket is open");
+        let ours = tokio::net::UnixStream::from_std(ours).expect("inside a runtime");
+        let task = tokio::spawn(connection.sibling().run(ours));
+        (bounded(theirs), task)
+    }
+
+    /// Write one command on a client socket and read its reply line, with the
+    /// descriptor it carried.
+    async fn call(client: &StdUnixStream, line: &str) -> (serde_json::Value, Option<OwnedFd>) {
+        let mut writer = client;
+        writer.write_all(line.as_bytes()).unwrap();
+        writer.write_all(b"\n").unwrap();
+        readable(client).await;
+        let mut buf = [0u8; 4096];
+        let chunk = super::fdpass::recv(client.as_raw_fd(), &mut buf)
+            .expect("a reply should be readable on the connection");
+        let reply = buf[..chunk.len]
+            .strip_suffix(b"\n")
+            .expect("one whole reply line per read");
+        (serde_json::from_slice(reply).unwrap(), chunk.fd)
+    }
+
+    /// Open a flow through a served socket, returning its id and descriptor.
+    async fn connect_over(client: &StdUnixStream) -> (u64, OwnedFd) {
+        let line = format!(
+            r#"{{"command":"connect","params":{{"peer":"{PEER}","remote_port":4242,"local_port":4243}}}}"#
+        );
+        let (value, fd) = call(client, &line).await;
+        assert_eq!(value["status"], "ok", "{value}");
+        let flow = value["data"]["flow_id"].as_u64().unwrap();
+        (
+            flow,
+            fd.expect("a connect reply carries the flow's descriptor"),
+        )
+    }
+
+    /// Assert that the node still holds a flow open, after giving its reader
+    /// every chance to notice a close.
+    ///
+    /// Where a close wakes the reader, a few turns of the runtime are that
+    /// chance. On macOS and FreeBSD the reader notices a close only when its
+    /// bounded wait expires and it retries, so a check made sooner passes
+    /// whether or not the flow has closed. There this also waits out two of
+    /// those intervals: a reader that parked just before a close has retried
+    /// by then, with one interval to spare for a loaded runner. Elsewhere the
+    /// interval is zero and the wait costs nothing.
+    async fn still_open(connection: &mut Connection, flow: u64, why: &str) {
+        for _ in 0..1000 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(super::seqpacket::CLOSE_LATENCY * 2).await;
+        let value = ask(
+            connection,
+            &format!(r#"{{"command":"stats","params":{{"flow_id":{flow}}}}}"#),
+        )
+        .await;
+        assert_eq!(value["status"], "ok", "{why}: {value}");
+        assert_eq!(value["data"]["closed"], false, "{why}: {value}");
+    }
+
+    /// Any command at all, sent only so the serving loop reads one.
+    const NEXT: &str = r#"{"command":"stats","params":{"flow_id":0}}"#;
+
+    #[tokio::test]
+    async fn a_descriptor_sent_in_a_reply_is_kept_until_the_clients_next_command() {
+        // Until the client reads a reply, the message carrying its descriptor
+        // can be the only reference to it, which is what xnu's collector
+        // flushes. So the daemon keeps its copy until the client sends another
+        // command, which it does only after reading the reply. On Linux the
+        // hold is observable as a flow that outlives the client's close.
+        let (mut probe, _outbound) = connect();
+        let (client, _task) = serve_socket(&probe);
+        let (flow, fd) = connect_over(&client).await;
+
+        drop(fd);
+        still_open(
+            &mut probe,
+            flow,
+            "the flow ended while the connection should still hold its descriptor",
+        )
+        .await;
+
+        call(&client, NEXT).await;
+        forgotten(&mut probe, flow).await;
+    }
+
+    #[tokio::test]
+    async fn a_descriptor_sent_in_a_reply_is_let_go_when_the_connection_ends() {
+        // The connection's close ends its hold. The client's own copy then
+        // carries the flow alone, so the flow survives the connection and ends
+        // with the client's close.
+        let (mut probe, _outbound) = connect();
+        let (client, task) = serve_socket(&probe);
+        let (flow, fd) = connect_over(&client).await;
+
+        drop(client);
+        task.await
+            .unwrap()
+            .expect("a connection closed between commands ends cleanly");
+        still_open(
+            &mut probe,
+            flow,
+            "the flow ended with the connection while the client still holds it",
+        )
+        .await;
+
+        drop(fd);
+        forgotten(&mut probe, flow).await;
+    }
+
+    #[tokio::test]
+    async fn a_flow_its_client_closes_after_its_next_command_ends_at_once() {
+        // Once the client has sent another command the hold is over, so the
+        // client's close is the flow's end of file with the connection still
+        // open.
+        let (mut probe, _outbound) = connect();
+        let (client, _task) = serve_socket(&probe);
+        let (flow, fd) = connect_over(&client).await;
+
+        call(&client, NEXT).await;
+        drop(fd);
+        forgotten(&mut probe, flow).await;
+        drop(client);
+    }
+
+    #[tokio::test]
+    async fn a_flow_whose_reply_is_never_followed_by_a_command_ends_with_the_connection() {
+        // A client that closes the flow and then the connection, sending
+        // nothing more, still ends the flow: the connection's end of file is
+        // the last point at which the daemon lets its copy go.
+        let (mut probe, _outbound) = connect();
+        let (client, task) = serve_socket(&probe);
+        let (flow, fd) = connect_over(&client).await;
+
+        drop(fd);
+        drop(client);
+        task.await
+            .unwrap()
+            .expect("a connection closed between commands ends cleanly");
+        forgotten(&mut probe, flow).await;
+    }
+
     #[test]
     fn a_listener_that_closed_and_one_that_stopped_reading_are_counted_apart() {
         // Both take the same cleanup, so the counter is the only place the
@@ -1946,19 +2444,8 @@ mod tests {
 
         // The unbind is what `close(listen_fd)` means in Berkeley, and the
         // daemon can only observe it by reading its own half. Without the read
-        // arm the port is held for the node's lifetime and every attempt below
-        // fails.
-        for _ in 0..1000 {
-            let (response, fd) = connection
-                .answer(br#"{"command":"listen","params":{"local_port":4242}}"#)
-                .await;
-            if serde_json::to_value(response).unwrap()["status"] == "ok" {
-                assert!(fd.is_some(), "a rebound listener still gets a descriptor");
-                return;
-            }
-            tokio::task::yield_now().await;
-        }
-        panic!("the closed listener never gave its port back");
+        // arm the port is held for the node's lifetime and every attempt fails.
+        rebind(&mut connection, 4242).await;
     }
 
     #[tokio::test]

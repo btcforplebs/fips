@@ -30,7 +30,7 @@ actual assignment.
 A spanning-tree update that changes only an internal path edge — no
 root change, no depth change — must not produce a sustained bloom
 announce storm at downstream nodes. The original regression
-(rolled-back `0caef2a`, fixed in master `4cdf382`) had this property:
+(since rolled back, and fixed in master `4cdf382`) had this property:
 in the field, a single mid-chain ancestor swap on an upstream node
 caused every downstream node in its subtree to issue a bloom
 announce on every parent re-evaluation tick of the upstream node,
@@ -74,7 +74,7 @@ including a regressed one.
 
 ## Threshold derivation
 
-The original `issues/2026-0019-repro/` reproduction harness measured
+The original reproduction harness, kept outside this repository, measured
 (90s flap window, ~21 induced parent switches at the mid-chain
 node):
 
@@ -93,8 +93,8 @@ n01=5  n02=5  n03=4  n04=12  n05=6  n06=0
 
 n04 (the flapping node) is the highest because it is legitimately
 re-sending its filter on its own parent changes. n06 (the depth-4
-"tail") sees 0, matching the calm post-fix behavior recorded in
-`issues/2026-0019-repro/RESULTS.md` for the `fix2` variant.
+"tail") sees 0, matching the calm post-fix behavior that harness recorded
+for its `fix2` variant.
 
 In the field, the regression's mesh-wide rate scaled ~480x above
 steady state. A `30 / 30s / node` ceiling sits ~2.5x above the
@@ -132,7 +132,7 @@ applied to every chaos-spawned container.
 
 Rationale for ceiling = 40: lab max 30 + ~2σ headroom (≈ 39.4) rounds to
 40, giving 33 % margin over the observed lab maximum while still firing
-loud on a regression-class storm (the original `0caef2a` regression
+loud on a regression-class storm (the original regression
 scaled mesh-wide bloom traffic ~480× above steady state, far above any
 plausible jitter band).
 
@@ -140,11 +140,11 @@ plausible jitter band).
 
 - The bloom-storm regression has not been confirmed-failing here
   on a regressed binary in this harness directly; the threshold is
-  inferred from the values measured in the dedicated
-  `issues/2026-0019-repro/` post-mortem harness against
-  `0caef2a`. To gain that confirmation, check out `0caef2a`
-  (or the `backup-broadcast-gate-bloom-storm` branch if still
-  retained), build, copy binaries into `testing/docker/`, and rerun
+  inferred from the values measured in the dedicated post-mortem
+  harness against a regressed build whose commit is not in this
+  repository. To gain that confirmation, build a binary that
+  carries the regression and predates the `4cdf382` fix, copy
+  binaries into `testing/docker/`, and rerun
   this scenario; the bloom-rate assertion is expected to fail loud
   with n05/n06 deltas well above 40.
 

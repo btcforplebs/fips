@@ -185,11 +185,15 @@ dns_locked() {
 # is among the process's open descriptors. Another process holding the port,
 # such as an mDNS responder on 5353, does not count.
 gateway_dns_held_by() {
-	local hex inode fd
+	local hex inodes inode fd
 	[ -n "$2" ] || return 1
 	hex="$(printf '%04X' "$1")"
-	for inode in $(cat /proc/net/udp /proc/net/udp6 2>/dev/null |
-		awk -v want=":$hex" 'substr($2, length($2) - 4) == want { print $10 }'); do
+	# cat rather than awk's own file arguments: busybox awk gives up on a
+	# missing /proc/net/udp6. A while-read loop on the pipe would run in a
+	# subshell under ash, where the return below could not leave this function.
+	inodes="$(cat /proc/net/udp /proc/net/udp6 2>/dev/null |
+		awk -v want=":$hex" 'substr($2, length($2) - 4) == want { print $10 }')"
+	for inode in $inodes; do
 		for fd in /proc/"$2"/fd/*; do
 			[ "$(readlink "$fd" 2>/dev/null)" = "socket:[$inode]" ] && return 0
 		done

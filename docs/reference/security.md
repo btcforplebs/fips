@@ -1,9 +1,10 @@
 # Security Reference
 
 Consolidated security reference covering the nftables baseline, peer
-ACL file format, cryptographic primitives, rekey defaults, replay
-window, filesystem permissions, threat-resistance matrix, and default
-network exposures per transport. For the threat-model design and
+ACL file format, cryptographic primitives, key material in memory,
+rekey defaults, replay window, filesystem permissions,
+threat-resistance matrix, and default network exposures per
+transport. For the threat-model design and
 rationale, see [../design/fips-security.md](../design/fips-security.md).
 For the operator activation steps and drop-in recipes, see
 [../how-to/enable-mesh-firewall.md](../how-to/enable-mesh-firewall.md).
@@ -85,6 +86,68 @@ Domain separation and DH binding survive through the chaining key `ck`, which
 `SymmetricState::initialize` (`src/noise/handshake.rs`). The handshake hash
 `h` is maintained at every step and is never fed to the AEAD, so it binds
 nothing.
+
+## Key Material in Memory
+
+The daemon clears the copies of secret material that its own code
+holds once they are no longer needed: the node's long-term private
+key when the identity is dropped, the static and ephemeral keypairs a
+Noise handshake holds, the chaining key and handshake hash, the
+per-message Diffie-Hellman results, the key-derivation outputs and the
+two session keys derived from them, the retained key on each cipher
+state, the bech32 and hex encodings of a secret, and the configuration
+text that carries `node.identity.nsec`. The SHA-256 state that hashes
+each Diffie-Hellman result and the HMAC states inside HKDF clear
+themselves on drop, through the opt-in `zeroize` features of `sha2`
+and `hmac`, which the daemon turns on. A completed session keeps its
+own copy of the handshake hash and does not clear it, on purpose:
+nothing derives a key from it, and the session hands it out to any
+caller.
+
+Each erase is a volatile write, and the optimiser does not remove a
+volatile write as a dead store. `secp256k1`'s erase follows the write
+with a compiler fence, and `zeroize`'s with an optimisation barrier (an
+empty `asm!` block on x86_64); those limit how the compiler may reorder
+code around the write, but it is the volatile write that keeps the
+store. This was checked against generated code rather than assumed: in
+an x86_64 release build (Rust 1.94.1, `secp256k1` 0.30.0, `zeroize`
+1.9.0), every erase in the Noise handshake and identity code that is
+linked into the daemon is present as stores in the machine code.
+
+An erase reaches only the place it is called on. What it does not
+reach:
+
+- **Copies left by moves.** Moving a value copies its bytes and leaves
+  the old bytes where they were. A handshake state is built on the
+  stack and moved several times between being created and being
+  dropped. Each of those moves leaves behind, in a stack frame that is
+  no longer in use, a copy of the node's long-term private key and,
+  once the handshake has started, of its ephemeral key and chaining
+  key. Two moves out of the slots on a connection's control machine
+  are cleared: when a completed handshake leaves the slot that held it,
+  and when a session is taken out of its slot for a rekey, the slot is
+  overwritten as the value leaves. Other moves are not. When a
+  connection is promoted to an active peer, or reaped as stale, its
+  whole handshake state is moved off its control machine, which leaves
+  the session's two traffic keys, or an unfinished handshake's private
+  keys, in the heap memory the machine occupies.
+- **Loading the identity from a secret string.** Building the node's
+  identity from its key file or from `node.identity.nsec` leaves
+  copies of the private key, among them a whole intermediate identity,
+  in that constructor's stack frame, and they are not cleared.
+- **Registers and spilled temporaries**, which no code in the daemon
+  can name.
+- **Library state.** The cipher keys cached inside `ring`'s
+  `LessSafeKey` have no clearing route. The daemon cannot clear the
+  internal temporaries of the `libsecp256k1` C library either; the
+  library clears some of its own, such as the nonce and secret scalar
+  used in signing, on a best-effort basis.
+
+Clearing therefore shortens how long secret material stays in memory
+and removes it from the places the daemon's own code keeps it; it does
+not guarantee that a secret is gone from the process. Reading what
+remains requires access to the daemon's memory, or to a core dump or
+swap image of it.
 
 ## Rekey Defaults
 
@@ -245,12 +308,14 @@ machine.
 
 **The file descriptor carries the grant, not the connection.** A setup call
 hands the client a socket descriptor and the connection it was made on is then
-closed; the flow or the held port lives until that descriptor is closed. A
-descriptor is an ordinary kernel object, so it survives `fork`, survives
-`exec` unless the client asked for it close-on-exec when it received it, and
-can be handed to another process over `SCM_RIGHTS`. A process holding one can
-send as this node on that flow, or receive on that port, without ever opening
-the API socket and without being in the `fips` group.
+closed; the flow or the held port lives until that descriptor is closed and
+the daemon has let go of the copy it keeps while the descriptor is being
+handed over. A descriptor is an ordinary kernel object, so it survives
+`fork`, survives `exec` unless the client asked for it close-on-exec when it
+received it, and can be handed to another process over `SCM_RIGHTS`. A
+process holding one can send as this node on that flow, or receive on that
+port, without ever opening the API socket and without being in the `fips`
+group.
 Nothing revokes a descriptor already handed out. Restarting the daemon closes
 its own halves and ends every flow and listener at once, and that is the only
 revocation there is.
@@ -268,6 +333,18 @@ the test harness: `arrive` makes the daemon dispatch a datagram as though a
 peer had sent it, reaching any listener on this node under any peer identity
 the caller names. Leave it off outside a test harness; a packaged node does
 not enable it.
+
+**A remote peer can fill the node's flow ceiling through a server that
+refuses flows by dropping them.** Until a program first sends on a flow it
+accepted, the daemon keeps its own copy of that flow's descriptor, so a flow
+accepted and dropped unanswered keeps its slot against the node-wide
+`node.native_api.max_flows` until its listener is dropped. A peer that opens
+flows to such a listener from many source ports can therefore exhaust the
+ceiling, and every other program on the node then gets `EMFILE` on `connect`
+and silently loses arrivals on its listeners. This is the accepted cost of
+keeping a flow alive while its descriptor is on the way to the program; see
+[../how-to/use-the-native-datagram-api.md](../how-to/use-the-native-datagram-api.md)
+for what releases the daemon's copy.
 
 The socket is local only. It is not reachable over the network, and nothing
 about it changes the mesh's own authentication: a peer still verifies the

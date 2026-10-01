@@ -20,6 +20,17 @@
 //! every unix so the platforms can be compared without the test itself being a
 //! variable.
 //!
+//! **A second measurement lives here: what the kernel does to a socket that is
+//! in flight.** When the daemon hands a flow's descriptor to a listener's
+//! client, the descriptor sits inside an `SCM_RIGHTS` message until the client
+//! reads it. xnu's descriptor garbage collector takes its roots only from files
+//! that are in flight, and treats one whose only references are messages as
+//! unreachable unless it is found in the receive buffer of another in-flight
+//! socket. The listener's client half is not in flight, so a flow socket whose
+//! daemon copy has been closed is flushed by any collection that runs before
+//! the client reads it. Linux keeps such a socket. The tests at the end of this
+//! file measure that difference directly.
+//!
 //! `SOCK_CLOEXEC` is deliberately not passed in the type argument, though
 //! `super::seqpacket::pair` does pass it. Linux and FreeBSD accept it there and
 //! macOS does not, and that difference belongs to the port rather than to this
@@ -462,5 +473,93 @@ fn freebsd_seqpacket_drops_a_zero_length_message_instead_of_delivering_it() {
          message to be first in the queue; got {first:?}. A 0 here means \
          FreeBSD does deliver an empty seqpacket message after all, and the \
          diagnosis of the stalled FreeBSD runs is wrong."
+    );
+}
+
+/// How long a collection is given to run after it has been queued.
+///
+/// xnu runs its descriptor collector as an asynchronous thread call, so the
+/// close that queues it returns before it has run. A fixed wait is the only
+/// handle a test has on it; if the Darwin probe below ever misses, this is the
+/// first number to raise.
+const COLLECTION_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Give the kernel's descriptor collector a reason to run, then time to run.
+///
+/// Freeing any `AF_UNIX` socket queues xnu's collector, so a fresh pair closed
+/// at once is enough. That is also why the collector can run at any moment on
+/// a busy host: every unix socket any process closes queues it. Linux runs its
+/// collector here too: in 6.8, the kernel this was read against, closing a unix
+/// socket while any descriptor is in flight runs it before the close returns.
+/// So the Linux probe below checks that Linux's collector keeps the socket,
+/// rather than only that no collector ran.
+pub(super) fn provoke_collection() {
+    let (a, b) = dgram_pair().expect("AF_UNIX SOCK_DGRAM socketpair");
+    drop(a);
+    drop(b);
+    std::thread::sleep(COLLECTION_WAIT);
+}
+
+/// Hand a flow's client half across a listener pair the way the daemon does,
+/// close the sender's copy, provoke a collection, and read what reaches the
+/// receiver.
+///
+/// Built from the product's own pair type and hand-off code rather than from
+/// [`dgram_pair`], so the measurement is of exactly the sockets the daemon
+/// uses. Returns the first read on the received descriptor: the held bytes if
+/// the socket survived, zero bytes if the collector flushed it.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn read_after_collection_in_flight() -> io::Result<usize> {
+    use super::{fdpass, seqpacket};
+    use std::os::fd::AsFd;
+
+    let (daemon, flow) = seqpacket::pair()?;
+    let (sender, receiver) = seqpacket::pair()?;
+    assert_eq!(send(daemon.as_raw_fd(), b"held")?, 4);
+
+    fdpass::try_send(sender.as_raw_fd(), b"arrival", Some(flow.as_fd()))?;
+    // The message is now the only reference to the flow's client half.
+    drop(flow);
+
+    provoke_collection();
+
+    let mut buf = [0u8; 64];
+    let chunk = fdpass::recv(receiver.as_raw_fd(), &mut buf)?;
+    let flow = chunk
+        .fd
+        .ok_or_else(|| io::Error::other("the message arrived without its descriptor"))?;
+    recv(flow.as_raw_fd(), &mut buf)
+}
+
+/// Darwin flushes an in-flight socket whose only reference is the message.
+///
+/// This is the defect behind the native API's intermittent macOS failures, in
+/// isolation: the listener's client receives a flow descriptor that reads as
+/// end of file, with the datagram written to it before the hand-off gone.
+/// A failure here means the collector did not run within
+/// [`COLLECTION_WAIT`], or that Darwin no longer collects such a socket. In
+/// the second case the daemon's hold on a handed-over descriptor is no longer
+/// needed there.
+#[cfg(target_os = "macos")]
+#[test]
+fn darwin_collects_an_in_flight_socket_whose_only_reference_is_the_message() {
+    let read = read_after_collection_in_flight();
+    assert!(
+        matches!(read, Ok(0)),
+        "expected the collector to flush the in-flight flow socket, so its first \
+         read returns end of file; got {read:?}"
+    );
+}
+
+/// Linux keeps the same socket through the collection the close provokes: a
+/// queue held by a socket that is not in flight counts as a reference to what
+/// it holds.
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_keeps_an_in_flight_socket_whose_only_reference_is_the_message() {
+    let read = read_after_collection_in_flight();
+    assert!(
+        matches!(read, Ok(4)),
+        "expected the in-flight flow socket to survive with its datagram; got {read:?}"
     );
 }

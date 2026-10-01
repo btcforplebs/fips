@@ -156,11 +156,11 @@ impl Node {
             }
             RequestOutcome::OwnRequestLooped => {
                 // Our own flooded request, come back to us through a bloom
-                // false positive. Counted apart from ReqDuplicate: that one
-                // describes a peer resending, and this one describes our own
-                // fan-out returning, so folding them together would put a
-                // permanent healthy floor on a counter an operator reads as
-                // neighbour misbehaviour.
+                // false positive. Counted apart from ReqDuplicate by cause:
+                // this is our own fan-out returning, that is a request id we
+                // already recorded, seen again. Neither counter says which
+                // peer delivered the copy; this debug line is the only
+                // per-peer record.
                 self.metrics()
                     .lookup
                     .record_reject(DiscoveryReject::ReqOwnLoopback);
@@ -390,6 +390,9 @@ impl Node {
                     now_ms,
                     path_mtu,
                 } => {
+                    // Reports about the path this verified value replaces are
+                    // not evidence against it.
+                    self.broken_quorum.clear(&target);
                     // The annotation is unsigned and accumulates hop by hop, so
                     // any forwarder on the reverse path can lower it. A value
                     // below the actionable floor cannot describe a usable path,

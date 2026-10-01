@@ -123,9 +123,12 @@ pub enum DiscoveryReject {
     /// forwarded to the peer that looped it. Tracked via
     /// [`DiscoveryStats::req_own_loopback`](crate::node::stats::DiscoveryStats).
     ///
-    /// **This has a nonzero floor in healthy operation** and rises with the
-    /// bloom fill ratio. It says nothing about the peer that delivered the
-    /// copy, which is why it is not counted as [`Self::ReqDuplicate`].
+    /// **This can occur in healthy operation**: a bloom false positive is
+    /// enough to send a copy back, so the rate rises with the bloom fill
+    /// ratio. It is counted apart from [`Self::ReqDuplicate`] by cause: this
+    /// is the node's own fan-out returning, while `ReqDuplicate` is a request
+    /// id the node has already recorded, seen again. Neither identifies the
+    /// peer that delivered the copy.
     ReqOwnLoopback,
     /// Request dedup cache (`recent_requests`) is at capacity, so the
     /// `LookupRequest` is dropped without being forwarded. Tracked via

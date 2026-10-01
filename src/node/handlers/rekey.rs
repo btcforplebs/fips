@@ -60,16 +60,57 @@ const DRAIN_MAX_RETENTION_SECS: u64 = crate::proto::fsp::limits::DRAIN_WINDOW_SE
 /// the configured handshake timers imply, so the ceiling always clears
 /// the recovery it is supposed to leave room for.
 pub(in crate::node) fn drain_max_retention_ms(rate_limit: &crate::config::RateLimitConfig) -> u64 {
-    let mut ladder_ms: u64 = 0;
-    let mut interval = rate_limit.handshake_resend_interval_ms as f64;
-    for _ in 0..rate_limit.handshake_max_resends {
-        ladder_ms = ladder_ms.saturating_add(interval as u64);
-        interval *= rate_limit.handshake_resend_backoff;
-    }
-    let recovery_budget_ms = ladder_ms
+    let recovery_budget_ms = ladder_ms(rate_limit)
         .saturating_add(rate_limit.handshake_timeout_secs.saturating_mul(1000))
         .saturating_add(crate::proto::fsp::limits::REKEY_DAMPENING_SECS * 1000);
     (DRAIN_MAX_RETENTION_SECS * 1000).max(recovery_budget_ms)
+}
+
+/// Sum of the handshake resend intervals, in milliseconds: the initial
+/// interval, multiplied by the backoff factor after each resend, over the
+/// configured number of resends.
+fn ladder_ms(rate_limit: &crate::config::RateLimitConfig) -> u64 {
+    let mut total: u64 = 0;
+    let mut interval = rate_limit.handshake_resend_interval_ms as f64;
+    for _ in 0..rate_limit.handshake_max_resends {
+        total = total.saturating_add(interval as u64);
+        interval *= rate_limit.handshake_resend_backoff;
+    }
+    total
+}
+
+/// The longest silence, in milliseconds, the node tolerates on a link it
+/// keeps.
+///
+/// A peer's handshake resend ladder, three ticks of scheduling slack, and
+/// the longer of one heartbeat interval and the link-dead timeout. The
+/// link-dead reap is suppressed while a rekey still has msg1 resends left,
+/// which is what the ladder term covers. It is also suppressed while a rekey
+/// msg3 still has resends left. That ladder runs on the same schedule and
+/// starts when the peer's msg2 arrives, a frame that ends any silence before
+/// it, so it does not extend a silence past this bound. 64 s at stock
+/// settings.
+pub(in crate::node) fn link_silence_ms(node: &crate::config::NodeConfig) -> u64 {
+    let after_ms = node
+        .heartbeat_interval_secs
+        .max(node.link_dead_timeout_secs)
+        .saturating_mul(1000);
+    ladder_ms(&node.rate_limit)
+        .saturating_add(node.tick_interval_secs.saturating_mul(3000))
+        .saturating_add(after_ms)
+}
+
+/// The inbound idle deadline for stream transports: how long an accepted
+/// connection may go without delivering a complete frame once it has
+/// delivered one.
+///
+/// Set to `link_silence_ms`, so a connection carrying a link the node would
+/// keep is never dropped by it, whatever the heartbeat, link-dead, tick and
+/// resend settings are; a connection carrying no live link is reclaimed.
+pub(in crate::node) fn inbound_idle_timeout(
+    node: &crate::config::NodeConfig,
+) -> std::time::Duration {
+    std::time::Duration::from_millis(link_silence_ms(node))
 }
 
 impl Node {

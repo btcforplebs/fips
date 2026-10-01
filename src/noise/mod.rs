@@ -479,5 +479,49 @@ pub(crate) fn open(
     Ok(buf)
 }
 
+/// Move the value out of `slot`, leaving `None`, and clear the bytes the
+/// value occupied.
+///
+/// `Option::take` moves the value out but writes only the `None` marker, so
+/// the old value's bytes stay where they were. For a slot holding a
+/// handshake or a session that is a full copy of its keys, which nothing
+/// will clear because nothing owns it any more. Here, once the value has
+/// moved out, the slot is cleared with [`clear_slot`].
+///
+/// This clears the slot only. The moved value is the caller's to clear, and
+/// any copy made on the way out, such as in a register or a stack slot, is
+/// out of reach as it is for every other move. A caller that unwraps the
+/// result straight away should use `take().expect(..)` followed by
+/// [`clear_slot`] instead: unwrapping after the slot has been cleared makes
+/// the optimiser keep a second copy of the value on the stack, because it
+/// can no longer copy the value straight from the slot to where it ends up.
+pub(crate) fn take_cleared<T>(slot: &mut Option<T>) -> Option<T> {
+    let value = slot.take();
+    clear_slot(slot);
+    value
+}
+
+/// Drop whatever `slot` holds, overwrite every byte of it with zeros, and
+/// leave it `None`.
+///
+/// The zeros are volatile writes, which the optimiser keeps. Meant for a
+/// slot whose value has just been moved out, so the bytes the move left
+/// behind are cleared.
+pub(crate) fn clear_slot<T>(slot: &mut Option<T>) {
+    *slot = None;
+    let raw: *mut Option<T> = slot;
+    // SAFETY: `raw` comes from a live `&mut`, so it is valid and aligned for
+    // `size_of::<Option<T>>()` bytes. Seen as `MaybeUninit`, those bytes have
+    // no drop glue, own nothing and may be all zero, which is what
+    // `zeroize_flat_type` asks of its target. The slot holds `None` after the
+    // assignment above, so zeroing it discards nothing, and writing `None`
+    // (which does not drop the zeroed bytes) leaves the slot valid before
+    // anything reads it again.
+    unsafe {
+        zeroize::zeroize_flat_type(raw.cast::<std::mem::MaybeUninit<Option<T>>>());
+        raw.write(None);
+    }
+}
+
 #[cfg(test)]
 mod tests;
