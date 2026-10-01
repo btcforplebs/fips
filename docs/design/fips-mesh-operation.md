@@ -272,18 +272,28 @@ follows the same path as the request. Greedy tree routing toward the
 `origin_coords` is used only as a fallback if the reverse-path entry has
 expired.
 
-**Originator check first**: a node tests its own outstanding lookups before
-consulting `recent_requests`. A request is flooded to every bloom-matching
-tree peer, and a bloom false positive can send a copy out into the wider
-network and back to the originator, which would otherwise file its own
-`request_id` as an ordinary transit entry and relay its own answer away. The
-originator arm therefore wins: a response naming a target with a lookup
+**Originator check**: on the response path, a node tests its own outstanding
+lookups before consulting `recent_requests`. A request is flooded to every
+bloom-matching tree peer, and a bloom false positive can send a copy out into
+the wider network and back to the originator, which would otherwise file its
+own `request_id` as an ordinary transit entry and relay its own answer away.
+The originator arm therefore wins: a response naming a target with a lookup
 outstanding, carrying a `request_id` that lookup issued, is accepted here
-whatever the dedup cache holds. A returning copy of the request is likewise
-dropped rather than recorded, so the originator's id never enters the transit
-cache. The drop is counted as `req_own_loopback` rather than as a duplicate: a
-returning copy has a nonzero floor in healthy operation and says nothing about
-the peer that delivered it.
+whatever the dedup cache holds. A returning copy of the request is dropped
+rather than recorded, so while the check recognises the id, it never enters the
+transit cache. The drop is counted as `req_own_loopback` rather than as a
+duplicate, because the cause differs: the node's own fan-out returning, not a
+request id it has already recorded arriving again. Neither counter identifies
+the peer that delivered the copy. The request path runs the two tests the other
+way round, the dedup test first, and the order is immaterial there: an id the
+originator check recognises is never in `recent_requests`, because the
+originator records the ids it issues only in its pending lookups and a request
+is recorded only after it has passed the check. Separately, the check
+recognises an id only while its lookup is outstanding and the id is among the
+last `MAX_RECORDED_IDS` (eight) that the lookup's retry ladder issued for that
+target. A copy that returns after the lookup completed or timed out, or a copy
+of an older attempt on a longer ladder, is recorded and forwarded as transit,
+and a later copy of it is dropped as a duplicate.
 
 **Response-forwarded flag**: Each `recent_requests` entry tracks whether a
 response has already been forwarded for that `request_id`. If a second
