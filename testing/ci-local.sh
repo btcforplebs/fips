@@ -1637,6 +1637,17 @@ run_nextest_flaky() {
     record "nextest-flaky" $rc
 }
 
+# check-glibc-floor.sh's cases: an input it cannot examine reports "could not
+# check" with exit 2, and only a binary above the floor gets exit 1 and the
+# rebuild advice. Static, a few seconds, and builds its inputs from the host's
+# own true executable.
+run_glibc_floor() {
+    local rc=0
+    info "[glibc-floor] Checking the glibc floor check against its cases"
+    bash "$SCRIPT_DIR/glibc-floor/test.sh" || rc=$?
+    record "glibc-floor" $rc
+}
+
 # ── Main ───────────────────────────────────────────────────────────────────
 
 main() {
@@ -1662,6 +1673,7 @@ main() {
     run_wait_converge
     run_deb_version
     run_nextest_flaky
+    run_glibc_floor
 
     if [[ "$TEST_ONLY" == true ]]; then
         run_tests
