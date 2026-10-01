@@ -89,6 +89,10 @@ jobs:
       # step with ci-local.sh's run_deb_version by hand.
       - name: Check the Debian version derived for tags and branches
         run: bash testing/check-deb-version.sh
+      # The unit-test jobs' flaky-test reporter, against recorded nextest
+      # reports. Kept in step with ci-local.sh's run_nextest_flaky by hand.
+      - name: Check the flaky-test reporter against its fixtures
+        run: bash testing/nextest-flaky/test.sh
 
   fmt:
     name: Format check
@@ -314,8 +318,25 @@ jobs:
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
 
+      # The cache restores target/, including the previous run's report. Remove
+      # it so the flaky-test check below reads only this run's, and reports a
+      # missing one when nextest wrote none.
+      - name: Remove a cached nextest report
+        shell: bash
+        run: rm -f target/nextest/ci/junit.xml
+
       - name: Run unit tests
         run: cargo nextest run --all --profile ci
+
+      # The ci profile retries a failing test, so a test that passed only on
+      # retry leaves the job green. Annotate each one, and list it in the run
+      # summary, so a flake is seen without failing an unrelated run. The
+      # Linux job's two junit reporters ignore nextest's <flakyFailure>
+      # elements, and the macOS and Windows jobs have no reporter at all.
+      - name: Report tests that passed only on retry
+        if: success() || failure()
+        shell: bash
+        run: bash testing/check-nextest-flaky.sh target/nextest/ci/junit.xml
 
       - name: Publish test report (Checks tab)
         uses: dorny/test-reporter@4a2e97665d5fa767581ef38eca97b9694bd4eef4 # v2
@@ -381,8 +402,25 @@ jobs:
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
 
+      # The cache restores target/, including the previous run's report. Remove
+      # it so the flaky-test check below reads only this run's, and reports a
+      # missing one when nextest wrote none.
+      - name: Remove a cached nextest report
+        shell: bash
+        run: rm -f target/nextest/ci/junit.xml
+
       - name: Run unit tests
         run: cargo nextest run --all --profile ci
+
+      # The ci profile retries a failing test, so a test that passed only on
+      # retry leaves the job green. Annotate each one, and list it in the run
+      # summary, so a flake is seen without failing an unrelated run. The
+      # Linux job's two junit reporters ignore nextest's <flakyFailure>
+      # elements, and the macOS and Windows jobs have no reporter at all.
+      - name: Report tests that passed only on retry
+        if: success() || failure()
+        shell: bash
+        run: bash testing/check-nextest-flaky.sh target/nextest/ci/junit.xml
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Job 2c – Unit tests (Windows)
@@ -413,8 +451,25 @@ jobs:
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
 
+      # The cache restores target/, including the previous run's report. Remove
+      # it so the flaky-test check below reads only this run's, and reports a
+      # missing one when nextest wrote none.
+      - name: Remove a cached nextest report
+        shell: bash
+        run: rm -f target/nextest/ci/junit.xml
+
       - name: Run unit tests
         run: cargo nextest run --all --profile ci
+
+      # The ci profile retries a failing test, so a test that passed only on
+      # retry leaves the job green. Annotate each one, and list it in the run
+      # summary, so a flake is seen without failing an unrelated run. The
+      # Linux job's two junit reporters ignore nextest's <flakyFailure>
+      # elements, and the macOS and Windows jobs have no reporter at all.
+      - name: Report tests that passed only on retry
+        if: success() || failure()
+        shell: bash
+        run: bash testing/check-nextest-flaky.sh target/nextest/ci/junit.xml
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Job 2d – PowerShell lint (Windows packaging scripts)

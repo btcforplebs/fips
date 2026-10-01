@@ -1604,6 +1604,18 @@ run_deb_version() {
     record "deb-version" $rc
 }
 
+# The GitHub unit-test jobs run check-nextest-flaky.sh after nextest to
+# surface tests that passed only on retry. Nothing local runs nextest under the
+# retrying ci profile, so the checker itself never runs here; its fixture tests
+# do, so a checker that stopped seeing flaky tests fails here rather than going
+# quiet on GitHub. Static, about a second, and needs nothing built.
+run_nextest_flaky() {
+    local rc=0
+    info "[nextest-flaky] Checking the flaky-test reporter against its fixtures"
+    bash "$SCRIPT_DIR/nextest-flaky/test.sh" || rc=$?
+    record "nextest-flaky" $rc
+}
+
 # ── Main ───────────────────────────────────────────────────────────────────
 
 main() {
@@ -1626,6 +1638,7 @@ main() {
     run_comment_refs
     run_wait_converge
     run_deb_version
+    run_nextest_flaky
 
     if [[ "$TEST_ONLY" == true ]]; then
         run_tests

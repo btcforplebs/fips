@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="nextest-run" tests="4" skipped="0" failures="0" errors="0" uuid="96d6f863-2fd5-4341-9a26-0fcb517b97d7" timestamp="2026-10-01T03:24:55.168+00:00" time="0.025">
+    <testsuite name="flakydemo" tests="4" skipped="0" errors="0" failures="0">
+        <testcase name="tests::also_flips" classname="flakydemo" timestamp="2026-10-01T03:24:55.172+00:00" time="0.016"/>
+        <testcase name="tests::always_fails" classname="flakydemo" timestamp="2026-10-01T03:24:55.171+00:00" time="0.020"/>
+        <testcase name="tests::steady" classname="flakydemo" timestamp="2026-10-01T03:24:55.168+00:00" time="0.024"/>
+        <testcase name="tests::flips_once" classname="flakydemo" timestamp="2026-10-01T03:24:55.168+00:00" time="0.025"/>
+    </testsuite>
+</testsuites>

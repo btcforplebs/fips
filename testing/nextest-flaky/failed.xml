@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="nextest-run" tests="4" skipped="0" failures="1" errors="0" uuid="f7324cab-d0eb-42ec-aa2e-bb588c9f47b5" timestamp="2026-10-01T03:24:55.659+00:00" time="0.052">
+    <testsuite name="flakydemo" tests="4" skipped="0" errors="0" failures="1">
+        <testcase name="tests::steady" classname="flakydemo" timestamp="2026-10-01T03:24:55.659+00:00" time="0.009"/>
+        <testcase name="tests::also_flips" classname="flakydemo" timestamp="2026-10-01T03:24:55.660+00:00" time="0.009"/>
+        <testcase name="tests::flips_once" classname="flakydemo" timestamp="2026-10-01T03:24:55.660+00:00" time="0.015"/>
+        <testcase name="tests::always_fails" classname="flakydemo" timestamp="2026-10-01T03:24:55.659+00:00" time="0.015">
+            <failure message="thread &apos;tests::always_fails&apos; (191023) panicked at src/lib.rs:22:67" type="test failure with exit code 101">thread &apos;tests::always_fails&apos; (191023) panicked at src/lib.rs:22:67:
+nope
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace</failure>
+            <rerunFailure timestamp="2026-10-01T03:24:55.679+00:00" time="0.016" message="thread &apos;tests::always_fails&apos; (191028) panicked at src/lib.rs:22:67" type="test failure with exit code 101">thread &apos;tests::always_fails&apos; (191028) panicked at src/lib.rs:22:67:
+nope
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+                <system-out>
+running 1 test
+test tests::always_fails ... FAILED
+
+failures:
+
+failures:
+    tests::always_fails
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+</system-out>
+                <system-err>
+thread &apos;tests::always_fails&apos; (191028) panicked at src/lib.rs:22:67:
+nope
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+</system-err>
+            </rerunFailure>
+            <rerunFailure timestamp="2026-10-01T03:24:55.695+00:00" time="0.016" message="thread &apos;tests::always_fails&apos; (191032) panicked at src/lib.rs:22:67" type="test failure with exit code 101">thread &apos;tests::always_fails&apos; (191032) panicked at src/lib.rs:22:67:
+nope
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+                <system-out>
+running 1 test
+test tests::always_fails ... FAILED
+
+failures:
+
+failures:
+    tests::always_fails
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.01s
+
+</system-out>
+                <system-err>
+thread &apos;tests::always_fails&apos; (191032) panicked at src/lib.rs:22:67:
+nope
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+</system-err>
+            </rerunFailure>
+            <system-out>
+running 1 test
+test tests::always_fails ... FAILED
+
+failures:
+
+failures:
+    tests::always_fails
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+</system-out>
+            <system-err>
+thread &apos;tests::always_fails&apos; (191023) panicked at src/lib.rs:22:67:
+nope
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+</system-err>
+        </testcase>
+    </testsuite>
+</testsuites>
