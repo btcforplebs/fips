@@ -2024,6 +2024,7 @@ impl Node {
                         "PathBroken quorum reached; demoted verified coordinates to a hint");
                 }
                 FspAction::InitiateLookup { dest } => {
+                    self.cache_session_identity(&dest);
                     self.maybe_initiate_lookup(&dest).await;
                 }
                 _ => {}
@@ -2068,6 +2069,23 @@ impl Node {
                 warmup_packets = n,
                 "Reset coords warmup counter after PathBroken"
             );
+        }
+    }
+
+    /// Cache the identity of `dest` from its session entry if the identity
+    /// cache has none.
+    ///
+    /// A lookup's answer is verified against the target's cached key, so a
+    /// lookup for a destination whose identity has been evicted runs to its
+    /// timeout and drops the packets queued for it as unreachable. A session
+    /// already holds the key: the one this node initiated to, or the one the
+    /// responder handshake authenticated.
+    fn cache_session_identity(&mut self, dest: &NodeAddr) {
+        if self.has_cached_identity(dest) {
+            return;
+        }
+        if let Some(pubkey) = self.sessions.get(dest).map(|e| *e.remote_pubkey()) {
+            self.register_identity(*dest, pubkey);
         }
     }
 

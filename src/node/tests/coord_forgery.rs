@@ -542,6 +542,106 @@ async fn an_admitted_path_broken_starts_a_lookup_without_a_cached_identity() {
     cleanup_nodes(&mut fx.nodes).await;
 }
 
+/// The lookup a PathBroken starts must be answerable when the destination's
+/// identity is not cached. The session already holds the destination's key,
+/// so the lookup's answer can be verified with it: the position is learned,
+/// the lookup does not run to its timeout, and packets queued for the
+/// destination are not dropped as unreachable when it would have.
+#[tokio::test]
+async fn a_path_broken_without_a_cached_identity_starts_a_lookup_this_node_can_verify() {
+    // V - P1 - D, with D a real node V has a session with but whose identity
+    // V has not cached.
+    let mut nodes = run_tree_test(3, &[(0, 1), (1, 2)], false).await;
+    let p1 = *nodes[1].node.node_addr();
+    let dest = *nodes[2].node.node_addr();
+    let dest_pubkey = nodes[2].node.identity().pubkey_full();
+    let real: Vec<NodeAddr> = nodes[2]
+        .node
+        .tree_state()
+        .my_coords()
+        .node_addrs()
+        .copied()
+        .collect();
+    let handshake = crate::noise::HandshakeState::new_xk_initiator(
+        nodes[0].node.identity().keypair(),
+        dest_pubkey,
+    );
+    nodes[0].node.sessions.insert(
+        dest,
+        crate::node::session::SessionEntry::new(
+            dest,
+            dest_pubkey,
+            EndToEndState::Initiating(handshake),
+            1000,
+            true,
+        ),
+    );
+    assert!(
+        !nodes[0].node.has_cached_identity(&dest),
+        "precondition: the destination's identity is not cached"
+    );
+    nodes[0]
+        .node
+        .queue_pending_tun_packet_for_test(dest, vec![0x60; 40]);
+
+    let lookup = &nodes[0].node.metrics().lookup;
+    let (accepted, miss, timed_out) = (
+        lookup.resp_accepted.get(),
+        lookup.resp_identity_miss.get(),
+        lookup.resp_timed_out.get(),
+    );
+
+    let victim = *nodes[0].node.node_addr();
+    let payload = PathBroken::new(dest, p1).encode();
+    let encoded = SessionDatagram::new(p1, victim, payload).encode();
+    let start = wall_ms();
+    nodes[0]
+        .node
+        .handle_session_datagram(&p1, &encoded[1..], false)
+        .await;
+    for _ in 0..10 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        crate::node::tests::spanning_tree::process_available_packets(&mut nodes).await;
+    }
+
+    let lookup = &nodes[0].node.metrics().lookup;
+    assert_eq!(
+        lookup.resp_identity_miss.get(),
+        miss,
+        "the lookup's answer could not be verified for want of an identity"
+    );
+    assert!(
+        lookup.resp_accepted.get() > accepted,
+        "the lookup's answer must be verified and accepted"
+    );
+    let entry = nodes[0].node.coord_cache().get_entry(&dest).unwrap();
+    assert_eq!(
+        entry.coords().node_addrs().copied().collect::<Vec<_>>(),
+        real
+    );
+    assert!(entry.is_verified(wall_ms()));
+
+    // Run the lookup schedule well past its end: an answered lookup has
+    // nothing left to time out, so the queued packet survives.
+    for step in 1..=6 {
+        nodes[0]
+            .node
+            .check_pending_lookups(start + step * 20_000)
+            .await;
+    }
+    assert_eq!(
+        nodes[0].node.metrics().lookup.resp_timed_out.get(),
+        timed_out,
+        "the lookup ran to its timeout"
+    );
+    assert_eq!(
+        nodes[0].node.pending_tun_total_packets(),
+        1,
+        "the packet queued for the destination was dropped"
+    );
+    cleanup_nodes(&mut nodes).await;
+}
+
 /// The healthy path for keeping a verified entry below quorum: a genuine
 /// failure reported once is still recovered, because the lookup the report
 /// starts replaces the stale value with the destination's real position.

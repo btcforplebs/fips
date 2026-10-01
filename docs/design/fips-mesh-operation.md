@@ -384,8 +384,8 @@ source.
    whose signals all arrive over one link never demotes this way; its
    verified coordinates last until discovery replaces them or their
    verification ages out after 300 seconds.
-3. Initiate discovery for the destination, whether or not its identity is
-   cached
+3. Initiate discovery for the destination. If its identity is not cached,
+   cache it first from the session's key, so the response can be verified
 4. Reset CP warmup counter
 
 The source also counts, without refusing anything, a PathBroken that
