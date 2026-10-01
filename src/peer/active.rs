@@ -7,7 +7,7 @@ use crate::config::MmpConfig;
 use crate::node::REKEY_JITTER_SECS;
 use crate::noise::{HandshakeState as NoiseHandshakeState, NoiseError, NoiseSession};
 use crate::proto::bloom::BloomFilter;
-use crate::proto::fmp::RekeyRole;
+use crate::proto::fmp::{RekeyAnswer, RekeyRole};
 use crate::proto::mmp::MmpPeerState;
 use crate::proto::stp::{ParentDeclaration, TreeCoordinate};
 use crate::transport::{LinkId, LinkStats, TransportAddr, TransportId};
@@ -293,6 +293,11 @@ pub struct ActivePeer {
     pending_role: Option<RekeyRole>,
     /// When the pending session was installed, for the responder hold.
     pending_since: Option<Instant>,
+    /// The answer that armed a pending this node holds as the responder: the
+    /// msg1 it answered, by digest, and the msg2 it sent. Set with a responder
+    /// pending and cleared with it, so a resend of that msg1 can be answered
+    /// again while the pending is held.
+    rekey_answer: Option<RekeyAnswer>,
 
     // === Published active-send-state (two-tier boundary) ===
     /// The send-critical subset read (and, on roam/responder-cutover, written)
@@ -337,6 +342,7 @@ impl ActivePeer {
             rekey_msg1_resend_count: 0,
             pending_role: None,
             pending_since: None,
+            rekey_answer: None,
             send: PeerSendState::new(link_id, now, authenticated_at),
         }
     }
@@ -419,6 +425,7 @@ impl ActivePeer {
             rekey_msg1_resend_count: 0,
             pending_role: None,
             pending_since: None,
+            rekey_answer: None,
             send,
         }
     }
@@ -1110,6 +1117,12 @@ impl ActivePeer {
         self.pending_role
     }
 
+    /// The answer that armed the pending session, when this node holds it as
+    /// the rekey responder; `None` otherwise.
+    pub(crate) fn rekey_answer(&self) -> Option<&RekeyAnswer> {
+        self.rekey_answer.as_ref()
+    }
+
     /// Check whether the pending session has been held for at least `hold`
     /// since it was installed. False when no pending session is held.
     pub(crate) fn pending_expired(&self, hold: Duration) -> bool {
@@ -1129,12 +1142,14 @@ impl ActivePeer {
         their_index: SessionIndex,
     ) {
         self.install_pending(session, our_index, their_index, RekeyRole::Initiator);
+        self.rekey_answer = None;
     }
 
     /// Store the session this node produced by answering the peer's rekey
-    /// msg1. It is held until a frame on the new epoch from the peer
-    /// authenticates against it ([`handle_peer_kbit_flip`](Self::handle_peer_kbit_flip)),
-    /// or until the responder hold passes and the node retires it
+    /// msg1, with the answer it sent. It is held until a frame on the new
+    /// epoch from the peer authenticates against it
+    /// ([`handle_peer_kbit_flip`](Self::handle_peer_kbit_flip)), or until the
+    /// responder hold passes and the node retires it
     /// ([`retire_pending`](Self::retire_pending)); it is never cut over on this
     /// node's own schedule.
     pub(crate) fn answer_rekey(
@@ -1142,8 +1157,19 @@ impl ActivePeer {
         session: NoiseSession,
         our_index: SessionIndex,
         their_index: SessionIndex,
+        answer: RekeyAnswer,
     ) {
         self.install_pending(session, our_index, their_index, RekeyRole::Responder);
+        self.rekey_answer = Some(answer);
+    }
+
+    /// Clear what is recorded beside the pending slot: its role, its install
+    /// time, and the answer that armed it. Every path that empties the slot
+    /// calls this, so none of the three outlives the session it describes.
+    fn release_pending(&mut self) {
+        self.pending_role = None;
+        self.pending_since = None;
+        self.rekey_answer = None;
     }
 
     /// Store a pending session with the role that produced it and the time it
@@ -1183,8 +1209,7 @@ impl ActivePeer {
         let new_session = self.send.pending_new_session.take()?;
         let new_our_index = self.send.pending_our_index.take();
         let new_their_index = self.send.pending_their_index.take();
-        self.pending_role = None;
-        self.pending_since = None;
+        self.release_pending();
 
         // Demote current to previous
         self.send.previous_session = self.send.noise_session.take();
@@ -1227,8 +1252,7 @@ impl ActivePeer {
         let new_session = self.send.pending_new_session.take()?;
         let new_our_index = self.send.pending_our_index.take();
         let new_their_index = self.send.pending_their_index.take();
-        self.pending_role = None;
-        self.pending_since = None;
+        self.release_pending();
 
         // Demote current to previous
         self.send.previous_session = self.send.noise_session.take();
@@ -1296,8 +1320,7 @@ impl ActivePeer {
         }
         self.send.pending_new_session.take()?;
         self.send.pending_their_index = None;
-        self.pending_role = None;
-        self.pending_since = None;
+        self.release_pending();
         debug_assert_eq!(
             self.pending_role.is_some(),
             self.send.pending_new_session.is_some(),
@@ -1321,8 +1344,7 @@ impl ActivePeer {
         let freed = self.rekey_our_index.take().or_else(|| {
             self.send.pending_new_session = None;
             self.send.pending_their_index = None;
-            self.pending_role = None;
-            self.pending_since = None;
+            self.release_pending();
             self.send.pending_our_index.take()
         });
         debug_assert_eq!(
@@ -1935,6 +1957,55 @@ mod tests {
         assert_eq!(cur_pt.as_deref(), Some(&b"steady"[..]));
     }
 
+    /// A stand-in for the answer a responder records when it arms a pending.
+    fn answer() -> RekeyAnswer {
+        RekeyAnswer {
+            msg1: crate::proto::fmp::Msg1Digest::of(b"msg1"),
+            msg2: vec![0x02; 8],
+        }
+    }
+
+    /// The answer that armed a responder pending is held exactly as long as
+    /// the pending: it leaves on retirement, on promotion, and on abandon, and
+    /// a pending this node initiated carries none.
+    #[test]
+    fn the_answer_that_armed_a_pending_leaves_with_it() {
+        type Exit = fn(&mut ActivePeer) -> Option<SessionIndex>;
+        let exits: [(&str, Exit); 3] = [
+            ("retire", ActivePeer::retire_pending),
+            ("promote", ActivePeer::handle_peer_kbit_flip),
+            ("abandon", ActivePeer::abandon_rekey),
+        ];
+        for (name, exit) in exits {
+            let (_cur_send, cur_recv) = ik_session_pair();
+            let (_pend_send, pend_recv) = ik_session_pair();
+            let mut peer = peer_with_current(cur_recv);
+            peer.answer_rekey(
+                pend_recv,
+                SessionIndex::new(3),
+                SessionIndex::new(4),
+                answer(),
+            );
+            assert_eq!(
+                peer.rekey_answer().map(|a| a.msg2.clone()),
+                Some(vec![0x02; 8]),
+                "{name}: the answer must be held with the pending"
+            );
+            assert!(exit(&mut peer).is_some(), "{name}: the pending must exit");
+            assert!(peer.pending_new_session().is_none());
+            assert!(
+                peer.rekey_answer().is_none(),
+                "{name}: the answer must leave with the pending"
+            );
+        }
+
+        let (_cur_send, cur_recv) = ik_session_pair();
+        let (_pend_send, pend_recv) = ik_session_pair();
+        let mut peer = peer_with_current(cur_recv);
+        peer.set_pending_session(pend_recv, SessionIndex::new(3), SessionIndex::new(4));
+        assert!(peer.rekey_answer().is_none());
+    }
+
     /// Retiring a pending session this node answered hands back its index for
     /// the caller to free, empties the pending slot and its role, and leaves
     /// the current session alone.
@@ -1943,7 +2014,12 @@ mod tests {
         let (_cur_send, cur_recv) = ik_session_pair();
         let (_pend_send, pend_recv) = ik_session_pair();
         let mut peer = peer_with_current(cur_recv);
-        peer.answer_rekey(pend_recv, SessionIndex::new(3), SessionIndex::new(4));
+        peer.answer_rekey(
+            pend_recv,
+            SessionIndex::new(3),
+            SessionIndex::new(4),
+            answer(),
+        );
         assert_eq!(peer.pending_role(), Some(RekeyRole::Responder));
 
         assert_eq!(peer.retire_pending(), Some(SessionIndex::new(3)));
@@ -1977,7 +2053,12 @@ mod tests {
         let (_cur_send, cur_recv) = ik_session_pair();
         let (_pend_send, pend_recv) = ik_session_pair();
         let mut peer = peer_with_current(cur_recv);
-        peer.answer_rekey(pend_recv, SessionIndex::new(3), SessionIndex::new(4));
+        peer.answer_rekey(
+            pend_recv,
+            SessionIndex::new(3),
+            SessionIndex::new(4),
+            answer(),
+        );
 
         assert!(peer.handle_peer_kbit_flip().is_some());
         assert_eq!(peer.pending_role(), None);
@@ -1991,7 +2072,12 @@ mod tests {
         let (_cur_send, cur_recv) = ik_session_pair();
         let (_pend_send, pend_recv) = ik_session_pair();
         let mut peer = peer_with_current(cur_recv);
-        peer.answer_rekey(pend_recv, SessionIndex::new(3), SessionIndex::new(4));
+        peer.answer_rekey(
+            pend_recv,
+            SessionIndex::new(3),
+            SessionIndex::new(4),
+            answer(),
+        );
 
         assert!(!peer.pending_expired(Duration::from_secs(60)));
         peer.backdate_pending(Duration::from_secs(61));

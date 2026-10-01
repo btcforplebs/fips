@@ -1397,16 +1397,30 @@ async fn pump_until_quiet(nodes: &mut [TestNode]) {
 
 /// Drive node 0's rekey msg1 resend ladder on the synthetic clock from
 /// `base_ms`: at the default 1 s interval and 2x backoff, resends at +1, +3,
-/// +7, +15 and +31 s, then the abandon past the budget at +63 s, pumping
-/// after each.
-async fn walk_ladder(nodes: &mut [TestNode], base_ms: u64) {
+/// +7, +15 and +31 s, then the abandon past the budget at +63 s. Each resend
+/// is delivered to node 1, and every msg2 node 1 sends back is lost. Returns
+/// the number of msg2s lost.
+async fn walk_ladder_losing_msg2s(nodes: &mut [TestNode], base_ms: u64) -> usize {
+    use crate::proto::fmp::wire::{CommonPrefix, PHASE_MSG2};
+
+    let mut lost = 0;
     for offset_s in [1u64, 3, 7, 15, 31, 63] {
         nodes[0]
             .node
             .resend_pending_rekeys(base_ms + offset_s * 1000)
             .await;
+        process_available_packets(&mut nodes[1..]).await;
+        while let Ok(packet) = nodes[0].packet_rx.try_recv() {
+            assert_eq!(
+                CommonPrefix::parse(&packet.data).map(|p| p.phase),
+                Some(PHASE_MSG2),
+                "only node 1's msg2s may be queued at node 0 during the ladder"
+            );
+            lost += 1;
+        }
         pump_until_quiet(nodes).await;
     }
+    lost
 }
 
 /// A forged rekey msg2 that carries the initiator's live rekey index must not
@@ -1522,9 +1536,10 @@ async fn forged_rekey_msg2_does_not_split_the_link() {
 /// node 1 answers node 0's rekey msg1 and holds its new session as pending.
 /// node 1's msg2 never arrives, so node 0 never shows it holds the new keys,
 /// and node 1's own rekey tick must not cut over to them. node 0 walks its
-/// whole msg1 resend ladder and re-fires after the abandon; node 1 refuses
-/// each of those msg1s while it holds the pending. Data must flow both ways on
-/// the original sessions throughout. The assertion that tells the outcomes
+/// whole msg1 resend ladder, each resend's msg2 lost too, and re-fires after
+/// the abandon; node 1 answers each resend with the msg2 it already sent and
+/// refuses the re-fired msg1 while it holds the pending. Data must flow both
+/// ways on the original sessions throughout. The assertion that tells the outcomes
 /// apart is node 1 to node 0: a node 1 that cut over would seal to the rekey
 /// index node 0 abandoned.
 ///
@@ -1569,7 +1584,11 @@ async fn dropped_rekey_msg2_does_not_split_the_link() {
     );
     let node1_rejects_before = nodes[1].node.stats().handshake.bad_state;
 
-    walk_ladder(&mut nodes, Node::now_ms()).await;
+    assert_eq!(
+        walk_ladder_losing_msg2s(&mut nodes, Node::now_ms()).await,
+        5,
+        "node 1 must answer each of node 0's five resends"
+    );
     assert!(
         !nodes[0]
             .node
@@ -1588,8 +1607,8 @@ async fn dropped_rekey_msg2_does_not_split_the_link() {
     pump_until_quiet(&mut nodes).await;
     assert_eq!(
         nodes[1].node.stats().handshake.bad_state - node1_rejects_before,
-        6,
-        "node 1 must refuse node 0's five resends and its re-fired msg1 while it holds the pending"
+        1,
+        "node 1 must refuse node 0's re-fired msg1 while it holds the pending"
     );
 
     let post_fwd = build_ipv6_packet(&fips0, &fips1, b"post-loss 0 to 1");
@@ -1731,9 +1750,10 @@ async fn a_responder_retires_an_unadopted_rekey_and_the_next_rekey_completes() {
         .pending_our_index()
         .expect("node 1 must still hold the session it answered with");
 
-    // 2. node 0 walks its ladder to the abandon and re-fires; node 1 refuses
-    // the re-fired msg1 while it holds the pending.
-    walk_ladder(&mut nodes, Node::now_ms()).await;
+    // 2. node 0 walks its ladder to the abandon, losing node 1's answer to
+    // every resend, and re-fires; node 1 refuses the re-fired msg1 while it
+    // holds the pending.
+    walk_ladder_losing_msg2s(&mut nodes, Node::now_ms()).await;
     nodes[0].node.check_rekey().await;
     pump_until_quiet(&mut nodes).await;
     assert!(
@@ -1840,6 +1860,176 @@ async fn a_responder_retires_an_unadopted_rekey_and_the_next_rekey_completes() {
     );
 
     cleanup_nodes(&mut nodes).await;
+}
+
+/// A rekey responder whose msg2 was lost answers the initiator's resend of the
+/// same msg1 with the msg2 it already sent, so the cycle completes one resend
+/// interval after the loss rather than after the responder hold.
+///
+/// node 1 must not allocate or arm a second pending for the resend: the msg2
+/// it repeats is bound to the pending it already holds, and node 0 reads that
+/// msg2 to complete the handshake it started. The rekey then finishes as an
+/// unbroken one would, with node 1 promoting on node 0's first new-epoch frame.
+#[tokio::test]
+async fn a_resent_rekey_msg1_draws_the_held_msg2_and_the_rekey_completes() {
+    let HeldMsg2Pair {
+        mut nodes,
+        node0_addr,
+        node1_addr,
+        fips0,
+        fips1,
+        tun0_rx,
+        tun1_rx,
+        node0_idx_before,
+        node1_idx_before,
+        held_msg2,
+        ..
+    } = rekey_pair_with_held_msg2().await;
+
+    // The msg2 is lost.
+    let lost_msg2 = held_msg2.data.clone();
+    drop(held_msg2);
+    let pending_idx = nodes[1]
+        .node
+        .get_peer(&node0_addr)
+        .unwrap()
+        .pending_our_index()
+        .expect("node 1 must hold the session it answered with");
+    let node1_rejects_before = nodes[1].node.stats().handshake.bad_state;
+
+    // node 0's first resend, at +1 s, reaches node 1 only.
+    nodes[0]
+        .node
+        .resend_pending_rekeys(Node::now_ms() + 1_000)
+        .await;
+    assert_eq!(
+        process_available_packets(&mut nodes[1..]).await,
+        1,
+        "node 1 must have exactly node 0's resent msg1 queued"
+    );
+    assert_eq!(
+        nodes[1].node.stats().handshake.bad_state,
+        node1_rejects_before,
+        "node 1 must answer the resent msg1, not refuse it"
+    );
+    assert_eq!(
+        nodes[1]
+            .node
+            .get_peer(&node0_addr)
+            .unwrap()
+            .pending_our_index(),
+        Some(pending_idx),
+        "node 1 must keep the pending it holds, not arm another"
+    );
+
+    // node 1's answer is the msg2 that was lost, byte for byte.
+    let answered: Vec<_> = std::iter::from_fn(|| nodes[0].packet_rx.try_recv().ok()).collect();
+    assert_eq!(answered.len(), 1, "node 0 must have one answer queued");
+    assert_eq!(
+        answered[0].data, lost_msg2,
+        "node 1 must resend the msg2 it sent for this msg1"
+    );
+    nodes[0]
+        .node
+        .handle_msg2(answered.into_iter().next().unwrap())
+        .await;
+    assert!(
+        nodes[0]
+            .node
+            .get_peer(&node1_addr)
+            .unwrap()
+            .pending_new_session()
+            .is_some(),
+        "node 0 must complete its rekey on the resent msg2"
+    );
+
+    // node 0 cuts over; node 1 promotes on node 0's first new-epoch frame.
+    nodes[0].node.check_rekey().await;
+    nodes[1].node.check_rekey().await;
+    pump_until_quiet(&mut nodes).await;
+    let post_fwd = build_ipv6_packet(&fips0, &fips1, b"post-resend 0 to 1");
+    let post_rev = build_ipv6_packet(&fips1, &fips0, b"post-resend 1 to 0");
+    nodes[0].node.handle_tun_outbound(post_fwd.clone()).await;
+    pump_until_quiet(&mut nodes).await;
+    nodes[1].node.handle_tun_outbound(post_rev.clone()).await;
+    pump_until_quiet(&mut nodes).await;
+
+    let got: Vec<Vec<u8>> = std::iter::from_fn(|| tun1_rx.try_recv().ok()).collect();
+    assert_eq!(got, vec![post_fwd], "node 0 to node 1 must decode");
+    let got: Vec<Vec<u8>> = std::iter::from_fn(|| tun0_rx.try_recv().ok()).collect();
+    assert_eq!(got, vec![post_rev], "node 1 to node 0 must decode");
+    assert_ne!(
+        nodes[0].node.get_peer(&node1_addr).unwrap().our_index(),
+        node0_idx_before,
+        "node 0 must have cut over"
+    );
+    let node1_peer = nodes[1].node.get_peer(&node0_addr).unwrap();
+    assert_eq!(
+        node1_peer.our_index(),
+        Some(pending_idx),
+        "node 1 must have promoted the pending it answered with"
+    );
+    assert_ne!(node1_peer.our_index(), node1_idx_before);
+
+    cleanup_nodes(&mut nodes).await;
+}
+
+/// A copy of the msg1 that armed a responder's pending, arriving from an
+/// address that is not the peer's, draws the held msg2 only on the peer's
+/// established link. Nothing goes back to the address the copy came from.
+///
+/// A captured msg1 still authenticates as the peer when replayed, so the
+/// responder cannot tell a replay from a resend; answering the datagram's
+/// source would hand anyone who sends one a reflector.
+#[tokio::test]
+async fn a_held_rekey_msg2_is_resent_only_on_the_peers_established_link() {
+    use crate::node::tests::spanning_tree::make_test_node;
+
+    let HeldMsg2Pair {
+        mut nodes,
+        node0_addr,
+        held_msg2,
+        ..
+    } = rekey_pair_with_held_msg2().await;
+    let lost_msg2 = held_msg2.data.clone();
+    drop(held_msg2);
+    let mut third = vec![make_test_node().await];
+
+    // Capture node 0's resend and deliver it to node 1 under the third node's
+    // address, as a spoofed source would.
+    nodes[0]
+        .node
+        .resend_pending_rekeys(Node::now_ms() + 1_000)
+        .await;
+    let mut msg1 = nodes[1]
+        .packet_rx
+        .try_recv()
+        .expect("node 0's resent msg1 must be queued at node 1");
+    msg1.remote_addr = third[0].addr.clone();
+    nodes[1].node.handle_msg1(msg1).await;
+
+    assert!(
+        third[0].packet_rx.try_recv().is_err(),
+        "nothing may be sent to the source of the copy"
+    );
+    let answered: Vec<_> = std::iter::from_fn(|| nodes[0].packet_rx.try_recv().ok()).collect();
+    assert_eq!(
+        answered.iter().map(|p| &p.data).collect::<Vec<_>>(),
+        vec![&lost_msg2],
+        "the held msg2 must go to node 0 on its established link"
+    );
+    assert!(
+        nodes[1]
+            .node
+            .get_peer(&node0_addr)
+            .unwrap()
+            .pending_new_session()
+            .is_some(),
+        "node 1 must still hold its pending"
+    );
+
+    cleanup_nodes(&mut nodes).await;
+    cleanup_nodes(&mut third).await;
 }
 
 /// The responder hold is the drain ceiling at stock settings, and a raised

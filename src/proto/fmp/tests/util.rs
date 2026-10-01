@@ -1,7 +1,7 @@
 //! Shared test helpers for the FMP connection-lifecycle unit tests.
 
 use crate::proto::fmp::{
-    ConnSnapshot, EstablishSnapshot, PeerSnapshot, RekeyResendSnapshot, WireOutcome,
+    ConnSnapshot, EstablishSnapshot, Msg1Digest, PeerSnapshot, RekeyResendSnapshot, WireOutcome,
 };
 use crate::testutil::make_node_addr;
 use crate::transport::LinkId;
@@ -85,6 +85,7 @@ pub(super) fn establish_snapshot() -> EstablishSnapshot {
         is_healthy: false,
         pending_new_session: false,
         rekey_in_progress: false,
+        held_answer: None,
         existing_msg2: None,
         at_max_peers: false,
         has_pending_outbound_to_peer: false,
@@ -103,5 +104,6 @@ pub(super) fn wire_outcome(remote_epoch: Option<[u8; 8]>) -> WireOutcome {
         remote_epoch,
         their_index: SessionIndex::new(0x1234),
         msg2_payload: Vec::new(),
+        msg1_digest: Msg1Digest::of(b"msg1"),
     }
 }

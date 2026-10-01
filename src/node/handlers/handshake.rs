@@ -14,8 +14,8 @@ use crate::peer::machine::{
 };
 use crate::proto::fmp::wire::{Msg1Header, Msg2Header, build_msg2};
 use crate::proto::fmp::{
-    EstablishSnapshot, EstablishView, InboundDecision, InboundReject, OutboundSnapshot,
-    PromotionResult, WireOutcome, cross_connection_winner,
+    EstablishSnapshot, EstablishView, InboundDecision, InboundReject, Msg1Digest, OutboundSnapshot,
+    PromotionResult, RekeyAnswer, WireOutcome, cross_connection_winner,
 };
 use crate::transport::{Link, LinkDirection, LinkId, ReceivedPacket};
 use crate::utils::index::SessionIndex;
@@ -84,6 +84,7 @@ impl EstablishView for Node {
                 .map(|p| p.pending_new_session().is_some())
                 .unwrap_or(false),
             rekey_in_progress: existing.map(|p| p.rekey_in_progress()).unwrap_or(false),
+            held_answer: existing.and_then(|p| p.rekey_answer().cloned()),
             existing_msg2: existing.and_then(|p| p.handshake_msg2().map(|m| m.to_vec())),
             at_max_peers: max_peers > 0 && self.peers.len() >= max_peers,
             has_pending_outbound_to_peer: self.connections().any(|(_, machine)| {
@@ -553,6 +554,7 @@ impl Node {
             remote_epoch: machine.conn_remote_epoch(),
             their_index: header.sender_idx,
             msg2_payload: msg2_response,
+            msg1_digest: Msg1Digest::of(&packet.data),
         };
 
         // === PHASE C input ===
@@ -642,6 +644,38 @@ impl Node {
                     }
                 }
             }
+            InboundDecision::ResendRekeyMsg2 { peer, msg2 } => {
+                // A resend of the msg1 that armed the pending we hold: our
+                // msg2 was lost, so give the same answer again. It goes to the
+                // peer's established address, not the msg1's source: a
+                // captured msg1 replayed from elsewhere authenticates the same
+                // as a resend, and answering its source would reflect.
+                debug_assert!(actions.is_empty());
+                let target = self
+                    .peers
+                    .get(&peer)
+                    .and_then(|p| Some((p.transport_id()?, p.current_addr()?.clone())));
+                if let Some((tid, addr)) = target
+                    && let Some(transport) = self.transports.get(&tid)
+                {
+                    match transport.send(&addr, &msg2).await {
+                        Ok(_) => debug!(
+                            peer = %self.peer_display_name(&peer),
+                            "Resent rekey msg2 for a resent msg1"
+                        ),
+                        Err(e) => debug!(
+                            peer = %self.peer_display_name(&peer),
+                            error = %e,
+                            "Failed to resend rekey msg2"
+                        ),
+                    }
+                } else {
+                    debug!(
+                        peer = %self.peer_display_name(&peer),
+                        "No established link to resend rekey msg2 on"
+                    );
+                }
+            }
             InboundDecision::RekeyRespond {
                 peer,
                 abandon_first,
@@ -720,8 +754,14 @@ impl Node {
                 // Store the new session as the responder's pending session. It
                 // is promoted by the initiator's first new-epoch frame, not by
                 // our own tick.
+                // The answer is kept with it, so a resend of this msg1 draws
+                // the same msg2 if this one is lost.
                 if let Some(existing) = self.peers.get_mut(&peer) {
-                    existing.answer_rekey(noise_session, our_new_index, wire.their_index);
+                    let answer = RekeyAnswer {
+                        msg1: wire.msg1_digest,
+                        msg2: wire_msg2,
+                    };
+                    existing.answer_rekey(noise_session, our_new_index, wire.their_index, answer);
                     existing.record_peer_rekey();
                 }
 

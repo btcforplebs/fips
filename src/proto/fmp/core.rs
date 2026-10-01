@@ -144,6 +144,34 @@ pub(crate) enum RekeyRole {
     Responder,
 }
 
+/// A digest of one link handshake msg1 exactly as it arrived, header included.
+///
+/// The initiator's resend ladder retransmits its stored msg1 bytes unchanged,
+/// so a resend digests equal to the original and any other msg1 does not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Msg1Digest([u8; 32]);
+
+impl Msg1Digest {
+    /// Digest the wire bytes of one msg1.
+    pub(crate) fn of(wire_msg1: &[u8]) -> Self {
+        use sha2::{Digest, Sha256};
+        Self(Sha256::digest(wire_msg1).into())
+    }
+}
+
+/// What this node sent when it answered a peer's rekey msg1 as the responder:
+/// the msg1 it answered, by digest, and the framed msg2 it sent back.
+///
+/// Kept with the pending session that answer armed, so a resend of that msg1
+/// draws the same msg2 again rather than a refusal while the pending is held.
+#[derive(Clone, Debug)]
+pub(crate) struct RekeyAnswer {
+    /// The msg1 that armed the pending session.
+    pub msg1: Msg1Digest,
+    /// The framed msg2 sent in answer, opaque to the core.
+    pub msg2: Vec<u8>,
+}
+
 /// A snapshot of one active peer's rekey-relevant state, taken by the shell.
 ///
 /// Every clock read is resolved shell-side into a plain `u64`/`bool` before the
@@ -225,6 +253,9 @@ pub(crate) struct WireOutcome {
     /// The opaque Noise msg2 payload the responder produced (empty only if no
     /// msg2 is to be sent).
     pub msg2_payload: Vec<u8>,
+    /// Digest of the msg1 as it arrived, matched against the msg1 that armed
+    /// a held responder pending.
+    pub msg1_digest: Msg1Digest,
 }
 
 /// A snapshot of the `Node` registry state the inbound establish decision reads
@@ -252,6 +283,10 @@ pub(crate) struct EstablishSnapshot {
     pub pending_new_session: bool,
     /// The existing peer has a rekey handshake in flight.
     pub rekey_in_progress: bool,
+    /// When the pending session is one this node answered as the rekey
+    /// responder, the answer that armed it. `None` with no pending, or with a
+    /// pending this node initiated.
+    pub held_answer: Option<RekeyAnswer>,
     /// The existing peer's stored msg2 wire bytes (an opaque blob), resent on a
     /// same-epoch duplicate msg1. `None` when there is no existing peer or it
     /// has no stored msg2.
@@ -395,6 +430,12 @@ pub(crate) enum InboundDecision {
     /// only on the dual-initiation *loser* path, where we first abandon our own
     /// in-flight rekey. `peer` is the rekey target.
     RekeyRespond { peer: NodeAddr, abandon_first: bool },
+    /// A resend of the rekey msg1 that armed the responder pending this node
+    /// holds: send `msg2`, the answer already given, again. The shell sends it
+    /// only on the peer's established link and never to the msg1's source
+    /// address, since a captured msg1 replayed from anywhere authenticates
+    /// the same as a resend. Nothing else changes; the pending stays held.
+    ResendRekeyMsg2 { peer: NodeAddr, msg2: Vec<u8> },
     /// Same-epoch duplicate msg1 (not a rekey): resend the existing peer's stored
     /// msg2. `msg2` is the opaque stored bytes (`None` → nothing to resend, the
     /// silent no-op preserved from the pre-refactor path).
@@ -414,7 +455,8 @@ pub(crate) enum InboundReject {
     /// bypass the cap: silent-drop before any msg2 build/send.
     AtMaxPeers,
     /// The peer already holds a pending post-rekey session awaiting K-bit
-    /// cutover; a second rekey msg1 must not overwrite it.
+    /// cutover, and this msg1 is not the one that armed it; a second rekey
+    /// msg1 must not overwrite it.
     PendingSession,
     /// Dual rekey initiation and we are the tie-break *winner* (smaller
     /// NodeAddr): drop the peer's msg1 and keep driving our own rekey.
@@ -666,7 +708,18 @@ impl Fmp {
                         };
                     }
                     if snap.pending_new_session {
-                        // A completed rekey is already pending cutover.
+                        // A completed rekey is already pending cutover. A
+                        // resend of the msg1 this node answered to arm it
+                        // means the answer was lost: give it again. Any other
+                        // msg1 is refused.
+                        if let Some(answer) = &snap.held_answer
+                            && answer.msg1 == wire.msg1_digest
+                        {
+                            return InboundDecision::ResendRekeyMsg2 {
+                                peer: peer_addr,
+                                msg2: answer.msg2.clone(),
+                            };
+                        }
                         return InboundDecision::Reject {
                             reason: InboundReject::PendingSession,
                         };

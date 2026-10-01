@@ -6,8 +6,8 @@ use super::util::{
 };
 use crate::NodeAddr;
 use crate::proto::fmp::{
-    ConnAction, Fmp, InboundDecision, InboundReject, OutboundDecision, OutboundSnapshot, RekeyCfg,
-    RekeyRole, cross_connection_winner,
+    ConnAction, Fmp, InboundDecision, InboundReject, Msg1Digest, OutboundDecision,
+    OutboundSnapshot, RekeyAnswer, RekeyCfg, RekeyRole, cross_connection_winner,
 };
 use crate::testutil::make_node_addr;
 use crate::transport::LinkId;
@@ -492,6 +492,74 @@ fn establish_inbound_pending_session_rejects() {
     snap.existing_session_age_secs = 31;
     snap.pending_new_session = true;
     let wire = wire_outcome(Some([7u8; 8]));
+    assert!(matches!(
+        fmp.establish_inbound(&snap, &wire),
+        InboundDecision::Reject {
+            reason: InboundReject::PendingSession
+        }
+    ));
+}
+
+/// An aged, healthy existing peer holding a responder pending armed by the
+/// msg1 whose wire bytes are `armed_by`, answered with msg2 `[0x02; 4]`.
+fn snapshot_holding_an_answer(armed_by: &[u8]) -> crate::proto::fmp::EstablishSnapshot {
+    let mut snap = establish_snapshot();
+    snap.has_existing_peer = true;
+    snap.existing_peer_epoch = Some([7u8; 8]);
+    snap.has_session = true;
+    snap.is_healthy = true;
+    snap.existing_session_age_secs = 31;
+    snap.pending_new_session = true;
+    snap.held_answer = Some(RekeyAnswer {
+        msg1: Msg1Digest::of(armed_by),
+        msg2: vec![0x02; 4],
+    });
+    snap
+}
+
+#[test]
+fn a_resent_msg1_matching_the_held_answer_resends_its_msg2() {
+    // The msg2 answering a held pending was lost and the initiator resent the
+    // same msg1: answer it again with the same msg2, for the same peer.
+    let fmp = Fmp::new();
+    let snap = snapshot_holding_an_answer(b"the msg1 that armed it");
+    let mut wire = wire_outcome(Some([7u8; 8]));
+    wire.msg1_digest = Msg1Digest::of(b"the msg1 that armed it");
+    let peer = *wire.peer_identity.node_addr();
+    match fmp.establish_inbound(&snap, &wire) {
+        InboundDecision::ResendRekeyMsg2 { peer: p, msg2 } => {
+            assert_eq!(p, peer);
+            assert_eq!(msg2, vec![0x02; 4]);
+        }
+        other => panic!("expected ResendRekeyMsg2, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_different_msg1_is_refused_while_an_answered_pending_is_held() {
+    // Only the msg1 that armed the pending draws its answer; a new msg1 from
+    // the same peer must not, and must not replace the pending either.
+    let fmp = Fmp::new();
+    let snap = snapshot_holding_an_answer(b"the msg1 that armed it");
+    let mut wire = wire_outcome(Some([7u8; 8]));
+    wire.msg1_digest = Msg1Digest::of(b"a fresh msg1");
+    assert!(matches!(
+        fmp.establish_inbound(&snap, &wire),
+        InboundDecision::Reject {
+            reason: InboundReject::PendingSession
+        }
+    ));
+}
+
+#[test]
+fn a_pending_this_node_initiated_answers_no_msg1() {
+    // A pending this node initiated has no answer recorded, so every msg1 is
+    // refused while it is held, as before.
+    let fmp = Fmp::new();
+    let mut snap = snapshot_holding_an_answer(b"msg1");
+    snap.held_answer = None;
+    let mut wire = wire_outcome(Some([7u8; 8]));
+    wire.msg1_digest = Msg1Digest::of(b"msg1");
     assert!(matches!(
         fmp.establish_inbound(&snap, &wire),
         InboundDecision::Reject {
