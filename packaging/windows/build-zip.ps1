@@ -138,9 +138,9 @@ Configuration:
   %USERPROFILE%\.fips.yaml and .\fips.yaml. The key file sits
   beside the last config loaded. \etc\fips\fips.yaml was the
   system config of earlier releases, and any local user can
-  create it; the daemon warns when it loads it, and v0.6.0 stops
-  reading it. Move what you need from it into
-  C:\ProgramData\fips\fips.yaml and delete it.
+  create it; the daemon warns when it loads it, and from v0.6.0
+  the search no longer looks there. Move what you need from it
+  into C:\ProgramData\fips\fips.yaml and delete it.
 
   A service that earlier releases ran from \etc\fips reads
   only C:\ProgramData\fips once install-service.ps1 has run,
