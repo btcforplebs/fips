@@ -2032,6 +2032,209 @@ async fn a_held_rekey_msg2_is_resent_only_on_the_peers_established_link() {
     cleanup_nodes(&mut third).await;
 }
 
+/// A ReceiverReport about `highest` frames, as the link-layer message a peer
+/// sends: the type byte followed by the body.
+fn receiver_report_message(highest: u64) -> Vec<u8> {
+    crate::proto::mmp::ReceiverReport {
+        highest_counter: highest,
+        cumulative_packets_recv: highest,
+        cumulative_bytes_recv: highest * 100,
+        timestamp_echo: 0,
+        dwell_time: 0,
+        max_burst_loss: 0,
+        mean_burst_loss: 0,
+        jitter: 0,
+        ecn_ce_count: 0,
+        owd_trend: 0,
+        burst_loss_count: 0,
+        cumulative_reorder_count: 0,
+        interval_packets_recv: highest as u32,
+        interval_bytes_recv: (highest * 100) as u32,
+    }
+    .encode()
+}
+
+/// A link rekey initiator that has cut over keeps its new session's MMP state
+/// free of frames the responder sealed on the old session.
+///
+/// node 0 cuts over and resets its MMP receiver and metrics. node 1 has not
+/// yet seen a frame on the new epoch, so it still sends on the old session,
+/// and node 0 decrypts those frames against its previous session during the
+/// drain. Their payload is still delivered, but they describe the old
+/// session: a data frame's counter must not become the new session's highest
+/// counter, which would make every new-session frame count as a reorder, and
+/// a ReceiverReport about node 0's old-session traffic must not become the
+/// baseline later reports are judged against, which would reject every
+/// new-session report as regressed. Once node 1 promotes, its frames and
+/// reports on the new session are counted and accepted.
+#[tokio::test]
+async fn frames_on_the_previous_link_session_do_not_feed_the_new_sessions_mmp() {
+    let HeldMsg2Pair {
+        mut nodes,
+        node0_addr,
+        node1_addr,
+        fips0,
+        fips1,
+        tun0_rx,
+        tun1_rx,
+        node0_idx_before,
+        node1_idx_before,
+        held_msg2,
+        ..
+    } = rekey_pair_with_held_msg2().await;
+
+    // node 0 completes its rekey and cuts over on its own tick; nothing is
+    // delivered to node 1, which stays on the old session.
+    nodes[0].node.handle_msg2(held_msg2).await;
+    nodes[0].node.check_rekey().await;
+    let peer = nodes[0].node.get_peer(&node1_addr).unwrap();
+    assert_ne!(peer.our_index(), node0_idx_before, "node 0 must cut over");
+    let mmp = peer.mmp().expect("node 0 must run link MMP");
+    assert_eq!(mmp.receiver.highest_counter(), 0, "the cutover resets MMP");
+    assert_eq!(mmp.metrics.rr_counters(), None, "the cutover resets MMP");
+    let reports_before = mmp.metrics.reports_seen();
+
+    // node 1, still on the old session, sends data and then a report about
+    // node 0's old-session traffic. Only node 0's queue is delivered.
+    let old_rev = build_ipv6_packet(&fips1, &fips0, b"old session 1 to 0");
+    nodes[1].node.handle_tun_outbound(old_rev.clone()).await;
+    nodes[1]
+        .node
+        .send_encrypted_link_message(&node0_addr, &receiver_report_message(1_000))
+        .await
+        .unwrap();
+    assert_eq!(
+        nodes[1].node.get_peer(&node0_addr).unwrap().our_index(),
+        node1_idx_before,
+        "node 1 must still be on the old session"
+    );
+    for _ in 0..3 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        process_available_packets(&mut nodes[..1]).await;
+    }
+
+    let got: Vec<Vec<u8>> = std::iter::from_fn(|| tun0_rx.try_recv().ok()).collect();
+    assert_eq!(
+        got,
+        vec![old_rev],
+        "an old-session frame's payload must still be delivered"
+    );
+    let mmp = nodes[0].node.get_peer(&node1_addr).unwrap().mmp().unwrap();
+    assert_eq!(
+        mmp.metrics.reports_seen(),
+        reports_before,
+        "an old-session ReceiverReport must not reach the new session's metrics"
+    );
+    assert_eq!(mmp.metrics.rr_counters(), None);
+    assert_eq!(
+        mmp.receiver.highest_counter(),
+        0,
+        "an old-session frame's counter must not become the new session's highest"
+    );
+
+    // node 0's first new-epoch frame promotes node 1; node 1's frames and
+    // reports on the new session then feed node 0's MMP.
+    let new_fwd = build_ipv6_packet(&fips0, &fips1, b"new session 0 to 1");
+    nodes[0].node.handle_tun_outbound(new_fwd.clone()).await;
+    pump_until_quiet(&mut nodes).await;
+    let got: Vec<Vec<u8>> = std::iter::from_fn(|| tun1_rx.try_recv().ok()).collect();
+    assert_eq!(got, vec![new_fwd]);
+    assert_ne!(
+        nodes[1].node.get_peer(&node0_addr).unwrap().our_index(),
+        node1_idx_before,
+        "node 1 must promote on node 0's first new-epoch frame"
+    );
+    let new_rev = build_ipv6_packet(&fips1, &fips0, b"new session 1 to 0");
+    nodes[1].node.handle_tun_outbound(new_rev.clone()).await;
+    nodes[1]
+        .node
+        .send_encrypted_link_message(&node0_addr, &receiver_report_message(5))
+        .await
+        .unwrap();
+    pump_until_quiet(&mut nodes).await;
+    let got: Vec<Vec<u8>> = std::iter::from_fn(|| tun0_rx.try_recv().ok()).collect();
+    assert_eq!(got, vec![new_rev]);
+    let mmp = nodes[0].node.get_peer(&node1_addr).unwrap().mmp().unwrap();
+    assert!(
+        mmp.receiver.highest_counter() > 0,
+        "new-session frames must be counted"
+    );
+    assert_eq!(
+        mmp.metrics.rr_counters().map(|(highest, _, _)| highest),
+        Some(5),
+        "a new-session ReceiverReport must be accepted"
+    );
+
+    cleanup_nodes(&mut nodes).await;
+}
+
+/// The decrypt-worker path tells the sessions apart too. A frame the worker
+/// decrypted under the previous session's index, bounced back after the
+/// cutover, does not feed the new session's MMP; the same frame under the
+/// current session's index does.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_worker_decrypted_frame_on_the_previous_link_session_does_not_feed_mmp() {
+    use crate::node::decrypt_worker::DecryptFallback;
+
+    let HeldMsg2Pair {
+        mut nodes,
+        node1_addr,
+        node0_idx_before,
+        held_msg2,
+        ..
+    } = rekey_pair_with_held_msg2().await;
+    nodes[0].node.handle_msg2(held_msg2).await;
+    nodes[0].node.check_rekey().await;
+    let peer = nodes[0].node.get_peer(&node1_addr).unwrap();
+    let previous_idx = peer.previous_our_index().expect("node 0 must be draining");
+    assert_eq!(Some(previous_idx), node0_idx_before);
+    let current_idx = peer.our_index().expect("node 0 must have cut over");
+
+    // A bounced worker plaintext: the 4-byte session timestamp, then a
+    // ReceiverReport about 1000 frames.
+    let (transport_id, remote_addr) = (nodes[0].transport_id, nodes[1].addr.clone());
+    let bounce = |receiver_idx: u32, counter: u64| {
+        let mut data = 0u32.to_le_bytes().to_vec();
+        data.extend(receiver_report_message(1_000));
+        DecryptFallback {
+            source_node_addr: node1_addr,
+            transport_id,
+            remote_addr: remote_addr.clone(),
+            timestamp_ms: Node::now_ms(),
+            packet_len: data.len() + 32,
+            receiver_idx,
+            fmp_counter: counter,
+            fmp_flags: 0,
+            fmp_plaintext_len: data.len(),
+            packet_data: data,
+            fmp_plaintext_offset: 0,
+        }
+    };
+
+    let previous = bounce(previous_idx.as_u32(), 900);
+    nodes[0].node.process_decrypt_fallback(previous).await;
+    let mmp = nodes[0].node.get_peer(&node1_addr).unwrap().mmp().unwrap();
+    assert_eq!(
+        mmp.receiver.highest_counter(),
+        0,
+        "a previous-session frame's counter must not be counted"
+    );
+    assert_eq!(
+        mmp.metrics.rr_counters(),
+        None,
+        "a previous-session ReceiverReport must not be processed"
+    );
+
+    let current = bounce(current_idx.as_u32(), 1);
+    nodes[0].node.process_decrypt_fallback(current).await;
+    let mmp = nodes[0].node.get_peer(&node1_addr).unwrap().mmp().unwrap();
+    assert_eq!(mmp.receiver.highest_counter(), 1);
+    assert_eq!(mmp.metrics.rr_counters().map(|(h, _, _)| h), Some(1_000));
+
+    cleanup_nodes(&mut nodes).await;
+}
+
 /// The responder hold is the drain ceiling at stock settings, and a raised
 /// link-dead timeout or heartbeat interval raises it past that ceiling, taking
 /// the larger of the two rather than their sum.

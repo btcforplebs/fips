@@ -150,6 +150,10 @@ pub(crate) struct DecryptFallback {
     /// MMP's 30-second link-dead timer fires even though packets
     /// are arriving fine.
     pub packet_len: usize,
+    /// The frame's receiver index: the index of the session that decrypted
+    /// it, so rx_loop can tell a current-session frame from one on the
+    /// previous session during a rekey drain.
+    pub receiver_idx: u32,
     pub fmp_counter: u64,
     pub fmp_flags: u8,
     /// Original received wire buffer, mutated in place by the FMP
@@ -521,6 +525,7 @@ fn handle_job(
         remote_addr,
         timestamp_ms,
         packet_len,
+        receiver_idx: cache_key.1,
         fmp_counter,
         fmp_flags,
         packet_data,

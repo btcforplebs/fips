@@ -1485,10 +1485,12 @@ fn next_counter(node: &Node, peer: &NodeAddr) -> u64 {
         .current_send_counter()
 }
 
-/// Around a rekey, reports that describe the previous session reach both
-/// ends of the link: the initiator accepts one the responder built before it
-/// switched, and the responder's frames from the old session pollute the
-/// initiator's receiver. Neither kind of report may trigger a resend.
+/// Around a rekey, frames the responder sent on the old session reach the
+/// initiator after it cut over: a report about the initiator's old-session
+/// traffic, and data frames carrying the responder's old-session counters.
+/// Neither may feed the new session's MMP state, so the reports either end
+/// holds after the cutover describe the new session, an announce sent after
+/// it is confirmed by them, and nothing is resent.
 #[tokio::test]
 async fn test_bloom_reports_from_the_previous_session_do_not_trigger_resends() {
     let mut fx = flip_fixture(true).await;
@@ -1567,17 +1569,46 @@ async fn test_bloom_reports_from_the_previous_session_do_not_trigger_resends() {
     for packet in held {
         fx.nodes[M].node.handle_encrypted_frame(packet).await;
     }
+    assert_eq!(
+        rr_counters(&fx.nodes[M].node, &p),
+        None,
+        "M must not take P's report about M's previous session"
+    );
     mmp_round(&mut fx.nodes).await;
-
-    let m_rr = rr_counters(&fx.nodes[M].node, &p).expect("setup: M holds a report");
-    let p_rr = rr_counters(&fx.nodes[P].node, &m).expect("setup: P holds a report");
+    let describes_new = |rr: Option<(u64, u64, u32)>, next: u64| rr.is_none_or(|rr| rr.0 < next);
     assert!(
-        m_rr.0 >= next_counter(&fx.nodes[M].node, &p),
-        "setup: M's report must describe M's previous session"
+        describes_new(
+            rr_counters(&fx.nodes[M].node, &p),
+            next_counter(&fx.nodes[M].node, &p)
+        ),
+        "M's report must describe M's new session"
     );
     assert!(
-        p_rr.0 >= next_counter(&fx.nodes[P].node, &m),
-        "setup: P's report must carry P's previous-session counter"
+        describes_new(
+            rr_counters(&fx.nodes[P].node, &m),
+            next_counter(&fx.nodes[P].node, &m)
+        ),
+        "P's report must not carry P's previous-session counter"
+    );
+
+    // Both ends come to hold a usable report on the new session, which an
+    // announce sent next is measured from. Under the old behaviour the
+    // previous-session reports kept both ends from ever holding one here.
+    let usable = |fx: &FlipFixture| {
+        [(M, p), (P, m)].into_iter().all(|(i, remote)| {
+            rr_counters(&fx.nodes[i].node, &remote)
+                .is_some_and(|rr| rr.0 < next_counter(&fx.nodes[i].node, &remote))
+        })
+    };
+    for _ in 0..5 {
+        if usable(&fx) {
+            break;
+        }
+        mmp_round(&mut fx.nodes).await;
+    }
+    assert!(
+        usable(&fx),
+        "both ends must hold a usable new-session report"
     );
 
     fx.nodes[M].node.bloom_state.mark_update_needed(p);
@@ -1594,49 +1625,31 @@ async fn test_bloom_reports_from_the_previous_session_do_not_trigger_resends() {
     let sent_m = fx.nodes[M].node.metrics().bloom.sent.get();
     let sent_p = fx.nodes[P].node.metrics().bloom.sent.get();
     let guard = switch_guard(&fx);
-    let mut last = rr_counters(&fx.nodes[P].node, &m);
-    let mut changes = 0;
     for _ in 0..5 {
         mmp_round(&mut fx.nodes).await;
         fx.nodes[M].node.check_bloom_state().await;
         fx.nodes[P].node.check_bloom_state().await;
         process_available_packets(&mut fx.nodes).await;
-        let now = rr_counters(&fx.nodes[P].node, &m);
-        if now != last {
-            changes += 1;
-        }
-        last = now;
     }
-    assert!(
-        changes >= 2,
-        "setup: P must accept at least two reports from M, saw {changes}"
-    );
     assert_unswitched(&fx, &guard);
-    let m_rr = rr_counters(&fx.nodes[M].node, &p).expect("setup: M holds a report");
-    let p_rr = rr_counters(&fx.nodes[P].node, &m).expect("setup: P holds a report");
-    assert!(
-        m_rr.0 >= next_counter(&fx.nodes[M].node, &p)
-            && p_rr.0 >= next_counter(&fx.nodes[P].node, &m),
-        "setup: both reports must still describe a previous session"
-    );
 
     assert_eq!(
         fx.nodes[M].node.metrics().bloom.sent.get(),
         sent_m,
-        "M must not resend on reports from the previous session"
+        "M must not resend a delivered announce after the rekey"
     );
     assert_eq!(
         fx.nodes[P].node.metrics().bloom.sent.get(),
         sent_p,
-        "P must not resend on reports carrying its previous-session counter"
+        "P must not resend a delivered announce after the rekey"
     );
     assert!(
-        fx.nodes[M].node.bloom_state.announce_outstanding(&p),
-        "M must still hold its announce to P"
+        !fx.nodes[M].node.bloom_state.announce_outstanding(&p),
+        "M's announce must be confirmed by a new-session report"
     );
     assert!(
-        fx.nodes[P].node.bloom_state.announce_outstanding(&m),
-        "P must still hold its announce to M"
+        !fx.nodes[P].node.bloom_state.announce_outstanding(&m),
+        "P's announce must be confirmed by a new-session report"
     );
     cleanup_nodes(&mut fx.nodes).await;
 }
