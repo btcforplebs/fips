@@ -120,8 +120,9 @@ jobs:
 
       - name: Install Rust toolchain (nightly, Tier 3)
         if: matrix.rust_channel == 'nightly'
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@be39649afda95dbf70f87cce95f68b8d5797b296 # nightly
         with:
+          toolchain: nightly
           components: rust-src
 
       - name: Cache Cargo registry + build
