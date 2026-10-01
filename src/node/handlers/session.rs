@@ -1296,15 +1296,17 @@ impl Node {
 
         // Rekey path: entry is Established with rekey_state (responder side)
         //
-        // Every failure below abandons only the handshake. Nothing in a msg3
-        // is authenticated until `read_message_3` has both succeeded and
-        // produced a static key matching this session's peer, so a failure
-        // here proves nothing about the sender and must not cost the entry
-        // anything it would miss. A `pending_new_session` beside the
-        // handshake is the epoch the real peer may already have cut over to,
-        // and dropping it kills the reverse direction on two unauthenticated
-        // messages: a forged msg1 to arm the handshake, then any garbage
-        // msg3. `abandon_handshake` keeps it; `abandon_rekey` does not.
+        // Nothing in a msg3 is authenticated until `read_message_3` has both
+        // succeeded and produced a static key matching this session's peer,
+        // so a failure here proves nothing about the sender and must not cost
+        // the entry anything it would miss. An unreadable msg3 therefore
+        // costs nothing at all: the handshake goes back, rolled back, for the
+        // genuine msg3. Every later failure abandons only the handshake. A
+        // `pending_new_session` beside the handshake is the epoch the real
+        // peer may already have cut over to, and dropping it kills the
+        // reverse direction on two unauthenticated messages: a forged msg1 to
+        // arm the handshake, then any garbage msg3. `abandon_handshake` keeps
+        // it; `abandon_rekey` does not.
         //
         // What `abandon_handshake` leaves behind, and why each is safe here:
         // `rekey_completed_ms` must survive, since `pending_stale` reads it
@@ -1341,14 +1343,23 @@ impl Node {
                 (msg3.handshake_payload.as_slice(), None)
             };
 
-            // Process XX msg3
-            if let Err(e) = handshake.read_message_3(base_msg3) {
+            // Process XX msg3. The only tie between this msg3 and the
+            // handshake is the datagram's source address, which the sender
+            // chooses, and the peer that read our SessionAck may already hold
+            // the new keys. Abandoning here would let anyone able to name the
+            // session discard the handshake the peer's genuine msg3 needs,
+            // splitting the session's epochs. So the handshake goes back,
+            // rolled back to its pre-read state, because the read advances
+            // the cipher nonce before it authenticates. The restore leaves
+            // the deadline alone, which runs from the peer's setup, so a
+            // spray cannot hold the handshake open.
+            if let Err(e) = handshake.try_read_message_3(base_msg3) {
                 debug!(
                     src = %self.peer_display_name(src_addr),
                     error = %e,
-                    "Failed to process rekey XX msg3"
+                    "Failed to process rekey XX msg3, keeping the handshake"
                 );
-                entry.abandon_handshake();
+                entry.set_rekey_state(handshake, false);
                 self.sessions.insert(*src_addr, entry);
                 return;
             }
@@ -1461,9 +1472,22 @@ impl Node {
             (msg3.handshake_payload.as_slice(), None)
         };
 
-        // Process XX msg3 (learns initiator's identity and epoch)
-        if let Err(e) = handshake.read_message_3(base_msg3) {
-            debug!(error = %e, "Failed to process Noise XX msg3");
+        // Process XX msg3 (learns initiator's identity and epoch).
+        //
+        // Nothing here has been authenticated: the only tie to this half-open
+        // entry is the datagram's source address, which the sender chooses,
+        // and the initiator considers the session established once it has
+        // sent msg3. Dropping the entry would let anyone able to name the
+        // initiator discard the handshake its genuine msg3 and resends need,
+        // so the entry goes back with the handshake rolled back to its
+        // pre-read state, as the SessionAck arm does. `touch()` is
+        // deliberately not called, so a spray cannot push the handshake
+        // sweep's deadline out. The drops below stay drops: each follows a
+        // read that authenticated the sender.
+        if let Err(e) = handshake.try_read_message_3(base_msg3) {
+            debug!(error = %e, "Failed to process Noise XX msg3, keeping the handshake");
+            entry.set_state(EndToEndState::AwaitingMsg3(handshake));
+            self.sessions.insert(*src_addr, entry);
             return;
         }
 
