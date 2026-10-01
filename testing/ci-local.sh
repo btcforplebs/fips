@@ -1614,15 +1614,16 @@ run_wait_converge() {
     record "wait-converge" $rc
 }
 
-# The .deb version package-linux.yml derives for a release tag, a candidate
-# tag and a branch. A candidate must sort below its release under dpkg, which
-# the tag's -rcN does not, so the workflow maps it to ~rcN; this runs the
-# workflow's own step text. Static, about a second, and needs nothing built.
-run_deb_version() {
+# The package versions the packaging workflows derive for a release tag, a
+# candidate tag and a branch. A candidate must sort below its release under the
+# package manager, which the tag's -rcN does not, so the workflows map it to
+# ~rcN; this runs the workflows' own step text. Static, a few seconds, and
+# needs nothing built.
+run_package_versions() {
     local rc=0
-    info "[deb-version] Checking the Debian version derived for tags and branches"
-    bash "$SCRIPT_DIR/check-deb-version.sh" || rc=$?
-    record "deb-version" $rc
+    info "[package-versions] Checking the package versions derived for tags and branches"
+    bash "$SCRIPT_DIR/check-package-versions.sh" || rc=$?
+    record "package-versions" $rc
 }
 
 # The GitHub unit-test jobs run check-nextest-flaky.sh after nextest to
@@ -1671,7 +1672,7 @@ main() {
     run_portable_atomics
     run_shellcheck
     run_wait_converge
-    run_deb_version
+    run_package_versions
     run_nextest_flaky
     run_glibc_floor
 

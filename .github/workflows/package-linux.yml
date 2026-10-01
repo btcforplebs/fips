@@ -46,7 +46,7 @@ jobs:
           # dpkg reads X.Y.Z-rcN as revision rcN of X.Y.Z and sorts it above
           # the release; X.Y.Z~rcN sorts below it. git refuses '~' in a ref
           # name, so the tag carries '-' and this maps it, for the .deb only.
-          # testing/check-deb-version.sh runs this step's text.
+          # testing/check-package-versions.sh runs this step's text.
           DEB_VERSION="$VERSION"
           if [[ "$GITHUB_REF" == refs/tags/* ]] \
             && [[ "$VERSION" =~ ^([0-9]+\.[0-9]+\.[0-9]+)-((alpha|beta|pre|rc)[0-9]*)$ ]]; then

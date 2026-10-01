@@ -97,11 +97,11 @@ jobs:
       # a matrix suite.
       - name: Run convergence-gate unit tests
         run: bash testing/lib/wait-converge-test.sh
-      # Runs package-linux.yml's own version derivation on a release tag, a
-      # candidate tag and a branch. Not a matrix suite either, so it is kept in
-      # step with ci-local.sh's run_deb_version by hand.
-      - name: Check the Debian version derived for tags and branches
-        run: bash testing/check-deb-version.sh
+      # Runs the packaging workflows' own version derivations on a release
+      # tag, a candidate tag and a branch. Not a matrix suite either, so it is
+      # kept in step with ci-local.sh's run_package_versions by hand.
+      - name: Check the package versions derived for tags and branches
+        run: bash testing/check-package-versions.sh
       # The unit-test jobs' flaky-test reporter, against recorded nextest
       # reports. Kept in step with ci-local.sh's run_nextest_flaky by hand.
       - name: Check the flaky-test reporter against its fixtures
