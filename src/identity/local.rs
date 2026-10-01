@@ -20,7 +20,9 @@ use super::{FipsAddress, IdentityError, NodeAddr, sha256};
 /// write, so the optimiser keeps it, but it reaches only the place it is
 /// called on: a copy made before it runs is not cleared, and that includes
 /// the bytes a move leaves behind wherever the value used to be, such as
-/// the frame of the constructor that built it.
+/// the frame of the constructor that built it. `from_secret_str` is a known
+/// case: it leaves copies of the private key, a whole intermediate
+/// `Identity` among them, in its own frame.
 #[derive(Clone)]
 pub struct Identity {
     keypair: Keypair,
@@ -143,36 +145,36 @@ impl Drop for Identity {
     }
 }
 
-/// A `Keypair` copy that is erased when it goes out of scope.
+/// Erases a `Keypair` in place when it goes out of scope.
 ///
 /// `Keypair` is `Copy` and so cannot clear itself on drop. A frame that holds
 /// a copy of the node's long-term private key across several exit paths —
 /// early error returns, `?`, a normal return — would otherwise need an erase
-/// written at each one, and a missed path is invisible. Holding the copy here
-/// instead makes the clearing structural.
+/// written at each one, and a missed path is invisible. Guarding the copy
+/// makes the clearing structural.
 ///
-/// This clears the copy this guard owns, not every copy that ever existed.
-/// The erase is a volatile write, so the optimiser keeps it, but it reaches
-/// only the guard's final location: moving the guard, including out of
-/// [`ErasingKeypair::take`], leaves the bytes behind where it used to be.
-pub(crate) struct ErasingKeypair(Keypair);
+/// The guard borrows the keypair rather than holding one, so making it and
+/// moving it copy no key bytes: the erase lands on the caller's own binding,
+/// wherever that lies, and there is no second copy for an early return to
+/// leave behind. It clears that one binding, not every copy that ever
+/// existed. The erase is a volatile write, so the optimiser keeps it, but a
+/// copy made before the guard existed, or taken out through
+/// [`ErasingKeypair::get`], is not cleared by it.
+pub(crate) struct ErasingKeypair<'a>(&'a mut Keypair);
 
-impl ErasingKeypair {
-    /// Take a copy of `source` into the guard and erase `source` in place, so
-    /// the caller's own binding does not outlive the move.
-    pub(crate) fn take(source: &mut Keypair) -> Self {
-        let guarded = Self(*source);
-        source.non_secure_erase();
-        guarded
+impl<'a> ErasingKeypair<'a> {
+    /// Guard `source` so it is erased where it lies when the guard drops.
+    pub(crate) fn new(source: &'a mut Keypair) -> Self {
+        Self(source)
     }
 
     /// Borrow the guarded keypair.
     pub(crate) fn get(&self) -> &Keypair {
-        &self.0
+        self.0
     }
 }
 
-impl Drop for ErasingKeypair {
+impl Drop for ErasingKeypair<'_> {
     fn drop(&mut self) {
         self.0.non_secure_erase();
     }

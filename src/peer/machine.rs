@@ -622,8 +622,9 @@ impl PeerMachine {
     ) -> Result<Vec<u8>, NoiseError> {
         // The parameter is this frame's own copy of the node's long-term
         // private key, and the state checks below return before it is used.
-        // The guard clears it on every exit path.
-        let our_keypair = ErasingKeypair::take(&mut our_keypair);
+        // The guard clears it in place on every exit path, and makes no copy
+        // of its own for an early return to leave behind.
+        let our_keypair = ErasingKeypair::new(&mut our_keypair);
 
         let msg1 = {
             let direction = self.conn.direction();
@@ -668,8 +669,9 @@ impl PeerMachine {
         current_time_ms: u64,
     ) -> Result<Vec<u8>, NoiseError> {
         // Same as `start_handshake`: the parameter copy outlives two early
-        // returns, so the guard owns it rather than an erase per exit path.
-        let our_keypair = ErasingKeypair::take(&mut our_keypair);
+        // returns, so the guard clears it in place rather than an erase per
+        // exit path.
+        let our_keypair = ErasingKeypair::new(&mut our_keypair);
 
         let (msg2, learned_identity, remote_epoch) = {
             let direction = self.conn.direction();
@@ -738,10 +740,15 @@ impl PeerMachine {
                 });
             }
 
+            // The slot is heap memory that outlives this call; clearing it once
+            // the handshake has left keeps both private keys from staying
+            // there. Unwrapping before clearing lets the handshake move
+            // straight from the slot to `hs`, with no second stack copy.
             let mut hs = leg
                 .noise_handshake
                 .take()
                 .expect("noise handshake must exist in SentMsg1 state");
+            noise::clear_slot(&mut leg.noise_handshake);
 
             hs.read_message_2(message)?;
 
@@ -766,7 +773,11 @@ impl PeerMachine {
     pub(crate) fn take_session(&mut self) -> Option<NoiseSession> {
         // The session exists iff the handshake reached `Complete`, so taking it
         // unconditionally is byte-equivalent to the old `== Complete` gate.
-        self.leg.as_mut().and_then(|leg| leg.noise_session.take())
+        // The slot is cleared as the session leaves, so its two traffic keys
+        // do not stay behind in the machine.
+        self.leg
+            .as_mut()
+            .and_then(|leg| noise::take_cleared(&mut leg.noise_session))
     }
 
     /// Check if we have a completed session ready to take.

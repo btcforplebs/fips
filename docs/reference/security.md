@@ -96,17 +96,23 @@ Noise handshake holds, the chaining key and handshake hash, the
 per-message Diffie-Hellman results, the key-derivation outputs and the
 two session keys derived from them, the retained key on each cipher
 state, the bech32 and hex encodings of a secret, and the configuration
-text that carries `node.identity.nsec`. A completed session keeps its
+text that carries `node.identity.nsec`. The SHA-256 state that hashes
+each Diffie-Hellman result and the HMAC states inside HKDF clear
+themselves on drop, through the opt-in `zeroize` features of `sha2`
+and `hmac`, which the daemon turns on. A completed session keeps its
 own copy of the handshake hash and does not clear it, on purpose:
 nothing derives a key from it, and the session hands it out to any
 caller.
 
-Each erase is a volatile write followed by a compiler fence, so the
-optimiser cannot remove it as a dead store. This was checked against
-generated code rather than assumed: in an x86_64 release build (Rust
-1.94.1, `secp256k1` 0.30.0, `zeroize` 1.9.0), every erase in the Noise
-handshake and identity code that is linked into the daemon is present
-as stores in the machine code.
+Each erase is a volatile write, and the optimiser does not remove a
+volatile write as a dead store. `secp256k1`'s erase follows the write
+with a compiler fence, and `zeroize`'s with an optimisation barrier (an
+empty `asm!` block on x86_64); those limit how the compiler may reorder
+code around the write, but it is the volatile write that keeps the
+store. This was checked against generated code rather than assumed: in
+an x86_64 release build (Rust 1.94.1, `secp256k1` 0.30.0, `zeroize`
+1.9.0), every erase in the Noise handshake and identity code that is
+linked into the daemon is present as stores in the machine code.
 
 An erase reaches only the place it is called on. What it does not
 reach:
@@ -117,22 +123,25 @@ reach:
   dropped. Each of those moves leaves behind, in a stack frame that is
   no longer in use, a copy of the node's long-term private key and,
   once the handshake has started, of its ephemeral key and chaining
-  key. When a completed handshake is taken out of the connection slot
-  that held it, the slot keeps the handshake's full contents in heap
-  memory until that memory is reused. The session that comes out of
-  the handshake is left the same way: it is moved out of the handshake
-  and into the connection's session slot, and taking it out of that
-  slot leaves both of its traffic keys behind in heap memory.
+  key. Two moves out of the slots on a connection's control machine
+  are cleared: when a completed handshake leaves the slot that held it,
+  and when a session is taken out of its slot for a rekey, the slot is
+  overwritten as the value leaves. Other moves are not. When a
+  connection is promoted to an active peer, or reaped as stale, its
+  whole handshake state is moved off its control machine, which leaves
+  the session's two traffic keys, or an unfinished handshake's private
+  keys, in the heap memory the machine occupies.
+- **Loading the identity from a secret string.** Building the node's
+  identity from its key file or from `node.identity.nsec` leaves
+  copies of the private key, among them a whole intermediate identity,
+  in that constructor's stack frame, and they are not cleared.
 - **Registers and spilled temporaries**, which no code in the daemon
   can name.
-- **Library state.** The SHA-256 state that hashes each
-  Diffie-Hellman result and the HMAC states inside HKDF are not
-  cleared: `sha2` and `hmac` offer an opt-in `zeroize` feature that
-  clears them on drop, and the daemon does not enable it. The cipher
-  keys cached inside `ring`'s `LessSafeKey` have no clearing route. The
-  daemon cannot clear the internal temporaries of the `libsecp256k1` C
-  library either; the library clears some of its own, such as the
-  nonce and secret scalar used in signing, on a best-effort basis.
+- **Library state.** The cipher keys cached inside `ring`'s
+  `LessSafeKey` have no clearing route. The daemon cannot clear the
+  internal temporaries of the `libsecp256k1` C library either; the
+  library clears some of its own, such as the nonce and secret scalar
+  used in signing, on a best-effort basis.
 
 Clearing therefore shortens how long secret material stays in memory
 and removes it from the places the daemon's own code keeps it; it does
