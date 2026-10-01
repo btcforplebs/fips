@@ -123,7 +123,8 @@ per node-spec into `generated-configs/docker-compose.generated.yml`.
    with its ref + short SHA.
 5. Remove the temp worktree (done per-ref so peak disk stays at one worktree).
 
-It also writes `.build/refs.env`, recording each slot's ref and SHA. The
+It also writes `.build/refs.env`, recording each slot's ref and the short SHA
+of the commit it resolves to (an annotated tag is peeled to its commit). The
 driver reads it to know which pairs are mixed-version. (If absent, it falls
 back to the image labels.)
 
@@ -244,19 +245,20 @@ working copy at all.
 
 ## How to read the output
 
-The driver runs eight phases (0 to 7), plus 1b and 5b when data-plane
+The driver runs nine phases (0 to 8), plus 1b and 5b when data-plane
 streams are on:
 
 | Phase | Check                                                            |
 | ----- | ---------------------------------------------------------------- |
 | 0     | Bring up the mesh (+ optional netem).                            |
 | 1     | All nodes reach N-1 authenticated peers; all directed pairs ping over `fips0` (the definitive FSP-session check). |
-| 2     | First FMP rekey cutover completes within the timeout.            |
+| 2     | First FMP rekey cutover completes within the timeout (the count is role-blind: builds before v0.5.2 log a responder's cutover with the same line). |
 | 3     | All pairs still ping after the first rekey.                      |
 | 4     | Wait out a second rekey cycle.                                   |
 | 5     | All pairs still ping after the second rekey.                     |
 | 6     | Per-node / per-pair interop log analysis.                        |
-| 7     | Every node's mesh-size estimate within ±25% of N after warmup.   |
+| 7     | Every node's mesh-size estimate within ±25% of N after warmup, and every node lists all its direct peers in every poll round, warmup included (one isolated round in which a node cannot be asked is tolerated). |
+| 8     | Whole-run log health (the global negative checks below).         |
 
 When data-plane streams are on (`--topology`, or `FIPS_INTEROP_STREAMS`),
 Phase 1b measures stream loss over a quiet control window and Phase 5b
@@ -270,12 +272,16 @@ many reps Phase 5b abstained and in how many it re-measured.
 
 Phase 6 is the interop-specific part. It reports:
 
-- **Global health** — panics, `ERROR` lines, `unknown FMP version` drops,
-  link teardowns, decrypt failures, handshake failures, rekey-msg2 failures.
-  Any non-zero count is broken down per node, attributed to a specific build.
 - **Rekey machinery exercised** — both FMP and FSP rekey cutovers fired.
 - **Per-pair interop summary** — each unordered pair, classified
-  same-version vs MIXED, with whether it stayed healthy through the run.
+  same-version vs MIXED, with whether it stayed healthy through Phase 6.
+
+Phase 8 runs the global health checks last, so they cover the whole run,
+the Phase 7 warmup included: panics, `ERROR` lines, `unknown FMP version`
+drops, link teardowns (`MMP link teardown`, which the generated config
+makes visible by setting `fips::node::handlers::mmp` to debug), decrypt
+failures, handshake failures, rekey-msg2 failures. Any non-zero count is
+broken down per node, attributed to a specific build.
 
 The final verdict lists every failure attributed to a specific
 `x[ref@sha] <-> y[ref@sha]` pair or build, then states the attribution:
