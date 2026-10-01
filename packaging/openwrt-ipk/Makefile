@@ -38,7 +38,10 @@ else ifeq ($(ARCH),arm)
   # OpenWrt ARM targets predominantly use hardfloat ABI.
   # Override RUST_TARGET in your build if your target uses softfloat.
   RUST_TARGET:=arm-unknown-linux-musleabihf
-else
+else ifeq ($(DUMP),)
+  # Not while OpenWrt scans package metadata (DUMP=1): the scan does not read
+  # the target config, so ARCH is empty then, and stopping here would leave the
+  # package out of the build entirely.
   $(error Unsupported architecture: $(ARCH). Add a RUST_TARGET mapping in packaging/openwrt-ipk/Makefile.)
 endif
 
@@ -107,7 +110,8 @@ define Package/fips/install
 	$(INSTALL_BIN) $(CURDIR)/files/etc/init.d/fips $(1)/etc/init.d/fips
 	$(INSTALL_BIN) $(CURDIR)/files/etc/init.d/fips-gateway $(1)/etc/init.d/fips-gateway
 
-	# Default config — installed as CONF so opkg will not overwrite it on upgrade
+	# Default config, mode 0600. Package/fips/conffiles below is what keeps an
+	# edited copy across an upgrade.
 	$(INSTALL_DIR) $(1)/etc/fips
 	$(INSTALL_CONF) $(CURDIR)/files/etc/fips/fips.yaml $(1)/etc/fips/fips.yaml
 
@@ -130,6 +134,28 @@ define Package/fips/install
 	# sysupgrade: preserve /etc/fips/ (config + identity key) across firmware upgrades
 	$(INSTALL_DIR) $(1)/lib/upgrade/keep.d
 	$(INSTALL_DATA) $(CURDIR)/files/lib/upgrade/keep.d/fips $(1)/lib/upgrade/keep.d/fips
+endef
+
+# A user's edits to the config survive an upgrade.
+define Package/fips/conffiles
+/etc/fips/fips.yaml
+endef
+
+# Maintainer scripts, read from scripts/ so this package runs the same
+# postinst and prerm bodies that build-ipk.sh and build-apk.sh install. OpenWrt
+# wraps those two in its generated scripts, around default_postinst and
+# default_prerm. The preinst is used only here: it keeps fips-gateway disabled
+# and stopped through default_postinst's enable-and-start loop.
+define Package/fips/preinst
+$(file < $(CURDIR)/scripts/preinst)
+endef
+
+define Package/fips/postinst
+$(file < $(CURDIR)/scripts/postinst)
+endef
+
+define Package/fips/prerm
+$(file < $(CURDIR)/scripts/prerm)
 endef
 
 $(eval $(call BuildPackage,fips))

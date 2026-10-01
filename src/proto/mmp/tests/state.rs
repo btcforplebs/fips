@@ -783,3 +783,37 @@ fn test_gap_tracker_saturates_when_advancing_onto_the_ceiling_counter() {
         "a saturated expectation must not keep opening bursts"
     );
 }
+
+/// Why a previous-session ReceiverReport must not reach the metrics after a
+/// rekey: the reset leaves no baseline, so a report about the old session's
+/// high counters is accepted as the first one, and every report on the new
+/// session then reads as regressed against it until the new session's
+/// counters pass the old ones. This pins the mechanism the data plane guards
+/// against by dropping such reports; it is not a red-first test of that fix,
+/// which lives in the node-level rekey tests.
+#[test]
+fn a_report_about_the_old_session_after_a_rekey_reset_rejects_the_new_sessions_reports() {
+    let mut m = MmpMetrics::new();
+    m.process_receiver_report(&make_rr(1_000, 1_000, 100_000, 1_000, 0, 0), 1_050, 0);
+    m.reset_for_rekey();
+    assert_eq!(m.rr_counters(), None, "the reset clears the baseline");
+
+    // A report the peer sent about the old session, arriving after the reset.
+    m.process_receiver_report(&make_rr(1_200, 1_200, 120_000, 1_100, 0, 0), 1_150, 1_000);
+    assert_eq!(m.rr_counters().map(|(h, _, _)| h), Some(1_200));
+
+    // The new session's reports start from small counters and are refused.
+    m.process_receiver_report(&make_rr(10, 10, 1_000, 1_200, 0, 0), 1_250, 2_000);
+    assert_eq!(
+        m.rr_counters().map(|(h, _, _)| h),
+        Some(1_200),
+        "the new session's report is rejected as regressed"
+    );
+
+    // Without the old-session report, the same new-session report is taken.
+    let mut m = MmpMetrics::new();
+    m.process_receiver_report(&make_rr(1_000, 1_000, 100_000, 1_000, 0, 0), 1_050, 0);
+    m.reset_for_rekey();
+    m.process_receiver_report(&make_rr(10, 10, 1_000, 1_200, 0, 0), 1_250, 2_000);
+    assert_eq!(m.rr_counters().map(|(h, _, _)| h), Some(10));
+}

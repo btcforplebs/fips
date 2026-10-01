@@ -9,8 +9,8 @@
 //! `swap(0)`, so there are no "previous value" arrays to carry and the counters
 //! are per-interval by construction.
 
+use portable_atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::LazyLock;
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
 /// Measurement domain. Structural only: one variant today.

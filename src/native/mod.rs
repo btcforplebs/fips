@@ -81,11 +81,12 @@ mod unix_impl {
     use crate::config::NativeApiConfig;
     use crate::control::protocol::{Request, Response};
     use crate::identity::{NodeAddr, decode_npub, encode_npub};
+    use portable_atomic::AtomicU64;
     use secp256k1::XOnlyPublicKey;
     use std::collections::HashMap;
     use std::os::fd::{AsFd, OwnedFd};
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use tokio::io::BufReader;
     use tokio::net::{UnixListener, UnixStream};

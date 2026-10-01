@@ -694,6 +694,23 @@ impl Node {
                         self.config().node.session.idle_timeout_secs * 1000,
                     );
 
+                // A handshake the peer armed is held until its msg3 or its
+                // timeout. Once the peer has read our SessionAck it holds the
+                // new keys, so this handshake is the only one its msg3 can
+                // complete, and discarding it for an unauthenticated setup
+                // splits the session's epochs. A genuine retry that meets a
+                // stale handshake here completes one handshake timeout
+                // later, once the handshake has expired.
+                if rekey_in_progress && !existing.is_rekey_initiator() {
+                    debug!(
+                        src = %self.peer_display_name(src_addr),
+                        "FSP rekey msg1 received while the peer's handshake awaits msg3, dropping"
+                    );
+                    self.stats_mut()
+                        .record_reject(RejectReason::Session(SessionReject::RekeyHeld));
+                    return;
+                }
+
                 // Dual-initiation detection: both sides sent SessionSetup
                 // simultaneously. Apply the smaller-NodeAddr tie-breaker so
                 // both sides converge on a single Noise session.
@@ -710,22 +727,16 @@ impl Node {
                             .record_reject(RejectReason::Session(SessionReject::RekeyTiebreak));
                         return;
                     }
-                    // We lose — abandon the armed handshake, become responder
-                    // below.
+                    // We lose — abandon our armed handshake, become
+                    // responder below.
                     //
-                    // `abandon_handshake`, not `abandon_rekey`: the gate
-                    // above is `has_rekey_in_progress`, which says only that
-                    // *some* handshake is armed, not that we armed it. A
-                    // handshake the peer armed carries `rekey_initiator ==
-                    // false` and can sit beside a completed epoch that a
-                    // stale `pending_outranks` no longer vetoes, so a
-                    // stranger reaches this line with two unauthenticated
-                    // setup messages: one to arm the handshake, one to lose
-                    // the tie-break against it. Dropping the pending session
-                    // there kills the epoch the peer may already have cut
-                    // over to. Only the handshake is ours to discard, and
-                    // discarding it costs nothing, since an armed handshake
-                    // holds no key material either endpoint is using.
+                    // `abandon_handshake`, not `abandon_rekey`, although the
+                    // arm above leaves only handshakes this node initiated,
+                    // and an initiator handshake never sits beside a pending
+                    // session (see the SessionAck handler). Only the handshake
+                    // is ours to discard, and discarding it costs nothing:
+                    // the peer has not answered it, so it holds no key
+                    // material either endpoint is using.
                     info!(
                         src = %self.peer_display_name(src_addr),
                         our_addr = %self.identity().node_addr(),

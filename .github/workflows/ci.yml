@@ -77,6 +77,8 @@ jobs:
         run: bash testing/check-action-pins.sh
       - name: Check every source comment resolves in-repo
         run: bash testing/check-comment-refs.sh
+      - name: Check no non-test code uses std 64-bit atomics
+        run: python3 testing/check-portable-atomics.py
       # Hermetic: synthetic ping functions, no containers, ~45s. Lives beside
       # the other two so both runners gate on it identically — putting it in
       # only one would create exactly the drift check-ci-parity.sh exists to
@@ -89,6 +91,10 @@ jobs:
       # step with ci-local.sh's run_deb_version by hand.
       - name: Check the Debian version derived for tags and branches
         run: bash testing/check-deb-version.sh
+      # The unit-test jobs' flaky-test reporter, against recorded nextest
+      # reports. Kept in step with ci-local.sh's run_nextest_flaky by hand.
+      - name: Check the flaky-test reporter against its fixtures
+        run: bash testing/nextest-flaky/test.sh
 
   fmt:
     name: Format check
@@ -338,9 +344,25 @@ jobs:
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
 
+      # The cache restores target/, including the previous run's report. Remove
+      # it so the flaky-test check below reads only this run's, and reports a
+      # missing one when nextest wrote none.
+      - name: Remove a cached nextest report
+        shell: bash
+        run: rm -f target/nextest/ci/junit.xml
 
       - name: Run unit tests
         run: cargo nextest run --all --profile ci
+
+      # The ci profile retries a failing test, so a test that passed only on
+      # retry leaves the job green. Annotate each one, and list it in the run
+      # summary, so a flake is seen without failing an unrelated run. The
+      # Linux job's two junit reporters ignore nextest's <flakyFailure>
+      # elements, and the macOS and Windows jobs have no reporter at all.
+      - name: Report tests that passed only on retry
+        if: success() || failure()
+        shell: bash
+        run: bash testing/check-nextest-flaky.sh target/nextest/ci/junit.xml
 
       # The bind-success half. Every other unit-test leg runs unprivileged, so
       # `PacketSocket::open` cannot succeed on any of them and everything past
@@ -460,8 +482,25 @@ jobs:
           # one fails when the fixture is missing instead of skipping silently.
           echo "FIPS_TEST_REQUIRE_FIXTURES=1" >> "$GITHUB_ENV"
 
+      # The cache restores target/, including the previous run's report. Remove
+      # it so the flaky-test check below reads only this run's, and reports a
+      # missing one when nextest wrote none.
+      - name: Remove a cached nextest report
+        shell: bash
+        run: rm -f target/nextest/ci/junit.xml
+
       - name: Run unit tests
         run: cargo nextest run --all --profile ci
+
+      # The ci profile retries a failing test, so a test that passed only on
+      # retry leaves the job green. Annotate each one, and list it in the run
+      # summary, so a flake is seen without failing an unrelated run. The
+      # Linux job's two junit reporters ignore nextest's <flakyFailure>
+      # elements, and the macOS and Windows jobs have no reporter at all.
+      - name: Report tests that passed only on retry
+        if: success() || failure()
+        shell: bash
+        run: bash testing/check-nextest-flaky.sh target/nextest/ci/junit.xml
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Job 2bb – Unit tests (musl)
@@ -574,9 +613,25 @@ jobs:
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
 
+      # The cache restores target/, including the previous run's report. Remove
+      # it so the flaky-test check below reads only this run's, and reports a
+      # missing one when nextest wrote none.
+      - name: Remove a cached nextest report
+        shell: bash
+        run: rm -f target/nextest/ci/junit.xml
 
       - name: Run unit tests
         run: cargo nextest run --all --profile ci
+
+      # The ci profile retries a failing test, so a test that passed only on
+      # retry leaves the job green. Annotate each one, and list it in the run
+      # summary, so a flake is seen without failing an unrelated run. The
+      # Linux job's two junit reporters ignore nextest's <flakyFailure>
+      # elements, and the macOS and Windows jobs have no reporter at all.
+      - name: Report tests that passed only on retry
+        if: success() || failure()
+        shell: bash
+        run: bash testing/check-nextest-flaky.sh target/nextest/ci/junit.xml
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Job 2d – PowerShell lint (Windows packaging scripts)
@@ -762,6 +817,11 @@ jobs:
           # per-distro images and no TUN. ~2-3 min.
           - suite: native-api
             type: native-api
+          # mDNS LAN discovery: two daemons on a user-defined bridge with LAN
+          # rendezvous on and no configured peers, which must find and peer
+          # with each other by mDNS alone. Seconds when healthy.
+          - suite: mdns
+            type: mdns
 
           # Moves a multi-homed node's default route between two live paths
           # while mesh traffic is in flight, and asserts the peering survives
@@ -1027,6 +1087,17 @@ jobs:
           docker ps -a --filter "name=fips-native" --format '{{.Names}}' | while read -r c; do
             docker rm -f "$c" >/dev/null 2>&1 || true
           done
+
+      # ── mDNS LAN discovery ──────────────────────────────────────────────
+      # Reads FIPS_TEST_IMAGE, so it runs against the image this workflow
+      # built. Creates and removes its own docker network; the harness prints
+      # both nodes' discovery log lines itself when a check fails.
+      - name: Run mDNS LAN discovery test
+        if: matrix.type == 'mdns'
+        timeout-minutes: 10
+        env:
+          FIPS_TEST_IMAGE: fips-test:latest
+        run: bash testing/mdns/test.sh
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Job 4 – The .deb the install suite installs

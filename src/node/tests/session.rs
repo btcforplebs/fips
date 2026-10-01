@@ -1444,6 +1444,412 @@ async fn pump_until_quiet(nodes: &mut [TestNode]) {
     }
 }
 
+/// A two-node pair with an FSP session over an FMP link whose link sessions
+/// have been aged, with a TUN receiver on each node. Built by
+/// [`aged_link_pair`].
+struct AgedLinkPair {
+    nodes: Vec<TestNode>,
+    node0_addr: NodeAddr,
+    node1_addr: NodeAddr,
+    fips0: crate::FipsAddress,
+    fips1: crate::FipsAddress,
+    tun0_rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    tun1_rx: std::sync::mpsc::Receiver<Vec<u8>>,
+}
+
+/// Build a two-node pair from `cfg0` and `cfg1`, peer node 0 to node 1 over
+/// FMP, open an FSP session from node 0, show that both directions decode,
+/// then backdate both link sessions by `age`.
+async fn aged_link_pair(
+    cfg0: crate::config::Config,
+    cfg1: crate::config::Config,
+    age: Duration,
+) -> AgedLinkPair {
+    let mut nodes = vec![
+        make_test_node_with_config(cfg0, 1280).await,
+        make_test_node_with_config(cfg1, 1280).await,
+    ];
+
+    // FMP peering + FSP session between the two loopback nodes.
+    initiate_handshake(&mut nodes, 0, 1).await;
+    drain_all_packets(&mut nodes, false).await;
+    let node0_addr = *nodes[0].node.node_addr();
+    let node1_addr = *nodes[1].node.node_addr();
+    assert!(nodes[0].node.get_peer(&node1_addr).is_some());
+    assert!(nodes[1].node.get_peer(&node0_addr).is_some());
+    populate_all_coord_caches(&mut nodes);
+
+    let node1_pubkey = nodes[1].node.identity().pubkey_full();
+    nodes[0]
+        .node
+        .initiate_session(node1_addr, node1_pubkey)
+        .await
+        .unwrap();
+    for _ in 0..4 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        process_available_packets(&mut nodes).await;
+    }
+    for (i, remote) in [(0, node1_addr), (1, node0_addr)] {
+        assert!(
+            nodes[i]
+                .node
+                .get_session(&remote)
+                .is_some_and(|s| s.state().is_established()),
+            "node {i} session established"
+        );
+    }
+
+    // Each node's TUN receiver observes the plaintext the other one sent.
+    let (tun0_tx, tun0_rx) = std::sync::mpsc::channel();
+    nodes[0].node.supervisor.tun_tx = Some(tun0_tx);
+    let (tun1_tx, tun1_rx) = std::sync::mpsc::channel();
+    nodes[1].node.supervisor.tun_tx = Some(tun1_tx);
+    let fips0 = crate::FipsAddress::from_node_addr(&node0_addr);
+    let fips1 = crate::FipsAddress::from_node_addr(&node1_addr);
+
+    // Baseline: both directions decode before the caller's scenario, so a
+    // later failure is the scenario's and not the harness's.
+    let pre_fwd = build_ipv6_packet(&fips0, &fips1, b"pre-rekey 0 to 1");
+    let pre_rev = build_ipv6_packet(&fips1, &fips0, b"pre-rekey 1 to 0");
+    nodes[0].node.handle_tun_outbound(pre_fwd.clone()).await;
+    nodes[1].node.handle_tun_outbound(pre_rev.clone()).await;
+    pump_until_quiet(&mut nodes).await;
+    let got: Vec<Vec<u8>> = std::iter::from_fn(|| tun1_rx.try_recv().ok()).collect();
+    assert_eq!(got, vec![pre_fwd], "baseline node 0 to node 1 must decode");
+    let got: Vec<Vec<u8>> = std::iter::from_fn(|| tun0_rx.try_recv().ok()).collect();
+    assert_eq!(got, vec![pre_rev], "baseline node 1 to node 0 must decode");
+
+    // Age both link sessions.
+    nodes[0]
+        .node
+        .get_peer_mut(&node1_addr)
+        .unwrap()
+        .test_backdate_session_established(age);
+    nodes[1]
+        .node
+        .get_peer_mut(&node0_addr)
+        .unwrap()
+        .test_backdate_session_established(age);
+
+    AgedLinkPair {
+        nodes,
+        node0_addr,
+        node1_addr,
+        fips0,
+        fips1,
+        tun0_rx,
+        tun1_rx,
+    }
+}
+
+/// A two-node pair whose FMP link rekey node 0 has completed and cut over to,
+/// while node 0's msg3 is held back from node 1, which is therefore still on
+/// the old link session. Built by [`rekey_pair_cut_over_with_held_msg3`].
+struct HeldMsg3Pair {
+    nodes: Vec<TestNode>,
+    node0_addr: NodeAddr,
+    node1_addr: NodeAddr,
+    fips0: crate::FipsAddress,
+    fips1: crate::FipsAddress,
+    tun0_rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    tun1_rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    node0_idx_before: Option<crate::utils::index::SessionIndex>,
+    node1_idx_before: Option<crate::utils::index::SessionIndex>,
+    held_msg3: crate::transport::ReceivedPacket,
+}
+
+/// Build a two-node pair with an FSP session, age both link sessions past
+/// node 0's rekey trigger, and run node 0's FMP rekey through msg1 and msg2.
+/// node 0's msg3 is pulled out of node 1's queue, and node 0 then cuts over
+/// to its new session on its own tick, so node 0 is on the new link session
+/// and node 1 is still on the old one when this returns.
+async fn rekey_pair_cut_over_with_held_msg3() -> HeldMsg3Pair {
+    use crate::proto::fmp::wire::{CommonPrefix, PHASE_MSG3};
+    use crate::transport::ReceivedPacket;
+
+    const REKEY_AFTER_SECS: u64 = 60;
+
+    // node 0 rekeys on time; node 1 only ever responds.
+    let mut cfg0 = crate::config::Config::new();
+    cfg0.node.rekey.enabled = true;
+    cfg0.node.rekey.after_secs = REKEY_AFTER_SECS;
+    cfg0.node.rekey.after_messages = u64::MAX;
+    let mut cfg1 = crate::config::Config::new();
+    cfg1.node.rekey.enabled = true;
+    cfg1.node.rekey.after_secs = u64::MAX;
+    cfg1.node.rekey.after_messages = u64::MAX;
+
+    let age = Duration::from_secs(REKEY_AFTER_SECS + crate::node::REKEY_JITTER_SECS as u64 + 1);
+    let AgedLinkPair {
+        mut nodes,
+        node0_addr,
+        node1_addr,
+        fips0,
+        fips1,
+        tun0_rx,
+        tun1_rx,
+    } = aged_link_pair(cfg0, cfg1, age).await;
+    let node0_idx_before = nodes[0].node.get_peer(&node1_addr).unwrap().our_index();
+    let node1_idx_before = nodes[1].node.get_peer(&node0_addr).unwrap().our_index();
+
+    // node 0 starts the rekey; node 1 answers its msg1 with msg2.
+    nodes[0].node.check_rekey().await;
+    assert!(
+        nodes[0]
+            .node
+            .get_peer(&node1_addr)
+            .unwrap()
+            .rekey_in_progress(),
+        "node 0 must have started a rekey"
+    );
+    assert_eq!(
+        process_available_packets(&mut nodes[1..]).await,
+        1,
+        "node 1 must have exactly node 0's rekey msg1 queued"
+    );
+
+    // node 0 reads the msg2, holds the new session as pending and sends msg3.
+    assert_eq!(
+        process_available_packets(&mut nodes[..1]).await,
+        1,
+        "node 0 must have exactly node 1's msg2 queued"
+    );
+    assert!(
+        nodes[0]
+            .node
+            .get_peer(&node1_addr)
+            .unwrap()
+            .pending_new_session()
+            .is_some(),
+        "node 0 must hold the new session once it has read msg2"
+    );
+
+    // Hold node 0's msg3 back from node 1.
+    let mut held: Vec<ReceivedPacket> =
+        std::iter::from_fn(|| nodes[1].packet_rx.try_recv().ok()).collect();
+    assert_eq!(held.len(), 1, "node 1 must have only node 0's msg3 queued");
+    let held_msg3 = held.remove(0);
+    assert_eq!(
+        CommonPrefix::parse(&held_msg3.data).map(|p| p.phase),
+        Some(PHASE_MSG3),
+        "the held packet must be node 0's msg3"
+    );
+
+    // node 0 cuts over on its own tick.
+    nodes[0].node.check_rekey().await;
+    let peer = nodes[0].node.get_peer(&node1_addr).unwrap();
+    assert_ne!(peer.our_index(), node0_idx_before, "node 0 must cut over");
+    assert_eq!(
+        nodes[1].node.get_peer(&node0_addr).unwrap().our_index(),
+        node1_idx_before,
+        "node 1 must still be on the old session"
+    );
+
+    HeldMsg3Pair {
+        nodes,
+        node0_addr,
+        node1_addr,
+        fips0,
+        fips1,
+        tun0_rx,
+        tun1_rx,
+        node0_idx_before,
+        node1_idx_before,
+        held_msg3,
+    }
+}
+
+/// A ReceiverReport about `highest` frames, as the link-layer message a peer
+/// sends: the type byte followed by the body.
+fn receiver_report_message(highest: u64) -> Vec<u8> {
+    crate::proto::mmp::ReceiverReport {
+        highest_counter: highest,
+        cumulative_packets_recv: highest,
+        cumulative_bytes_recv: highest * 100,
+        timestamp_echo: 0,
+        dwell_time: 0,
+        jitter: 0,
+        ecn_ce_count: 0,
+        owd_trend: 0,
+        burst_loss_count: 0,
+        cumulative_reorder_count: 0,
+    }
+    .encode()
+}
+
+/// A link rekey initiator that has cut over keeps its new session's MMP state
+/// free of frames the responder sealed on the old session.
+///
+/// node 0 cuts over and resets its MMP receiver and metrics. node 1 has not
+/// yet received msg3, so it still sends on the old session, and node 0
+/// decrypts those frames against its previous session during the drain.
+/// Their payload is still delivered, but they describe the old session: a
+/// data frame's counter must not become the new session's highest counter,
+/// which would make every new-session frame count as a reorder, and a
+/// ReceiverReport about node 0's old-session traffic must not become the
+/// baseline later reports are judged against, which would reject every
+/// new-session report as regressed. Once node 1 completes and promotes, its
+/// frames and reports on the new session are counted and accepted.
+#[tokio::test]
+async fn frames_on_the_previous_link_session_do_not_feed_the_new_sessions_mmp() {
+    let HeldMsg3Pair {
+        mut nodes,
+        node0_addr,
+        node1_addr,
+        fips0,
+        fips1,
+        tun0_rx,
+        tun1_rx,
+        node1_idx_before,
+        held_msg3,
+        ..
+    } = rekey_pair_cut_over_with_held_msg3().await;
+
+    let mmp = nodes[0]
+        .node
+        .get_peer(&node1_addr)
+        .unwrap()
+        .mmp()
+        .expect("node 0 must run link MMP");
+    assert_eq!(mmp.receiver.highest_counter(), 0, "the cutover resets MMP");
+    assert_eq!(mmp.metrics.rr_counters(), None, "the cutover resets MMP");
+    let reports_before = mmp.metrics.reports_seen();
+
+    // node 1, still on the old session, sends data and then a report about
+    // node 0's old-session traffic. Only node 0's queue is delivered.
+    let old_rev = build_ipv6_packet(&fips1, &fips0, b"old session 1 to 0");
+    nodes[1].node.handle_tun_outbound(old_rev.clone()).await;
+    nodes[1]
+        .node
+        .send_encrypted_link_message(&node0_addr, &receiver_report_message(1_000))
+        .await
+        .unwrap();
+    for _ in 0..3 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        process_available_packets(&mut nodes[..1]).await;
+    }
+
+    let got: Vec<Vec<u8>> = std::iter::from_fn(|| tun0_rx.try_recv().ok()).collect();
+    assert_eq!(
+        got,
+        vec![old_rev],
+        "an old-session frame's payload must still be delivered"
+    );
+    let mmp = nodes[0].node.get_peer(&node1_addr).unwrap().mmp().unwrap();
+    assert_eq!(
+        mmp.metrics.reports_seen(),
+        reports_before,
+        "an old-session ReceiverReport must not reach the new session's metrics"
+    );
+    assert_eq!(mmp.metrics.rr_counters(), None);
+    assert_eq!(
+        mmp.receiver.highest_counter(),
+        0,
+        "an old-session frame's counter must not become the new session's highest"
+    );
+
+    // node 1 completes the rekey on the held msg3, and node 0's first
+    // new-epoch frame promotes it; node 1's frames and reports on the new
+    // session then feed node 0's MMP.
+    nodes[1].node.handle_msg3(held_msg3).await;
+    let new_fwd = build_ipv6_packet(&fips0, &fips1, b"new session 0 to 1");
+    nodes[0].node.handle_tun_outbound(new_fwd.clone()).await;
+    pump_until_quiet(&mut nodes).await;
+    let got: Vec<Vec<u8>> = std::iter::from_fn(|| tun1_rx.try_recv().ok()).collect();
+    assert_eq!(got, vec![new_fwd]);
+    assert_ne!(
+        nodes[1].node.get_peer(&node0_addr).unwrap().our_index(),
+        node1_idx_before,
+        "node 1 must promote on node 0's first new-epoch frame"
+    );
+    let new_rev = build_ipv6_packet(&fips1, &fips0, b"new session 1 to 0");
+    nodes[1].node.handle_tun_outbound(new_rev.clone()).await;
+    nodes[1]
+        .node
+        .send_encrypted_link_message(&node0_addr, &receiver_report_message(5))
+        .await
+        .unwrap();
+    pump_until_quiet(&mut nodes).await;
+    let got: Vec<Vec<u8>> = std::iter::from_fn(|| tun0_rx.try_recv().ok()).collect();
+    assert_eq!(got, vec![new_rev]);
+    let mmp = nodes[0].node.get_peer(&node1_addr).unwrap().mmp().unwrap();
+    assert!(
+        mmp.receiver.highest_counter() > 0,
+        "new-session frames must be counted"
+    );
+    assert_eq!(
+        mmp.metrics.rr_counters().map(|(highest, _, _)| highest),
+        Some(5),
+        "a new-session ReceiverReport must be accepted"
+    );
+
+    cleanup_nodes(&mut nodes).await;
+}
+
+/// The decrypt-worker path tells the sessions apart too. A frame the worker
+/// decrypted under the previous session's index, bounced back after the
+/// cutover, does not feed the new session's MMP; the same frame under the
+/// current session's index does.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_worker_decrypted_frame_on_the_previous_link_session_does_not_feed_mmp() {
+    use crate::node::decrypt_worker::DecryptFallback;
+
+    let HeldMsg3Pair {
+        mut nodes,
+        node1_addr,
+        node0_idx_before,
+        ..
+    } = rekey_pair_cut_over_with_held_msg3().await;
+    let peer = nodes[0].node.get_peer(&node1_addr).unwrap();
+    let previous_idx = peer.previous_our_index().expect("node 0 must be draining");
+    assert_eq!(Some(previous_idx), node0_idx_before);
+    let current_idx = peer.our_index().expect("node 0 must have cut over");
+
+    // A bounced worker plaintext: the 4-byte session timestamp, then a
+    // ReceiverReport about 1000 frames.
+    let (transport_id, remote_addr) = (nodes[0].transport_id, nodes[1].addr.clone());
+    let bounce = |receiver_idx: u32, counter: u64| {
+        let mut data = 0u32.to_le_bytes().to_vec();
+        data.extend(receiver_report_message(1_000));
+        DecryptFallback {
+            source_node_addr: node1_addr,
+            transport_id,
+            remote_addr: remote_addr.clone(),
+            timestamp_ms: Node::now_ms(),
+            packet_len: data.len() + 32,
+            receiver_idx,
+            fmp_counter: counter,
+            fmp_flags: 0,
+            fmp_plaintext_len: data.len(),
+            packet_data: data,
+            fmp_plaintext_offset: 0,
+        }
+    };
+
+    let previous = bounce(previous_idx.as_u32(), 900);
+    nodes[0].node.process_decrypt_fallback(previous).await;
+    let mmp = nodes[0].node.get_peer(&node1_addr).unwrap().mmp().unwrap();
+    assert_eq!(
+        mmp.receiver.highest_counter(),
+        0,
+        "a previous-session frame's counter must not be counted"
+    );
+    assert_eq!(
+        mmp.metrics.rr_counters(),
+        None,
+        "a previous-session ReceiverReport must not be processed"
+    );
+
+    let current = bounce(current_idx.as_u32(), 1);
+    nodes[0].node.process_decrypt_fallback(current).await;
+    let mmp = nodes[0].node.get_peer(&node1_addr).unwrap().mmp().unwrap();
+    assert_eq!(mmp.receiver.highest_counter(), 1);
+    assert_eq!(mmp.metrics.rr_counters().map(|(h, _, _)| h), Some(1_000));
+
+    cleanup_nodes(&mut nodes).await;
+}
+
 #[tokio::test]
 async fn test_tun_outbound_triggers_session_initiation() {
     // Two connected nodes, no session yet.
@@ -6747,25 +7153,23 @@ async fn test_setup_naming_a_peer_whose_address_sorts_below_ours_yields_our_reke
 }
 
 #[tokio::test]
-async fn test_losing_the_tiebreak_against_a_peer_armed_handshake_keeps_the_completed_epoch() {
+async fn test_a_setup_against_a_peer_armed_handshake_is_dropped_and_keeps_the_handshake_and_the_completed_epoch()
+ {
     let mut config = Config::new();
     config.node.rekey.enabled = false;
     let mut node = make_node_with(config);
 
-    // Our address sorts larger, so the second setup loses the tie-break.
-    // Which side of it a given pair lands on is fixed by the two addresses,
-    // not chosen by the sender, so this is half of all peers rather than
-    // something an attacker selects.
+    // Our address sorts larger, which is the end that used to yield: the
+    // tie-break would make us the responder to the second setup.
     let peer = peer_identity_sorting_below(node.node_addr());
     let peer_addr = install_established_peer(&mut node, &peer);
 
-    // What a first forged setup leaves: a handshake the *stranger* armed,
-    // beside a completed epoch too stale for `pending_outranks` to veto. The
-    // tie-break arm gates on `has_rekey_in_progress`, which this satisfies,
-    // so a second forged setup reaches the yield with a pending session
-    // present. Nothing here required us to be the rekey initiator.
+    // What a first setup leaves: a handshake the sender armed, beside a
+    // completed epoch too stale for `pending_outranks` to veto, so only the
+    // armed handshake stands between a second setup and the arming path.
     let stranger = Identity::generate();
-    arm_stranger_handshake_beside_stale_pending(&mut node, &peer_addr, &peer, &stranger);
+    let valid_msg3 =
+        arm_stranger_handshake_beside_stale_pending(&mut node, &peer_addr, &peer, &stranger);
     assert!(
         !node.sessions.get(&peer_addr).unwrap().is_rekey_initiator(),
         "the state under test is a handshake we did not arm"
@@ -6775,26 +7179,37 @@ async fn test_losing_the_tiebreak_against_a_peer_armed_handshake_keeps_the_compl
     node.handle_session_payload(&peer_addr, &stub_link_peer(), &forged, 1280, false)
         .await;
 
-    let entry = node.sessions.get(&peer_addr).expect("session present");
+    let stats = &node.stats().session;
     assert_eq!(
-        node.stats().session.rekey_yielded,
-        1,
-        "the test must actually reach the yield arm, or it proves nothing"
+        stats.rekey_held, 1,
+        "a setup meeting a peer-armed handshake must be dropped and counted"
+    );
+    assert_eq!(
+        (stats.rekey_yielded, stats.rekey_tiebreak, stats.rekey_armed),
+        (0, 0, 0),
+        "the tie-break is for two initiators; nothing may yield or arm here"
+    );
+    let entry = node.sessions.get(&peer_addr).expect("session present");
+    assert!(
+        entry.pending_new_session().is_some() && entry.is_established(),
+        "the completed epoch and the running session must be left intact"
     );
     assert!(
-        entry.pending_new_session().is_some(),
-        "yielding a tie-break to an unauthenticated setup must not discard \
-         the key epoch the peer may already have cut over to; two forged \
-         setups would otherwise kill the reverse direction"
+        entry.has_rekey_in_progress() && !entry.is_rekey_initiator(),
+        "the handshake the peer armed must survive the setup, since a peer \
+         that read our SessionAck needs it for its msg3"
     );
-    assert!(
-        entry.is_established(),
-        "the running session must be left intact alongside the pending one"
-    );
-    assert!(
-        !entry.has_rekey_in_progress(),
-        "the handshake we yielded must still be abandoned"
-    );
+
+    // The kept handshake is the same one: its own msg3 still reads.
+    node.handle_session_payload(
+        &peer_addr,
+        &stub_link_peer(),
+        &SessionMsg3::new(valid_msg3).encode(),
+        1280,
+        false,
+    )
+    .await;
+    assert_eq!(node.stats().session.rekey_key_mismatch, 1);
 }
 
 #[tokio::test]
@@ -7332,19 +7747,19 @@ async fn test_a_rekey_whose_session_ack_was_lost_is_retired_after_the_handshake_
 ///
 /// Both nodes would rekey after one message; the initiator is picked at run
 /// time so that the responder holds the smaller address when
-/// `responder_wins`, and the larger otherwise. Only the initiator's tick is
-/// run before the responder has armed, after which the responder is
+/// `responder_smaller`, and the larger otherwise. Only the initiator's tick
+/// is run before the responder has armed, after which the responder is
 /// dampened and cannot start a rekey of its own inside the test.
 ///
-/// A responder that wins the tie-break drops the retry before arming
-/// anything, so both handshakes expire and the next retry completes one
-/// timeout later. A responder that loses yields and answers the retry at
-/// once.
-async fn lostack_retry(responder_wins: bool) {
+/// A responder holding a handshake its peer armed drops the retry before
+/// arming anything, at either address, since that handshake is the only one
+/// a peer that read the SessionAck could finish. Both handshakes then
+/// expire, and the next retry completes one timeout later.
+async fn lostack_retry(responder_smaller: bool) {
     let mut nodes = rekey_pair([true, true], Some(1)).await;
     let node0_smaller =
         crate::proto::fsp::initiation_winner(nodes[0].node.node_addr(), nodes[1].node.node_addr());
-    let resp = if responder_wins == node0_smaller {
+    let resp = if responder_smaller == node0_smaller {
         0
     } else {
         1
@@ -7389,56 +7804,52 @@ async fn lostack_retry(responder_wins: bool) {
     tokio::time::sleep(Duration::from_millis(20)).await;
     process_available_packets(&mut nodes[resp..=resp]).await;
     let stats = &nodes[resp].node.stats().session;
-    let (tiebreak, yielded) = (stats.rekey_tiebreak, stats.rekey_yielded);
     assert_eq!(
-        tiebreak + yielded,
-        1,
+        stats.rekey_held, 1,
         "the retry must have met the responder's stale handshake"
     );
-    if responder_wins {
-        assert_eq!(tiebreak, 1, "the smaller responder must win");
-    } else {
-        assert_eq!(yielded, 1, "the larger responder must yield");
-    }
+    assert_eq!(
+        (stats.rekey_tiebreak, stats.rekey_yielded),
+        (0, 0),
+        "a handshake the peer armed is not a dual initiation at either address"
+    );
     pump_all(&mut nodes).await;
 
-    if responder_wins {
-        assert!(
-            !holds_pending(&nodes[init], &resp_addr) && !holds_pending(&nodes[resp], &init_addr),
-            "a retry the responder dropped completes nothing"
-        );
-        tokio::time::sleep(Duration::from_millis(1200)).await;
-        nodes[resp].node.check_session_rekey().await;
-        assert_eq!(
-            nodes[resp].node.stats().session.rekey_expired,
-            1,
-            "the responder's stale handshake must expire on its own rule"
-        );
-        nodes[init].node.check_session_rekey().await;
-        assert!(
-            !nodes[init]
-                .node
-                .get_session(&resp_addr)
-                .unwrap()
-                .has_rekey_in_progress(),
-            "the retry the responder dropped must itself be retired"
-        );
-        nodes[init].node.check_session_rekey().await;
-        assert!(
-            rekey_initiated(&nodes[init], &resp_addr),
-            "the trigger must start a second retry"
-        );
-        pump_all(&mut nodes).await;
-    }
+    assert!(
+        !holds_pending(&nodes[init], &resp_addr) && !holds_pending(&nodes[resp], &init_addr),
+        "a retry the responder dropped completes nothing"
+    );
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    nodes[resp].node.check_session_rekey().await;
+    assert_eq!(
+        nodes[resp].node.stats().session.rekey_expired,
+        1,
+        "the responder's stale handshake must expire on its own rule"
+    );
+    nodes[init].node.check_session_rekey().await;
+    assert!(
+        !nodes[init]
+            .node
+            .get_session(&resp_addr)
+            .unwrap()
+            .has_rekey_in_progress(),
+        "the retry the responder dropped must itself be retired"
+    );
+    nodes[init].node.check_session_rekey().await;
+    assert!(
+        rekey_initiated(&nodes[init], &resp_addr),
+        "the trigger must start a second retry"
+    );
+    pump_all(&mut nodes).await;
 
     assert!(
         holds_pending(&nodes[init], &resp_addr) && holds_pending(&nodes[resp], &init_addr),
         "the retried rekey must complete on both nodes"
     );
-    // The first handshake always; the retry too when the responder dropped it.
+    // The first handshake and the retry the responder dropped.
     assert_eq!(
         nodes[init].node.stats().session.rekey_unanswered,
-        if responder_wins { 2 } else { 1 },
+        2,
         "every retired handshake must be counted once"
     );
     assert_eq!(nodes[resp].node.stats().session.rekey_unanswered, 0);
@@ -7454,11 +7865,254 @@ async fn test_a_retry_dropped_by_a_smaller_responders_stale_handshake_completes_
     lostack_retry(true).await;
 }
 
-/// A retry that a larger responder, still holding its stale handshake,
-/// yields to completes at once.
+/// A retry dropped by a larger responder still holding its stale handshake
+/// completes once both handshakes have expired, as at a smaller one: the
+/// larger end no longer yields a handshake its peer armed.
 #[tokio::test]
-async fn test_a_retry_that_a_larger_responder_yields_to_completes_at_once() {
+async fn test_a_retry_dropped_by_a_larger_responders_stale_handshake_completes_one_timeout_later() {
     lostack_retry(false).await;
+}
+
+// ============================================================================
+// Integration tests: a forgery inside a rekey responder's msg2-to-msg3 window
+// ============================================================================
+
+/// An unauthenticated message delivered to a rekey responder after the
+/// initiator has read its SessionAck and before the initiator's msg3 arrives.
+#[derive(Clone, Copy, Debug)]
+enum WindowForgery {
+    /// Nothing is forged: the control the other two are measured against.
+    Nothing,
+    /// A SessionSetup carrying a stranger's ephemeral under the initiator's
+    /// address, delivered at the larger address, where the dual-initiation
+    /// tie-break would yield to it.
+    Setup,
+}
+
+/// What a rekey left behind once a forgery may have reached its window.
+#[derive(Debug, PartialEq, Eq)]
+struct WindowOutcome {
+    /// The responder completed the handshake on the initiator's genuine msg3.
+    responder_completed: bool,
+    /// The initiator cut over on its liveness timer.
+    initiator_cut_over: bool,
+    /// A frame the initiator sent after its cutover and after its whole msg3
+    /// resend budget decoded at the responder.
+    initiator_to_responder: bool,
+    /// A frame the responder sent decoded at the initiator.
+    responder_to_initiator: bool,
+    /// After the responder's own next rekey, frames decode both ways.
+    next_cycle_carries_both_ways: bool,
+}
+
+/// The outcome of a rekey nothing interfered with.
+const WINDOW_HEALTHY: WindowOutcome = WindowOutcome {
+    responder_completed: true,
+    initiator_cut_over: true,
+    initiator_to_responder: true,
+    responder_to_initiator: true,
+    next_cycle_carries_both_ways: true,
+};
+
+/// Send one data frame from `nodes[from]` to `nodes[to]`, deliver it, and
+/// report whether it decoded at `nodes[to]`.
+async fn session_frame_decodes(nodes: &mut [TestNode], from: usize, to: usize) -> bool {
+    let from_addr = *nodes[from].node.node_addr();
+    let to_addr = *nodes[to].node.node_addr();
+    let received = |nodes: &[TestNode]| {
+        nodes[to]
+            .node
+            .get_session(&from_addr)
+            .expect("the session must survive")
+            .traffic_counters()
+            .1
+    };
+    let before = received(nodes);
+    nodes[from]
+        .node
+        .send_session_data(&to_addr, 0, 0, b"window forgery probe")
+        .await
+        .expect("send_session_data failed");
+    pump_all(nodes).await;
+    received(nodes) == before + 1
+}
+
+/// Cut `nodes[init]` over to the rekey it initiated by running its tick with
+/// the liveness timer already elapsed, and report whether it did.
+async fn cut_over_initiator(nodes: &mut [TestNode], init: usize, resp_addr: &NodeAddr) -> bool {
+    nodes[init]
+        .node
+        .sessions
+        .get_mut(resp_addr)
+        .unwrap()
+        .set_rekey_completed_ms(wall_clock_ms() - 10_000);
+    nodes[init].node.check_session_rekey().await;
+    let entry = nodes[init].node.get_session(resp_addr).unwrap();
+    entry.pending_new_session().is_none() && !entry.has_rekey_in_progress()
+}
+
+/// Drive a genuine FSP rekey to the point where the initiator has read the
+/// SessionAck and derived the new session, deliver `forgery` to the
+/// responder, then release the initiator's genuine msg3 and follow the cycle
+/// through the initiator's cutover, its msg3 resend budget, and one data frame
+/// each way. Then let the responder start the next rekey and check that it
+/// carries frames both ways.
+///
+/// The responder is chosen at run time to hold the larger address, the end
+/// at which the dual-initiation tie-break yields; a smaller responder wins it
+/// and drops the forged setup regardless.
+///
+/// Returns the outcome and a note of the responder's counters for the
+/// failure message: msg3s refused for arriving with no handshake to read
+/// them, and dual-initiation yields.
+async fn rekey_with_window_forgery(forgery: WindowForgery) -> (WindowOutcome, String) {
+    use crate::transport::ReceivedPacket;
+
+    let mut nodes = rekey_pair([true, true], None).await;
+    let node0_smaller =
+        crate::proto::fsp::initiation_winner(nodes[0].node.node_addr(), nodes[1].node.node_addr());
+    let (init, resp) = if node0_smaller { (0, 1) } else { (1, 0) };
+    let init_addr = *nodes[init].node.node_addr();
+    let resp_addr = *nodes[resp].node.node_addr();
+    assert!(
+        !crate::proto::fsp::initiation_winner(&resp_addr, &init_addr),
+        "the responder must hold the larger address"
+    );
+
+    // The setup reaches the responder only; it arms and answers.
+    start_rekey(&mut nodes, init).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    process_available_packets(&mut nodes[resp..=resp]).await;
+    assert_eq!(
+        nodes[resp].node.stats().session.rekey_armed,
+        1,
+        "the responder must have armed"
+    );
+
+    // The SessionAck reaches the initiator only; it derives the new session
+    // and sends msg3, which waits in the responder's queue.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    process_available_packets(&mut nodes[init..=init]).await;
+    assert!(
+        holds_pending(&nodes[init], &resp_addr)
+            && !nodes[init]
+                .node
+                .get_session(&resp_addr)
+                .unwrap()
+                .has_rekey_in_progress(),
+        "the initiator must have read the SessionAck and hold the new session"
+    );
+    assert!(
+        nodes[resp]
+            .node
+            .get_session(&init_addr)
+            .is_some_and(|e| e.has_rekey_in_progress() && !e.is_rekey_initiator()),
+        "the responder must still be waiting for msg3"
+    );
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let held: Vec<ReceivedPacket> =
+        std::iter::from_fn(|| nodes[resp].packet_rx.try_recv().ok()).collect();
+    assert!(
+        !held.is_empty(),
+        "the initiator's msg3 must be queued at the responder"
+    );
+
+    match forgery {
+        WindowForgery::Nothing => {}
+        WindowForgery::Setup => {
+            let forged = forge_setup_for(&nodes[resp].node);
+            nodes[resp]
+                .node
+                .handle_session_payload(&init_addr, &init_addr, &forged, 1280, false)
+                .await;
+            assert_eq!(
+                nodes[resp].node.stats().session.rekey_held,
+                1,
+                "the forged setup must have reached the armed handshake and \
+                 been held off, or the test measures nothing"
+            );
+        }
+    }
+
+    // Release the genuine msg3.
+    for packet in held {
+        nodes[resp].node.handle_encrypted_frame(packet).await;
+    }
+    pump_all(&mut nodes).await;
+    let responder_completed = holds_pending(&nodes[resp], &init_addr);
+
+    // The initiator cuts over on its timer, then spends its msg3 resend
+    // budget: a resend is what recovers a msg3 that was merely lost.
+    let initiator_cut_over = cut_over_initiator(&mut nodes, init, &resp_addr).await;
+    let max_resends = nodes[init]
+        .node
+        .config()
+        .node
+        .rate_limit
+        .handshake_max_resends;
+    let base_ms = Node::now_ms();
+    for step in 1..=u64::from(max_resends) + 1 {
+        nodes[init]
+            .node
+            .resend_pending_session_msg3(base_ms + step * 64_000)
+            .await;
+        pump_all(&mut nodes).await;
+    }
+
+    let initiator_to_responder = session_frame_decodes(&mut nodes, init, resp).await;
+    let responder_to_initiator = session_frame_decodes(&mut nodes, resp, init).await;
+
+    // The responder's own next rekey, once past the dampening that the
+    // initiator's setup started. Its data frame above crossed its trigger.
+    nodes[resp]
+        .node
+        .sessions
+        .get_mut(&init_addr)
+        .unwrap()
+        .record_peer_rekey(wall_clock_ms() - 60_000);
+    nodes[resp].node.check_session_rekey().await;
+    assert!(
+        rekey_initiated(&nodes[resp], &init_addr),
+        "the responder must start the next rekey"
+    );
+    pump_all(&mut nodes).await;
+    let next_cycle_carries_both_ways = cut_over_initiator(&mut nodes, resp, &init_addr).await
+        && session_frame_decodes(&mut nodes, resp, init).await
+        && session_frame_decodes(&mut nodes, init, resp).await;
+
+    let stats = &nodes[resp].node.stats().session;
+    let note = format!(
+        "the responder refused {} msg3s and yielded {} times",
+        stats.bad_state, stats.rekey_yielded
+    );
+    cleanup_nodes(&mut nodes).await;
+    (
+        WindowOutcome {
+            responder_completed,
+            initiator_cut_over,
+            initiator_to_responder,
+            responder_to_initiator,
+            next_cycle_carries_both_ways,
+        },
+        note,
+    )
+}
+
+/// The control: with nothing forged, the procedure that measures the two
+/// forgeries completes the rekey and carries frames both ways on both cycles.
+#[tokio::test]
+async fn a_rekey_with_nothing_forged_in_the_responders_window_completes_and_carries_traffic_both_ways()
+ {
+    let (outcome, note) = rekey_with_window_forgery(WindowForgery::Nothing).await;
+    assert_eq!(outcome, WINDOW_HEALTHY, "{note}");
+}
+
+/// A forged setup at a larger rekey responder, after the initiator has read
+/// the SessionAck, must not cost the genuine msg3 its handshake.
+#[tokio::test]
+async fn a_forged_setup_at_the_larger_responder_in_its_window_does_not_split_the_rekey() {
+    let (outcome, note) = rekey_with_window_forgery(WindowForgery::Setup).await;
+    assert_eq!(outcome, WINDOW_HEALTHY, "{note}");
 }
 
 /// A forged SessionAck arriving midway through an unanswered rekey must not
