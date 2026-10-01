@@ -245,12 +245,14 @@ machine.
 
 **The file descriptor carries the grant, not the connection.** A setup call
 hands the client a socket descriptor and the connection it was made on is then
-closed; the flow or the held port lives until that descriptor is closed. A
-descriptor is an ordinary kernel object, so it survives `fork`, survives
-`exec` unless the client asked for it close-on-exec when it received it, and
-can be handed to another process over `SCM_RIGHTS`. A process holding one can
-send as this node on that flow, or receive on that port, without ever opening
-the API socket and without being in the `fips` group.
+closed; the flow or the held port lives until that descriptor is closed and
+the daemon has let go of the copy it keeps while the descriptor is being
+handed over. A descriptor is an ordinary kernel object, so it survives
+`fork`, survives `exec` unless the client asked for it close-on-exec when it
+received it, and can be handed to another process over `SCM_RIGHTS`. A
+process holding one can send as this node on that flow, or receive on that
+port, without ever opening the API socket and without being in the `fips`
+group.
 Nothing revokes a descriptor already handed out. Restarting the daemon closes
 its own halves and ends every flow and listener at once, and that is the only
 revocation there is.
@@ -268,6 +270,18 @@ the test harness: `arrive` makes the daemon dispatch a datagram as though a
 peer had sent it, reaching any listener on this node under any peer identity
 the caller names. Leave it off outside a test harness; a packaged node does
 not enable it.
+
+**A remote peer can fill the node's flow ceiling through a server that
+refuses flows by dropping them.** Until a program first sends on a flow it
+accepted, the daemon keeps its own copy of that flow's descriptor, so a flow
+accepted and dropped unanswered keeps its slot against the node-wide
+`node.native_api.max_flows` until its listener is dropped. A peer that opens
+flows to such a listener from many source ports can therefore exhaust the
+ceiling, and every other program on the node then gets `EMFILE` on `connect`
+and silently loses arrivals on its listeners. This is the accepted cost of
+keeping a flow alive while its descriptor is on the way to the program; see
+[../how-to/use-the-native-datagram-api.md](../how-to/use-the-native-datagram-api.md)
+for what releases the daemon's copy.
 
 The socket is local only. It is not reachable over the network, and nothing
 about it changes the mesh's own authentication: a peer still verifies the

@@ -227,6 +227,16 @@ leaves the flows already accepted from it untouched. A program that parks
 streams in a `Vec` and never removes them holds ports and flow slots
 exactly as if it had leaked descriptors.
 
+**An accepted flow you drop without ever sending on stays open until you
+drop its listener.** Until your program has sent on an accepted flow, the
+daemon keeps its own copy of the flow's descriptor, because on macOS the
+kernel can otherwise destroy the flow while its descriptor is still on the
+way to you. Your first `send` on the flow, or dropping the listener, lets
+that copy go. So a server that refuses flows by dropping them unanswered
+holds a port and a flow slot for each one until its listener goes, and a
+long-lived listener that refuses many flows can walk the node into its flow
+ceiling.
+
 **Nothing peer-driven ever ends a flow, so your program has to.** The v1
 wire carries no half-close. Nothing closes the daemon's half of a live
 accepted flow, so a loop written as "echo until the flow closes", or one

@@ -180,6 +180,19 @@ pub fn set_sndbuf(fd: &OwnedFd, bytes: usize) -> io::Result<()> {
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 const CLOSE_RETRY: Duration = Duration::from_millis(250);
 
+/// How long a reader can leave a closed peer unnoticed, for the native API
+/// tests that assert a flow is still open and so must wait long enough to have
+/// seen it close.
+///
+/// `CLOSE_RETRY` where the reactor cannot see a close, because the reader then
+/// notices one only when that bound expires and it retries the read.
+#[cfg(all(test, any(target_os = "macos", target_os = "freebsd")))]
+pub(super) const CLOSE_LATENCY: Duration = CLOSE_RETRY;
+
+/// Zero where a close wakes the reader itself.
+#[cfg(all(test, not(any(target_os = "macos", target_os = "freebsd"))))]
+pub(super) const CLOSE_LATENCY: Duration = Duration::ZERO;
+
 /// The daemon's half of a flow's or a listener's socket pair, registered with
 /// the reactor.
 pub struct Seqpacket {

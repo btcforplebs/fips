@@ -124,7 +124,7 @@ one producer on the surface, which is what lets a caller read it.
 
 ## Step 6: Keep descriptor hygiene
 
-Five rules. Each one leaks a flow or loses one when broken.
+Six rules. Each one leaks a flow or loses one when broken.
 
 **Request close-on-exec** with `MSG_CMSG_CLOEXEC` on the `recvmsg`, rather than
 setting it afterwards. Without it the descriptor survives an `exec` into a
@@ -140,7 +140,15 @@ descriptors rather than dropping them on the floor.
 
 **Lift the descriptor out of an arrival you cannot parse** before discarding
 the message. Refusing a flow is closing its descriptor; discarding the message
-without taking it leaks the flow instead.
+without taking it leaks the flow instead. A refused flow ends only when the
+listener closes, though, unless you wrote on it first: the daemon keeps its
+own copy of an accepted flow's descriptor until your first write or the
+listener's close.
+
+**Close the setup connection once you have the reply.** The daemon keeps its
+own copy of the descriptor in its last reply until your next command on that
+connection or the connection's close. A flow or listener you close while the
+connection sits idle stays open until one of those happens.
 
 **Bound the partial line.** A daemon that stopped sending newlines would
 otherwise grow your buffer without end. The shipped client caps it at 64 KiB,
