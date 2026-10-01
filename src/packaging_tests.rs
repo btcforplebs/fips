@@ -874,11 +874,9 @@ fn windows_installer_creates_empty_peer_acl_files_and_refuses_legacy_ones() {
             .unwrap_or_else(|| panic!("install-service.ps1: no line {what}"))
     };
 
-    let legacy_dir = first("assigning $legacyAclDir", &|l| {
-        l.starts_with("$legacyAclDir = ")
-    });
+    let legacy_dir = first("assigning $legacyDir", &|l| l.starts_with("$legacyDir = "));
     assert_eq!(
-        lines[legacy_dir], r#"$legacyAclDir = "$env:SystemDrive\etc\fips""#,
+        lines[legacy_dir], r#"$legacyDir = "$env:SystemDrive\etc\fips""#,
         "install-service.ps1: the legacy peer ACL directory is not \\etc\\fips on the \
          system drive"
     );
@@ -906,7 +904,7 @@ fn windows_installer_creates_empty_peer_acl_files_and_refuses_legacy_ones() {
     let creation_body = creation + 1..creation_end;
 
     for text in [
-        "$legacy = Join-Path $legacyAclDir $name",
+        "$legacy = Join-Path $legacyDir $name",
         r#"$current = "$ConfigDir\$name""#,
     ] {
         assert!(
@@ -967,7 +965,7 @@ fn windows_installer_creates_empty_peer_acl_files_and_refuses_legacy_ones() {
     let is_check = |l: &str| l == "& $refuseEntries";
     let order = [
         ("check after the reset", all(&is_check).get(2).copied()),
-        ("$legacyAclDir", Some(legacy_dir)),
+        ("$legacyDir", Some(legacy_dir)),
         ("refusal loop", Some(refusal)),
         ("refusal of a legacy file", Some(check)),
         ("end of the refusal loop", Some(refusal_end)),
@@ -981,6 +979,93 @@ fn windows_installer_creates_empty_peer_acl_files_and_refuses_legacy_ones() {
         (
             "service registration",
             all(&|l| l.contains("--install-service")).first().copied(),
+        ),
+    ];
+    for pair in order.windows(2) {
+        let [(a, ia), (b, ib)] = pair else {
+            unreachable!("windows(2) yields pairs")
+        };
+        let (ia, ib) = (
+            ia.unwrap_or_else(|| panic!("install-service.ps1: no {a}")),
+            ib.unwrap_or_else(|| panic!("install-service.ps1: no {b}")),
+        );
+        assert!(
+            ia < ib,
+            "install-service.ps1: {a} (code line {ia}) must come before {b} (code line {ib})"
+        );
+    }
+}
+
+/// Guards install-service.ps1's refusal of an identity key left in
+/// `\etc\fips`.
+///
+/// A service that earlier releases ran from `\etc\fips` reads only
+/// `C:\ProgramData\fips` once the installer sets `FIPS_CONFIG`, so a key left
+/// in `\etc\fips` with none in the config directory means the node would
+/// come up with a new identity. The installer must stop in exactly that case,
+/// and must decide it before it creates any file in the config directory,
+/// copies the binaries or registers the service, so a refusal leaves an
+/// existing install as it was.
+#[test]
+fn windows_installer_refuses_a_legacy_identity_key_with_none_in_the_config_dir() {
+    let lines = ps_lines(&repo_file("packaging/windows/install-service.ps1"));
+    let first = |what: &str, pred: &dyn Fn(&str) -> bool| -> usize {
+        lines
+            .iter()
+            .position(|l| pred(l))
+            .unwrap_or_else(|| panic!("install-service.ps1: no line {what}"))
+    };
+
+    let dir = first("assigning $legacyDir", &|l| l.starts_with("$legacyDir = "));
+    let key = first("assigning $legacyKey", &|l| l.starts_with("$legacyKey = "));
+    assert_eq!(
+        lines[key], r#"$legacyKey = Join-Path $legacyDir "fips.key""#,
+        "install-service.ps1: the legacy key is not fips.key in $legacyDir"
+    );
+    let checks: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.starts_with("if (") && l.contains("$legacyKey"))
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(
+        checks.len(),
+        1,
+        "install-service.ps1: expected one test of the legacy key, found {}",
+        checks.len()
+    );
+    let check = checks[0];
+    assert_eq!(
+        lines[check],
+        r#"if ((Test-Path -LiteralPath $legacyKey) -and -not (Test-Path -LiteralPath "$ConfigDir\fips.key")) {"#,
+        "install-service.ps1: the refusal must hold only when the legacy key exists and \
+         the config directory has none"
+    );
+    refuses_at(&lines, check, "refusal of a legacy identity key");
+
+    let order = [
+        ("$legacyDir", Some(dir)),
+        ("$legacyKey", Some(key)),
+        ("refusal of a legacy identity key", Some(check)),
+        (
+            "creation of a peer ACL file",
+            lines
+                .iter()
+                .position(|l| l.contains("New-Item") && l.contains("-ItemType File")),
+        ),
+        (
+            "binary copy",
+            lines.iter().position(|l| l.contains("$Binaries")),
+        ),
+        (
+            "default config copy",
+            lines
+                .iter()
+                .position(|l| l.contains("Copy-Item") && l.contains("$ConfigDir\\fips.yaml")),
+        ),
+        (
+            "service registration",
+            lines.iter().position(|l| l.contains("--install-service")),
         ),
     ];
     for pair in order.windows(2) {
