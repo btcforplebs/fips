@@ -1622,6 +1622,78 @@ async fn dropped_rekey_msg2_does_not_split_the_link() {
     cleanup_nodes(&mut nodes).await;
 }
 
+/// A rekey responder whose msg2 was lost must not cut over on its own tick,
+/// and must not answer the initiator's resent msg1 with the msg2 it stored at
+/// startup.
+///
+/// A responder that cut over on its own tick reset its session age, so the
+/// resent msg1 fell under the 30 s floor below which a msg1 is taken as a
+/// duplicate of the startup one, and the responder resent its startup msg2,
+/// addressed to the startup index the initiator no longer dispatches. Every
+/// resend in the ladder met the same answer, and the rekey stalled until a
+/// fresh handshake replaced the link.
+///
+/// Today the responder refuses the resent msg1 while it holds the pending and
+/// sends no msg2 at all. A responder that instead resends the msg2 it answered
+/// the rekey with is also correct, so the assertion admits a msg2 addressed to
+/// the rekey index and refuses only one addressed anywhere else.
+#[tokio::test]
+async fn a_lost_rekey_msg2_is_not_followed_by_a_cutover_or_the_startup_msg2() {
+    use crate::proto::fmp::wire::{CommonPrefix, Msg2Header, PHASE_MSG2};
+
+    let HeldMsg2Pair {
+        mut nodes,
+        node0_addr,
+        node1_idx_before,
+        rekey_idx,
+        held_msg2,
+        ..
+    } = rekey_pair_with_held_msg2().await;
+    let startup_msg2 = nodes[1]
+        .node
+        .get_peer(&node0_addr)
+        .unwrap()
+        .handshake_msg2()
+        .map(|m| m.to_vec());
+
+    // The msg2 is lost, and node 1's rekey tick runs before node 0 resends.
+    drop(held_msg2);
+    nodes[1].node.check_rekey().await;
+    let node1_idx_after_tick = nodes[1].node.get_peer(&node0_addr).unwrap().our_index();
+
+    // node 0's first msg1 resend, delivered to node 1 only.
+    nodes[0]
+        .node
+        .resend_pending_rekeys(Node::now_ms() + 1000)
+        .await;
+    assert_eq!(
+        process_available_packets(&mut nodes[1..]).await,
+        1,
+        "node 1 must have exactly node 0's resent rekey msg1 queued"
+    );
+
+    let msg2s: Vec<Vec<u8>> = std::iter::from_fn(|| nodes[0].packet_rx.try_recv().ok())
+        .filter(|p| CommonPrefix::parse(&p.data).map(|c| c.phase) == Some(PHASE_MSG2))
+        .map(|p| p.data)
+        .collect();
+    for msg2 in &msg2s {
+        let receiver = Msg2Header::parse(msg2).map(|h| h.receiver_idx);
+        assert_eq!(
+            receiver,
+            Some(rekey_idx),
+            "node 1 answered the resent rekey msg1 with a msg2 not addressed to the rekey \
+             (it is the stored startup msg2: {})",
+            startup_msg2.as_deref() == Some(msg2.as_slice())
+        );
+    }
+    assert_eq!(
+        node1_idx_after_tick, node1_idx_before,
+        "node 1 must not cut over on its own tick to a session node 0 never adopted"
+    );
+
+    cleanup_nodes(&mut nodes).await;
+}
+
 /// A rekey responder whose msg2 was lost holds the pending session it
 /// answered with until the hold passes, then retires it: the pending slot and
 /// its role are emptied, its index is unregistered and freed, and the current
