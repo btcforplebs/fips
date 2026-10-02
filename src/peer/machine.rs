@@ -594,7 +594,12 @@ impl PeerMachine {
     /// Take the handshake crypto carrier off the machine (promotion and
     /// teardown consume it by value).
     pub(crate) fn take_leg(&mut self) -> Option<HandshakeCrypto> {
-        self.leg.take()
+        // On promotion the machine lives on as the peer's control machine, so
+        // the slot is cleared as the leg leaves, or it would keep the session's
+        // traffic keys. Callers unwrap the result at once, which `take_cleared`
+        // warns may leave a second stack copy; clearing here still covers every
+        // caller's heap slot, and a stack copy is a move like any other.
+        noise::take_cleared(&mut self.leg)
     }
 
     /// Attach a handshake crypto carrier to the machine.
@@ -3399,6 +3404,44 @@ mod tests {
         let ciphertext = init_session.encrypt(plaintext).unwrap();
         let decrypted = resp_session.decrypt(&ciphertext).unwrap();
         assert_eq!(decrypted, plaintext);
+    }
+
+    /// Non-zero bytes left in a leg slot, read in place.
+    #[cfg(not(debug_assertions))]
+    fn leg_slot_nonzero_bytes(slot: &Option<HandshakeCrypto>) -> usize {
+        let base = (slot as *const Option<HandshakeCrypto>).cast::<u8>();
+        (0..std::mem::size_of::<Option<HandshakeCrypto>>())
+            // SAFETY: `base` comes from a live reference, so every byte of the
+            // slot is in bounds; volatile so the read is of memory as it is.
+            .filter(|&i| unsafe { std::ptr::read_volatile(base.add(i)) } != 0)
+            .count()
+    }
+
+    /// Release only: in a debug build `Option::take` leaves stack garbage in
+    /// the payload of the `None` it writes, so the count means nothing there.
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn take_leg_leaves_no_session_keys_in_the_slot_it_empties() {
+        let initiator = Identity::generate();
+        let responder = Identity::generate();
+        let responder_id = PeerIdentity::from_pubkey_full(responder.pubkey_full());
+        let mut ini = outbound_leg(LinkId::new(1), responder_id, 1000);
+        let mut res = Box::new(inbound_leg(LinkId::new(2), 1000));
+        let msg1 = ini
+            .start_handshake(initiator.keypair(), make_epoch(), 1100)
+            .unwrap();
+        res.receive_handshake_init(responder.keypair(), make_epoch(), &msg1, 1200)
+            .unwrap();
+        assert!(res.has_session(), "the responder's leg holds the session");
+        assert!(leg_slot_nonzero_bytes(&res.leg) > 64);
+
+        let leg = res.take_leg().expect("the leg was attached");
+        assert!(leg.noise_session.is_some(), "the session left with the leg");
+        let left = leg_slot_nonzero_bytes(&res.leg);
+        assert!(
+            left <= 8,
+            "{left} non-zero bytes of the session stayed in the emptied leg slot"
+        );
     }
 
     #[test]

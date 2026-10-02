@@ -541,6 +541,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the interface goes away between the presence check and the bind.
 - TCP connections try the remaining addresses for a hostname after a
   connection fails, within the existing overall connection timeout.
+- An Ethernet peer's address is always shown as a colon-separated MAC address
+  in `fipsctl show links` and in log lines. An address whose six bytes happened
+  to be valid UTF-8 was printed as text instead.
 
 #### Gateway
 
@@ -560,6 +563,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - If an encrypt worker thread exits, the daemon no longer stops once that
   worker's send queue fills. Packets for that worker are now dropped instead
   of blocking forever. This applies to the default sender.
+- With the opt-in ordered sender (`FIPS_MACOS_ORDERED_SENDER`), the daemon no
+  longer stops forwarding when an encrypt worker thread or a destination's send
+  thread exits. Packets that thread would have handled are dropped instead of
+  holding up every later packet to the same destination.
 
 #### Native datagram API
 
@@ -625,6 +632,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   foreground run reads, which it omitted, and says to stop the service before
   rerunning `install-service.ps1` to upgrade: with the service running, the
   installer fails copying `fips.exe`.
+- An ICMP port-unreachable answering a datagram the node sent no longer shows
+  up as a receive error on the UDP transport's socket. Windows reports one on
+  the socket's next receive by default, and that socket is shared by every UDP
+  peer, so one unreachable peer address put errors into the receive path that
+  every other UDP peer's traffic uses.
 
 ### Security
 
@@ -682,6 +694,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   handshake. The security reference now states what clearing key material in
   memory does and does not cover in a release build, including copies left
   behind by moves and the identity loaded from a secret string.
+- A connection's handshake state is now cleared from its control machine when
+  the connection is promoted to an active peer, resolved as one side of a
+  cross-connection, or reaped as stale. After a promotion, the memory it left
+  held the session's two traffic keys for as long as the peer stayed
+  connected. The security reference is updated to match.
 
 ## [0.5.2] - 2026-09-28
 

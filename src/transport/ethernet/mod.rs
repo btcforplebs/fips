@@ -1295,7 +1295,7 @@ async fn ethernet_receive_loop(
                             }
                         };
                         let bytes = data.len();
-                        let addr = TransportAddr::from_bytes(&src_mac);
+                        let addr = TransportAddr::from_mac(src_mac);
                         let packet = ReceivedPacket::new(transport_id, addr, data);
 
                         trace!(
