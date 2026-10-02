@@ -2178,7 +2178,18 @@ async fn test_msg3_crypto_fail_disposes_leg_machine() {
     assert_eq!(responder.node.peer_machines.len(), 1, "msg1-born machine");
     assert_eq!(responder.node.index_allocator.count(), 1);
 
-    // Corrupt the Noise payload so `complete_handshake_msg3` fails.
+    // Corrupt the last byte so `complete_handshake_msg3` fails. It lands in
+    // the negotiation payload, after a base read that succeeds, so this is
+    // the authenticated-but-bad msg3 that still tears the leg down; an
+    // unreadable base msg3 keeps it (see
+    // `an_unreadable_msg3_leaves_the_pending_leg_for_the_genuine_msg3`).
+    let offset = crate::proto::fmp::wire::Msg3Header::parse(&msg3.data)
+        .unwrap()
+        .noise_msg3_offset;
+    assert!(
+        msg3.data.len() - offset > crate::noise::HANDSHAKE_MSG3_SIZE,
+        "msg3 carries a negotiation payload after the base message"
+    );
     let last = msg3.data.len() - 1;
     msg3.data[last] ^= 0xFF;
     responder.node.handle_msg3(msg3).await;
@@ -5049,6 +5060,167 @@ async fn a_dampened_epoch_restart_leaves_the_peer_address_naming_the_peer_link()
     );
     #[cfg(debug_assertions)]
     responder.node.debug_assert_peer_maps_coherent();
+
+    stop_hs(&mut initiator).await;
+    stop_hs(&mut responder).await;
+}
+
+// ===========================================================================
+// An unreadable msg3 must not cost the pending inbound leg. Nothing ties a
+// msg3 to the leg before the read except the receiver index, which travels in
+// cleartext in msg2's header, so anyone who saw msg2 can send garbage under
+// it; the genuine msg3 (or its resend) must still find the leg.
+// ===========================================================================
+
+/// `msg3` with its Noise part replaced by zeros of the base msg3 length, so
+/// the read fails at its first AEAD. Flipping a trailing byte does not do
+/// this: the flip lands in the negotiation payload, the read succeeds, and
+/// the post-read teardown runs instead. The forgery is stamped later than
+/// the genuine msg3, so a path that touched the leg on it would show.
+fn unreadable_msg3(msg3: &ReceivedPacket) -> ReceivedPacket {
+    use crate::proto::fmp::wire::Msg3Header;
+
+    let offset = Msg3Header::parse(&msg3.data)
+        .expect("genuine msg3 header")
+        .noise_msg3_offset;
+    let mut data = msg3.data[..offset].to_vec();
+    data.extend(std::iter::repeat_n(0u8, crate::noise::HANDSHAKE_MSG3_SIZE));
+    ReceivedPacket {
+        transport_id: msg3.transport_id,
+        remote_addr: msg3.remote_addr.clone(),
+        data,
+        timestamp_ms: msg3.timestamp_ms + 10_000,
+    }
+}
+
+/// Assert `leg` is still a pending inbound leg awaiting msg3: its link, its
+/// machine parked at `SentMsg2` with `index`, its `pending_inbound` entry and
+/// its allocated index, with its activity stamp unchanged.
+fn assert_leg_pending(node: &HsNode, leg: LinkId, index: SessionIndex, activity: u64) {
+    use crate::peer::machine::{HandshakePhase, PeerState};
+
+    assert!(node.node.links.contains_key(&leg), "the leg's link stays");
+    let machine = node
+        .node
+        .peer_machines
+        .get(&leg)
+        .expect("the leg's machine stays");
+    assert!(matches!(
+        machine.state(),
+        PeerState::Handshaking {
+            phase: HandshakePhase::SentMsg2,
+            ..
+        }
+    ));
+    assert_eq!(machine.our_index(), Some(index));
+    assert_eq!(
+        node.node
+            .pending_inbound
+            .get(&(node.transport_id, index.as_u32())),
+        Some(&leg),
+        "the leg's pending-inbound entry goes back"
+    );
+    assert!(node.node.index_allocator.is_allocated(index));
+    assert_eq!(
+        node.node.connection_last_activity(leg),
+        activity,
+        "an unreadable msg3 must not extend the leg's reap deadline"
+    );
+}
+
+#[tokio::test]
+async fn an_unreadable_msg3_leaves_the_pending_leg_for_the_genuine_msg3() {
+    let mut initiator = make_hs_node(Config::new()).await;
+    let mut responder = make_hs_node(Config::new()).await;
+
+    let msg3 = drive_to_msg3(&mut initiator, &mut responder, 1000).await;
+    let leg = responder.node.connections().next().unwrap().1.link_id();
+    let index = responder
+        .node
+        .peer_machines
+        .get(&leg)
+        .and_then(|m| m.our_index())
+        .unwrap();
+    let activity = responder.node.connection_last_activity(leg);
+
+    responder.node.handle_msg3(unreadable_msg3(&msg3)).await;
+    assert_eq!(responder.node.peer_count(), 0);
+    assert_leg_pending(&responder, leg, index, activity);
+    #[cfg(debug_assertions)]
+    responder.node.debug_assert_peer_maps_coherent();
+
+    responder.node.handle_msg3(msg3).await;
+    let peer_addr =
+        *PeerIdentity::from_pubkey_full(initiator.node.identity().pubkey_full()).node_addr();
+    let peer = responder
+        .node
+        .get_peer(&peer_addr)
+        .expect("the genuine msg3 must still promote the leg");
+    assert_eq!(peer.link_id(), leg);
+    assert_eq!(peer.our_index(), Some(index));
+
+    stop_hs(&mut initiator).await;
+    stop_hs(&mut responder).await;
+}
+
+#[tokio::test]
+async fn an_unreadable_rekey_msg3_leaves_the_rekey_leg_for_the_resent_msg3() {
+    let mut initiator = make_hs_node(rekey_config()).await;
+    let mut responder = make_hs_node(rekey_config()).await;
+    let (peer_addr, _peer_link, leg) = park_rekey_leg(&mut initiator, &mut responder).await;
+    let index = responder
+        .node
+        .peer_machines
+        .get(&leg)
+        .and_then(|m| m.our_index())
+        .unwrap();
+    let activity = responder.node.connection_last_activity(leg);
+
+    let msg2 = recv_phase(&mut initiator.packet_rx, 2, "rekey msg2").await;
+    initiator.node.handle_msg2(msg2).await;
+    let msg3 = recv_phase(&mut responder.packet_rx, 3, "rekey msg3").await;
+
+    responder.node.handle_msg3(unreadable_msg3(&msg3)).await;
+    assert_leg_pending(&responder, leg, index, activity);
+    assert!(
+        responder
+            .node
+            .get_peer(&peer_addr)
+            .unwrap()
+            .pending_new_session()
+            .is_none()
+    );
+    #[cfg(debug_assertions)]
+    responder.node.debug_assert_peer_maps_coherent();
+
+    // The initiator's own msg3 resend, not the held original, completes it.
+    drop(msg3);
+    let responder_addr =
+        *PeerIdentity::from_pubkey_full(responder.node.identity().pubkey_full()).node_addr();
+    let resend_at = initiator
+        .node
+        .get_peer(&responder_addr)
+        .unwrap()
+        .rekey_msg3_next_resend_ms();
+    initiator
+        .node
+        .resend_pending_fmp_rekey_msg3(resend_at)
+        .await;
+    let resent = recv_phase(&mut responder.packet_rx, 3, "resent rekey msg3").await;
+    responder.node.handle_msg3(resent).await;
+    assert!(
+        responder
+            .node
+            .get_peer(&peer_addr)
+            .unwrap()
+            .pending_new_session()
+            .is_some(),
+        "the resent msg3 must complete the rekey on the kept leg"
+    );
+    assert!(
+        !responder.node.links.contains_key(&leg),
+        "the leg is consumed"
+    );
 
     stop_hs(&mut initiator).await;
     stop_hs(&mut responder).await;

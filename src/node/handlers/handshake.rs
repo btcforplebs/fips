@@ -13,7 +13,7 @@ use crate::node::rate_limit::Msg1Class;
 use crate::node::reject::{HandshakeReject, RejectReason};
 use crate::node::{Node, NodeError};
 use crate::peer::machine::{
-    CrossConnOutcome, HandshakeCrypto, PeerAction, PeerEvent, PeerMachine, TimerKind,
+    CrossConnOutcome, HandshakeCrypto, Msg3Error, PeerAction, PeerEvent, PeerMachine, TimerKind,
 };
 use crate::peer::{ActivePeer, RekeyMsg2Step};
 use crate::proto::fmp::wire::{Msg1Header, Msg2Header, Msg3Header, build_msg2, build_msg3};
@@ -1452,7 +1452,22 @@ impl Node {
             let received_negotiation =
                 match machine.complete_handshake_msg3(noise_msg3, packet.timestamp_ms) {
                     Ok(neg) => neg,
-                    Err(e) => {
+                    Err(Msg3Error::Unreadable(e)) => {
+                        // The leg is untouched; put its pending-inbound entry
+                        // back so the genuine msg3, or the initiator's resend,
+                        // still finds it. Debug, not warn: anyone who saw
+                        // msg2's cleartext header can send these.
+                        debug!(
+                            link_id = %link_id,
+                            error = %e,
+                            "Unreadable msg3, keeping the pending leg"
+                        );
+                        self.pending_inbound.insert(key, link_id);
+                        self.stats_mut()
+                            .record_reject(RejectReason::Handshake(HandshakeReject::BadState));
+                        return;
+                    }
+                    Err(e @ Msg3Error::Failed(_)) => {
                         warn!(
                             link_id = %link_id,
                             error = %e,

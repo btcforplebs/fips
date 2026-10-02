@@ -96,6 +96,20 @@ use crate::utils::index::{IndexAllocator, SessionIndex};
 use crate::{NodeAddr, PeerIdentity};
 use secp256k1::Keypair;
 
+/// Why [`PeerMachine::complete_handshake_msg3`] did not complete the leg.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum Msg3Error {
+    /// The base msg3 did not authenticate. The leg is unchanged: its
+    /// handshake is back, rolled back to its pre-read state, for the genuine
+    /// msg3.
+    #[error("unreadable msg3: {0}")]
+    Unreadable(NoiseError),
+    /// The leg had no handshake to read with, or a step after a successful
+    /// read failed. The leg's handshake is consumed.
+    #[error(transparent)]
+    Failed(#[from] NoiseError),
+}
+
 // ============================================================================
 // Timing placeholders
 //
@@ -955,11 +969,17 @@ impl PeerMachine {
     ///
     /// If the msg3 contains a negotiation payload (bytes beyond base XX msg3),
     /// it is decrypted and returned.
+    ///
+    /// A base msg3 that does not authenticate returns
+    /// [`Msg3Error::Unreadable`] and leaves the leg as it was: the handshake
+    /// goes back rolled back to its pre-read state and the carrier is not
+    /// touched, so the genuine msg3 can still complete the leg and a spray
+    /// cannot push out its reap deadline.
     pub(crate) fn complete_handshake_msg3(
         &mut self,
         message: &[u8],
         current_time_ms: u64,
-    ) -> Result<Option<Vec<u8>>, NoiseError> {
+    ) -> Result<Option<Vec<u8>>, Msg3Error> {
         let (received_negotiation, learned_identity, remote_epoch) = {
             let leg = self.leg.as_mut().ok_or_else(no_pending_connection)?;
 
@@ -972,7 +992,8 @@ impl PeerMachine {
                 return Err(NoiseError::WrongState {
                     expected: "received_msg1 state".to_string(),
                     got: "no active handshake".to_string(),
-                });
+                }
+                .into());
             }
 
             // Cleared as on the initiator's msg2 path: under XX the responder
@@ -991,8 +1012,18 @@ impl PeerMachine {
                 (message, None)
             };
 
-            // Process XX msg3 (learns initiator identity + epoch)
-            hs.read_message_3(base_msg3)?;
+            // Process XX msg3 (learns initiator identity + epoch). Nothing
+            // ties this msg3 to the leg before the read except the receiver
+            // index, which travels in cleartext in msg2's header, so a msg3
+            // that does not read proves nothing about the initiator. The
+            // handshake goes back, rolled back because the read advances the
+            // cipher nonce before it authenticates. Failures after a
+            // successful read keep their teardown: only the initiator's keys
+            // could have produced that read.
+            if let Err(e) = hs.try_read_message_3(base_msg3) {
+                leg.noise_handshake = Some(hs);
+                return Err(Msg3Error::Unreadable(e));
+            }
 
             // Decrypt negotiation payload from msg3 if present
             let received_negotiation = if let Some(encrypted) = extra {
