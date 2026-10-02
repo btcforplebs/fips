@@ -437,10 +437,18 @@ jobs:
       # Debug-only helpers (anything behind #[cfg(debug_assertions)]) vanish in
       # a release build, so a test calling one without the same gate breaks a
       # build no other job performs: every run above compiles the test target
-      # in debug. Compile it in release too, without running it — the point is
-      # that it builds at all. Mirrored in testing/ci-local.sh.
-      - name: Compile the library tests in release mode
-        run: cargo test --release --lib --no-run
+      # in debug. Compile it in release too. Of what it builds, run only the
+      # leg-slot residue test, which is release-only because only an optimised
+      # build leaves the slot in a state worth measuring; the grep fails the
+      # step if that test did not run, since a name filter that matches
+      # nothing passes. Mirrored in testing/ci-local.sh.
+      - name: Compile the library tests in release mode and run the leg-slot residue test
+        shell: bash
+        env:
+          RESIDUE_TEST: peer::machine::tests::take_leg_leaves_no_session_keys_in_the_slot_it_empties
+        run: |
+          cargo test --release --lib -- --exact "$RESIDUE_TEST" | tee "$RUNNER_TEMP/release-lib-tests.log"
+          grep -q '^test result: ok\. 1 passed;' "$RUNNER_TEMP/release-lib-tests.log"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Job 2b – Unit tests (macOS)

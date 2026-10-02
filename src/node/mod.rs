@@ -1453,7 +1453,7 @@ impl Node {
                 NodeError::NoTransportForType(format!("invalid MAC in '{}': {}", addr_str, e))
             })?;
 
-            Ok((transport_id, TransportAddr::from_bytes(&mac)))
+            Ok((transport_id, TransportAddr::from_mac(mac)))
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {

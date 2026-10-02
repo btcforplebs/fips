@@ -155,7 +155,7 @@ impl NeighborBuffer {
     /// This line's beacon carries no key, so there is no pubkey hint to
     /// attach: the identity is learned from the handshake instead.
     fn peer(&self, src_mac: [u8; 6]) -> DiscoveredPeer {
-        let addr = TransportAddr::from_bytes(&src_mac);
+        let addr = TransportAddr::from_mac(src_mac);
         DiscoveredPeer::new(self.transport_id, addr)
     }
 }
@@ -241,6 +241,17 @@ mod tests {
         // Second take should be empty
         let peers = buffer.take();
         assert!(peers.is_empty());
+    }
+
+    #[test]
+    fn a_discovered_peer_whose_mac_bytes_are_valid_utf8_still_displays_as_a_mac() {
+        // "2|\u{46c}Zd": six bytes that decode as UTF-8, seen on a veth MAC.
+        let mac = [0x32, 0x7c, 0xd1, 0xac, 0x5a, 0x64];
+        assert!(core::str::from_utf8(&mac).is_ok());
+        let buffer = NeighborBuffer::new(TransportId::new(1));
+        assert!(buffer.add_peer(mac));
+        let peers = buffer.take();
+        assert_eq!(peers[0].addr.to_string(), "32:7c:d1:ac:5a:64");
     }
 
     #[test]
