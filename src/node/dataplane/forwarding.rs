@@ -55,13 +55,12 @@ impl Node {
         self.try_warm_coord_cache_ref(&datagram_ref, payload.len());
 
         // Pre-resolve the next hop only for datagrams the core can actually
-        // forward: not locally destined, and carrying a TTL that survives the
-        // decrement (`ttl > 1` — the shell-side mirror of the core's
-        // would-leave-zero drop). This keeps `find_next_hop`'s coord-cache
-        // LRU-touch side effect scoped to genuine forwards, as it was when the
-        // TTL test ran inline ahead of it. Warming above has already run, so
-        // the resolution observes freshly cached coords.
-        let next_hop = if datagram_ref.dest_addr != my_addr && datagram_ref.ttl > 1 {
+        // forward: not locally destined, and passing `can_forward`, which is
+        // the core's own hop-limit rule. This keeps `find_next_hop`'s
+        // coord-cache LRU-touch side effect scoped to genuine forwards, as it
+        // was when the TTL test ran inline ahead of it. Warming above has
+        // already run, so the resolution observes freshly cached coords.
+        let next_hop = if datagram_ref.dest_addr != my_addr && datagram_ref.can_forward() {
             self.resolve_next_hop(&datagram_ref.dest_addr)
         } else {
             None

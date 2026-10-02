@@ -1,7 +1,7 @@
 //! Tests for the sans-IO routing decision core.
 
 use super::util::{MockPeer, MockRoutingView, make_coords, make_datagram_ref, make_next_hop};
-use crate::proto::link::SessionDatagramRef;
+use crate::proto::link::{SessionDatagramRef, ttl_after_hop};
 use crate::proto::routing::RoutingSignalType;
 use crate::proto::routing::{
     DropReason, LimitVerdict, RouteAction, RouteOutcome, Router, RoutingView, select_best_candidate,
@@ -513,4 +513,46 @@ fn synth_mtu_exceeded_rate_limit_gate_suppresses_second_call() {
     let third = router.synth_mtu_exceeded(&other, &source, &my_addr, 1280, 0, 64);
     assert!(third.action.is_some());
     assert_eq!(third.verdict, LimitVerdict::Admit);
+}
+
+/// The routing core's hop-limit drop and the shell's `can_forward` pre-check
+/// agree for every TTL: a transit datagram with a next hop is dropped as
+/// TTL-exhausted exactly when `can_forward` is false, and otherwise leaves
+/// with the TTL `ttl_after_hop` gives.
+#[test]
+fn route_drops_for_hop_limit_exactly_when_can_forward_is_false() {
+    let my_addr = make_node_addr(0x10);
+    let nh_addr = make_node_addr(0x30);
+    let rv = MockRoutingView::new(false);
+    for ttl in 0..=u8::MAX {
+        let mut router = Router::new();
+        let dg = make_datagram_ref(ttl, make_node_addr(0x20));
+        let out = router.route(
+            &dg,
+            &my_addr,
+            false,
+            Some(make_next_hop(nh_addr, 1400)),
+            &rv,
+        );
+        match out {
+            RouteOutcome::Drop {
+                reason: DropReason::TtlExhausted,
+            } => assert!(
+                !dg.can_forward(),
+                "ttl={ttl}: the core dropped a datagram the pre-check would forward"
+            ),
+            RouteOutcome::Forward { bytes, .. } => {
+                assert!(
+                    dg.can_forward(),
+                    "ttl={ttl}: the core forwarded a datagram the pre-check would not"
+                );
+                assert_eq!(
+                    Some(decode_forward(&bytes).ttl),
+                    ttl_after_hop(ttl),
+                    "ttl={ttl}: the forwarded TTL must be the shared rule's"
+                );
+            }
+            _ => panic!("ttl={ttl}: expected Drop(TtlExhausted) or Forward"),
+        }
+    }
 }

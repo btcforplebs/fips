@@ -155,6 +155,53 @@ async fn test_forwarding_ttl_two_transit_clears_the_gate() {
     );
 }
 
+/// The next hop is resolved only for a datagram the core can forward, and that
+/// resolution refreshes the destination's cached coordinates. A last-hop
+/// transit datagram (ttl=1) is dropped by the core, so it must not refresh
+/// them; a ttl=2 datagram reaches the resolution and does.
+#[tokio::test]
+async fn test_forwarding_last_hop_transit_does_not_refresh_destination_coords() {
+    let mut node = make_node();
+    let from = make_node_addr(0xAA);
+    let src = make_node_addr(0x01);
+    let dest = make_node_addr(0x02);
+    let root = make_node_addr(0xF0);
+    let coords = TreeCoordinate::from_addrs(vec![dest, root]).unwrap();
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let stamped_ms = now_ms - node.coord_cache().default_ttl_ms() / 2;
+    node.coord_cache_mut()
+        .insert_verified(dest, coords, stamped_ms);
+    let last_used = |node: &Node| node.coord_cache().get_entry(&dest).unwrap().last_used();
+    assert_eq!(
+        last_used(&node),
+        stamped_ms,
+        "precondition: the entry carries the past stamp"
+    );
+
+    for ttl in [1u8, 2] {
+        let dg = SessionDatagram::new(src, dest, vec![0x10, 0x00, 0x00, 0x00]).with_ttl(ttl);
+        let encoded = dg.encode();
+        node.handle_session_datagram(&from, &encoded[1..], false)
+            .await;
+        if ttl == 1 {
+            assert_eq!(
+                last_used(&node),
+                stamped_ms,
+                "a transit ttl=1 datagram is dropped, so it must not refresh the destination's coords"
+            );
+        } else {
+            assert!(
+                last_used(&node) > stamped_ms,
+                "a transit ttl=2 datagram reaches next-hop resolution, which refreshes the coords"
+            );
+        }
+    }
+}
+
 // --- Local delivery ---
 
 #[tokio::test]
