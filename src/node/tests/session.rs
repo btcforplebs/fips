@@ -1873,6 +1873,9 @@ async fn a_lost_link_rekey_msg3_is_still_resent_after_an_old_session_frame() {
         ..
     } = rekey_pair_cut_over_with_held_msg3().await;
     drop(held_msg3);
+    // Windows never spawns the worker pools, so there the decrypt is
+    // always inline and the pool field does not exist.
+    #[cfg(unix)]
     assert!(
         nodes[0].node.supervisor.decrypt_workers.is_none(),
         "node 0 must decrypt inline, so this exercises the inline confirm"
