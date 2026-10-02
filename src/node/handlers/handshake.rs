@@ -427,7 +427,12 @@ impl Node {
         );
 
         self.links.insert(link_id, link);
-        self.addr_to_link.insert(addr_key, link_id);
+        // The key may already name a live link: an established peer's (a rekey
+        // or restart msg1) or our own outbound dial (a crossing msg1). Record it
+        // so `remove_link` hands the key back if this leg is disposed.
+        if let Some(prior) = self.addr_to_link.insert(addr_key.clone(), link_id) {
+            self.displaced_links.insert(link_id, (addr_key, prior));
+        }
 
         // Build the msg2 response, storing it on the surviving carrier for
         // potential resend before the machine enters the registry below.
@@ -464,9 +469,7 @@ impl Node {
                     );
                     // Clean up on failure (disposing the machine drops the
                     // Noise handles it carries with it)
-                    self.links.remove(&link_id);
-                    self.addr_to_link
-                        .remove(&(packet.transport_id, packet.remote_addr));
+                    self.remove_link(&link_id);
                     let _ = self.index_allocator.free(our_index);
                     self.remove_peer_machine(link_id);
                     self.stats_mut()
@@ -1419,7 +1422,9 @@ impl Node {
                     // (`allocate_link_id`) so a stale value can never name a
                     // different live connection. `remove_link` drops the
                     // `addr_to_link` reverse entry only if it still points here,
-                    // so a newer leg on the same address is untouched.
+                    // so a newer leg on the same address is untouched, and hands
+                    // it back to the link this leg displaced at msg1 if that
+                    // link is still live.
                     debug!(
                         link_id = %link_id,
                         "No pending connection for msg3"
@@ -1770,7 +1775,7 @@ impl Node {
                     "Epoch mismatch dampened, dropping msg1"
                 );
                 self.execute_peer_actions(link_id, &ambient, actions).await;
-                self.links.remove(&link_id);
+                self.remove_link(&link_id);
                 self.remove_peer_machine(link_id);
                 self.stats_mut()
                     .record_reject(RejectReason::Handshake(HandshakeReject::BadState));
@@ -1796,7 +1801,7 @@ impl Node {
                     !self.index_allocator.is_allocated(our_index),
                     "inbound index freed exactly once via the machine action"
                 );
-                self.links.remove(&link_id);
+                self.remove_link(&link_id);
                 self.remove_peer_machine(link_id);
                 self.stats_mut()
                     .record_reject(RejectReason::Handshake(HandshakeReject::BadState));
@@ -1829,7 +1834,7 @@ impl Node {
                     !self.index_allocator.is_allocated(our_index),
                     "inbound index freed exactly once via the machine action"
                 );
-                self.links.remove(&link_id);
+                self.remove_link(&link_id);
                 self.remove_peer_machine(link_id);
             }
             decision @ (InboundDecision::RestartThenPromote { .. }

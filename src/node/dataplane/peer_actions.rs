@@ -224,9 +224,7 @@ impl Node {
                             // (`handle_msg1` L665): the send error text is surfaced
                             // at the executor point where the failure is now handled.
                             warn!(link_id = %link, error = %e, "Failed to send msg2");
-                            self.links.remove(&link);
-                            self.addr_to_link
-                                .remove(&(ambient.transport_id, ambient.remote_addr.clone()));
+                            self.remove_link(&link);
                             if let Some(idx) = ambient.our_index {
                                 let _ = self.index_allocator.free(idx);
                             }
@@ -693,10 +691,11 @@ impl Node {
                         );
                     }
 
-                    // Both branches tear down the temporary inbound link fully
-                    // (including its `addr_to_link` mapping) via `remove_link`,
-                    // disposing the leg's machine (and its embedded connection)
-                    // with it.
+                    // Both branches tear down the temporary inbound link via
+                    // `remove_link`, which hands its `addr_to_link` key back to
+                    // the link the leg displaced at msg1 if that link is still
+                    // live, disposing the leg's machine (and its embedded
+                    // connection) with it.
                     self.remove_link(&link);
                     self.remove_peer_machine(link);
                     return;
@@ -738,7 +737,7 @@ impl Node {
                     let noise_session = {
                         let Some(machine) = self.peer_machines.get_mut(&link) else {
                             warn!(link_id = %link, "Connection removed during rekey msg3 processing");
-                            self.links.remove(&link);
+                            self.remove_link(&link);
                             self.remove_peer_machine(link);
                             self.stats_mut().record_reject(RejectReason::Handshake(
                                 HandshakeReject::UnknownConnection,
@@ -753,7 +752,7 @@ impl Node {
                         Some(s) => s,
                         None => {
                             warn!("Rekey msg3: no session from handshake");
-                            self.links.remove(&link);
+                            self.remove_link(&link);
                             self.remove_peer_machine(link);
                             self.stats_mut()
                                 .record_reject(RejectReason::Handshake(HandshakeReject::BadState));
@@ -773,12 +772,10 @@ impl Node {
 
                     // Clean up: remove the temporary link and the leg's machine
                     // (dropping its embedded connection; the established peer
-                    // keeps its own machine, keyed by its own link). Do NOT
-                    // remove addr_to_link — the entry must remain pointing to
-                    // the original link so the established peer stays routable,
-                    // so this uses the bare `links.remove` rather than the full
-                    // `remove_link`.
-                    self.links.remove(&link);
+                    // keeps its own machine, keyed by its own link). The rekey
+                    // msg1 pointed the peer's `addr_to_link` key at this leg;
+                    // `remove_link` hands it back to the peer's link.
+                    self.remove_link(&link);
                     self.remove_peer_machine(link);
 
                     debug!(

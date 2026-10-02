@@ -398,7 +398,9 @@ struct PendingConnect {
 /// entry is also single-valued per key, so an inbound handshake overwrites an
 /// outbound dial's entry for the same address. The readers above tolerate this
 /// because each compares a key written in the same form it reads; a new reader
-/// that does not will be quietly wrong.
+/// that does not will be quietly wrong. An inbound handshake that overwrites a
+/// key records the link it displaced, and the key returns to that link, if it
+/// is still live, when the handshake's leg is disposed.
 // Discovery lookup constants moved to config: node.lookup.attempt_timeouts_secs, node.lookup.ttl
 pub struct Node {
     // === Immutable Context ===
@@ -475,6 +477,10 @@ pub struct Node {
     links: HashMap<LinkId, Link>,
     /// Reverse lookup: (transport_id, remote_addr) -> link_id.
     addr_to_link: HashMap<AddrKey, LinkId>,
+    /// For an inbound handshake leg that took over an `addr_to_link` key at
+    /// msg1, the key and the link it named before. `remove_link` hands the key
+    /// back to that link, if it is still live, when the leg goes.
+    displaced_links: HashMap<LinkId, (AddrKey, LinkId)>,
 
     // === Packet Channel ===
     /// Packet receiver (for event loop).
@@ -906,6 +912,7 @@ impl Node {
             transport_drops: HashMap::new(),
             links: HashMap::new(),
             addr_to_link: HashMap::new(),
+            displaced_links: HashMap::new(),
             packet_rx: None,
             child_exit_tx: None,
             child_exit_rx: None,
@@ -1083,6 +1090,7 @@ impl Node {
             transport_drops: HashMap::new(),
             links: HashMap::new(),
             addr_to_link: HashMap::new(),
+            displaced_links: HashMap::new(),
             packet_rx: None,
             child_exit_tx: None,
             child_exit_rx: None,
@@ -2858,9 +2866,21 @@ impl Node {
     ///
     /// Entries a newer link has already claimed are left alone, since they no
     /// longer name this link.
+    ///
+    /// An inbound handshake leg that overwrote a key at msg1 hands it back to
+    /// the link it displaced, if that link is still live and nothing has claimed
+    /// the key since. Restoring only to a live link is what keeps a stale record
+    /// harmless: `LinkId`s come from a monotonic counter, so a dead link's id
+    /// never names a new one.
     pub fn remove_link(&mut self, link_id: &LinkId) -> Option<Link> {
+        let displaced = self.displaced_links.remove(link_id);
         let link = self.links.remove(link_id)?;
         self.addr_to_link.retain(|_, mapped| *mapped != *link_id);
+        if let Some((key, prior)) = displaced
+            && self.links.contains_key(&prior)
+        {
+            self.addr_to_link.entry(key).or_insert(prior);
+        }
         Some(link)
     }
 
@@ -2952,6 +2972,13 @@ impl Node {
                 has_carrier,
                 "control machine for link {link} has no live carrier \
                  (no pending connection, active peer, or pending connect)"
+            );
+        }
+        for leg in self.displaced_links.keys() {
+            assert!(
+                self.links.contains_key(leg),
+                "displaced-key record for link {leg} outlived its link \
+                 (a removal path bypassed `remove_link`)"
             );
         }
     }

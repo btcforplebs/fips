@@ -1884,6 +1884,11 @@ async fn test_msg3_dual_rekey_won_frees_index() {
     // established peer's machine remains.
     let peer_link = responder.node.get_peer(&peer_addr).unwrap().link_id();
     assert_eq!(responder.node.peer_machines.len(), 1);
+    assert_eq!(
+        link_at(&responder, &initiator.addr),
+        Some(peer_link),
+        "the rejected leg must hand the peer's address key back to the peer's link"
+    );
     assert!(responder.node.peer_machines.contains_key(&peer_link));
     #[cfg(debug_assertions)]
     responder.node.debug_assert_peer_maps_coherent();
@@ -2057,6 +2062,11 @@ async fn test_msg3_resend_msg2_frees_index() {
     // established peer's machine remains.
     let peer_link = responder.node.get_peer(&peer_addr).unwrap().link_id();
     assert_eq!(responder.node.peer_machines.len(), 1);
+    assert_eq!(
+        link_at(&responder, &initiator.addr),
+        Some(peer_link),
+        "the duplicate leg must hand the peer's address key back to the peer's link"
+    );
     assert!(responder.node.peer_machines.contains_key(&peer_link));
     #[cfg(debug_assertions)]
     responder.node.debug_assert_peer_maps_coherent();
@@ -4741,6 +4751,304 @@ async fn test_abandon_rekey_frees_index_and_pending_outbound() {
             .contains_key(&(initiator.transport_id, session_idx.as_u32())),
         "the established session stays registered for dispatch"
     );
+
+    stop_hs(&mut initiator).await;
+    stop_hs(&mut responder).await;
+}
+
+// ===========================================================================
+// The responder's `addr_to_link` key for an established peer's address must
+// keep naming the peer's link once a msg1-born leg that took the key over is
+// disposed, on every exit that disposes of it. A key left naming the dead leg
+// stops the anonymous-beacon dial dedup from ever dialling that address again
+// after the peer goes away; a key removed outright lets it dial an address
+// that already has a peer.
+// ===========================================================================
+
+/// The `addr_to_link` entry for `addr` on `node`'s handshake transport.
+fn link_at(node: &HsNode, addr: &TransportAddr) -> Option<LinkId> {
+    node.node
+        .addr_to_link
+        .get(&(node.transport_id, addr.clone()))
+        .copied()
+}
+
+/// Rekey config for a node that both fires and answers rekeys.
+fn rekey_config() -> Config {
+    let mut c = Config::new();
+    c.node.rekey.enabled = true;
+    c.node.rekey.after_secs = 30;
+    c
+}
+
+/// Establish `initiator` as a peer of `responder`, age both sessions past the
+/// rekey trigger, then deliver only the initiator's real rekey msg1 to the
+/// responder. Returns the initiator's `NodeAddr` at the responder, the peer's
+/// link, and the rekey leg the msg1 built.
+async fn park_rekey_leg(
+    initiator: &mut HsNode,
+    responder: &mut HsNode,
+) -> (NodeAddr, LinkId, LinkId) {
+    let msg3 = drive_to_msg3(initiator, responder, 1000).await;
+    responder.node.handle_msg3(msg3).await;
+    let peer_addr =
+        *PeerIdentity::from_pubkey_full(initiator.node.identity().pubkey_full()).node_addr();
+    let responder_addr =
+        *PeerIdentity::from_pubkey_full(responder.node.identity().pubkey_full()).node_addr();
+    for (node, addr) in [
+        (&mut initiator.node, responder_addr),
+        (&mut responder.node, peer_addr),
+    ] {
+        node.get_peer_mut(&addr)
+            .unwrap()
+            .test_backdate_session_established(std::time::Duration::from_secs(120));
+    }
+    let peer_link = responder.node.get_peer(&peer_addr).unwrap().link_id();
+    assert_eq!(link_at(responder, &initiator.addr), Some(peer_link));
+
+    initiator.node.check_rekey().await;
+    let msg1 = recv_phase(&mut responder.packet_rx, 1, "rekey msg1").await;
+    responder.node.handle_msg1(msg1).await;
+    let leg = link_at(responder, &initiator.addr).expect("the rekey leg holds the key");
+    assert_ne!(leg, peer_link, "the rekey msg1 built its own leg");
+    (peer_addr, peer_link, leg)
+}
+
+#[tokio::test]
+async fn a_completed_rekey_leaves_the_peer_address_naming_the_peer_link_and_teardown_clears_it() {
+    let mut initiator = make_hs_node(rekey_config()).await;
+    let mut responder = make_hs_node(rekey_config()).await;
+    let (peer_addr, peer_link, _leg) = park_rekey_leg(&mut initiator, &mut responder).await;
+
+    let msg2 = recv_phase(&mut initiator.packet_rx, 2, "rekey msg2").await;
+    initiator.node.handle_msg2(msg2).await;
+    let msg3 = recv_phase(&mut responder.packet_rx, 3, "rekey msg3").await;
+    responder.node.handle_msg3(msg3).await;
+    assert!(
+        responder
+            .node
+            .get_peer(&peer_addr)
+            .unwrap()
+            .pending_new_session()
+            .is_some(),
+        "the rekey-responder arm ran"
+    );
+    assert_eq!(
+        link_at(&responder, &initiator.addr),
+        Some(peer_link),
+        "the consumed rekey leg must hand the key back to the peer's link"
+    );
+    #[cfg(debug_assertions)]
+    responder.node.debug_assert_peer_maps_coherent();
+
+    responder.node.remove_active_peer(&peer_addr);
+    assert_eq!(
+        link_at(&responder, &initiator.addr),
+        None,
+        "tearing the peer down must leave no key naming a dead link"
+    );
+
+    stop_hs(&mut initiator).await;
+    stop_hs(&mut responder).await;
+}
+
+/// The two `RekeyRespondTrigger` exits that find no session to install are
+/// defensive and unreachable through `handle_msg3`, so they are driven through
+/// the executor directly against a real rekey leg.
+async fn rekey_respond_without_session(drop_machine: bool) {
+    let mut initiator = make_hs_node(rekey_config()).await;
+    let mut responder = make_hs_node(rekey_config()).await;
+    let (peer_addr, peer_link, leg) = park_rekey_leg(&mut initiator, &mut responder).await;
+    let leg_index = responder
+        .node
+        .peer_machines
+        .get(&leg)
+        .and_then(|m| m.our_index())
+        .expect("the rekey leg holds its index");
+    if drop_machine {
+        responder.node.remove_peer_machine(leg);
+    }
+
+    let ambient = crate::node::dataplane::PeerActionCtx {
+        verified_identity: PeerIdentity::from_pubkey_full(initiator.node.identity().pubkey_full()),
+        transport_id: responder.transport_id,
+        remote_addr: initiator.addr.clone(),
+        our_index: Some(leg_index),
+        their_index: Some(SessionIndex::new(0x5151)),
+        now_ms: Node::now_ms(),
+        is_outbound: false,
+        pending_outbound_key: None,
+    };
+    responder
+        .node
+        .execute_peer_actions(
+            leg,
+            &ambient,
+            vec![crate::peer::machine::PeerAction::RekeyRespondTrigger {
+                peer: peer_addr,
+                our_index: leg_index,
+                abandon_first: false,
+            }],
+        )
+        .await;
+
+    assert!(!responder.node.links.contains_key(&leg), "the leg is gone");
+    assert!(
+        responder
+            .node
+            .get_peer(&peer_addr)
+            .unwrap()
+            .pending_new_session()
+            .is_none(),
+        "the exit installed nothing"
+    );
+    assert_eq!(
+        link_at(&responder, &initiator.addr),
+        Some(peer_link),
+        "the disposed rekey leg must hand the key back to the peer's link"
+    );
+    #[cfg(debug_assertions)]
+    responder.node.debug_assert_peer_maps_coherent();
+
+    stop_hs(&mut initiator).await;
+    stop_hs(&mut responder).await;
+}
+
+#[tokio::test]
+async fn a_rekey_responder_exit_without_a_session_leaves_the_peer_address_naming_the_peer_link() {
+    rekey_respond_without_session(false).await;
+}
+
+#[tokio::test]
+async fn a_rekey_responder_exit_without_a_machine_leaves_the_peer_address_naming_the_peer_link() {
+    rekey_respond_without_session(true).await;
+}
+
+#[tokio::test]
+async fn a_reaped_rekey_leg_leaves_the_peer_address_naming_the_peer_link() {
+    let mut initiator = make_hs_node(rekey_config()).await;
+    let mut cfg = rekey_config();
+    cfg.node.rate_limit.handshake_timeout_secs = 0;
+    let mut responder = make_hs_node(cfg).await;
+    let (peer_addr, peer_link, leg) = park_rekey_leg(&mut initiator, &mut responder).await;
+
+    // With a zero timeout the leg is stale one millisecond after its msg1.
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    responder.node.check_timeouts().await;
+
+    assert!(
+        !responder.node.links.contains_key(&leg),
+        "the reaper took the leg"
+    );
+    assert_eq!(responder.node.peer_count(), 1, "the peer is untouched");
+    assert_eq!(
+        responder.node.get_peer(&peer_addr).unwrap().link_id(),
+        peer_link
+    );
+    assert_eq!(
+        link_at(&responder, &initiator.addr),
+        Some(peer_link),
+        "the reaped rekey leg must hand the key back to the peer's link"
+    );
+    #[cfg(debug_assertions)]
+    responder.node.debug_assert_peer_maps_coherent();
+
+    stop_hs(&mut initiator).await;
+    stop_hs(&mut responder).await;
+}
+
+#[tokio::test]
+async fn a_failed_msg2_send_leaves_the_peer_address_naming_the_peer_link() {
+    use crate::proto::fmp::wire::build_msg1;
+
+    let mut initiator = make_hs_node(Config::new()).await;
+    let mut responder = make_hs_node(Config::new()).await;
+    let msg3 = drive_to_msg3(&mut initiator, &mut responder, 1000).await;
+    responder.node.handle_msg3(msg3).await;
+    let peer_addr =
+        *PeerIdentity::from_pubkey_full(initiator.node.identity().pubkey_full()).node_addr();
+    let peer_link = responder.node.get_peer(&peer_addr).unwrap().link_id();
+    let reject_before = responder.node.stats().handshake.bad_state;
+
+    // A stopped UDP transport refuses the msg2 with `NotStarted`, which is
+    // terminal, so the leg is torn down rather than kept.
+    stop_hs(&mut responder).await;
+    let mut hs = crate::noise::HandshakeState::new_initiator(initiator.node.identity().keypair());
+    hs.set_local_epoch(initiator.node.startup_epoch());
+    let noise_msg1 = hs.write_message_1().unwrap();
+    let wire = build_msg1(SessionIndex::new(0x7171), &noise_msg1);
+    responder
+        .node
+        .handle_msg1(ReceivedPacket::new(
+            responder.transport_id,
+            initiator.addr.clone(),
+            wire,
+        ))
+        .await;
+
+    assert_eq!(
+        responder.node.stats().handshake.bad_state,
+        reject_before + 1,
+        "the terminal send failure tore the leg down"
+    );
+    assert_eq!(responder.node.connection_count(), 0, "no leg is left");
+    assert_eq!(
+        link_at(&responder, &initiator.addr),
+        Some(peer_link),
+        "the torn-down leg must hand the key back to the peer's link"
+    );
+    #[cfg(debug_assertions)]
+    responder.node.debug_assert_peer_maps_coherent();
+
+    stop_hs(&mut initiator).await;
+}
+
+#[tokio::test]
+async fn a_dampened_epoch_restart_leaves_the_peer_address_naming_the_peer_link() {
+    let mut initiator = make_hs_node(Config::new()).await;
+    let mut responder = make_hs_node(Config::new()).await;
+    let msg3 = drive_to_msg3(&mut initiator, &mut responder, 1000).await;
+    responder.node.handle_msg3(msg3).await;
+    let peer_addr =
+        *PeerIdentity::from_pubkey_full(initiator.node.identity().pubkey_full()).node_addr();
+    let peer_link = responder.node.get_peer(&peer_addr).unwrap().link_id();
+
+    // Record a different epoch for the peer, so the next handshake from it
+    // reads as a restart; the peering is seconds old, so the restart is
+    // refused as dampened.
+    responder
+        .node
+        .get_peer_mut(&peer_addr)
+        .unwrap()
+        .set_remote_epoch(Some([0xEE; 8]));
+    let indices_before = {
+        let p = responder.node.get_peer(&peer_addr).unwrap();
+        (p.our_index(), p.their_index())
+    };
+    let bad_state_before = responder.node.stats().handshake.bad_state;
+
+    let msg3b = drive_to_msg3(&mut initiator, &mut responder, 2000).await;
+    responder.node.handle_msg3(msg3b).await;
+
+    let p = responder.node.get_peer(&peer_addr).unwrap();
+    assert_eq!(
+        (p.our_index(), p.their_index()),
+        indices_before,
+        "the dampened arm leaves the peering alone; changed indices mean a \
+         restart or cross-connection ran instead"
+    );
+    assert_eq!(
+        responder.node.stats().handshake.bad_state,
+        bad_state_before + 1,
+        "the dampened arm records its reject"
+    );
+    assert_eq!(
+        link_at(&responder, &initiator.addr),
+        Some(peer_link),
+        "the dampened leg must hand the key back to the peer's link"
+    );
+    #[cfg(debug_assertions)]
+    responder.node.debug_assert_peer_maps_coherent();
 
     stop_hs(&mut initiator).await;
     stop_hs(&mut responder).await;
