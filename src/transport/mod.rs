@@ -1182,10 +1182,31 @@ mod tests {
 
     #[test]
     fn test_transport_addr_mac_display() {
-        // Raw 6-byte MACs (as Ethernet stores via from_bytes) display in
-        // standard colon-separated notation, not bare hex.
+        // Raw 6-byte non-UTF-8 values from from_bytes display in standard
+        // colon-separated notation, not bare hex.
         let mac = TransportAddr::from_bytes(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
         assert_eq!(format!("{}", mac), "aa:bb:cc:dd:ee:ff");
+    }
+
+    #[test]
+    fn a_mac_address_whose_bytes_are_valid_utf8_displays_as_a_mac() {
+        let bytes = [0x32, 0x7c, 0xd1, 0xac, 0x5a, 0x64];
+        assert!(core::str::from_utf8(&bytes).is_ok());
+        let mac = TransportAddr::from_mac(bytes);
+        assert_eq!(mac.to_string(), "32:7c:d1:ac:5a:64");
+        assert_eq!(format!("{:?}", mac), "TransportAddr(32:7c:d1:ac:5a:64)");
+        assert_eq!(mac.as_bytes(), &bytes);
+    }
+
+    #[test]
+    fn a_mac_address_equals_and_hashes_as_its_bytes() {
+        use std::hash::BuildHasher;
+        let bytes = [0x32, 0x7c, 0xd1, 0xac, 0x5a, 0x64];
+        let mac = TransportAddr::from_mac(bytes);
+        let raw = TransportAddr::from_bytes(&bytes);
+        assert_eq!(mac, raw);
+        let hasher = std::collections::hash_map::RandomState::new();
+        assert_eq!(hasher.hash_one(&mac), hasher.hash_one(&raw));
     }
 
     #[test]

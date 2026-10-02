@@ -90,75 +90,116 @@ impl fmt::Display for LinkDirection {
 ///
 /// Each transport type interprets this differently:
 /// - UDP/TCP: "host:port" (IP address or DNS hostname)
-/// - Ethernet: MAC address (6 bytes)
-#[derive(Clone, PartialEq, Eq, Hash)]
-pub struct TransportAddr(Vec<u8>);
+/// - Ethernet: MAC address (6 bytes), built with [`TransportAddr::from_mac`]
+///   so it always displays as a MAC, whatever its bytes decode as
+#[derive(Clone)]
+pub struct TransportAddr {
+    bytes: Vec<u8>,
+    /// Set only by [`TransportAddr::from_mac`]: the bytes are a MAC address
+    /// and always display as one. Not part of equality or hashing.
+    mac: bool,
+}
+
+impl PartialEq for TransportAddr {
+    fn eq(&self, other: &Self) -> bool {
+        self.bytes == other.bytes
+    }
+}
+
+impl Eq for TransportAddr {}
+
+impl core::hash::Hash for TransportAddr {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        self.bytes.hash(state);
+    }
+}
 
 impl TransportAddr {
     /// Create a transport address from raw bytes.
     pub fn new(bytes: Vec<u8>) -> Self {
-        Self(bytes)
+        Self { bytes, mac: false }
     }
 
     /// Create a transport address from a byte slice.
     pub fn from_bytes(bytes: &[u8]) -> Self {
-        Self(bytes.to_vec())
+        Self::new(bytes.to_vec())
+    }
+
+    /// Create an Ethernet transport address from a MAC address.
+    pub fn from_mac(mac: [u8; 6]) -> Self {
+        Self {
+            bytes: mac.to_vec(),
+            mac: true,
+        }
     }
 
     /// Create a transport address from a string.
     pub fn from_string(s: &str) -> Self {
-        Self(s.as_bytes().to_vec())
+        Self::new(s.as_bytes().to_vec())
     }
 
     /// Get the raw bytes.
     pub fn as_bytes(&self) -> &[u8] {
-        &self.0
+        &self.bytes
     }
 
     /// Try to interpret as a UTF-8 string.
     pub fn as_str(&self) -> Option<&str> {
-        core::str::from_utf8(&self.0).ok()
+        core::str::from_utf8(&self.bytes).ok()
     }
 
     /// Get the length in bytes.
     pub fn len(&self) -> usize {
-        self.0.len()
+        self.bytes.len()
     }
 
     /// Check if empty.
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.bytes.is_empty()
+    }
+}
+
+impl TransportAddr {
+    /// Write the bytes as a colon-separated MAC address.
+    fn write_mac(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (i, byte) in self.bytes.iter().enumerate() {
+            if i > 0 {
+                write!(f, ":")?;
+            }
+            write!(f, "{:02x}", byte)?;
+        }
+        Ok(())
     }
 }
 
 impl fmt::Debug for TransportAddr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.mac {
+            write!(f, "TransportAddr(")?;
+            self.write_mac(f)?;
+            return write!(f, ")");
+        }
         match self.as_str() {
             Some(s) => write!(f, "TransportAddr(\"{}\")", s),
-            None => write!(f, "TransportAddr({:?})", self.0),
+            None => write!(f, "TransportAddr({:?})", self.bytes),
         }
     }
 }
 
 impl fmt::Display for TransportAddr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Best-effort display as string if valid UTF-8. Otherwise render a
-        // 6-byte payload as a colon-separated MAC (standard Unix notation,
-        // matching BLE addrs, `ip link`/`ip neigh`, and packet logs), and
-        // any other non-UTF-8 byte string as bare hex.
+        // An Ethernet address is a MAC whatever its bytes decode as. Any
+        // other address displays as a string if it is valid UTF-8; otherwise
+        // a 6-byte payload is rendered as a colon-separated MAC and any other
+        // byte string as bare hex.
+        if self.mac {
+            return self.write_mac(f);
+        }
         match self.as_str() {
             Some(s) => write!(f, "{}", s),
-            None if self.0.len() == 6 => {
-                for (i, byte) in self.0.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ":")?;
-                    }
-                    write!(f, "{:02x}", byte)?;
-                }
-                Ok(())
-            }
+            None if self.bytes.len() == 6 => self.write_mac(f),
             None => {
-                for byte in &self.0 {
+                for byte in &self.bytes {
                     write!(f, "{:02x}", byte)?;
                 }
                 Ok(())
@@ -175,7 +216,7 @@ impl From<&str> for TransportAddr {
 
 impl From<String> for TransportAddr {
     fn from(s: String) -> Self {
-        Self(s.into_bytes())
+        Self::new(s.into_bytes())
     }
 }
 
