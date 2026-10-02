@@ -3,7 +3,8 @@
 //! exited.
 //!
 //! The pools are a performance offload, and Windows never starts them at
-//! all, so losing workers is `Degraded` at most and never fatal. Inbound
+//! all, so losing workers is `Degraded` at most and never fatal. An outbound
+//! packet for a missing encrypt worker is sealed on the main loop. Inbound
 //! packets for a session already held by a missing decrypt worker are
 //! dropped until the session rekeys or the link is re-established; a session
 //! that would be registered on the missing worker after the loss is decrypted

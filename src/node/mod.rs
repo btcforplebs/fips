@@ -3914,7 +3914,7 @@ impl Node {
                     // Drop bulk endpoint data on UDP backpressure to
                     // keep the queue moving; control frames retry.
                     let drop_on_backpressure = plaintext.first().is_some_and(|t| *t == 0x00);
-                    workers.dispatch(crate::node::encrypt_worker::FmpSendJob {
+                    let dispatched = workers.dispatch(crate::node::encrypt_worker::FmpSendJob {
                         cipher: fmp_cipher,
                         counter,
                         wire_buf,
@@ -3926,12 +3926,27 @@ impl Node {
                         drop_on_backpressure,
                         queued_at: None,
                     });
+                    let sent_bytes = match dispatched {
+                        Ok(()) => predicted_bytes,
+                        // The worker for this destination has exited. Seal
+                        // here with the counter already reserved, so no
+                        // counter is skipped, and send as the inline path does.
+                        Err(job) => {
+                            let wire = job.seal_inline().map_err(|e| NodeError::SendFailed {
+                                node_addr: *node_addr,
+                                reason: format!("encryption failed: {}", e),
+                            })?;
+                            transport
+                                .send(&remote_addr, &wire)
+                                .await
+                                .map_err(|e| link_send_error(*node_addr, e))?
+                        }
+                    };
 
                     if let Some(peer) = self.peers.get_mut(node_addr) {
-                        peer.link_stats_mut().record_sent(predicted_bytes);
+                        peer.link_stats_mut().record_sent(sent_bytes);
                         if let Some(mmp) = peer.mmp_mut() {
-                            mmp.sender
-                                .record_sent(counter, timestamp_ms, predicted_bytes);
+                            mmp.sender.record_sent(counter, timestamp_ms, sent_bytes);
                         }
                     }
                     return Ok(());
@@ -3989,25 +4004,7 @@ impl Node {
         let bytes_sent = transport
             .send(&remote_addr, &wire_packet)
             .await
-            .map_err(|e| match e {
-                TransportError::MtuExceeded { packet_size, mtu } => NodeError::MtuExceeded {
-                    node_addr: *node_addr,
-                    packet_size,
-                    mtu,
-                },
-                // Preserve the transport's own classification instead of
-                // flattening every non-MTU failure into one string. A caller
-                // that wants to keep its half-built state across an interface
-                // flap can only do that if the distinction survives to it.
-                other if other.is_transient() => NodeError::SendUnavailable {
-                    node_addr: *node_addr,
-                    reason: format!("transport send: {}", other),
-                },
-                other => NodeError::SendFailed {
-                    node_addr: *node_addr,
-                    reason: format!("transport send: {}", other),
-                },
-            })?;
+            .map_err(|e| link_send_error(*node_addr, e))?;
 
         // Update send statistics
         if let Some(peer) = self.peers.get_mut(node_addr) {
@@ -4019,6 +4016,30 @@ impl Node {
         }
 
         Ok(())
+    }
+}
+
+/// Map a transport's refusal of an encrypted link frame to `node_addr` onto
+/// the error the link-send path reports.
+fn link_send_error(node_addr: NodeAddr, e: TransportError) -> NodeError {
+    match e {
+        TransportError::MtuExceeded { packet_size, mtu } => NodeError::MtuExceeded {
+            node_addr,
+            packet_size,
+            mtu,
+        },
+        // Preserve the transport's own classification instead of
+        // flattening every non-MTU failure into one string. A caller
+        // that wants to keep its half-built state across an interface
+        // flap can only do that if the distinction survives to it.
+        other if other.is_transient() => NodeError::SendUnavailable {
+            node_addr,
+            reason: format!("transport send: {}", other),
+        },
+        other => NodeError::SendFailed {
+            node_addr,
+            reason: format!("transport send: {}", other),
+        },
     }
 }
 

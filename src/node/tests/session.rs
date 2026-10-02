@@ -9016,3 +9016,110 @@ async fn a_path_broken_flood_releases_the_stored_path_mtu_only_once_per_interval
         "a second release for the same destination inside the interval is refused"
     );
 }
+
+/// Session data whose next hop's encrypt worker has exited is still
+/// delivered, sealed on the main loop with the FSP and FMP counters the
+/// worker path reserved.
+#[cfg(unix)]
+mod dead_encrypt_worker {
+    use super::*;
+    use crate::config::UdpConfig;
+    use crate::node::tests::pool_with_dead_worker_for;
+    use crate::transport::udp::UdpTransport;
+    use crate::transport::{TransportAddr, TransportHandle, TransportId, packet_channel};
+
+    /// A test node on a real UDP socket: the worker path needs one.
+    async fn make_test_node_udp() -> TestNode {
+        let mut node = make_node();
+        let transport_id = TransportId::new(1);
+        let config = UdpConfig {
+            bind_addr: Some("127.0.0.1:0".to_string()),
+            mtu: Some(1280),
+            ..Default::default()
+        };
+        let (packet_tx, packet_rx) = packet_channel(256);
+        let mut transport = UdpTransport::new(transport_id, None, config, packet_tx);
+        transport.start_async().await.unwrap();
+        let addr = TransportAddr::from_string(&transport.local_addr().unwrap().to_string());
+        node.transports
+            .insert(transport_id, TransportHandle::Udp(transport));
+        TestNode {
+            node,
+            transport_id,
+            packet_rx: crate::node::tests::spanning_tree::bridge_to_unbounded(packet_rx),
+            addr,
+        }
+    }
+
+    fn fsp_send_counter(node: &Node, dest: &NodeAddr) -> u64 {
+        match node.get_session(dest).expect("session").state() {
+            EndToEndState::Established(session) => session.current_send_counter(),
+            _ => panic!("session not established"),
+        }
+    }
+
+    fn fmp_send_counter(node: &Node, peer: &NodeAddr) -> u64 {
+        node.get_peer(peer)
+            .expect("peer")
+            .noise_session()
+            .expect("link session")
+            .current_send_counter()
+    }
+
+    #[tokio::test]
+    async fn session_data_for_a_dead_workers_next_hop_is_still_delivered() {
+        let mut nodes = vec![make_test_node_udp().await, make_test_node_udp().await];
+        initiate_handshake(&mut nodes, 0, 1).await;
+        drain_all_packets(&mut nodes, false).await;
+        verify_tree_convergence(&nodes);
+        populate_all_coord_caches(&mut nodes);
+        establish_pair_session(&mut nodes).await;
+        drain_all_packets(&mut nodes, false).await;
+
+        let node0 = *nodes[0].node.node_addr();
+        let node1 = *nodes[1].node.node_addr();
+        let dest: std::net::SocketAddr = nodes[1].addr.to_string().parse().unwrap();
+        let pool = pool_with_dead_worker_for(dest);
+        nodes[0].node.supervisor.encrypt_workers = Some(pool.clone());
+
+        let fsp_before = fsp_send_counter(&nodes[0].node, &node1);
+        let fmp_before = fmp_send_counter(&nodes[0].node, &node1);
+        let recv_before = nodes[1]
+            .node
+            .get_session(&node0)
+            .unwrap()
+            .traffic_counters()
+            .1;
+
+        nodes[0]
+            .node
+            .send_session_data(&node1, 0, 0, b"for a dead worker")
+            .await
+            .expect("send_session_data");
+        // Read before anything else runs on A: one packet, one counter each.
+        assert_eq!(fsp_send_counter(&nodes[0].node, &node1), fsp_before + 1);
+        assert_eq!(fmp_send_counter(&nodes[0].node, &node1), fmp_before + 1);
+        assert_eq!(pool.liveness().refused_dispatches(), 1);
+
+        let delivered = |nodes: &[TestNode]| {
+            nodes[1]
+                .node
+                .get_session(&node0)
+                .unwrap()
+                .traffic_counters()
+                .1
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while delivered(&nodes) == recv_before && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            process_available_packets(&mut nodes).await;
+        }
+        assert_eq!(
+            delivered(&nodes),
+            recv_before + 1,
+            "the payload never reached the destination"
+        );
+
+        cleanup_nodes(&mut nodes).await;
+    }
+}

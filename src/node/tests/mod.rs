@@ -94,6 +94,31 @@ pub(super) fn install_connected_udp(
         .set_connected_udp(socket, drain);
 }
 
+/// An encrypt pool of two whose worker for `dest` has exited. Where the worker
+/// for a destination is not a function of the address alone (macOS), both
+/// have.
+#[cfg(unix)]
+pub(super) fn pool_with_dead_worker_for(
+    dest: std::net::SocketAddr,
+) -> crate::node::encrypt_worker::EncryptWorkerPool {
+    use crate::node::encrypt_worker::EncryptWorkerPool;
+    use crate::node::worker_set::TestWorker;
+
+    let dead = EncryptWorkerPool::for_test(vec![TestWorker::FailSpawn, TestWorker::FailSpawn])
+        .worker_index_for_dest(dest);
+    EncryptWorkerPool::for_test(
+        (0..2)
+            .map(|idx| {
+                if dead.is_none_or(|d| d == idx) {
+                    TestWorker::FailSpawn
+                } else {
+                    TestWorker::Run
+                }
+            })
+            .collect(),
+    )
+}
+
 /// Build a test node with an explicit `max_peers` limit (replaces the removed
 /// `set_max_peers` setter; resource limits are immutable post-construction).
 pub(super) fn make_node_with_max_peers(max_peers: usize) -> Node {

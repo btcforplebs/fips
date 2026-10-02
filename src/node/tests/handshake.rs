@@ -2377,3 +2377,209 @@ async fn a_transient_msg2_failure_on_the_restart_path_leaves_the_fresh_leg_pendi
         "a local interface flap must not be recorded as the peer's misbehaviour"
     );
 }
+
+/// Link messages to a peer whose encrypt worker has exited are still sent,
+/// sealed on the main loop with the counter the worker path reserved.
+#[cfg(unix)]
+mod dead_encrypt_worker {
+    use super::*;
+    use crate::config::UdpConfig;
+    use crate::node::encrypt_worker::EncryptWorkerPool;
+    use crate::node::tests::pool_with_dead_worker_for;
+    use crate::node::worker_set::TestWorker;
+    use crate::proto::fmp::wire::{EncryptedHeader, build_msg1};
+    use crate::transport::ReceivedPacket;
+    use crate::transport::udp::UdpTransport;
+    use tokio::time::{Duration, timeout};
+
+    /// Two nodes on real UDP sockets with an established link from A to B.
+    struct Pair {
+        node_a: Node,
+        node_b: Node,
+        packet_rx_b: crate::transport::PacketRx,
+        peer_a: NodeAddr,
+        peer_b: NodeAddr,
+        addr_b: std::net::SocketAddr,
+    }
+
+    async fn linked_pair() -> Pair {
+        let mut node_a = make_node();
+        let mut node_b = make_node();
+        let tid = TransportId::new(1);
+        let udp_config = UdpConfig {
+            bind_addr: Some("127.0.0.1:0".to_string()),
+            mtu: Some(1280),
+            ..Default::default()
+        };
+        let (packet_tx_a, mut packet_rx_a) = packet_channel(64);
+        let (packet_tx_b, mut packet_rx_b) = packet_channel(64);
+        let mut transport_a = UdpTransport::new(tid, None, udp_config.clone(), packet_tx_a);
+        let mut transport_b = UdpTransport::new(tid, None, udp_config, packet_tx_b);
+        transport_a.start_async().await.unwrap();
+        transport_b.start_async().await.unwrap();
+        let addr_b = transport_b.local_addr().unwrap();
+        let remote_addr_b = TransportAddr::from_string(&addr_b.to_string());
+        node_a
+            .transports
+            .insert(tid, TransportHandle::Udp(transport_a));
+        node_b
+            .transports
+            .insert(tid, TransportHandle::Udp(transport_b));
+
+        let peer_b_identity = PeerIdentity::from_pubkey_full(node_b.identity().pubkey_full());
+        let peer_b = *peer_b_identity.node_addr();
+        let peer_a = *PeerIdentity::from_pubkey_full(node_a.identity().pubkey_full()).node_addr();
+        let link_id = node_a.allocate_link_id();
+        let our_index = node_a.index_allocator.allocate().unwrap();
+        node_a
+            .seed_handshake_machine(
+                HandshakeSeed::outbound(link_id, peer_b_identity, 1000)
+                    .with_our_index(our_index)
+                    .with_transport_id(tid)
+                    .with_source_addr(remote_addr_b.clone()),
+            )
+            .unwrap();
+        let keypair = node_a.identity().keypair();
+        let epoch = node_a.startup_epoch();
+        let msg1 = node_a
+            .peer_machines
+            .get_mut(&link_id)
+            .unwrap()
+            .start_handshake(keypair, epoch, 1000)
+            .unwrap();
+        node_a.links.insert(
+            link_id,
+            Link::connectionless(
+                link_id,
+                tid,
+                remote_addr_b.clone(),
+                LinkDirection::Outbound,
+                Duration::from_millis(100),
+            ),
+        );
+        node_a
+            .pending_outbound
+            .insert((tid, our_index.as_u32()), link_id);
+        node_a
+            .transports
+            .get(&tid)
+            .unwrap()
+            .send(&remote_addr_b, &build_msg1(our_index, &msg1))
+            .await
+            .expect("send msg1");
+
+        let msg1 = next_packet(&mut packet_rx_b).await;
+        node_b.handle_msg1(msg1).await;
+        let msg2 = next_packet(&mut packet_rx_a).await;
+        node_a.handle_msg2(msg2).await;
+        assert!(node_a.get_peer(&peer_b).is_some(), "A promoted B");
+        assert!(node_b.get_peer(&peer_a).is_some(), "B promoted A");
+
+        Pair {
+            node_a,
+            node_b,
+            packet_rx_b,
+            peer_a,
+            peer_b,
+            addr_b,
+        }
+    }
+
+    async fn next_packet(rx: &mut crate::transport::PacketRx) -> ReceivedPacket {
+        timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("no packet within the bound")
+            .expect("packet channel closed")
+    }
+
+    /// Send one link message from A to B through `pool` and have B process
+    /// it. Returns (the frame's FMP counter, A's send counter before the
+    /// send, A's packets-sent delta, B's packets-received delta, encrypt
+    /// WARN lines).
+    async fn send_through(
+        pair: &mut Pair,
+        pool: &EncryptWorkerPool,
+    ) -> (u64, u64, u64, u64, Vec<String>) {
+        // Let B take whatever A sent on promotion before measuring.
+        while let Ok(Some(packet)) =
+            timeout(Duration::from_millis(100), pair.packet_rx_b.recv()).await
+        {
+            pair.node_b.handle_encrypted_frame(packet).await;
+        }
+        pair.node_a.supervisor.encrypt_workers = Some(pool.clone());
+        let peer = pair.node_a.get_peer(&pair.peer_b).unwrap();
+        let counter_before = peer.noise_session().unwrap().current_send_counter();
+        let sent_before = peer.link_stats().packets_sent;
+        let recv_before = pair
+            .node_b
+            .get_peer(&pair.peer_a)
+            .unwrap()
+            .link_stats()
+            .packets_recv;
+
+        let (logs, guard) = crate::testutil::capture_logs_scoped();
+        pair.node_a
+            .send_encrypted_link_message(&pair.peer_b, b"\x10dead worker test")
+            .await
+            .expect("link message send");
+        drop(guard);
+
+        let packet = next_packet(&mut pair.packet_rx_b).await;
+        let frame_counter = EncryptedHeader::parse(&packet.data)
+            .expect("an established frame")
+            .counter;
+        pair.node_b.handle_encrypted_frame(packet).await;
+
+        let sent = pair
+            .node_a
+            .get_peer(&pair.peer_b)
+            .unwrap()
+            .link_stats()
+            .packets_sent
+            - sent_before;
+        let recv = pair
+            .node_b
+            .get_peer(&pair.peer_a)
+            .unwrap()
+            .link_stats()
+            .packets_recv
+            - recv_before;
+        let warnings = logs
+            .warnings()
+            .into_iter()
+            .filter(|line| line.contains("pool=\"encrypt\""))
+            .collect();
+        (frame_counter, counter_before, sent, recv, warnings)
+    }
+
+    #[tokio::test]
+    async fn a_link_message_for_a_dead_workers_peer_is_still_sent() {
+        let mut pair = linked_pair().await;
+        let pool = pool_with_dead_worker_for(pair.addr_b);
+        let (frame_counter, counter_before, sent, recv, warnings) =
+            send_through(&mut pair, &pool).await;
+
+        assert_eq!(recv, 1, "B did not authenticate the frame");
+        assert_eq!(
+            frame_counter, counter_before,
+            "the frame must carry the counter reserved for it, not a fresh one"
+        );
+        assert_eq!(sent, 1, "A counted the packet other than once");
+        assert_eq!(pool.liveness().refused_dispatches(), 1);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+    }
+
+    #[tokio::test]
+    async fn a_link_message_through_live_workers_is_sent_by_the_worker() {
+        let mut pair = linked_pair().await;
+        let pool = EncryptWorkerPool::for_test(vec![TestWorker::Run, TestWorker::Run]);
+        let (frame_counter, counter_before, sent, recv, warnings) =
+            send_through(&mut pair, &pool).await;
+
+        assert_eq!(recv, 1, "B did not authenticate the frame");
+        assert_eq!(frame_counter, counter_before);
+        assert_eq!(sent, 1);
+        assert_eq!(pool.liveness().refused_dispatches(), 0);
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+}
