@@ -144,6 +144,20 @@ pub struct SessionDatagramRef<'a> {
     pub payload: &'a [u8],
 }
 
+/// The TTL a transit datagram leaves this node with, or `None` when it may not
+/// be transmitted because it would leave with zero.
+///
+/// Follows IP semantics: the decrement comes first, and `saturating_sub` folds
+/// an already-exhausted arrival (TTL 0) into the same outcome as a last-hop
+/// arrival (TTL 1). This is the one rule behind the routing core's hop-limit
+/// drop and both `can_forward`s.
+pub(crate) fn ttl_after_hop(ttl: u8) -> Option<u8> {
+    match ttl.saturating_sub(1) {
+        0 => None,
+        left => Some(left),
+    }
+}
+
 /// SessionDatagram fixed header size: msg_type(1) + ttl(1) + path_mtu(2) + src_addr(16) + dest_addr(16).
 pub const SESSION_DATAGRAM_HEADER_SIZE: usize = 36;
 
@@ -191,7 +205,7 @@ impl SessionDatagram {
     /// True only at TTL 2 or more: at TTL 1 the decrement leaves zero, so the
     /// datagram is dropped rather than forwarded.
     pub fn can_forward(&self) -> bool {
-        self.ttl > 1
+        ttl_after_hop(self.ttl).is_some()
     }
 
     /// Encode as link-layer message (msg_type + ttl + path_mtu + src_addr + dest_addr + payload).
@@ -237,6 +251,12 @@ impl<'a> SessionDatagramRef<'a> {
             path_mtu,
             payload: &payload[35..],
         })
+    }
+
+    /// Check whether this datagram would survive a transit hop, by the same
+    /// rule the routing core drops on (`ttl_after_hop`).
+    pub fn can_forward(&self) -> bool {
+        ttl_after_hop(self.ttl).is_some()
     }
 
     /// Materialize an owned datagram for forwarding/re-encoding paths.
@@ -422,6 +442,36 @@ mod tests {
             "ttl=2 leaves at one, so it is forwardable"
         );
         assert!(dg.with_ttl(255).can_forward());
+    }
+
+    #[test]
+    fn ttl_after_hop_drops_only_what_would_leave_at_zero() {
+        assert_eq!(
+            ttl_after_hop(0),
+            None,
+            "an exhausted arrival leaves at zero"
+        );
+        assert_eq!(ttl_after_hop(1), None, "a last-hop arrival leaves at zero");
+        assert_eq!(ttl_after_hop(2), Some(1));
+        assert_eq!(ttl_after_hop(255), Some(254));
+
+        let dg = SessionDatagram::new(make_node_addr(1), make_node_addr(2), vec![0x42]);
+        for ttl in 0..=u8::MAX {
+            assert_eq!(
+                ttl_after_hop(ttl).is_some(),
+                ttl > 1,
+                "ttl={ttl}: only a TTL of 2 or more survives the hop"
+            );
+            let owned = dg.clone().with_ttl(ttl);
+            let encoded = owned.encode();
+            let view = SessionDatagramRef::decode(&encoded[1..]).unwrap();
+            assert_eq!(
+                view.can_forward(),
+                owned.can_forward(),
+                "ttl={ttl}: the borrowed and owned views must agree"
+            );
+            assert_eq!(view.can_forward(), ttl_after_hop(ttl).is_some());
+        }
     }
 
     #[test]

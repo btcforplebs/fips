@@ -632,6 +632,27 @@ with v0.5.x or earlier peers.
   per-peer `connect()`-ed UDP socket stayed pinned to the old 5-tuple;
   the sibling path already cleared it.
 
+- A crypto worker thread that exits now shows: the node reports `Degraded`,
+  and a warning names the pool and how many of its workers are still live,
+  logged again each time another one goes. A worker thread that cannot be
+  started is logged and leaves the node degraded instead of stopping start-up.
+  Losing workers never fails the node. Outbound packets for a lost encrypt
+  worker are sent from the main loop, as described below. Inbound packets for
+  a session held by a lost decrypt worker are still dropped, now with a
+  rate-limited warning, until the session rekeys or the link is re-established;
+  a session that would be placed on the lost worker after the loss is
+  decrypted on the main loop instead.
+
+- On every Unix platform, a packet whose encrypt worker thread has exited is
+  now encrypted and sent from the main loop. It was dropped, while the link
+  statistics counted it as sent, so every peer whose traffic went to that
+  worker was cut off until the daemon restarted. The packet keeps the counters
+  reserved for it, so the receiver sees no gap. Each such packet is counted and
+  logged at WARN, rate-limited, in place of a debug line. This includes macOS,
+  where the fix listed under macOS below dropped these packets; only packets
+  already queued to the exited worker are lost. With the macOS ordered sender,
+  a packet sent this way can arrive out of order with the rest of its flow.
+
 #### Data plane and transports
 
 - A peer that stops reading can no longer stall the node. TCP, Tor, Nym and

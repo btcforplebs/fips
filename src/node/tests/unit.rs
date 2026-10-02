@@ -5010,3 +5010,244 @@ async fn msg1_handler_holds_its_pending_slot_while_the_handler_runs() {
         "each handler released its own slot exactly once on the way out"
     );
 }
+
+/// The tick's crypto worker liveness sweep: a lost worker degrades the node and
+/// is logged with the live count; a healthy pool changes nothing.
+#[cfg(unix)]
+mod worker_liveness {
+    use super::*;
+    use crate::node::decrypt_worker::DecryptWorkerPool;
+    use crate::node::encrypt_worker::EncryptWorkerPool;
+    use crate::node::lifecycle::supervisor::{Child, SupervisorFsm};
+    use crate::node::worker_set::{TestWorker, WorkerLiveness, wait_for};
+    use std::collections::HashSet;
+    use std::sync::mpsc;
+
+    /// A node seeded straight into a full `Running` with both pools up.
+    fn running_node() -> Node {
+        let mut node = make_node();
+        node.supervisor.fsm = SupervisorFsm::running_with([
+            Child::Transport(TransportId::new(1)),
+            Child::EncryptWorkers,
+            Child::DecryptWorkers,
+        ]);
+        node.supervisor.state = NodeState::Running;
+        node
+    }
+
+    /// Two workers that each exit when their sender is used.
+    fn two_workers() -> (Vec<TestWorker>, [mpsc::Sender<()>; 2]) {
+        let (kill0, exit0) = mpsc::channel();
+        let (kill1, exit1) = mpsc::channel();
+        (
+            vec![TestWorker::ExitOn(exit0), TestWorker::ExitOn(exit1)],
+            [kill0, kill1],
+        )
+    }
+
+    /// An encrypt pool of two workers that each exit when their sender is
+    /// used.
+    fn pool_of_two() -> (EncryptWorkerPool, [mpsc::Sender<()>; 2]) {
+        let (plan, kills) = two_workers();
+        (EncryptWorkerPool::for_test(plan), kills)
+    }
+
+    /// Signal one worker of `workers` to exit and wait until `live_after`
+    /// remain.
+    fn kill_worker(workers: &dyn WorkerLiveness, kill: &mpsc::Sender<()>, live_after: usize) {
+        kill.send(()).expect("worker gone before its signal");
+        assert!(
+            wait_for(|| workers.live_workers() == live_after),
+            "worker never exited"
+        );
+    }
+
+    fn kill(node: &Node, kill: &mpsc::Sender<()>, live_after: usize) {
+        let pool = node.supervisor.encrypt_workers.as_ref().unwrap();
+        kill_worker(pool.liveness(), kill, live_after);
+    }
+
+    #[tokio::test]
+    async fn a_dead_worker_degrades_the_node_and_names_the_live_count() {
+        let mut node = running_node();
+        let (pool, kills) = pool_of_two();
+        node.supervisor.encrypt_workers = Some(pool);
+        kill(&node, &kills[1], 1);
+
+        let ((), logs) = crate::testutil::capture_logs(|| node.poll_worker_liveness());
+        assert_eq!(node.state(), NodeState::Degraded);
+        assert!(
+            node.supervisor
+                .fsm
+                .degraded_children()
+                .contains(&Child::EncryptWorkers)
+        );
+        let warnings = logs.warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains(" pool=\"encrypt\""), "{warnings:?}");
+        assert!(warnings[0].contains(" live=1"), "{warnings:?}");
+        assert!(warnings[0].contains(" configured=2"), "{warnings:?}");
+
+        // Nothing new: no second report.
+        let ((), logs) = crate::testutil::capture_logs(|| node.poll_worker_liveness());
+        assert!(logs.warnings().is_empty(), "{:?}", logs.warnings());
+        assert_eq!(node.state(), NodeState::Degraded);
+
+        // The last worker goes: reported with the new count, and the node is
+        // still degraded, not failed.
+        kill(&node, &kills[0], 0);
+        let ((), logs) = crate::testutil::capture_logs(|| node.poll_worker_liveness());
+        let warnings = logs.warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains(" live=0"), "{warnings:?}");
+        assert_eq!(node.state(), NodeState::Degraded);
+    }
+
+    #[tokio::test]
+    async fn a_dead_decrypt_worker_degrades_the_node_and_names_its_pool() {
+        let mut node = running_node();
+        let (encrypt, _encrypt_kills) = pool_of_two();
+        node.supervisor.encrypt_workers = Some(encrypt);
+        let (plan, kills) = two_workers();
+        node.supervisor.decrypt_workers = Some(DecryptWorkerPool::for_test(plan));
+        let pool = node.supervisor.decrypt_workers.as_ref().unwrap();
+        kill_worker(pool.liveness(), &kills[0], 1);
+
+        let ((), logs) = crate::testutil::capture_logs(|| node.poll_worker_liveness());
+        assert_eq!(node.state(), NodeState::Degraded);
+        assert_eq!(
+            node.supervisor.fsm.degraded_children(),
+            HashSet::from([Child::DecryptWorkers])
+        );
+        let warnings = logs.warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains(" pool=\"decrypt\""), "{warnings:?}");
+        assert!(warnings[0].contains(" live=1"), "{warnings:?}");
+        assert!(warnings[0].contains(" configured=2"), "{warnings:?}");
+    }
+
+    #[tokio::test]
+    async fn healthy_pools_leave_the_node_running() {
+        let mut node = running_node();
+        let (pool, _kills) = pool_of_two();
+        node.supervisor.encrypt_workers = Some(pool);
+        let (plan, _decrypt_kills) = two_workers();
+        node.supervisor.decrypt_workers = Some(DecryptWorkerPool::for_test(plan));
+
+        let ((), logs) = crate::testutil::capture_logs(|| node.poll_worker_liveness());
+        assert!(logs.warnings().is_empty(), "{:?}", logs.warnings());
+        assert_eq!(node.state(), NodeState::Running);
+    }
+
+    /// What start-up made of the pools a test staged for it.
+    struct StartOutcome {
+        state: NodeState,
+        degraded: HashSet<Child>,
+        encrypt_installed: bool,
+        decrypt_installed: bool,
+    }
+
+    /// Start a node that installs `encrypt` and `decrypt` in place of the
+    /// pools it would spawn, then stop it. Fails if start-up did not take both
+    /// staged pools, since the outcome would then say nothing about them.
+    async fn start_with_staged(
+        encrypt: EncryptWorkerPool,
+        decrypt: DecryptWorkerPool,
+    ) -> StartOutcome {
+        let mut node = make_healthy_node();
+        node.supervisor.staged_pools.encrypt = Some(encrypt);
+        node.supervisor.staged_pools.decrypt = Some(decrypt);
+        node.start().await.unwrap();
+        let staged = &node.supervisor.staged_pools;
+        let taken = staged.encrypt.is_none() && staged.decrypt.is_none();
+        let outcome = StartOutcome {
+            state: node.state(),
+            degraded: node.supervisor.fsm.degraded_children(),
+            encrypt_installed: node.supervisor.encrypt_workers.is_some(),
+            decrypt_installed: node.supervisor.decrypt_workers.is_some(),
+        };
+        node.stop().await.unwrap();
+        assert!(taken, "start-up did not install both staged pools");
+        outcome
+    }
+
+    #[tokio::test]
+    async fn a_worker_that_fails_to_start_leaves_the_node_degraded_with_its_pool_installed() {
+        let outcome = start_with_staged(
+            EncryptWorkerPool::for_test(vec![TestWorker::Run, TestWorker::FailSpawn]),
+            DecryptWorkerPool::for_test(vec![TestWorker::Run, TestWorker::Run]),
+        )
+        .await;
+        assert_eq!(outcome.state, NodeState::Degraded);
+        assert_eq!(outcome.degraded, HashSet::from([Child::EncryptWorkers]));
+        assert!(
+            outcome.encrypt_installed,
+            "a pool with a live worker is kept"
+        );
+        assert!(outcome.decrypt_installed);
+    }
+
+    #[tokio::test]
+    async fn a_pool_with_no_worker_started_leaves_the_node_degraded_and_is_not_installed() {
+        let outcome = start_with_staged(
+            EncryptWorkerPool::for_test(vec![TestWorker::Run, TestWorker::Run]),
+            DecryptWorkerPool::for_test(vec![TestWorker::FailSpawn, TestWorker::FailSpawn]),
+        )
+        .await;
+        assert_eq!(outcome.state, NodeState::Degraded);
+        assert_eq!(outcome.degraded, HashSet::from([Child::DecryptWorkers]));
+        assert!(outcome.encrypt_installed);
+        assert!(
+            !outcome.decrypt_installed,
+            "a pool with no live worker is dropped for the main-loop path"
+        );
+    }
+
+    #[tokio::test]
+    async fn staged_pools_with_every_worker_started_leave_the_node_running() {
+        let outcome = start_with_staged(
+            EncryptWorkerPool::for_test(vec![TestWorker::Run, TestWorker::Run]),
+            DecryptWorkerPool::for_test(vec![TestWorker::Run, TestWorker::Run]),
+        )
+        .await;
+        assert_eq!(outcome.state, NodeState::Running);
+        assert!(outcome.degraded.is_empty(), "{:?}", outcome.degraded);
+        assert!(outcome.encrypt_installed && outcome.decrypt_installed);
+    }
+
+    /// Start a node, swap in a pool of two, optionally kill one worker, and
+    /// drive the real rx loop past one tick. Returns the state it published.
+    async fn drive_with_pool(kill_one: bool) -> NodeState {
+        let mut node = make_healthy_node();
+        node.start().await.unwrap();
+        assert_eq!(node.state(), NodeState::Running);
+        let (pool, kills) = pool_of_two();
+        node.supervisor.encrypt_workers = Some(pool);
+        if kill_one {
+            kill(&node, &kills[1], 1);
+        }
+
+        let drive = tokio::time::timeout(
+            Duration::from_millis(1500),
+            node.run_rx_loop_with_shutdown(std::future::pending()),
+        )
+        .await;
+        assert!(
+            drive.is_err(),
+            "the rx loop must still be running: {drive:?}"
+        );
+        let state = node.state();
+        node.stop().await.unwrap();
+        state
+    }
+
+    #[tokio::test]
+    async fn a_dead_worker_degrades_the_node_through_the_rx_loop() {
+        assert_eq!(drive_with_pool(true).await, NodeState::Degraded);
+    }
+
+    #[tokio::test]
+    async fn a_healthy_pool_leaves_the_node_running_through_the_rx_loop() {
+        assert_eq!(drive_with_pool(false).await, NodeState::Running);
+    }
+}

@@ -165,6 +165,8 @@ impl Stp {
     /// `classify_announce`, the periodic path has no same-parent loop-drop /
     /// ancestry-update arms — a periodic tick has no announcing peer, so those cases
     /// never arise; the no-change tail is a re-broadcast rather than a true no-op.
+    /// The first-RTT re-evaluation in `node::handlers::mmp` is driven by it too,
+    /// and ignores `PeriodicRebroadcast`.
     pub(crate) fn classify_periodic(
         tree: &TreeState,
         peer_costs: &BTreeMap<NodeAddr, f64>,

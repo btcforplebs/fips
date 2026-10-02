@@ -15,7 +15,7 @@ use crate::proto::mmp::{
     LinkReportKind, LinkReportSnapshot, MmpAction, PeerLivenessSnapshot, ReceiverReport, RrLog,
     SenderReport,
 };
-use crate::proto::stp::ParentEval;
+use crate::proto::stp::{Stp, TreeDecision};
 use crate::transport::{TransportAddr, TransportId};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, trace, warn};
@@ -258,75 +258,88 @@ impl Node {
             // Compute the flap-dampening / hold-down veto at the edge; a mandatory
             // switch bypasses it, a discretionary one is taken only if not suppressed.
             let switch_suppressed = self.tree_state.is_switch_suppressed(mono_now_ms);
-            let new_parent = match self.tree_state.evaluate_parent(&peer_costs, &skip) {
-                ParentEval::Mandatory(p) => Some(p),
-                ParentEval::Discretionary(p) if !switch_suppressed => Some(p),
-                ParentEval::Discretionary(_) | ParentEval::None => None,
-            };
-            if let Some(new_parent) = new_parent {
-                let new_seq = self.tree_state.my_declaration().sequence() + 1;
-                let flap_dampened =
-                    self.tree_state
-                        .set_parent(new_parent, new_seq, now_secs, mono_now_ms);
-                self.tree_state.recompute_coords();
-                // Clone identity once: sign_declaration borrows &mut tree_state while
-                // the identity() accessor borrows all of &self, so an owned copy avoids
-                // the split-borrow conflict on this infrequent parent-switch path.
-                let our_identity = self.identity().clone();
-                if let Err(e) =
-                    sign_declaration(self.tree_state.my_declaration_mut(), &our_identity)
-                {
-                    warn!(error = %e, "Failed to sign declaration after first-RTT parent eval");
-                    self.metrics()
-                        .tree
-                        .record_reject(TreeReject::OutboundSignFailed);
-                    return;
+            match Stp::classify_periodic(&self.tree_state, &peer_costs, &skip, switch_suppressed) {
+                TreeDecision::Switch {
+                    new_parent,
+                    new_seq,
+                } => {
+                    let flap_dampened =
+                        self.tree_state
+                            .set_parent(new_parent, new_seq, now_secs, mono_now_ms);
+                    self.tree_state.recompute_coords();
+                    // Clone identity once: sign_declaration borrows &mut tree_state while
+                    // the identity() accessor borrows all of &self, so an owned copy avoids
+                    // the split-borrow conflict on this infrequent parent-switch path.
+                    let our_identity = self.identity().clone();
+                    if let Err(e) =
+                        sign_declaration(self.tree_state.my_declaration_mut(), &our_identity)
+                    {
+                        warn!(error = %e, "Failed to sign declaration after first-RTT parent eval");
+                        self.metrics()
+                            .tree
+                            .record_reject(TreeReject::OutboundSignFailed);
+                        return;
+                    }
+                    // Surgical invalidation — see CoordCache::invalidate_via_node doc.
+                    self.coord_cache
+                        .invalidate_via_node(our_identity.node_addr());
+                    self.reset_lookup_backoff();
+                    self.metrics().tree.parent_switches.inc();
+                    info!(
+                        new_parent = %self.peer_display_name(&new_parent),
+                        new_seq = new_seq,
+                        new_root = %self.tree_state.root(),
+                        depth = self.tree_state.my_coords().depth(),
+                        trigger = "first-rtt",
+                        "Parent switched after first RTT measurement"
+                    );
+                    if flap_dampened {
+                        self.note_flap("first-rtt");
+                    }
+                    self.send_tree_announce_to_all().await;
+                    let all_peers: Vec<crate::NodeAddr> = self.peers.keys().copied().collect();
+                    self.bloom_state.mark_all_updates_needed(all_peers);
                 }
-                // Surgical invalidation — see CoordCache::invalidate_via_node doc.
-                self.coord_cache
-                    .invalidate_via_node(our_identity.node_addr());
-                self.reset_lookup_backoff();
-                self.metrics().tree.parent_switches.inc();
-                info!(
-                    new_parent = %self.peer_display_name(&new_parent),
-                    new_seq = new_seq,
-                    new_root = %self.tree_state.root(),
-                    depth = self.tree_state.my_coords().depth(),
-                    trigger = "first-rtt",
-                    "Parent switched after first RTT measurement"
-                );
-                if flap_dampened {
-                    self.note_flap("first-rtt");
+                TreeDecision::SelfRoot => {
+                    self.tree_state.become_root(now_secs);
+                    // Clone identity once (see the parent-switch branch above for why).
+                    let our_identity = self.identity().clone();
+                    if let Err(e) =
+                        sign_declaration(self.tree_state.my_declaration_mut(), &our_identity)
+                    {
+                        warn!(error = %e, "Failed to sign self-root declaration after first-RTT");
+                        self.metrics()
+                            .tree
+                            .record_reject(TreeReject::OutboundSignFailed);
+                        return;
+                    }
+                    // Surgical invalidation — see CoordCache::invalidate_other_roots doc.
+                    self.coord_cache
+                        .invalidate_other_roots(our_identity.node_addr());
+                    self.reset_lookup_backoff();
+                    self.metrics().tree.parent_switches.inc();
+                    info!(
+                        new_root = %self.tree_state.root(),
+                        trigger = "first-rtt",
+                        "Self-promoted to root after first RTT: smallest visible NodeAddr"
+                    );
+                    self.send_tree_announce_to_all().await;
+                    let all_peers: Vec<crate::NodeAddr> = self.peers.keys().copied().collect();
+                    self.bloom_state.mark_all_updates_needed(all_peers);
                 }
-                self.send_tree_announce_to_all().await;
-                let all_peers: Vec<crate::NodeAddr> = self.peers.keys().copied().collect();
-                self.bloom_state.mark_all_updates_needed(all_peers);
-            } else if !self.tree_state.is_root() && self.tree_state.should_be_root() {
-                self.tree_state.become_root(now_secs);
-                // Clone identity once (see the parent-switch branch above for why).
-                let our_identity = self.identity().clone();
-                if let Err(e) =
-                    sign_declaration(self.tree_state.my_declaration_mut(), &our_identity)
-                {
-                    warn!(error = %e, "Failed to sign self-root declaration after first-RTT");
-                    self.metrics()
-                        .tree
-                        .record_reject(TreeReject::OutboundSignFailed);
-                    return;
+                // Nothing changed. The periodic tick rebroadcasts; this path does not.
+                TreeDecision::PeriodicRebroadcast => {}
+                // classify_periodic never yields these: there is no announcing
+                // peer, so the loop-drop / ancestry-update arms cannot arise, and
+                // ParentLost is the removal drive's outcome.
+                TreeDecision::LoopDrop
+                | TreeDecision::AncestryUpdate { .. }
+                | TreeDecision::ParentLost
+                | TreeDecision::NoChange => {
+                    unreachable!(
+                        "classify_periodic yields only Switch / SelfRoot / PeriodicRebroadcast"
+                    )
                 }
-                // Surgical invalidation — see CoordCache::invalidate_other_roots doc.
-                self.coord_cache
-                    .invalidate_other_roots(our_identity.node_addr());
-                self.reset_lookup_backoff();
-                self.metrics().tree.parent_switches.inc();
-                info!(
-                    new_root = %self.tree_state.root(),
-                    trigger = "first-rtt",
-                    "Self-promoted to root after first RTT: smallest visible NodeAddr"
-                );
-                self.send_tree_announce_to_all().await;
-                let all_peers: Vec<crate::NodeAddr> = self.peers.keys().copied().collect();
-                self.bloom_state.mark_all_updates_needed(all_peers);
             }
         }
     }

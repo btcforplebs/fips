@@ -1,11 +1,10 @@
 //! Transport-medium change detection.
 //!
-//! A node that moves between media (WLAN → LAN, WLAN → 5G, a BLE adapter
-//! coming or going) would otherwise learn about it only as *silence*: the peer
-//! sits in the table until `node.link_dead_timeout_secs` reaps it, and the
-//! reconnect then waits out whatever backoff the old medium had already
-//! accumulated. The host kernel knew within milliseconds; the node would find
-//! out half a minute later.
+//! A node that moves between IP media (WLAN → LAN, WLAN → 5G) would otherwise
+//! learn about it only as *silence*: the peer sits in the table until
+//! `node.link_dead_timeout_secs` reaps it, and the reconnect then waits out
+//! whatever backoff the old medium had already accumulated. The host kernel
+//! knew within milliseconds; the node would find out half a minute later.
 //!
 //! This module closes that gap. It samples a coarse [`NetFingerprint`] of the
 //! host's network attachment and publishes a [`NetChange`] on the channel the
@@ -110,9 +109,13 @@
 //! is correct — there is nothing bound to the old path to repair.
 //!
 //! **A BLE adapter's state** is invisible here, as it was before: it is not an
-//! IP attachment at all. That signal comes from the radio (BlueZ properties,
-//! the Android callback) and belongs on this same channel, pushed by the BLE
-//! transport rather than sampled here.
+//! IP attachment at all, and nothing routes it onto this channel. The detector
+//! below is the only source of a [`NetChange`]; the BLE transport publishes
+//! none. On Android the embedder-facing half does exist: the app installs and
+//! clears its radio through the `BleRadioSlot` returned by
+//! `Node::enable_app_owned_ble_radio`, and the BLE transport re-resolves the
+//! slot when it changes. That reaches only the BLE transport. The rest of the
+//! node sees a radio going away as the loss of the links it carried.
 //!
 //! # Where the peer list comes from
 //!

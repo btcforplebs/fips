@@ -33,7 +33,7 @@ use crate::node::session::{EndToEndState, SessionEntry};
 use crate::noise::HandshakeState;
 use crate::peer::ActivePeer;
 use crate::proto::mmp::{MmpMode, ReceiverReport};
-use crate::proto::stp::{ParentDeclaration, TreeCoordinate};
+use crate::proto::stp::{CoordEntry, ParentDeclaration, TreeCoordinate};
 
 // ===========================================================================
 // Helpers
@@ -432,5 +432,132 @@ async fn non_first_receiver_report_does_not_retrigger_tree() {
         node.metrics().tree.parent_switches.get(),
         switches_after_first,
         "a non-first ReceiverReport does not re-enter the first-RTT tree branch"
+    );
+}
+
+/// Insert a peer whose NodeAddr is strictly larger than the node's own, with
+/// link MMP but no RTT yet, aged so a crafted ReceiverReport yields a first
+/// RTT sample. The caller registers the peer's tree position.
+fn insert_larger_unmeasured_peer(node: &mut Node) -> NodeAddr {
+    let my_addr = *node.node_addr();
+    let (identity, addr) = loop {
+        let id = make_peer_identity();
+        let a = *id.node_addr();
+        if a > my_addr {
+            break (id, a);
+        }
+    };
+    let mut peer = ActivePeer::new(identity, LinkId::new(1), 0);
+    peer.test_init_mmp(MmpMode::Full);
+    peer.test_backdate_session_start(std::time::Duration::from_secs(10));
+    node.peers.insert(addr, peer);
+    addr
+}
+
+/// Sum of the tree-announce fan-out counters. Every attempt to send an
+/// announce to a peer moves exactly one of them.
+fn tree_announce_attempts(node: &Node) -> u64 {
+    let tree = &node.metrics().tree;
+    tree.sent.get() + tree.send_failed.get() + tree.rate_limited.get()
+}
+
+/// A root node whose only peer has a larger address has nothing to change on
+/// the first RTT sample: it stays root, records no switch, and sends no
+/// TreeAnnounce. The periodic tick rebroadcasts; the first-RTT path does not.
+#[tokio::test]
+async fn first_rtt_on_a_root_with_only_larger_peers_sends_no_tree_announce() {
+    let mut node = make_node();
+    let addr = insert_larger_unmeasured_peer(&mut node);
+    node.tree_state_mut().update_peer(
+        ParentDeclaration::self_root(addr, 1, 0),
+        TreeCoordinate::root(addr),
+    );
+
+    assert!(
+        node.tree_state().is_root(),
+        "precondition: node starts as its own root"
+    );
+    let switches_before = node.metrics().tree.parent_switches.get();
+    let attempts_before = tree_announce_attempts(&node);
+
+    node.handle_receiver_report(&addr, &craft_rr_payload(10, 5, 500))
+        .await;
+
+    assert!(
+        node.get_peer(&addr).unwrap().has_srtt(),
+        "precondition: this report was the peer's first RTT sample"
+    );
+    assert!(node.tree_state().is_root(), "node remains its own root");
+    assert_eq!(
+        node.metrics().tree.parent_switches.get(),
+        switches_before,
+        "no parent switch is recorded"
+    );
+    assert_eq!(
+        tree_announce_attempts(&node),
+        attempts_before,
+        "the first-RTT path does not rebroadcast an unchanged declaration"
+    );
+}
+
+/// A node holding a parent whose tree has since re-rooted at a larger address
+/// than its own promotes itself to root on the first RTT sample.
+#[tokio::test]
+async fn first_rtt_self_promotes_when_no_visible_root_is_smaller() {
+    let mut node = make_node();
+    let addr = insert_larger_unmeasured_peer(&mut node);
+
+    // The peer first sits under a root smaller than us, and we take it as
+    // parent, so our root is that smaller node.
+    let far_root = NodeAddr::from_bytes([0u8; 16]);
+    assert!(
+        far_root < *node.node_addr(),
+        "precondition: the far root is smaller than the node"
+    );
+    node.tree_state_mut().update_peer(
+        ParentDeclaration::new(addr, far_root, 1, 0),
+        TreeCoordinate::new(vec![
+            CoordEntry::new(addr, 1, 0),
+            CoordEntry::new(far_root, 1, 0),
+        ])
+        .unwrap(),
+    );
+    let seq = node.tree_state().my_declaration().sequence() + 1;
+    node.tree_state_mut()
+        .set_parent(addr, seq, 0, crate::time::mono_ms());
+    node.tree_state_mut().recompute_coords();
+    assert_eq!(
+        node.tree_state().root(),
+        &far_root,
+        "precondition: the node sits under the far root"
+    );
+
+    // The peer then re-roots at itself, larger than us: no visible root is
+    // smaller than the node any more.
+    node.tree_state_mut().update_peer(
+        ParentDeclaration::self_root(addr, 2, 0),
+        TreeCoordinate::root(addr),
+    );
+    assert!(
+        !node.tree_state().is_root() && node.tree_state().should_be_root(),
+        "precondition: not root, but should be"
+    );
+    let switches_before = node.metrics().tree.parent_switches.get();
+
+    node.handle_receiver_report(&addr, &craft_rr_payload(10, 5, 500))
+        .await;
+
+    assert!(
+        node.get_peer(&addr).unwrap().has_srtt(),
+        "precondition: this report was the peer's first RTT sample"
+    );
+    assert!(
+        node.tree_state().is_root(),
+        "the first-RTT path promoted the node to root"
+    );
+    assert_eq!(
+        node.metrics().tree.parent_switches.get(),
+        switches_before + 1,
+        "the self-promotion is recorded as one parent switch"
     );
 }

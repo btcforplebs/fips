@@ -17,7 +17,7 @@
 use super::limits::LimitVerdict;
 use super::state::Router;
 use super::wire::{CoordsRequired, MtuExceeded, PathBroken};
-use crate::proto::link::{SessionDatagram, SessionDatagramRef};
+use crate::proto::link::{SessionDatagram, SessionDatagramRef, ttl_after_hop};
 use crate::{NodeAddr, TreeCoordinate};
 
 /// Read-only view of routing state the routing core needs.
@@ -116,7 +116,8 @@ impl Router {
     /// datagram that would leave with a TTL of zero is not transmitted.
     ///
     /// The shell pre-resolves `next_hop` only for datagrams this can actually
-    /// forward (dest not local and TTL surviving the decrement), so
+    /// forward (dest not local, and `SessionDatagramRef::can_forward`, which
+    /// applies the same [`ttl_after_hop`] rule this drops on), so
     /// `find_next_hop`'s LRU-touch side effect stays scoped to genuine
     /// forwards. `route` still re-checks local delivery and the TTL
     /// authoritatively.
@@ -136,15 +137,14 @@ impl Router {
         }
 
         // TTL enforcement on the transit path: decrement first, then drop if
-        // the datagram would leave with a TTL of zero. `saturating_sub` folds
-        // the already-exhausted arrival (ttl=0) into the same test as the
-        // last-hop arrival (ttl=1); neither is transmitted.
-        let forwarded_ttl = dg.ttl.saturating_sub(1);
-        if forwarded_ttl == 0 {
+        // the datagram would leave with a TTL of zero. The already-exhausted
+        // arrival (ttl=0) and the last-hop arrival (ttl=1) are both dropped;
+        // neither is transmitted.
+        let Some(forwarded_ttl) = ttl_after_hop(dg.ttl) else {
             return RouteOutcome::Drop {
                 reason: DropReason::TtlExhausted,
             };
-        }
+        };
 
         let nh = match next_hop {
             Some(nh) => nh,

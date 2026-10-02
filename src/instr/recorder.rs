@@ -41,7 +41,7 @@ impl Domain {
 ///
 /// `as usize` indexes the counter arrays, so the discriminants are dense and
 /// `WholeTick` is last (it defines `N_STEPS`). Variants are declared
-/// unconditionally — see [`Step::emitted`] for how the two platform- and
+/// unconditionally — see [`Step::emitted`] for how the three platform- and
 /// profile-conditional steps are kept out of the emitted table.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(usize)]
@@ -76,6 +76,7 @@ pub(crate) enum Step {
     PollTransportDiscovery,
     SampleTransportCongestion,
     ActivateConnectedUdpSessions,
+    PollWorkerLiveness,
     DebugAssertPeerMapsCoherent,
     /// The whole tick-arm body, from before `check_timeouts` to after the last
     /// step. Composes safely with the per-step spans because the macro
@@ -116,6 +117,7 @@ pub(crate) const STEPS: [Step; N_STEPS] = [
     Step::PollTransportDiscovery,
     Step::SampleTransportCongestion,
     Step::ActivateConnectedUdpSessions,
+    Step::PollWorkerLiveness,
     Step::DebugAssertPeerMapsCoherent,
     Step::WholeTick,
 ];
@@ -151,6 +153,7 @@ impl Step {
             Step::PollTransportDiscovery => "poll_transport_discovery",
             Step::SampleTransportCongestion => "sample_transport_congestion",
             Step::ActivateConnectedUdpSessions => "activate_connected_udp_sessions",
+            Step::PollWorkerLiveness => "poll_worker_liveness",
             Step::DebugAssertPeerMapsCoherent => "debug_assert_peer_maps_coherent",
             Step::WholeTick => "whole_tick",
         }
@@ -158,7 +161,7 @@ impl Step {
 
     /// Whether this step gets a row in this build.
     ///
-    /// Two steps are conditionally compiled at their call sites. Emitting a row
+    /// Three steps are conditionally compiled at their call sites. Emitting a row
     /// for them in a build where the call site does not exist would publish a
     /// count that is structurally zero forever, which reads as "this step never
     /// runs" rather than "this step is not in this build". The predicates below
@@ -169,6 +172,7 @@ impl Step {
             Step::ActivateConnectedUdpSessions => {
                 cfg!(any(target_os = "linux", target_os = "macos"))
             }
+            Step::PollWorkerLiveness => cfg!(unix),
             Step::DebugAssertPeerMapsCoherent => cfg!(debug_assertions),
             _ => true,
         }
@@ -388,7 +392,7 @@ mod tests {
         let emitted = STEPS.iter().filter(|s| s.emitted()).count();
         // 27 unconditional subsystem steps on this line (26 shared with the
         // master line, plus `resend_pending_fmp_rekey_msg3`, which exists only
-        // here) + the whole-tick span, plus the two conditionally-compiled
+        // here) + the whole-tick span, plus the three conditionally-compiled
         // steps where this build has them. The count is pinned deliberately: it
         // is what caught the extra step when the master-line instrumentation
         // was merged up, rather than letting the tables silently disagree — and
@@ -400,6 +404,9 @@ mod tests {
         // conflict and only the comment above it collided.
         let mut expected = 28;
         if cfg!(any(target_os = "linux", target_os = "macos")) {
+            expected += 1;
+        }
+        if cfg!(unix) {
             expected += 1;
         }
         if cfg!(debug_assertions) {

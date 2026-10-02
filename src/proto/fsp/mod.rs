@@ -33,7 +33,7 @@ mod tests;
 pub(crate) use core::{
     DecryptSlot, EpochReaction, Fsp, FspAction, InitialMsg3ResendSnapshot, RekeyCfg,
     RekeyMsg3ResendSnapshot, SessionSnapshot, cutover_timer_elapsed, initiation_winner,
-    mark_ipv6_ecn_ce, push_bounded_pending,
+    mark_ipv6_ecn_ce, push_bounded_pending, should_apply_path_mtu,
 };
 pub use wire::{
     FspInnerFlags, SessionAck, SessionFlags, SessionMessageType, SessionMsg3, SessionSetup,

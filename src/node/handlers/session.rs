@@ -3085,7 +3085,7 @@ impl Node {
             entry.touch(send.now_ms);
         }
 
-        workers.dispatch(crate::node::encrypt_worker::FmpSendJob {
+        let dispatched = workers.dispatch(crate::node::encrypt_worker::FmpSendJob {
             cipher: fmp_cipher,
             counter: fmp_counter,
             wire_buf,
@@ -3105,7 +3105,42 @@ impl Node {
             drop_on_backpressure: true,
             queued_at: None,
         });
+        if let Err(job) = dispatched {
+            self.send_refused_job_inline(*job, transport_id, &remote_addr, next_hop_addr)
+                .await;
+        }
         Ok(true)
+    }
+
+    /// Seal and send a job the encrypt worker for its next hop refused
+    /// because that worker has exited, using the FSP and FMP counters the
+    /// job already reserved so neither counter is skipped. Stats were
+    /// recorded before dispatch and now describe this packet.
+    ///
+    /// A failure is logged and swallowed, as the worker does with its own:
+    /// the caller sees the same result whichever of the two sent the packet.
+    #[cfg(unix)]
+    async fn send_refused_job_inline(
+        &self,
+        job: crate::node::encrypt_worker::FmpSendJob,
+        transport_id: crate::transport::TransportId,
+        remote_addr: &crate::transport::TransportAddr,
+        next_hop_addr: NodeAddr,
+    ) {
+        let wire = match job.seal_inline() {
+            Ok(wire) => wire,
+            Err(error) => {
+                debug!(next_hop = %next_hop_addr, %error, "Inline seal of session data failed");
+                return;
+            }
+        };
+        let Some(transport) = self.transports.get(&transport_id) else {
+            debug!(next_hop = %next_hop_addr, "Transport gone before inline send of session data");
+            return;
+        };
+        if let Err(error) = transport.send(remote_addr, &wire).await {
+            debug!(next_hop = %next_hop_addr, %error, "Inline send of session data failed");
+        }
     }
 
     /// Send an IPv6 packet through the IPv6 shim (port 256) with header compression.

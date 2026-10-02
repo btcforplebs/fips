@@ -50,6 +50,9 @@
 // warnings rather than gate every function individually.
 #![cfg_attr(not(unix), allow(dead_code))]
 
+#[cfg(test)]
+use crate::node::worker_set::{TestWorker, test_spawner};
+use crate::node::worker_set::{WorkerLiveness, WorkerSet, worth_logging};
 use crate::proto::fmp::wire::ESTABLISHED_HEADER_SIZE;
 use crate::proto::fsp::wire::FSP_HEADER_SIZE;
 use crate::transport::udp::io::AsyncUdpSocket;
@@ -178,6 +181,24 @@ impl QueuedFmpSendJob {
     }
 }
 
+/// A queued job its worker refused because the worker has exited. Boxed so
+/// the dispatch path's `Result` stays small; the allocation happens only on a
+/// refusal.
+struct Refused(Box<QueuedFmpSendJob>);
+
+impl Refused {
+    /// The job, with any macOS ordered-flow slot it held released as a skip.
+    fn into_job(self) -> Box<FmpSendJob> {
+        #[cfg(target_os = "macos")]
+        let QueuedFmpSendJob { job, macos_ticket } = *self.0;
+        #[cfg(not(target_os = "macos"))]
+        let QueuedFmpSendJob { job } = *self.0;
+        #[cfg(target_os = "macos")]
+        drop(macos_ticket);
+        Box::new(job)
+    }
+}
+
 /// Handle to the encrypt worker pool. Dispatches jobs **hash-by-
 /// destination** across N worker tasks via per-worker bounded
 /// crossbeam channels. The bounded queue intentionally backpressures
@@ -239,14 +260,17 @@ struct MacWorkerQueueState<T> {
     closed: bool,
 }
 
+/// Why `try_push` did not queue a job. Both variants hand the job back.
 #[cfg(any(target_os = "macos", test))]
 enum MacWorkerTryPushError<T> {
     Full(Box<T>),
-    Closed,
+    /// The receiver is gone: the worker has exited.
+    Closed(Box<T>),
 }
 
+/// `push_blocking` found the receiver gone; the job is handed back.
 #[cfg(any(target_os = "macos", test))]
-struct MacWorkerPushError;
+struct MacWorkerPushError<T>(Box<T>);
 
 #[cfg(any(target_os = "macos", test))]
 fn mac_worker_channel<T>(cap: usize) -> (MacWorkerSender<T>, MacWorkerReceiver<T>) {
@@ -277,10 +301,10 @@ impl<T> MacWorkerSender<T> {
             .lock()
             .expect("encrypt worker queue poisoned");
         if state.closed {
-            // Outside the lock: dropping a sequenced job completes its slot.
+            // The caller drops or reuses the job, outside the lock: dropping a
+            // sequenced job completes its slot.
             drop(state);
-            drop(job);
-            return Err(MacWorkerTryPushError::Closed);
+            return Err(MacWorkerTryPushError::Closed(Box::new(job)));
         }
         if state.queue.len() >= self.inner.cap {
             return Err(MacWorkerTryPushError::Full(Box::new(job)));
@@ -295,7 +319,7 @@ impl<T> MacWorkerSender<T> {
         Ok(())
     }
 
-    fn push_blocking(&self, job: T) -> Result<(), MacWorkerPushError> {
+    fn push_blocking(&self, job: T) -> Result<(), MacWorkerPushError<T>> {
         let mut state = self
             .inner
             .state
@@ -304,8 +328,7 @@ impl<T> MacWorkerSender<T> {
         loop {
             if state.closed {
                 drop(state);
-                drop(job);
-                return Err(MacWorkerPushError);
+                return Err(MacWorkerPushError(Box::new(job)));
             }
             if state.queue.len() < self.inner.cap {
                 let was_empty = state.queue.is_empty();
@@ -406,6 +429,36 @@ type WorkerSender = MacWorkerSender<QueuedFmpSendJob>;
 #[cfg(not(target_os = "macos"))]
 type WorkerSender = Sender<QueuedFmpSendJob>;
 
+#[cfg(target_os = "macos")]
+type WorkerReceiver = MacWorkerReceiver<QueuedFmpSendJob>;
+
+#[cfg(not(target_os = "macos"))]
+type WorkerReceiver = Receiver<QueuedFmpSendJob>;
+
+fn worker_channel() -> (WorkerSender, WorkerReceiver) {
+    #[cfg(target_os = "macos")]
+    {
+        mac_worker_channel(WORKER_CHANNEL_CAP)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        bounded::<QueuedFmpSendJob>(WORKER_CHANNEL_CAP)
+    }
+}
+
+/// Start the production worker loop on `rx` in a named OS thread.
+fn spawn_worker(idx: usize, rx: WorkerReceiver) -> std::io::Result<std::thread::JoinHandle<()>> {
+    let builder = std::thread::Builder::new().name(format!("fips-encrypt-{idx}"));
+    #[cfg(target_os = "macos")]
+    {
+        builder.spawn(move || run_worker_macos(idx, rx))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        builder.spawn(move || run_worker(idx, rx))
+    }
+}
+
 /// Handle to the encrypt worker pool.
 ///
 /// Workers are **dedicated `std::thread`s** with **`crossbeam_channel`**
@@ -425,7 +478,7 @@ type WorkerSender = Sender<QueuedFmpSendJob>;
 /// destinations hash to different workers.
 #[derive(Clone)]
 pub(crate) struct EncryptWorkerPool {
-    senders: Arc<[WorkerSender]>,
+    workers: Arc<WorkerSet<WorkerSender>>,
     #[cfg(target_os = "macos")]
     macos_senders: Arc<MacSequencedSendFlows>,
     #[cfg(target_os = "macos")]
@@ -437,31 +490,21 @@ impl EncryptWorkerPool {
     /// dispatches jobs hash-by-destination to them. The workers exit
     /// when all senders for their channel are dropped (i.e. when the
     /// returned `EncryptWorkerPool` and all clones go away).
+    ///
+    /// A worker thread that cannot be started is logged and left dead;
+    /// the caller reads how many started from [`Self::liveness`].
     pub fn spawn(n: usize) -> Self {
-        let n = n.max(1);
-        let mut senders = Vec::with_capacity(n);
-        for i in 0..n {
-            #[cfg(target_os = "macos")]
-            {
-                let (tx, rx) = mac_worker_channel(WORKER_CHANNEL_CAP);
-                std::thread::Builder::new()
-                    .name(format!("fips-encrypt-{i}"))
-                    .spawn(move || run_worker_macos(i, rx))
-                    .expect("failed to spawn fips-encrypt OS thread");
-                senders.push(tx);
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                let (tx, rx) = bounded::<QueuedFmpSendJob>(WORKER_CHANNEL_CAP);
-                std::thread::Builder::new()
-                    .name(format!("fips-encrypt-{i}"))
-                    .spawn(move || run_worker(i, rx))
-                    .expect("failed to spawn fips-encrypt OS thread");
-                senders.push(tx);
-            }
-        }
+        Self::start_with(n, spawn_worker)
+    }
+
+    /// Build the pool, starting each worker with `spawn`. Production passes
+    /// [`spawn_worker`]; tests pass workers that fail to start or exit on cue.
+    fn start_with(
+        n: usize,
+        spawn: impl FnMut(usize, WorkerReceiver) -> std::io::Result<std::thread::JoinHandle<()>>,
+    ) -> Self {
         Self {
-            senders: senders.into(),
+            workers: Arc::new(WorkerSet::start("encrypt", n, worker_channel, spawn)),
             #[cfg(target_os = "macos")]
             macos_senders: Arc::new(MacSequencedSendFlows::default()),
             #[cfg(target_os = "macos")]
@@ -469,12 +512,26 @@ impl EncryptWorkerPool {
         }
     }
 
+    /// Whether each worker is still running, and how many dispatches a dead
+    /// one refused.
+    pub(crate) fn liveness(&self) -> &dyn WorkerLiveness {
+        &*self.workers
+    }
+
     /// Dispatch a job to the worker that owns its destination flow.
     /// The hash is over `dest_addr` so every packet for one peer's
     /// kernel `SocketAddr` lands on the same worker and stays in
     /// order — required for TCP's fast-retransmit logic above to
-    /// behave on a single-flow run. Fire-and-forget — the worker
-    /// handles send errors itself via stats counters.
+    /// behave on a single-flow run. The worker handles send errors
+    /// itself via stats counters.
+    ///
+    /// A job whose worker has exited is never queued: it is counted,
+    /// logged at WARN, and handed back as `Err` so the caller can seal
+    /// and send it on its own path with the counters it already
+    /// reserved. A job is handed back only when no worker has it, so
+    /// each reserved counter is still used at most once. In the macOS
+    /// ordered mode the job's place in its flow is released as a skip
+    /// before it is handed back.
     ///
     /// Uses `try_send` for the common uncontended case, then blocks
     /// only when the bounded worker channel is full. These jobs carry
@@ -482,13 +539,22 @@ impl EncryptWorkerPool {
     /// this internal queue makes TCP-over-TUN collapse with avoidable
     /// retransmits. Blocking here pushes back toward the TUN reader
     /// and lets the kernel/app TCP stack pace the flow instead.
-    pub fn dispatch(&self, job: FmpSendJob) {
-        if self.senders.is_empty() {
-            debug!("EncryptWorkerPool has no workers; dropping job");
-            return;
-        }
+    #[must_use = "a job handed back was not sent; the caller must send it another way"]
+    pub fn dispatch(&self, job: FmpSendJob) -> Result<(), Box<FmpSendJob>> {
         let (idx, job) = self.prepare_dispatch(job);
-        self.dispatch_to_worker(idx, job);
+        let Err(refused) = self.dispatch_to_worker(idx, job) else {
+            return Ok(());
+        };
+        let n = self.workers.note_refused();
+        if worth_logging(n) {
+            warn!(
+                pool = "encrypt",
+                worker = idx,
+                refused = n + 1,
+                "Encrypt worker has exited; encrypting the packet on the main loop"
+            );
+        }
+        Err(refused.into_job())
     }
 
     #[cfg(target_os = "macos")]
@@ -503,7 +569,7 @@ impl EncryptWorkerPool {
             };
             let mut h = std::collections::hash_map::DefaultHasher::new();
             key.hash(&mut h);
-            let idx = (h.finish() as usize) % self.senders.len();
+            let idx = (h.finish() as usize) % self.workers.len();
             return (idx, QueuedFmpSendJob::direct(job));
         }
 
@@ -518,64 +584,96 @@ impl EncryptWorkerPool {
             .next_worker
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             / macos_worker_stride();
-        let idx = ticket % self.senders.len();
+        let idx = ticket % self.workers.len();
         (idx, QueuedFmpSendJob::macos_sequenced(job, flow))
     }
 
     #[cfg(not(target_os = "macos"))]
     fn prepare_dispatch(&self, job: FmpSendJob) -> (usize, QueuedFmpSendJob) {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        job.dest_addr.hash(&mut h);
-        let idx = (h.finish() as usize) % self.senders.len();
+        let idx = self.worker_index_for(job.dest_addr);
         (idx, QueuedFmpSendJob::direct(job))
     }
 
+    /// The worker that owns `dest`'s flow.
+    #[cfg(not(target_os = "macos"))]
+    fn worker_index_for(&self, dest: SocketAddr) -> usize {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        dest.hash(&mut h);
+        (h.finish() as usize) % self.workers.len()
+    }
+
+    /// Queue `job` on worker `idx`, or hand it back when that worker has
+    /// exited.
     #[cfg(target_os = "macos")]
-    fn dispatch_to_worker(&self, idx: usize, job: QueuedFmpSendJob) {
-        match self.senders[idx].try_push(job) {
-            Ok(()) => {}
+    fn dispatch_to_worker(&self, idx: usize, job: QueuedFmpSendJob) -> Result<(), Refused> {
+        let sender = self.workers.sender(idx);
+        match sender.try_push(job) {
+            Ok(()) => Ok(()),
             Err(MacWorkerTryPushError::Full(job)) => {
                 static FULL_COUNT: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
                 let n = FULL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if n < 8 || n.is_multiple_of(10000) {
+                if worth_logging(n) {
                     warn!(
                         worker = idx,
                         full_events = n + 1,
                         "EncryptWorker channel full; applying outbound backpressure"
                     );
                 }
-                if let Err(MacWorkerPushError) = self.senders[idx].push_blocking(*job) {
-                    debug!(worker = idx, "EncryptWorker thread gone; dropping job");
-                }
+                sender
+                    .push_blocking(*job)
+                    .map_err(|MacWorkerPushError(job)| Refused(job))
             }
-            Err(MacWorkerTryPushError::Closed) => {
-                debug!(worker = idx, "EncryptWorker thread gone; dropping job");
-            }
+            Err(MacWorkerTryPushError::Closed(job)) => Err(Refused(job)),
         }
     }
 
+    /// Queue `job` on worker `idx`, or hand it back when that worker has
+    /// exited.
     #[cfg(not(target_os = "macos"))]
-    fn dispatch_to_worker(&self, idx: usize, job: QueuedFmpSendJob) {
-        match self.senders[idx].try_send(job) {
-            Ok(()) => {}
+    fn dispatch_to_worker(&self, idx: usize, job: QueuedFmpSendJob) -> Result<(), Refused> {
+        let sender = self.workers.sender(idx);
+        match sender.try_send(job) {
+            Ok(()) => Ok(()),
             Err(TrySendError::Full(job)) => {
                 static FULL_COUNT: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
                 let n = FULL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if n < 8 || n.is_multiple_of(10000) {
+                if worth_logging(n) {
                     warn!(
                         worker = idx,
                         full_events = n + 1,
                         "EncryptWorker channel full; applying outbound backpressure"
                     );
                 }
-                if let Err(SendError(_)) = self.senders[idx].send(job) {
-                    debug!(worker = idx, "EncryptWorker thread gone; dropping job");
-                }
+                sender
+                    .send(job)
+                    .map_err(|SendError(job)| Refused(Box::new(job)))
             }
-            Err(TrySendError::Disconnected(_)) => {
-                debug!(worker = idx, "EncryptWorker thread gone; dropping job");
-            }
+            Err(TrySendError::Disconnected(job)) => Err(Refused(Box::new(job))),
+        }
+    }
+}
+
+#[cfg(test)]
+impl EncryptWorkerPool {
+    /// A pool whose workers behave as `plan` says; `Run` workers are the
+    /// production loop.
+    pub(crate) fn for_test(plan: Vec<TestWorker>) -> Self {
+        Self::start_with(plan.len(), test_spawner(plan, spawn_worker))
+    }
+
+    /// The worker a job to `dest` is dispatched to, where that depends on
+    /// `dest` alone. On macOS it also depends on the sending sockets, or on a
+    /// round-robin in the ordered mode, so there it is `None`.
+    pub(crate) fn worker_index_for_dest(&self, dest: SocketAddr) -> Option<usize> {
+        #[cfg(target_os = "macos")]
+        {
+            let _ = dest;
+            None
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Some(self.worker_index_for(dest))
         }
     }
 }
@@ -1096,6 +1194,89 @@ fn run_worker_macos(idx: usize, rx: MacWorkerReceiver<QueuedFmpSendJob>) {
     trace!(worker = idx, "FMP encrypt worker thread exiting");
 }
 
+/// Why a job could not be sealed.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum SealError {
+    /// The offsets the job carries do not fit its buffer.
+    #[error("job layout does not fit its buffer")]
+    Layout,
+    /// The AEAD refused to seal.
+    #[error("AEAD seal failed")]
+    Aead,
+}
+
+impl FmpSendJob {
+    /// Seal this job on the calling thread, as its worker would have, and
+    /// return the wire packet. For a job its worker refused: the counters it
+    /// carries were reserved for it and are used here, once.
+    pub(crate) fn seal_inline(self) -> Result<Vec<u8>, SealError> {
+        let FmpSendJob {
+            cipher,
+            counter,
+            mut wire_buf,
+            fsp_seal,
+            ..
+        } = self;
+        seal_wire(&cipher, counter, &mut wire_buf, fsp_seal)?;
+        Ok(wire_buf)
+    }
+}
+
+/// Seal one job's wire buffer in place: the inner FSP seal first when the job
+/// carries one, then the outer FMP seal over `[16..]` with the header as AAD.
+/// Each tag is appended into capacity the builder reserved, so the buffer
+/// becomes the wire packet without reallocating.
+///
+/// A layout that does not fit the buffer is refused rather than indexed out of
+/// bounds: this runs on a worker thread and, for a job that worker refused, on
+/// the rx loop, where a panic would end the node rather than one worker.
+fn seal_wire(
+    cipher: &LessSafeKey,
+    counter: u64,
+    wire_buf: &mut Vec<u8>,
+    fsp_seal: Option<FspSealJob>,
+) -> Result<(), SealError> {
+    if let Some(fsp) = fsp_seal {
+        let aad_end = fsp
+            .aad_offset
+            .checked_add(FSP_HEADER_SIZE)
+            .ok_or(SealError::Layout)?;
+        if aad_end > fsp.plaintext_offset || fsp.plaintext_offset > wire_buf.len() {
+            return Err(SealError::Layout);
+        }
+
+        let mut nonce_bytes = [0u8; 12];
+        nonce_bytes[4..12].copy_from_slice(&fsp.counter.to_le_bytes());
+        let nonce = Nonce::assume_unique_for_key(nonce_bytes);
+        let (prefix, plaintext_slice) = wire_buf.split_at_mut(fsp.plaintext_offset);
+        let aad = &prefix[fsp.aad_offset..aad_end];
+        let tag = fsp
+            .cipher
+            .seal_in_place_separate_tag(nonce, Aad::from(aad), plaintext_slice)
+            .map_err(|_| SealError::Aead)?;
+        wire_buf.extend_from_slice(tag.as_ref());
+    }
+
+    if wire_buf.len() < ESTABLISHED_HEADER_SIZE {
+        return Err(SealError::Layout);
+    }
+    let mut nonce_bytes = [0u8; 12];
+    nonce_bytes[4..12].copy_from_slice(&counter.to_le_bytes());
+    let nonce = Nonce::assume_unique_for_key(nonce_bytes);
+    // Split-borrow: AAD reads from header bytes [0..16], seal writes
+    // into the plaintext slice [16..]. ring::aead's `seal_in_place_
+    // separate_tag` takes `&mut [u8]` so we can hand it the
+    // post-header slice while AAD references the header slice.
+    // `split_at_mut` is the standard way to do this safely.
+    let (header_slice, plaintext_slice) = wire_buf.split_at_mut(ESTABLISHED_HEADER_SIZE);
+    let tag = cipher
+        .seal_in_place_separate_tag(nonce, Aad::from(&*header_slice), plaintext_slice)
+        .map_err(|_| SealError::Aead)?;
+    // wire_buf already has `+16` capacity reserved → no realloc.
+    wire_buf.extend_from_slice(tag.as_ref());
+    Ok(())
+}
+
 /// Encrypt every job in `batch` in place, then issue one or more
 /// bulk-send syscalls grouped **by exact send target**. Clears
 /// `batch` on return. Sync version — operates directly on the raw
@@ -1178,64 +1359,13 @@ fn flush_batch_sync(
             crate::perf_profile::Stage::FmpWorkerQueueWait,
             queued_at,
         );
-        if let Some(fsp) = fsp_seal {
-            if fsp.aad_offset + FSP_HEADER_SIZE > fsp.plaintext_offset
-                || fsp.plaintext_offset > wire_buf.len()
-            {
-                #[cfg(target_os = "macos")]
-                if let Some(ticket) = macos_ticket {
-                    push_mac_completion(&mut macos_completions, ticket, MacSendItem::Skip);
-                }
-                continue;
+        if seal_wire(&cipher, counter, &mut wire_buf, fsp_seal).is_err() {
+            #[cfg(target_os = "macos")]
+            if let Some(ticket) = macos_ticket {
+                push_mac_completion(&mut macos_completions, ticket, MacSendItem::Skip);
             }
-
-            let mut nonce_bytes = [0u8; 12];
-            nonce_bytes[4..12].copy_from_slice(&fsp.counter.to_le_bytes());
-            let nonce = Nonce::assume_unique_for_key(nonce_bytes);
-            let (prefix, plaintext_slice) = wire_buf.split_at_mut(fsp.plaintext_offset);
-            let aad = &prefix[fsp.aad_offset..fsp.aad_offset + FSP_HEADER_SIZE];
-            let tag =
-                match fsp
-                    .cipher
-                    .seal_in_place_separate_tag(nonce, Aad::from(aad), plaintext_slice)
-                {
-                    Ok(tag) => tag,
-                    Err(_) => {
-                        #[cfg(target_os = "macos")]
-                        if let Some(ticket) = macos_ticket {
-                            push_mac_completion(&mut macos_completions, ticket, MacSendItem::Skip);
-                        }
-                        continue;
-                    }
-                };
-            wire_buf.extend_from_slice(tag.as_ref());
+            continue;
         }
-
-        let mut nonce_bytes = [0u8; 12];
-        nonce_bytes[4..12].copy_from_slice(&counter.to_le_bytes());
-        let nonce = Nonce::assume_unique_for_key(nonce_bytes);
-        // Split-borrow: AAD reads from header bytes [0..16], seal writes
-        // into the plaintext slice [16..]. ring::aead's `seal_in_place_
-        // separate_tag` takes `&mut [u8]` so we can hand it the
-        // post-header slice while AAD references the header slice.
-        // `split_at_mut` is the standard way to do this safely.
-        let (header_slice, plaintext_slice) = wire_buf.split_at_mut(ESTABLISHED_HEADER_SIZE);
-        let tag = match cipher.seal_in_place_separate_tag(
-            nonce,
-            Aad::from(&*header_slice),
-            plaintext_slice,
-        ) {
-            Ok(tag) => tag,
-            Err(_) => {
-                #[cfg(target_os = "macos")]
-                if let Some(ticket) = macos_ticket {
-                    push_mac_completion(&mut macos_completions, ticket, MacSendItem::Skip);
-                }
-                continue;
-            }
-        };
-        // wire_buf already has `+16` capacity reserved → no realloc.
-        wire_buf.extend_from_slice(tag.as_ref());
 
         #[cfg(target_os = "macos")]
         if let Some(ticket) = macos_ticket {
@@ -2153,6 +2283,150 @@ mod unix_tests {
             assert_eq!(recovered_fsp_plaintext, fsp_plaintext);
         });
     }
+
+    /// The seal a refused job gets on the main loop produces a packet the
+    /// canonical receive-side decoders accept, inner FSP layer included.
+    #[test]
+    fn an_inline_seal_matches_the_worker_wire_layout() {
+        use crate::NodeAddr;
+        use crate::noise::TAG_SIZE;
+        use crate::proto::fmp::wire::{EncryptedHeader, build_established_header};
+        use crate::proto::fsp::wire::build_fsp_header;
+        use crate::proto::link::{
+            LinkMessageType, SESSION_DATAGRAM_HEADER_SIZE, SessionDatagramRef,
+        };
+        use crate::utils::index::SessionIndex;
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .expect("tokio rt");
+        let _enter = rt.enter();
+        let socket = UdpRawSocket::open("127.0.0.1:0".parse().unwrap(), 1 << 20, 1 << 20)
+            .expect("open send socket")
+            .into_async()
+            .expect("into_async");
+
+        let fmp_cipher = test_cipher(0x31);
+        let fsp_cipher = test_cipher(0x32);
+        let (fmp_counter, fsp_counter) = (900u64, 77u64);
+        let fsp_plaintext = b"sealed on the main loop".to_vec();
+        let link_plaintext_len =
+            SESSION_DATAGRAM_HEADER_SIZE + FSP_HEADER_SIZE + fsp_plaintext.len();
+        let fmp_inner_len = 4 + link_plaintext_len + TAG_SIZE;
+        let fsp_header = build_fsp_header(fsp_counter, 0, fsp_plaintext.len() as u16);
+        let fmp_header =
+            build_established_header(SessionIndex::new(5), fmp_counter, 0, fmp_inner_len as u16);
+
+        let mut wire_buf = Vec::with_capacity(ESTABLISHED_HEADER_SIZE + fmp_inner_len + TAG_SIZE);
+        wire_buf.extend_from_slice(&fmp_header);
+        wire_buf.extend_from_slice(&7u32.to_le_bytes());
+        wire_buf.push(LinkMessageType::SessionDatagram.to_byte());
+        wire_buf.push(16);
+        wire_buf.extend_from_slice(&1280u16.to_le_bytes());
+        wire_buf.extend_from_slice(NodeAddr::from_bytes([0xAA; 16]).as_bytes());
+        wire_buf.extend_from_slice(NodeAddr::from_bytes([0xBB; 16]).as_bytes());
+        let aad_offset = wire_buf.len();
+        wire_buf.extend_from_slice(&fsp_header);
+        let plaintext_offset = wire_buf.len();
+        wire_buf.extend_from_slice(&fsp_plaintext);
+
+        let job = FmpSendJob {
+            cipher: fmp_cipher.clone(),
+            counter: fmp_counter,
+            wire_buf,
+            fsp_seal: Some(FspSealJob {
+                cipher: fsp_cipher.clone(),
+                counter: fsp_counter,
+                aad_offset,
+                plaintext_offset,
+            }),
+            socket: socket.clone(),
+            dest_addr: "127.0.0.1:9".parse().unwrap(),
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            connected_socket: None,
+            drop_on_backpressure: true,
+            queued_at: None,
+        };
+        let wire = job.seal_inline().expect("inline seal");
+
+        let parsed = EncryptedHeader::parse(&wire).expect("FMP header parses");
+        assert_eq!(parsed.counter, fmp_counter);
+        let fmp_plaintext = crate::noise::open(
+            Some(&fmp_cipher),
+            fmp_counter,
+            &parsed.header_bytes,
+            &wire[ESTABLISHED_HEADER_SIZE..],
+        )
+        .expect("FMP open");
+        let datagram = SessionDatagramRef::decode(&fmp_plaintext[5..]).expect("datagram decodes");
+        let inner = crate::noise::open(
+            Some(&fsp_cipher),
+            fsp_counter,
+            &datagram.payload[..FSP_HEADER_SIZE],
+            &datagram.payload[FSP_HEADER_SIZE..],
+        )
+        .expect("FSP open");
+        assert_eq!(inner, fsp_plaintext);
+
+        // FMP-only twin: a link message carries no inner seal.
+        let link_plaintext = b"\x10link message".to_vec();
+        let header = build_established_header(
+            SessionIndex::new(5),
+            fmp_counter + 1,
+            0,
+            (4 + link_plaintext.len()) as u16,
+        );
+        let mut wire_buf = Vec::with_capacity(ESTABLISHED_HEADER_SIZE + 4 + 64);
+        wire_buf.extend_from_slice(&header);
+        wire_buf.extend_from_slice(&9u32.to_le_bytes());
+        wire_buf.extend_from_slice(&link_plaintext);
+        let job = FmpSendJob {
+            cipher: fmp_cipher.clone(),
+            counter: fmp_counter + 1,
+            wire_buf,
+            fsp_seal: None,
+            socket,
+            dest_addr: "127.0.0.1:9".parse().unwrap(),
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            connected_socket: None,
+            drop_on_backpressure: false,
+            queued_at: None,
+        };
+        let wire = job.seal_inline().expect("inline seal");
+        let opened = crate::noise::open(
+            Some(&fmp_cipher),
+            fmp_counter + 1,
+            &wire[..ESTABLISHED_HEADER_SIZE],
+            &wire[ESTABLISHED_HEADER_SIZE..],
+        )
+        .expect("FMP open");
+        assert_eq!(&opened[4..], &link_plaintext[..]);
+    }
+
+    /// A job whose offsets do not fit its buffer is refused, not indexed out
+    /// of bounds. On the main loop a panic here would end the node.
+    #[test]
+    fn a_job_whose_layout_does_not_fit_is_refused_not_a_panic() {
+        let cipher = test_cipher(9);
+        let mut short = vec![0u8; ESTABLISHED_HEADER_SIZE - 1];
+        assert!(matches!(
+            seal_wire(&cipher, 1, &mut short, None),
+            Err(SealError::Layout)
+        ));
+
+        let mut buf = vec![0u8; 64];
+        let overflowing = FspSealJob {
+            cipher: test_cipher(8),
+            counter: 1,
+            aad_offset: usize::MAX - 2,
+            plaintext_offset: 40,
+        };
+        assert!(matches!(
+            seal_wire(&cipher, 1, &mut buf, Some(overflowing)),
+            Err(SealError::Layout)
+        ));
+    }
 }
 
 /// Standalone tests for the GSO-eligibility predicate. The full
@@ -2532,7 +2806,7 @@ mod mac_queue_tests {
     fn spawn_pusher<T: Send + 'static>(
         tx: MacWorkerSender<T>,
         item: T,
-    ) -> mpsc::Receiver<Result<(), MacWorkerPushError>> {
+    ) -> mpsc::Receiver<Result<(), MacWorkerPushError<T>>> {
         let (done_tx, done_rx) = mpsc::channel();
         thread::spawn(move || {
             let result = tx.push_blocking(item);
@@ -2572,7 +2846,10 @@ mod mac_queue_tests {
         let result = done
             .recv_timeout(WAIT)
             .expect("push_blocking still blocked after the worker thread died");
-        assert!(matches!(result, Err(MacWorkerPushError)));
+        match result {
+            Err(MacWorkerPushError(job)) => assert_eq!(*job, 3, "the refused job comes back"),
+            Ok(()) => panic!("push_blocking queued onto a dead worker"),
+        }
         assert!(worker.join().is_err(), "worker thread should have panicked");
     }
 
@@ -2580,12 +2857,18 @@ mod mac_queue_tests {
     fn try_push_returns_closed_after_receiver_dropped() {
         let (tx, rx) = mac_worker_channel::<u32>(2);
         drop(rx);
-        assert!(matches!(tx.try_push(1), Err(MacWorkerTryPushError::Closed)));
+        match tx.try_push(1) {
+            Err(MacWorkerTryPushError::Closed(job)) => assert_eq!(*job, 1),
+            _ => panic!("try_push on a closed queue should hand the job back"),
+        }
         let done = spawn_pusher(tx, 2);
         let result = done
             .recv_timeout(WAIT)
             .expect("push_blocking blocked on a queue whose receiver is gone");
-        assert!(matches!(result, Err(MacWorkerPushError)));
+        match result {
+            Err(MacWorkerPushError(job)) => assert_eq!(*job, 2),
+            Ok(()) => panic!("push_blocking queued onto a closed queue"),
+        }
     }
 
     #[test]
@@ -2775,9 +3058,11 @@ mod mac_ordered_tests {
         assert!(tx.try_push(rig.sequenced(1)).is_ok());
         assert!(tx.try_push(rig.sequenced(2)).is_ok());
         drop(rx);
+        // The refused job comes back and is dropped here, which releases its
+        // slot as the dispatcher's caller would.
         assert!(matches!(
             tx.try_push(rig.sequenced(3)),
-            Err(MacWorkerTryPushError::Closed)
+            Err(MacWorkerTryPushError::Closed(_))
         ));
         let mut batch = vec![rig.sequenced(4)];
         flush_batch_sync(&mut batch).expect("flush");
@@ -2890,5 +3175,228 @@ mod mac_ordered_tests {
             .recv_timeout(WAIT)
             .expect("dropping a job waited for room in a full flow");
         drop(gap);
+    }
+}
+
+/// The pool's view of its workers: which are live, what a dead one does to a
+/// dispatch, and that a live but full queue still blocks. Every wait is
+/// bounded so a regression fails instead of hanging.
+#[cfg(test)]
+mod pool_tests {
+    use super::*;
+    use crate::node::worker_set::wait_for;
+    #[cfg(not(target_os = "macos"))]
+    use crate::transport::udp::io::UdpRawSocket;
+    #[cfg(not(target_os = "macos"))]
+    use ring::aead::UnboundKey;
+    #[cfg(not(target_os = "macos"))]
+    use std::net::UdpSocket;
+    use std::sync::mpsc;
+    #[cfg(not(target_os = "macos"))]
+    use std::time::Duration;
+
+    #[cfg(not(target_os = "macos"))]
+    struct Rig {
+        _rt: tokio::runtime::Runtime,
+        socket: AsyncUdpSocket,
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    impl Rig {
+        fn new() -> Self {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_io()
+                .build()
+                .expect("tokio rt");
+            let enter = rt.enter();
+            let socket = UdpRawSocket::open("127.0.0.1:0".parse().unwrap(), 1 << 20, 1 << 20)
+                .expect("open send socket")
+                .into_async()
+                .expect("into_async");
+            drop(enter);
+            Self { _rt: rt, socket }
+        }
+
+        fn job(&self, dest: SocketAddr, counter: u64) -> FmpSendJob {
+            let key = UnboundKey::new(&ring::aead::CHACHA20_POLY1305, &[3u8; 32]).expect("key");
+            let mut wire_buf =
+                Vec::with_capacity(ESTABLISHED_HEADER_SIZE + 8 + crate::noise::TAG_SIZE);
+            wire_buf.extend_from_slice(&[0x5A; ESTABLISHED_HEADER_SIZE]);
+            wire_buf.extend_from_slice(&counter.to_le_bytes());
+            FmpSendJob {
+                cipher: LessSafeKey::new(key),
+                counter,
+                wire_buf,
+                fsp_seal: None,
+                socket: self.socket.clone(),
+                dest_addr: dest,
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                connected_socket: None,
+                drop_on_backpressure: false,
+                queued_at: None,
+            }
+        }
+    }
+
+    /// A bound receiver whose address the pool dispatches to worker `idx`.
+    #[cfg(not(target_os = "macos"))]
+    fn receiver_on_worker(pool: &EncryptWorkerPool, idx: usize) -> UdpSocket {
+        loop {
+            let sock = UdpSocket::bind("127.0.0.1:0").expect("bind receiver");
+            if pool.worker_index_for(sock.local_addr().unwrap()) == idx {
+                sock.set_read_timeout(Some(Duration::from_secs(5)))
+                    .expect("read timeout");
+                return sock;
+            }
+        }
+    }
+
+    #[test]
+    fn an_encrypt_worker_that_panics_is_counted_dead() {
+        let (die_tx, die_rx) = mpsc::channel::<()>();
+        let mut die_rx = Some(die_rx);
+        let pool = EncryptWorkerPool::start_with(2, |idx, rx| {
+            if idx != 1 {
+                return spawn_worker(idx, rx);
+            }
+            let die = die_rx.take().expect("worker 1 starts once");
+            std::thread::Builder::new().spawn(move || {
+                let _rx = rx;
+                let _ = die.recv();
+                panic!("simulated encrypt worker panic");
+            })
+        });
+        assert_eq!(pool.liveness().live_workers(), 2);
+        die_tx.send(()).expect("worker 1 gone before its signal");
+        assert!(
+            wait_for(|| pool.liveness().live_workers() == 1),
+            "a worker that panicked is still counted live"
+        );
+        assert_eq!(pool.liveness().dead_workers(), vec![1]);
+        assert_eq!(pool.liveness().worker_count(), 2);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn a_worker_that_fails_to_spawn_leaves_the_pool_serving_the_rest() {
+        let rig = Rig::new();
+        let pool = EncryptWorkerPool::for_test(vec![TestWorker::Run, TestWorker::FailSpawn]);
+        assert_eq!(pool.liveness().worker_count(), 2);
+        assert_eq!(pool.liveness().live_workers(), 1);
+
+        let recv = receiver_on_worker(&pool, 0);
+        assert!(
+            pool.dispatch(rig.job(recv.local_addr().unwrap(), 1))
+                .is_ok()
+        );
+        let mut buf = [0u8; 128];
+        recv.recv_from(&mut buf)
+            .expect("the live worker did not send the job dispatched to it");
+        assert_eq!(pool.liveness().refused_dispatches(), 0);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn dispatch_to_an_exited_encrypt_worker_warns_and_counts() {
+        let rig = Rig::new();
+        let pool = EncryptWorkerPool::for_test(vec![TestWorker::Run, TestWorker::FailSpawn]);
+        let recv = receiver_on_worker(&pool, 1);
+        let (dispatched, logs) =
+            crate::testutil::capture_logs(|| pool.dispatch(rig.job(recv.local_addr().unwrap(), 1)));
+        assert!(dispatched.is_err(), "a dead worker's job must come back");
+        let warnings = logs.warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains(" worker=1"), "{warnings:?}");
+        assert!(warnings[0].contains(" pool=\"encrypt\""), "{warnings:?}");
+        assert_eq!(pool.liveness().refused_dispatches(), 1);
+    }
+
+    /// A live worker that has fallen behind must hold the rx loop back, not
+    /// have its packets dropped: these are tunnelled packets, and a drop here
+    /// reads as loss to TCP inside the tunnel.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn a_full_live_encrypt_queue_still_blocks_dispatch() {
+        let rig = Rig::new();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let mut release_rx = Some(release_rx);
+        let pool = EncryptWorkerPool::start_with(1, |idx, rx| {
+            let release = release_rx.take().expect("one worker");
+            std::thread::Builder::new().spawn(move || {
+                let _ = release.recv();
+                run_worker(idx, rx);
+            })
+        });
+        let recv = UdpSocket::bind("127.0.0.1:0").expect("bind receiver");
+        let dest = recv.local_addr().unwrap();
+        for counter in 0..WORKER_CHANNEL_CAP as u64 {
+            assert!(pool.dispatch(rig.job(dest, counter)).is_ok());
+        }
+
+        let (done_tx, done_rx) = mpsc::channel::<bool>();
+        let blocked_pool = pool.clone();
+        let last = rig.job(dest, WORKER_CHANNEL_CAP as u64);
+        std::thread::spawn(move || {
+            let _ = done_tx.send(blocked_pool.dispatch(last).is_ok());
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            matches!(done_rx.try_recv(), Err(mpsc::TryRecvError::Empty)),
+            "dispatch returned while the live worker's queue was full"
+        );
+
+        release_tx.send(()).expect("worker gone before release");
+        let queued = done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("dispatch still blocked after the worker drained");
+        assert!(queued, "the blocked job was refused, not queued");
+        assert_eq!(pool.liveness().refused_dispatches(), 0);
+    }
+
+    /// A job refused by a dead worker comes back whole, with the counter and
+    /// buffer the caller reserved, whether the worker was already gone or
+    /// died while the dispatch waited on its full queue.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn dispatch_to_an_exited_worker_hands_the_job_back() {
+        let rig = Rig::new();
+        let dest: SocketAddr = "127.0.0.1:9".parse().unwrap();
+
+        let pool = EncryptWorkerPool::for_test(vec![TestWorker::FailSpawn]);
+        let job = rig.job(dest, 41);
+        let wire_buf = job.wire_buf.clone();
+        let back = match pool.dispatch(job) {
+            Err(back) => back,
+            Ok(()) => panic!("a dead worker took the job"),
+        };
+        assert_eq!(back.counter, 41);
+        assert_eq!(back.wire_buf, wire_buf);
+
+        // Worker alive but not draining; it exits while a dispatch waits.
+        let (exit_tx, exit_rx) = mpsc::channel::<()>();
+        let pool = EncryptWorkerPool::for_test(vec![TestWorker::ExitOn(exit_rx)]);
+        for counter in 0..WORKER_CHANNEL_CAP as u64 {
+            assert!(pool.dispatch(rig.job(dest, counter)).is_ok());
+        }
+        let (done_tx, done_rx) = mpsc::channel::<Option<u64>>();
+        let blocked_pool = pool.clone();
+        let last = rig.job(dest, 7_000);
+        std::thread::spawn(move || {
+            let _ = done_tx.send(blocked_pool.dispatch(last).err().map(|job| job.counter));
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            matches!(done_rx.try_recv(), Err(mpsc::TryRecvError::Empty)),
+            "dispatch returned while the queue was full and the worker alive"
+        );
+        exit_tx.send(()).expect("worker gone before its signal");
+        let back = done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("dispatch still blocked after the worker exited");
+        assert_eq!(
+            back,
+            Some(7_000),
+            "the job blocked on a dying worker must come back"
+        );
     }
 }

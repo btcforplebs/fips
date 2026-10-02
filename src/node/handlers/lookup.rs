@@ -7,6 +7,7 @@
 
 use crate::node::Node;
 use crate::node::reject::DiscoveryReject;
+use crate::proto::fsp::should_apply_path_mtu;
 use crate::proto::lookup::{
     LookupAction, LookupRequest, LookupResponse, MAX_RECENT_LOOKUP_REQUESTS,
 };
@@ -431,7 +432,9 @@ impl Node {
                     let fips_addr = crate::FipsAddress::from_node_addr(&target);
                     match self.path_mtu_lookup.write() {
                         Ok(mut map) => match map.get(&fips_addr).copied() {
-                            Some(existing) if existing.mtu <= path_mtu => {
+                            Some(existing)
+                                if !should_apply_path_mtu(Some(existing.mtu), path_mtu) =>
+                            {
                                 // Keep the tighter learned value; never loosen
                                 // the clamp. A reactive MtuExceeded or
                                 // PathMtuNotification tighten takes precedence
@@ -439,12 +442,15 @@ impl Node {
                                 // (cross-carrier keep-tighter).
                                 //
                                 // This arm deliberately leaves `learned_ms`
-                                // alone. That is what bounds a replayed
-                                // response: the replay of a value already
-                                // stored takes this arm, so the entry still
-                                // expires at first-write plus the TTL rather
-                                // than being pushed out again on every
-                                // injection. Refreshing the stamp here would
+                                // alone. A later answered lookup that reports
+                                // the value already stored takes this arm, so
+                                // the entry still expires at first-write plus
+                                // the TTL rather than being pushed out again
+                                // by every answer of the same value. (A
+                                // replayed response never gets here: the
+                                // pending lookup is gone once the first answer
+                                // is accepted, so the copy is dropped as
+                                // unsolicited.) Refreshing the stamp here would
                                 // read as a tidy-up and would silently restore
                                 // indefinite pinning.
                                 debug!(

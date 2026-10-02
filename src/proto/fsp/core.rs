@@ -483,10 +483,10 @@ impl Fsp {
     }
 
     /// Decide whether a path-MTU update should tighten the shared lookup: emit
-    /// `TightenPathMtuLookup` only when `candidate` is at least as tight as the
-    /// `existing` value (keep-tighter, never loosen). The `existing` read and
-    /// the applied write are performed shell-side under one `path_mtu_lookup`
-    /// write guard, so the decision stays atomic.
+    /// `TightenPathMtuLookup` only when there is no `existing` value or
+    /// `candidate` is strictly tighter than it (keep-tighter, never loosen).
+    /// The `existing` read and the applied write are performed shell-side
+    /// under one `path_mtu_lookup` write guard, so the decision stays atomic.
     pub(crate) fn plan_path_mtu_tighten(
         &self,
         fips_addr: FipsAddress,
@@ -524,7 +524,8 @@ pub(crate) fn initiation_winner(our_node_addr: &NodeAddr, their_node_addr: &Node
 /// Decide whether a path-MTU update should be applied to the shared
 /// `FipsAddress`-keyed lookup: keep the tighter of existing-or-candidate, never
 /// loosen. Returns `true` when `candidate` should be written (there is no
-/// existing value, or the candidate is at least as tight).
+/// existing value, or the candidate is strictly tighter). An equal candidate is
+/// not written, so the stored entry, and any learn time it carries, is kept.
 pub(crate) fn should_apply_path_mtu(existing: Option<u16>, candidate: u16) -> bool {
     !matches!(existing, Some(existing) if existing <= candidate)
 }

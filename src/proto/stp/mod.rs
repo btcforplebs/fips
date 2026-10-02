@@ -34,7 +34,11 @@ pub use crate::proto::coord::{CoordEntry, CoordError, TreeCoordinate};
 pub(crate) use crate::proto::coord::{
     coords_wire_size, decode_coords, decode_optional_coords, encode_coords, encode_empty_coords,
 };
-pub(crate) use core::{ParentEval, Stp, TreeDecision};
+// Callers outside this module take the decision from `Stp`; only the tests
+// name the parent evaluation itself.
+#[cfg(test)]
+pub(crate) use core::ParentEval;
+pub(crate) use core::{Stp, TreeDecision};
 pub use declaration::ParentDeclaration;
 pub use state::TreeState;
 pub use wire::TreeAnnounce;
