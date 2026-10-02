@@ -429,10 +429,10 @@ impl Node {
                     // The teardown here is already benign — this returns before
                     // `set_rekey_state`, so the cycle simply does not start and
                     // is retried when rekey next comes due, with nothing torn
-                    // down and nothing charged to the peer. Only the severity
-                    // is wrong for a transport between interfaces, which is a
-                    // local and self-clearing condition the presence machine
-                    // has already reported.
+                    // down. A transport between interfaces is a local and
+                    // self-clearing condition the presence machine has already
+                    // reported, so it is logged at debug and not charged to
+                    // the peer as a reject; a terminal error is both.
                     if e.is_transient() {
                         debug!(
                             peer = %self.peer_display_name(node_addr),
@@ -445,10 +445,10 @@ impl Node {
                             error = %e,
                             "Failed to send rekey msg1"
                         );
+                        self.stats_mut()
+                            .record_reject(RejectReason::Handshake(HandshakeReject::BadState));
                     }
                     let _ = self.index_allocator.free(our_index);
-                    self.stats_mut()
-                        .record_reject(RejectReason::Handshake(HandshakeReject::BadState));
                     return;
                 }
             }

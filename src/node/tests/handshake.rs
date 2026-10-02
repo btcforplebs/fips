@@ -5612,3 +5612,71 @@ async fn a_transient_msg2_failure_from_an_established_peer_address_leaves_the_fr
     #[cfg(debug_assertions)]
     node.debug_assert_peer_maps_coherent();
 }
+
+// ===========================================================================
+// A rekey msg1 send refused because the interface under the transport is
+// absent or mid-rebind is not charged to the peer as a reject; a terminal
+// refusal still is. Either way the cycle does not start and is retried when
+// rekey next comes due.
+// ===========================================================================
+
+/// Establish a peer on a rekey-enabled node whose one transport refuses every
+/// send, age the session past the rekey trigger, and run the rekey check.
+/// With `transient` the transport is Ethernet on an absent interface
+/// (`InterfaceUnavailable`); otherwise it is a UDP transport that was never
+/// started (`NotStarted`, terminal). Returns how many `BadState` rejects the
+/// refused rekey msg1 recorded.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn rekey_rejects(transient: bool) -> u64 {
+    use crate::config::UdpConfig;
+    use crate::transport::udp::UdpTransport;
+
+    let transport_id = TransportId::new(1);
+    let (mut node, addr) = if transient {
+        let node = absent_node(transport_id, rekey_config()).await;
+        (node, TransportAddr::from_string("aa:bb:cc:dd:ee:ff"))
+    } else {
+        let mut node = make_node_with(rekey_config());
+        node.supervisor.state = NodeState::Running;
+        let (tx, _rx) = packet_channel(8);
+        let udp = UdpTransport::new(transport_id, None, UdpConfig::default(), tx);
+        node.transports
+            .insert(transport_id, TransportHandle::Udp(udp));
+        (node, TransportAddr::from_string("127.0.0.1:5000"))
+    };
+    let (peer_addr, _, _) = seed_peer(&mut node, transport_id, &addr);
+    node.get_peer_mut(&peer_addr)
+        .unwrap()
+        .test_backdate_session_established(std::time::Duration::from_secs(120));
+    let rejects_before = node.stats().handshake.bad_state;
+
+    node.check_rekey().await;
+
+    assert!(
+        !node.get_peer(&peer_addr).unwrap().rekey_in_progress(),
+        "a refused rekey msg1 must leave no rekey cycle running"
+    );
+    #[cfg(debug_assertions)]
+    node.debug_assert_peer_maps_coherent();
+    node.stats().handshake.bad_state - rejects_before
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn a_transient_rekey_msg1_send_failure_is_not_charged_to_the_peer() {
+    assert_eq!(
+        rekey_rejects(true).await,
+        0,
+        "a local interface flap must not be recorded as the peer's misbehaviour"
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn a_terminal_rekey_msg1_send_failure_is_recorded_as_a_reject() {
+    assert_eq!(
+        rekey_rejects(false).await,
+        1,
+        "a terminal send failure is still counted"
+    );
+}
