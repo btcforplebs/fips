@@ -771,8 +771,39 @@ with v0.5.x or earlier peers.
   The outbound ACL-reject arm also regains the reschedule call its dial-gate
   sibling makes, so a configured peer no longer drops off the dial schedule.
 
+- A node that answered a rekey, a crossing dial or a restart from a peer's
+  address now returns that address to the peer's link when the inbound
+  handshake is finished with. After every completed rekey in which the node
+  was the responder, the address was left naming the discarded handshake
+  link, so once the peer went away the anonymous-beacon dial never tried that
+  neighbour again from this side; other exits removed the address from a peer
+  that was still connected, so the dial could try an address that already
+  had a peer. The wire format is unchanged.
+
 #### Link and session rekey
 
+- A lost link rekey msg3 is now resent until the responder answers on the new
+  session. Once the initiator had cut over, any frame from the responder
+  stopped the resend, including one still sent on the old session, which is
+  what a responder that never received msg3 sends. The resend then never ran,
+  and the link stayed split until the link-dead timeout tore it down. Only a
+  frame on the new session now confirms msg3. The wire format is unchanged.
+- An unreadable msg3 no longer discards the responder's pending link
+  handshake. The responder matches msg3 to its handshake by an index that
+  travels in cleartext in msg2, so anyone who saw msg2 could send garbage
+  under it, and the genuine msg3 then found no handshake: on a new link the
+  two ends stayed split until the link-dead timeout, and a rekey never
+  completed. The responder now keeps the handshake, rolled back to its
+  pre-read state, without extending its timeout. A msg3 that reads but then
+  fails is still refused and torn down. The wire format is unchanged.
+- A link handshake left pending at a peer's address, by a replayed msg1 or an
+  abandoned attempt, no longer blocks that peer's rekeys and dials until it
+  times out. Every new msg1 from the address was answered with the pending
+  handshake's msg2, which only the original msg1's sender can read. A
+  different msg1 now gets its own handshake, and an identical one, which is
+  what a resend sends, is still answered from the stored msg2. Each distinct
+  msg1 now costs the responder a handshake, metered by the existing msg1 rate
+  limits. The wire format is unchanged.
 - A forged rekey msg2 no longer ends the rekey cycle. The initiator matches
   msg2 to the rekey by an index that rekey msg1 carries in cleartext, so anyone
   on the path could answer first, either with a msg2 that does not authenticate
