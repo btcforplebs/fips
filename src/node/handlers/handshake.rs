@@ -23,7 +23,7 @@ use crate::proto::fmp::{
     NegotiationPayload, OutboundSnapshot, PromotionResult, RekeyClaim, RekeyMsg2Reject,
     RekeyMsg2Snapshot, WireOutcome, cross_connection_winner, decide_fmp_negotiation,
 };
-use crate::transport::{Link, LinkDirection, LinkId, ReceivedPacket};
+use crate::transport::{Link, LinkDirection, LinkId, ReceivedPacket, TransportError};
 use crate::utils::index::SessionIndex;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
@@ -481,27 +481,58 @@ impl Node {
                     );
                 }
                 Err(e) => {
-                    warn!(
-                        link_id = %link_id,
-                        error = %e,
-                        "Failed to send msg2"
-                    );
-                    // Clean up on failure (disposing the machine drops the
-                    // Noise handles it carries with it)
-                    self.remove_link(&link_id);
-                    let _ = self.index_allocator.free(our_index);
-                    self.remove_peer_machine(link_id);
-                    self.stats_mut()
-                        .record_reject(RejectReason::Handshake(HandshakeReject::BadState));
-                    return;
+                    if !self.msg2_failed(link_id, our_index, &e) {
+                        return;
+                    }
                 }
             }
         }
 
-        // XX: handshake NOT complete yet — need msg3.
+        // XX: handshake NOT complete yet — need msg3. A leg whose msg2 send
+        // was deferred waits here too, for the initiator's msg1 resend.
         // Store in pending_inbound for msg3 dispatch.
         self.pending_inbound
             .insert((packet.transport_id, our_index.as_u32()), link_id);
+    }
+
+    /// Apply the msg2-send-failure rule to the inbound leg on `link`, which
+    /// owns `our_index`. Returns whether the leg was kept.
+    ///
+    /// A transient refusal is not a failed handshake. The interface under the
+    /// transport is absent or mid-rebind and the binder is already working to
+    /// bring it back, so the leg is left exactly as it is for the initiator's
+    /// msg1 resend to land on, rather than being torn down and rebuilt.
+    /// Tearing down charged a local interface flap to the remote: the reject
+    /// counter it recorded means "the peer sent something invalid", which an
+    /// operator reads as the peer's fault. Nothing leaks by staying: a leg
+    /// nobody resends to is reaped at `handshake_timeout_secs` like every
+    /// other abandoned handshake.
+    ///
+    /// A terminal error disposes the leg (handing its address back to any
+    /// link it displaced), frees the index, removes the machine and records
+    /// the reject.
+    pub(in crate::node) fn msg2_failed(
+        &mut self,
+        link: LinkId,
+        our_index: SessionIndex,
+        error: &TransportError,
+    ) -> bool {
+        if error.is_transient() {
+            debug!(
+                link_id = %link,
+                error = %error,
+                "Deferred msg2: the transport is between interfaces"
+            );
+            return true;
+        }
+        warn!(link_id = %link, error = %error, "Failed to send msg2");
+        // Disposing the machine drops the Noise handles it carries.
+        self.remove_link(&link);
+        let _ = self.index_allocator.free(our_index);
+        self.remove_peer_machine(link);
+        self.stats_mut()
+            .record_reject(RejectReason::Handshake(HandshakeReject::BadState));
+        false
     }
 
     /// Whether `msg1` is a different attempt from the one the pending inbound

@@ -184,10 +184,12 @@ impl Node {
                         let frame = build_msg2(sender_idx, receiver_idx, &bytes);
                         // Surface the send Result. A missing transport skips
                         // the send and continues (mirrors `handle_msg1`'s
-                        // `if let Some(transport)` guard); a send *error* runs the
-                        // pre-refactor msg2-send-failure cleanup (`handle_msg1`
-                        // L494-503) and ABORTS the remaining queue so the queued
-                        // `PromoteToActive` never runs.
+                        // `if let Some(transport)` guard); a send *error* is
+                        // settled by the rule `handle_msg1` uses
+                        // (`Node::msg2_failed`: a transient one keeps the leg,
+                        // a terminal one disposes it) and, either way, ABORTS
+                        // the remaining queue so the queued `PromoteToActive`
+                        // never runs.
                         let send_err = match self.transports.get(&ambient.transport_id) {
                             Some(transport) => {
                                 transport.send(&ambient.remote_addr, &frame).await.err()
@@ -195,42 +197,7 @@ impl Node {
                             None => None,
                         };
                         if let Some(e) = send_err {
-                            // A transient refusal is not a failed handshake. The
-                            // interface under this transport is absent or
-                            // mid-rebind, and the binder is already working to
-                            // bring it back — so the half-built link is left
-                            // exactly as it is for the initiator's msg1 resend to
-                            // land on, rather than being torn down and rebuilt.
-                            //
-                            // Tearing down here charged a *local* interface flap
-                            // to the remote: the reject counter it recorded means
-                            // "the peer sent something invalid", which is a
-                            // different thing entirely and one an operator reads
-                            // as the peer's fault.
-                            //
-                            // Nothing leaks by staying. An initiator that never
-                            // resends leaves a stale connection, which
-                            // `check_timeouts` reaps at `handshake_timeout_secs`
-                            // exactly as it reaps every other abandoned handshake.
-                            if e.is_transient() {
-                                debug!(
-                                    link_id = %link,
-                                    error = %e,
-                                    "Deferred msg2: the transport is between interfaces"
-                                );
-                                return;
-                            }
-                            // Restored pre-refactor msg2-send-failure warn!
-                            // (`handle_msg1` L665): the send error text is surfaced
-                            // at the executor point where the failure is now handled.
-                            warn!(link_id = %link, error = %e, "Failed to send msg2");
-                            self.remove_link(&link);
-                            if let Some(idx) = ambient.our_index {
-                                let _ = self.index_allocator.free(idx);
-                            }
-                            self.remove_peer_machine(link);
-                            self.stats_mut()
-                                .record_reject(RejectReason::Handshake(HandshakeReject::BadState));
+                            self.msg2_failed(link, sender_idx, &e);
                             return;
                         }
                     } else {
