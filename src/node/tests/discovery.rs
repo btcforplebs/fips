@@ -1653,10 +1653,11 @@ async fn test_lookup_response_path_mtu_expires_without_a_session() {
 
 #[tokio::test]
 async fn test_replayed_lookup_response_does_not_extend_the_path_mtu_deadline() {
-    // The response carries no replay dedupe, so a captured one can be
-    // re-injected indefinitely. What bounds the damage is that a replay of a
-    // value already stored takes the keep-tighter arm, which does not touch
-    // the learn time: each injection buys one TTL, not one per packet.
+    // The response carries no replay dedupe of its own, so a captured one can
+    // be re-injected indefinitely. Accepting the first response clears the
+    // pending lookup, so each replay is dropped as unsolicited before it
+    // reaches the path-MTU write: each injection buys one TTL, not one per
+    // packet. The equal-value arm of that write is pinned by the next test.
     let mut node = make_node();
     let from = make_node_addr(0xAA);
 
@@ -1691,6 +1692,57 @@ async fn test_replayed_lookup_response_does_not_extend_the_path_mtu_deadline() {
         node.path_mtu_lookup_get(&target_fips),
         None,
         "replaying the same value must not push the deadline out"
+    );
+}
+
+#[tokio::test]
+async fn test_a_later_solicited_response_of_the_same_path_mtu_keeps_the_learn_time() {
+    // Two genuine lookups for one target, answered with the same path_mtu.
+    // The second answer is solicited, so it reaches the path-MTU write, and an
+    // equal value must keep the stored entry, learn time included. Refreshing
+    // the stamp on equality would let every answer of the same value push the
+    // deadline out again.
+    let mut node = make_node();
+    let from = make_node_addr(0xAA);
+
+    let target_identity = Identity::generate();
+    let target = *target_identity.node_addr();
+    let target_fips = crate::FipsAddress::from_node_addr(&target);
+    let root = make_node_addr(0xF0);
+    let coords = TreeCoordinate::from_addrs(vec![target, root]).unwrap();
+    node.register_identity(target, target_identity.pubkey_full());
+
+    let answer = |request_id: u64| {
+        let proof =
+            target_identity.sign(&LookupResponse::proof_bytes(request_id, &target, &coords));
+        let mut response = LookupResponse::new(request_id, target, coords.clone(), proof);
+        response.path_mtu = 1300;
+        response.encode()[1..].to_vec()
+    };
+
+    seed_pending_lookup(&mut node, target, 805);
+    node.handle_lookup_response(&from, &answer(805)).await;
+    let first = node
+        .path_mtu_lookup_entry(&target_fips)
+        .expect("precondition: the first response wrote an entry");
+    assert!(
+        first.learned_ms.is_some(),
+        "precondition: the entry carries a learn time"
+    );
+
+    // Real elapsed wall-clock, so a refreshed stamp would differ.
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    seed_pending_lookup(&mut node, target, 806);
+    node.handle_lookup_response(&from, &answer(806)).await;
+
+    assert!(
+        !node.lookup.pending_lookups.contains_key(&target),
+        "precondition: the second response was accepted as solicited"
+    );
+    assert_eq!(
+        node.path_mtu_lookup_entry(&target_fips),
+        Some(first),
+        "an equal path_mtu must leave the entry exactly as it was, learn time included"
     );
 }
 
