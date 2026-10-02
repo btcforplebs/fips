@@ -48,8 +48,9 @@ from .veth import VethManager
 
 log = logging.getLogger(__name__)
 
-# The final snapshot waits for this many identical consecutive tree reads,
-# taken this far apart, so the tree must hold still for two intervals.
+# The final snapshot waits until every node answers and this many identical
+# consecutive tree reads, taken this far apart, agree, so the tree must hold
+# still, with every node in it, for two intervals.
 SETTLE_READS = 3
 SETTLE_INTERVAL_SECS = 5
 SETTLE_TIMEOUT_SECS = 90
@@ -744,7 +745,8 @@ class SimRunner:
             # Take final tree snapshot while nodes are still running, once the
             # tree has stopped moving. A node restored a moment ago is its own
             # root until it re-parents, so a snapshot taken straight after the
-            # restore reads a mesh still converging.
+            # restore reads a mesh still converging. It may not answer at all
+            # yet either, and the settle waits for it.
             self._settle_tree()
             self._take_snapshot("final")
 
@@ -893,29 +895,39 @@ class SimRunner:
         return result
 
     def _settle_tree(self):
-        """Wait until consecutive tree reads agree, or the settle time runs out.
+        """Wait until every node answers and consecutive tree reads agree.
 
-        Compares each answering node's root and parent. A fixed delay would
-        either waste time on a mesh that settled at once or cut off one that
-        had not. Running out is logged and is not a failure in itself: the
-        final snapshot is taken anyway, and the assertions judge what it
-        shows.
+        Returns once SETTLE_READS reads in a row, SETTLE_INTERVAL_SECS apart,
+        have each been answered by every node in the topology and show the
+        same root and parent for each, or once SETTLE_TIMEOUT_SECS has passed.
+        The bound is checked after each read, so the settle can return up to
+        one interval and one read past it. A fixed delay would either waste
+        time on a mesh that settled at once or cut off one that had not.
 
-        A read that no node answered never counts toward agreement. It does
-        not catch a node that stays its own root for longer than the reads
-        span, which is a tree that is stable and wrong, and is left to the
-        assertions.
+        A read that any node did not answer never counts toward agreement. A
+        node restored at teardown may not have opened its control socket yet,
+        and a tree that holds still without it is not the tree the final
+        snapshot is meant to record.
+
+        Running out is logged, naming any node that still does not answer,
+        and is not a failure in itself: the final snapshot is taken anyway
+        and the assertions judge what it shows. A node that never comes back
+        is therefore reported as absent by the assertions that count nodes.
+        This does not catch a node that answers but stays its own root for
+        longer than the reads span, which is a tree that is stable and
+        wrong, and is left to the assertions.
         """
         started = time.time()
         previous = None
         agreeing = 0
         while not self._interrupted:
             trees = snapshot_all_trees(self.topology)
+            missing = sorted(set(self.topology.nodes) - trees.keys())
             shape = {
                 nid: (data.get("root"), data.get("parent"))
                 for nid, data in trees.items()
             }
-            if not shape:
+            if missing:
                 agreeing = 0
             else:
                 agreeing = agreeing + 1 if shape == previous else 1
@@ -925,10 +937,19 @@ class SimRunner:
                 log.info("Tree settled after %.0fs", waited)
                 return
             if waited >= SETTLE_TIMEOUT_SECS:
-                log.warning(
-                    "Tree still changing after %.0fs; taking the final snapshot anyway",
-                    waited,
-                )
+                if missing:
+                    log.warning(
+                        "%s still not answering after %.0fs; "
+                        "taking the final snapshot anyway",
+                        ", ".join(missing),
+                        waited,
+                    )
+                else:
+                    log.warning(
+                        "Tree still changing after %.0fs; "
+                        "taking the final snapshot anyway",
+                        waited,
+                    )
                 return
             self._sleep(SETTLE_INTERVAL_SECS)
 
