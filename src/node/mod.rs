@@ -2903,10 +2903,6 @@ impl Node {
     /// The `ActivePeer` limb also has to carry slots the maps do not: the
     /// `peers_by_index` insert for a rekeying peer's `pending_our_index` is
     /// itself gated on `if let Some(tid)` in `handle_msg2`'s rekey branch.
-    /// `rekey_responder_our_index` is listed for completeness — its only writer,
-    /// `set_rekey_responder_state`, has no callers today, so the slot is always
-    /// `None` and nothing exercises it; whoever wires the XX rekey-responder
-    /// path must not have to remember to add it here.
     ///
     /// Should-not-happen-path guard, not a general-purpose lookup: it is O(live
     /// sessions) and has exactly one call site.
@@ -2928,7 +2924,6 @@ impl Node {
         self.peers.values().any(|p| {
             p.our_index() == Some(idx)
                 || p.rekey_our_index() == Some(idx)
-                || p.rekey_responder_our_index() == Some(idx)
                 || p.pending_our_index() == Some(idx)
                 || p.previous_our_index() == Some(idx)
         })
