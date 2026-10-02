@@ -123,14 +123,13 @@ reach:
   dropped. Each of those moves leaves behind, in a stack frame that is
   no longer in use, a copy of the node's long-term private key and,
   once the handshake has started, of its ephemeral key and chaining
-  key. Two moves out of the slots on a connection's control machine
+  key. Three moves out of the slots on a connection's control machine
   are cleared: when a completed handshake leaves the slot that held it,
-  and when a session is taken out of its slot for a rekey, the slot is
-  overwritten as the value leaves. Other moves are not. When a
-  connection is promoted to an active peer, or reaped as stale, its
-  whole handshake state is moved off its control machine, which leaves
-  the session's two traffic keys, or an unfinished handshake's private
-  keys, in the heap memory the machine occupies.
+  when a session is taken out of its slot for a rekey, and when the
+  whole handshake state leaves the machine because the connection is
+  promoted to an active peer, resolved as one side of a
+  cross-connection, or reaped as stale. In each case the slot is
+  overwritten as the value leaves. Other moves are not.
 - **Loading the identity from a secret string.** Building the node's
   identity from its key file or from `node.identity.nsec` leaves
   copies of the private key, among them a whole intermediate identity,

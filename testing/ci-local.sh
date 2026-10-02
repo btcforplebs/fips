@@ -676,16 +676,24 @@ run_tests() {
     # Debug-only helpers (anything behind #[cfg(debug_assertions)]) vanish in a
     # release build, so a test calling one without the same gate breaks a build
     # nothing here ever performs: every run above compiles the test target in
-    # debug. Compile it in release too, without running it — the point is that
-    # it builds at all. Mirrored in .github/workflows/ci.yml; check-ci-parity.sh
-    # compares integration suites only and would not catch a stage added to one
-    # runner and not the other.
-    info "cargo test --release --lib --no-run"
-    if cargo test --release --lib --no-run 2>&1; then
+    # debug. Compile it in release too. Of what it builds, run only the leg-slot
+    # residue test, which is release-only because only an optimised build
+    # leaves the slot in a state worth measuring; the grep fails the stage if
+    # that test did not run, since a name filter that matches nothing passes.
+    # Mirrored in .github/workflows/ci.yml; check-ci-parity.sh compares
+    # integration suites only and would not catch a stage added to one runner
+    # and not the other.
+    local residue_test="peer::machine::tests::take_leg_leaves_no_session_keys_in_the_slot_it_empties"
+    local release_log
+    release_log=$(mktemp "/tmp/ci-release-lib-tests.XXXXXX")
+    info "cargo test --release --lib -- --exact $residue_test"
+    if cargo test --release --lib -- --exact "$residue_test" 2>&1 | tee "$release_log" \
+        && grep -q '^test result: ok\. 1 passed;' "$release_log"; then
         record "release-test-compile" 0
     else
         record "release-test-compile" 1
     fi
+    rm -f "$release_log"
 }
 
 # ── Stage 3: Integration Tests ─────────────────────────────────────────────
