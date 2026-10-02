@@ -1595,10 +1595,12 @@ mod tests {
         drop(client);
         connection.settle_closed(flow).await;
 
-        // `settle_closed` observes the reader's flag, which it sets before it
-        // sends the release, so the registry may not have processed it yet.
-        // Retry rather than sleep: without the reclaim every attempt fails and
-        // the loop runs out, which is the failure this test exists to produce.
+        // `settle_closed` returns once the reader has flagged the flow closed or
+        // forgotten it. Neither means the registry has served the release: the
+        // flag is set before the release is queued, and the flow is forgotten
+        // once it is queued, not once it is processed. Retry rather than sleep:
+        // without the reclaim every attempt fails and the loop runs out, which
+        // is the failure this test exists to produce.
         let mut last = serde_json::Value::Null;
         for _ in 0..1000 {
             // Not `ask`: a connect that succeeds carries a descriptor, and that

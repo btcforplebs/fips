@@ -1092,7 +1092,12 @@ mod tests {
         // already queued and no read here waits on anything.
         (&daemon).write_all(REFUSAL).unwrap();
         fdpass::send_once(daemon.as_raw_fd(), CONNECT_REPLY, Some(passed.as_fd())).unwrap();
-        drop(passed);
+        // `passed` stays alive until the client holds the descriptor: until
+        // then the message would be the socket's only reference, and Darwin's
+        // collector flushes such a socket. The provoked collection is there so
+        // a regression shows on macOS without waiting for a stray collection;
+        // whether it shows every run rests on `dgram_probe`'s fixed wait.
+        crate::native::dgram_probe::provoke_collection();
 
         // **How many reads this takes is the platform's business, and asserting
         // it was wrong.** Linux coalesces the plain write with the sendmsg that
@@ -1133,6 +1138,7 @@ mod tests {
         let (second, second_fd) = wire.line().unwrap();
         assert!(second.starts_with(br#"{"status":"ok""#));
         let received = second_fd.expect("the reply must carry the descriptor");
+        drop(passed);
 
         // A live socket rather than merely a number: the far half sees it.
         let mut received = UnixStream::from(received);
@@ -1207,7 +1213,6 @@ mod tests {
         let worker = thread::spawn(move || {
             let command = read_line(&daemon);
             fdpass::send_once(daemon.as_raw_fd(), LISTEN_REPLY, Some(passed.as_fd())).unwrap();
-            drop(passed);
             // As for connect: setup is over, so the connection is over. A
             // listener that held one would take its flows down with it.
             // A deadline, or the defect this asserts against fails as a hang
@@ -1220,6 +1225,9 @@ mod tests {
             let read = (&daemon)
                 .read(&mut rest)
                 .expect("the RPC connection outlived the setup call that opened it");
+            // Only now: the client closes once it holds the descriptor, and
+            // until then the message would be the socket's only reference.
+            drop(passed);
             (command, read)
         });
 
@@ -1308,9 +1316,15 @@ mod tests {
         // client could read the arrival is already there when it holds it.
         (&held).write_all(b"opening").unwrap();
         fdpass::send_once(theirs.as_raw_fd(), ARRIVAL, Some(passed.as_fd())).unwrap();
-        drop(passed);
+        // `passed` stays alive until the client holds the descriptor: until
+        // then the message would be the socket's only reference, and Darwin's
+        // collector flushes such a socket. The provoked collection is there so
+        // a regression shows on macOS without waiting for a stray collection;
+        // whether it shows every run rests on `dgram_probe`'s fixed wait.
+        crate::native::dgram_probe::provoke_collection();
 
         let (flow, peer) = listener.accept().unwrap();
+        drop(passed);
         assert_eq!(peer.to_string(), format!("{PEER}:5001"));
         assert_eq!(flow.peer_addr(), peer);
         // From the arrival's own `node`, not from the listener: an accepted
