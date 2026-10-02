@@ -594,7 +594,8 @@ impl Node {
     /// when an inbound peer frame authenticates against `pending` (peer cut
     /// over first, in `handle_encrypted_frame`) or against the post-cutover
     /// `current` session (initiator already cut over, responder reached the
-    /// new epoch, in `process_authentic_fmp_plaintext`). After
+    /// new epoch, at both FMP decrypt sites). A frame on the previous session
+    /// does not confirm: a responder that lost msg3 keeps sending on it. After
     /// `handshake_max_resends` with no confirmation the cycle is abandoned.
     pub(in crate::node) async fn resend_pending_fmp_rekey_msg3(&mut self, now_ms: u64) {
         if !self.config().node.rekey.enabled {

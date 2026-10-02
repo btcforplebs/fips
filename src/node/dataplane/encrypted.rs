@@ -285,9 +285,14 @@ impl Node {
         if let Some(peer) = self.peers.get_mut(&node_addr) {
             // Initiator-side msg3 confirm (see process_authentic_fmp_plaintext):
             // a frame authenticated against post-cutover `current` (no pending)
-            // proves the responder reached the new epoch. Inline-decrypt path
-            // mirror of the worker-bounce confirm.
-            if peer.rekey_msg3_payload().is_some() && peer.pending_new_session().is_none() {
+            // proves the responder reached the new epoch. A frame on the
+            // previous session proves nothing about msg3: a responder that
+            // never received it keeps sending on the old session. Inline-decrypt
+            // path mirror of the worker-bounce confirm.
+            if slot == LinkSlot::Current
+                && peer.rekey_msg3_payload().is_some()
+                && peer.pending_new_session().is_none()
+            {
                 peer.clear_rekey_msg3_payload();
             }
             if slot == LinkSlot::Current
@@ -433,10 +438,14 @@ impl Node {
             // peer frame here decrypts against the post-cutover `current`
             // session — proof the responder reached the new epoch. Stop
             // retransmitting. Mirrors the FSP Current-slot confirm in
-            // handle_encrypted_session_msg. Works in both the inline and
-            // worker-bounce paths since both funnel through here, and the
-            // only session registered for the new index is the new one.
-            if peer.rekey_msg3_payload().is_some() && peer.pending_new_session().is_none() {
+            // handle_encrypted_session_msg. Only a `Current` frame counts: a
+            // bounce under the previous session's index is the responder
+            // still on the old keys, which is exactly what a lost msg3 looks
+            // like, and confirming on it would stop the resend that recovers.
+            if slot == LinkSlot::Current
+                && peer.rekey_msg3_payload().is_some()
+                && peer.pending_new_session().is_none()
+            {
                 peer.clear_rekey_msg3_payload();
             }
             address_changed = peer.set_current_addr(transport_id, remote_addr.clone());

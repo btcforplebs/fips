@@ -1850,6 +1850,173 @@ async fn a_worker_decrypted_frame_on_the_previous_link_session_does_not_feed_mmp
     cleanup_nodes(&mut nodes).await;
 }
 
+/// A link rekey initiator that cut over keeps resending a lost msg3 through
+/// frames the responder sends on the old session.
+///
+/// node 0's msg3 is lost. node 1, which never received it, keeps sending on
+/// the old link session, and node 0 decrypts those frames against its
+/// previous session. Such a frame says nothing about msg3, so node 0 must
+/// keep the msg3 for resend; the resend then completes node 1's side and the
+/// link carries traffic both ways on the new session.
+#[tokio::test]
+async fn a_lost_link_rekey_msg3_is_still_resent_after_an_old_session_frame() {
+    let HeldMsg3Pair {
+        mut nodes,
+        node0_addr,
+        node1_addr,
+        fips0,
+        fips1,
+        tun0_rx,
+        tun1_rx,
+        node1_idx_before,
+        held_msg3,
+        ..
+    } = rekey_pair_cut_over_with_held_msg3().await;
+    drop(held_msg3);
+    assert!(
+        nodes[0].node.supervisor.decrypt_workers.is_none(),
+        "node 0 must decrypt inline, so this exercises the inline confirm"
+    );
+    assert!(
+        nodes[0]
+            .node
+            .get_peer(&node1_addr)
+            .unwrap()
+            .rekey_msg3_payload()
+            .is_some(),
+        "node 0 holds its msg3 for resend after the cutover"
+    );
+
+    // node 1, still on the old session, sends a frame; only node 0's queue is
+    // delivered.
+    let old_rev = build_ipv6_packet(&fips1, &fips0, b"old session 1 to 0");
+    nodes[1].node.handle_tun_outbound(old_rev.clone()).await;
+    for _ in 0..3 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        process_available_packets(&mut nodes[..1]).await;
+    }
+    let got: Vec<Vec<u8>> = std::iter::from_fn(|| tun0_rx.try_recv().ok()).collect();
+    assert_eq!(got, vec![old_rev], "the old-session frame was delivered");
+    let resend_at = {
+        let peer = nodes[0].node.get_peer(&node1_addr).unwrap();
+        assert!(
+            peer.rekey_msg3_payload().is_some(),
+            "an old-session frame must not confirm the msg3"
+        );
+        peer.rekey_msg3_next_resend_ms()
+    };
+
+    // The resend reaches node 1, which completes its side of the rekey.
+    nodes[0].node.resend_pending_fmp_rekey_msg3(resend_at).await;
+    pump_until_quiet(&mut nodes[1..]).await;
+    assert!(
+        nodes[1]
+            .node
+            .get_peer(&node0_addr)
+            .unwrap()
+            .pending_new_session()
+            .is_some(),
+        "the resent msg3 must give node 1 the new session"
+    );
+
+    // node 0's first new-session frame promotes node 1, and both directions
+    // then decode.
+    let new_fwd = build_ipv6_packet(&fips0, &fips1, b"new session 0 to 1");
+    nodes[0].node.handle_tun_outbound(new_fwd.clone()).await;
+    pump_until_quiet(&mut nodes).await;
+    let got: Vec<Vec<u8>> = std::iter::from_fn(|| tun1_rx.try_recv().ok()).collect();
+    assert_eq!(got, vec![new_fwd]);
+    assert_ne!(
+        nodes[1].node.get_peer(&node0_addr).unwrap().our_index(),
+        node1_idx_before,
+        "node 1 must promote on node 0's first new-session frame"
+    );
+    let new_rev = build_ipv6_packet(&fips1, &fips0, b"new session 1 to 0");
+    nodes[1].node.handle_tun_outbound(new_rev.clone()).await;
+    pump_until_quiet(&mut nodes).await;
+    let got: Vec<Vec<u8>> = std::iter::from_fn(|| tun0_rx.try_recv().ok()).collect();
+    assert_eq!(got, vec![new_rev]);
+    assert!(
+        nodes[0]
+            .node
+            .get_peer(&node1_addr)
+            .unwrap()
+            .rekey_msg3_payload()
+            .is_none(),
+        "a frame on the new session confirms the msg3"
+    );
+
+    cleanup_nodes(&mut nodes).await;
+}
+
+/// The decrypt-worker path confirms a rekey msg3 only on a frame under the
+/// current session's index; a bounce under the previous index leaves the
+/// msg3 for resend.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_worker_decrypted_previous_session_frame_does_not_confirm_the_rekey_msg3() {
+    use crate::node::decrypt_worker::DecryptFallback;
+
+    let HeldMsg3Pair {
+        mut nodes,
+        node1_addr,
+        ..
+    } = rekey_pair_cut_over_with_held_msg3().await;
+    let peer = nodes[0].node.get_peer(&node1_addr).unwrap();
+    let previous_idx = peer.previous_our_index().expect("node 0 must be draining");
+    let current_idx = peer.our_index().expect("node 0 must have cut over");
+    assert!(peer.rekey_msg3_payload().is_some());
+
+    let (transport_id, remote_addr) = (nodes[0].transport_id, nodes[1].addr.clone());
+    let bounce = |receiver_idx: u32, counter: u64| {
+        let mut data = 0u32.to_le_bytes().to_vec();
+        data.extend(receiver_report_message(1_000));
+        DecryptFallback {
+            source_node_addr: node1_addr,
+            transport_id,
+            remote_addr: remote_addr.clone(),
+            timestamp_ms: Node::now_ms(),
+            packet_len: data.len() + 32,
+            receiver_idx,
+            fmp_counter: counter,
+            fmp_flags: 0,
+            fmp_plaintext_len: data.len(),
+            packet_data: data,
+            fmp_plaintext_offset: 0,
+        }
+    };
+
+    nodes[0]
+        .node
+        .process_decrypt_fallback(bounce(previous_idx.as_u32(), 900))
+        .await;
+    assert!(
+        nodes[0]
+            .node
+            .get_peer(&node1_addr)
+            .unwrap()
+            .rekey_msg3_payload()
+            .is_some(),
+        "a previous-session bounce must not confirm the msg3"
+    );
+
+    nodes[0]
+        .node
+        .process_decrypt_fallback(bounce(current_idx.as_u32(), 1))
+        .await;
+    assert!(
+        nodes[0]
+            .node
+            .get_peer(&node1_addr)
+            .unwrap()
+            .rekey_msg3_payload()
+            .is_none(),
+        "a current-session bounce confirms the msg3"
+    );
+
+    cleanup_nodes(&mut nodes).await;
+}
+
 #[tokio::test]
 async fn test_tun_outbound_triggers_session_initiation() {
     // Two connected nodes, no session yet.
