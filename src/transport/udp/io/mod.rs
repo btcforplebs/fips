@@ -143,6 +143,43 @@ mod tests {
         assert!(reuse_port, "the adopted socket must carry SO_REUSEPORT");
     }
 
+    /// A datagram sent to a port nobody holds draws an ICMP port-unreachable.
+    /// Windows reports one, by default, as `WSAECONNRESET` on the socket's next
+    /// receive; this socket is shared by every peer, so the next datagram from
+    /// any of them must come through instead. Checked for both ways a socket
+    /// is set up.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_port_unreachable_answer_is_not_a_receive_error_on_windows() {
+        let opened = UdpRawSocket::open("127.0.0.1:0".parse().unwrap(), 65536, 65536)
+            .expect("failed to open");
+        let plain = std::net::UdpSocket::bind("127.0.0.1:0").expect("failed to bind");
+        let adopted = UdpRawSocket::adopt(plain, 65536, 65536).expect("failed to adopt");
+        for (how, raw) in [("open", opened), ("adopt", adopted)] {
+            let addr = raw.local_addr();
+            let sock = raw.into_async().expect("into_async");
+
+            let gone = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind the closed port");
+            let gone_addr = gone.local_addr().expect("closed port address");
+            drop(gone);
+            sock.send_to(b"nobody", &gone_addr).await.expect("send_to");
+            // Let the port-unreachable arrive before the datagram that follows.
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+            let peer = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind the peer");
+            peer.send_to(b"peer", addr).expect("peer send");
+
+            let mut buf = [0u8; 16];
+            let got =
+                tokio::time::timeout(std::time::Duration::from_secs(5), sock.recv_from(&mut buf))
+                    .await
+                    .unwrap_or_else(|_| panic!("{how}: nothing received"));
+            let (n, from, _) = got.unwrap_or_else(|e| panic!("{how}: receive failed: {e}"));
+            assert_eq!(&buf[..n], b"peer", "{how}");
+            assert_eq!(from, peer.local_addr().unwrap(), "{how}");
+        }
+    }
+
     #[tokio::test]
     async fn test_async_udp_socket_send_recv() {
         let sock1 = UdpRawSocket::open("127.0.0.1:0".parse().unwrap(), 65536, 65536)

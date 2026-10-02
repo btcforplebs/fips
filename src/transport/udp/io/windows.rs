@@ -8,7 +8,10 @@
 use crate::transport::TransportError;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::net::SocketAddr;
+use std::os::windows::io::AsRawSocket;
 use std::sync::Arc;
+use tracing::warn;
+use windows_sys::Win32::Networking::WinSock::{SIO_UDP_CONNRESET, SOCKET, SOCKET_ERROR, WSAIoctl};
 
 /// UDP socket wrapper (Windows).
 ///
@@ -44,6 +47,7 @@ impl UdpRawSocket {
 
         sock.bind(&bind_addr.into())
             .map_err(|e| TransportError::StartFailed(format!("bind failed: {}", e)))?;
+        ignore_port_unreachable(&sock);
 
         // Set socket buffer sizes
         sock.set_recv_buffer_size(recv_buf_size)
@@ -75,6 +79,7 @@ impl UdpRawSocket {
 
         sock.set_nonblocking(true)
             .map_err(|e| TransportError::StartFailed(format!("set nonblocking failed: {}", e)))?;
+        ignore_port_unreachable(&sock);
 
         sock.set_recv_buffer_size(recv_buf_size)
             .map_err(|e| TransportError::StartFailed(format!("set recv buffer: {}", e)))?;
@@ -123,6 +128,44 @@ impl UdpRawSocket {
         Ok(AsyncUdpSocket {
             inner: Arc::new(tokio_socket),
         })
+    }
+}
+
+/// Stop an ICMP port-unreachable from failing the socket's next receive.
+///
+/// By default Windows reports a port-unreachable answering any datagram the
+/// socket sent as `WSAECONNRESET` on its next `recv_from`. The socket is shared
+/// by every peer, so one unreachable address would put errors into the receive
+/// loop that all the other peers' traffic arrives through. `SIO_UDP_CONNRESET`
+/// set to false turns the report off. A socket that refuses it still works and
+/// still sees the errors, so a failure is logged rather than returned.
+fn ignore_port_unreachable(sock: &Socket) {
+    let report: u32 = 0;
+    let mut returned: u32 = 0;
+    // SAFETY: the socket is open for the duration of the call, the input
+    // buffer is a live u32 of the stated size, no output buffer is passed, and
+    // the call is synchronous (no OVERLAPPED, no completion routine).
+    let rc = unsafe {
+        WSAIoctl(
+            sock.as_raw_socket() as SOCKET,
+            SIO_UDP_CONNRESET,
+            (&report as *const u32).cast(),
+            std::mem::size_of::<u32>() as u32,
+            std::ptr::null_mut(),
+            0,
+            &mut returned,
+            std::ptr::null_mut(),
+            None,
+        )
+    };
+    if rc == SOCKET_ERROR {
+        // Read before `warn!`, whose level and dispatcher checks run first and
+        // could replace the error code WSAIoctl left.
+        let err = std::io::Error::last_os_error();
+        warn!(
+            error = %err,
+            "Could not turn off ICMP port-unreachable reports on the UDP socket"
+        );
     }
 }
 

@@ -78,6 +78,9 @@ bluer = { version = "0.17", features = ["bluetoothd", "l2cap"] }
 [target.'cfg(windows)'.dependencies]
 wintun = "0.5"
 windows-service = "0.8.1"
+# For WSAIoctl(SIO_UDP_CONNRESET) on the UDP socket. The version socket2 and
+# tokio already pull in, so the lock file gains no package.
+windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock", "Win32_System_IO"] }
 
 [package.metadata.deb]
 maintainer = "Johnathan Corgan <johnathan@corganlabs.com>"
