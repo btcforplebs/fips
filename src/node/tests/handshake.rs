@@ -5225,3 +5225,183 @@ async fn an_unreadable_rekey_msg3_leaves_the_rekey_leg_for_the_resent_msg3() {
     stop_hs(&mut initiator).await;
     stop_hs(&mut responder).await;
 }
+
+// ===========================================================================
+// A msg1 that differs from the one a pending inbound leg answered gets its own
+// leg. XX msg2 is bound to the initiator's ephemeral in msg1, so answering a
+// new msg1 with the pending leg's stored msg2 gives the sender a msg2 it can
+// never read; a byte-identical msg1 is still a resend, answered from the
+// stored msg2 (`test_xx_duplicate_msg1_resends_msg2`).
+// ===========================================================================
+
+/// A bare XX initiator with `keypair`: its handshake and the framed msg1 it
+/// sent under `idx`. Stands in for one dial attempt, so a test can put
+/// several distinct msg1s from one identity on the wire.
+fn bare_msg1(
+    keypair: secp256k1::Keypair,
+    epoch: [u8; 8],
+    idx: SessionIndex,
+) -> (crate::noise::HandshakeState, Vec<u8>) {
+    let mut hs = crate::noise::HandshakeState::new_initiator(keypair);
+    hs.set_local_epoch(epoch);
+    let noise_msg1 = hs.write_message_1().unwrap();
+    (hs, crate::proto::fmp::wire::build_msg1(idx, &noise_msg1))
+}
+
+/// Read a framed msg2 on a bare initiator's handshake and return the framed
+/// msg3 it answers with, sent under `our_idx`.
+fn bare_msg3(
+    mut hs: crate::noise::HandshakeState,
+    msg2: &[u8],
+    our_idx: SessionIndex,
+) -> Result<Vec<u8>, crate::noise::NoiseError> {
+    use crate::proto::fmp::wire::{Msg2Header, build_msg3};
+
+    let header = Msg2Header::parse(msg2).expect("msg2 header");
+    let noise = &msg2[header.noise_msg2_offset..];
+    let (base, extra) = noise.split_at(crate::noise::HANDSHAKE_MSG2_SIZE.min(noise.len()));
+    hs.read_message_2(base)?;
+    if !extra.is_empty() {
+        hs.decrypt_payload(extra)?;
+    }
+    let noise_msg3 = hs.write_message_3()?;
+    Ok(build_msg3(our_idx, header.sender_idx, &noise_msg3))
+}
+
+/// Send `wire` from `from`'s socket to `to` and have `to` handle it as msg1.
+async fn deliver_msg1(from: &mut HsNode, to: &mut HsNode, wire: &[u8]) {
+    from.node
+        .transports
+        .get(&from.transport_id)
+        .unwrap()
+        .send(&to.addr, wire)
+        .await
+        .expect("send msg1");
+    let pkt = recv_phase(&mut to.packet_rx, 1, "msg1").await;
+    to.node.handle_msg1(pkt).await;
+}
+
+#[tokio::test]
+async fn a_different_msg1_from_an_address_with_a_pending_leg_gets_a_msg2_it_can_read() {
+    let mut initiator = make_hs_node(Config::new()).await;
+    let mut responder = make_hs_node(Config::new()).await;
+    let keypair = initiator.node.identity().keypair();
+    let epoch = initiator.node.startup_epoch();
+
+    // A first attempt the initiator abandons: its leg stays pending at the
+    // responder.
+    let (_abandoned, first) = bare_msg1(keypair, epoch, SessionIndex::new(0x1001));
+    deliver_msg1(&mut initiator, &mut responder, &first).await;
+    recv_phase(&mut initiator.packet_rx, 2, "first msg2").await;
+
+    // The second attempt must get a msg2 of its own.
+    let second_idx = SessionIndex::new(0x1002);
+    let (hs, second) = bare_msg1(keypair, epoch, second_idx);
+    deliver_msg1(&mut initiator, &mut responder, &second).await;
+    let msg2 = recv_phase(&mut initiator.packet_rx, 2, "second msg2").await;
+    let msg3 = bare_msg3(hs, &msg2.data, second_idx)
+        .expect("the second attempt must be able to read the msg2 it gets");
+    assert_eq!(
+        responder.node.connection_count(),
+        2,
+        "the second attempt has its own leg"
+    );
+
+    responder
+        .node
+        .handle_msg3(ReceivedPacket {
+            transport_id: responder.transport_id,
+            remote_addr: initiator.addr.clone(),
+            data: msg3,
+            timestamp_ms: Node::now_ms(),
+        })
+        .await;
+    let peer_addr =
+        *PeerIdentity::from_pubkey_full(initiator.node.identity().pubkey_full()).node_addr();
+    assert!(
+        responder.node.get_peer(&peer_addr).is_some(),
+        "the second attempt completes"
+    );
+    assert_eq!(
+        responder.node.connection_count(),
+        1,
+        "the abandoned leg still waits for its msg3 or its reap"
+    );
+    #[cfg(debug_assertions)]
+    responder.node.debug_assert_peer_maps_coherent();
+
+    stop_hs(&mut initiator).await;
+    stop_hs(&mut responder).await;
+}
+
+#[tokio::test]
+async fn a_stale_leg_at_a_peer_address_does_not_block_the_peer_rekey() {
+    let mut initiator = make_hs_node(rekey_config()).await;
+    let mut responder = make_hs_node(rekey_config()).await;
+    let msg3 = drive_to_msg3(&mut initiator, &mut responder, 1000).await;
+    responder.node.handle_msg3(msg3).await;
+    let peer_addr =
+        *PeerIdentity::from_pubkey_full(initiator.node.identity().pubkey_full()).node_addr();
+    let responder_addr =
+        *PeerIdentity::from_pubkey_full(responder.node.identity().pubkey_full()).node_addr();
+    for (node, addr) in [
+        (&mut initiator.node, responder_addr),
+        (&mut responder.node, peer_addr),
+    ] {
+        node.get_peer_mut(&addr)
+            .unwrap()
+            .test_backdate_session_established(std::time::Duration::from_secs(120));
+    }
+    let peer_link = responder.node.get_peer(&peer_addr).unwrap().link_id();
+
+    // A stale leg at the peer's address: a msg1 from some other identity
+    // arriving from it. Its msg2 lands at the initiator and is drained here,
+    // so the rekey below cannot mistake it for its own.
+    let (_stale_hs, stale) = bare_msg1(
+        Identity::generate().keypair(),
+        [0x33; 8],
+        SessionIndex::new(0x2001),
+    );
+    deliver_msg1(&mut initiator, &mut responder, &stale).await;
+    recv_phase(&mut initiator.packet_rx, 2, "stale msg2").await;
+    let stale_leg = link_at(&responder, &initiator.addr).unwrap();
+    assert_ne!(stale_leg, peer_link);
+
+    // The peer's rekey msg1 gets its own leg.
+    initiator.node.check_rekey().await;
+    let msg1 = recv_phase(&mut responder.packet_rx, 1, "rekey msg1").await;
+    responder.node.handle_msg1(msg1).await;
+    let rekey_leg = link_at(&responder, &initiator.addr).unwrap();
+
+    // The stale leg is reaped while the rekey is in flight.
+    responder
+        .node
+        .cleanup_stale_connection(stale_leg, Node::now_ms())
+        .await;
+    assert!(!responder.node.links.contains_key(&stale_leg));
+
+    let msg2 = recv_phase(&mut initiator.packet_rx, 2, "rekey msg2").await;
+    initiator.node.handle_msg2(msg2).await;
+    let msg3 = recv_phase(&mut responder.packet_rx, 3, "rekey msg3").await;
+    responder.node.handle_msg3(msg3).await;
+    assert!(
+        responder
+            .node
+            .get_peer(&peer_addr)
+            .unwrap()
+            .pending_new_session()
+            .is_some(),
+        "the rekey completes despite the stale leg"
+    );
+    assert_ne!(rekey_leg, stale_leg, "the rekey msg1 had its own leg");
+    assert_eq!(
+        link_at(&responder, &initiator.addr),
+        Some(peer_link),
+        "the peer's address key returns to the peer's link past the reaped leg"
+    );
+    #[cfg(debug_assertions)]
+    responder.node.debug_assert_peer_maps_coherent();
+
+    stop_hs(&mut initiator).await;
+    stop_hs(&mut responder).await;
+}

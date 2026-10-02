@@ -2876,10 +2876,18 @@ impl Node {
         let displaced = self.displaced_links.remove(link_id);
         let link = self.links.remove(link_id)?;
         self.addr_to_link.retain(|_, mapped| *mapped != *link_id);
-        if let Some((key, prior)) = displaced
-            && self.links.contains_key(&prior)
-        {
-            self.addr_to_link.entry(key).or_insert(prior);
+        if let Some((key, prior)) = displaced {
+            // A newer leg at the same address displaced this one; it now
+            // displaces what this one did, or its disposal would find a dead
+            // link and drop the key from a link that is still live.
+            for (newer_key, newer_prior) in self.displaced_links.values_mut() {
+                if *newer_prior == *link_id && *newer_key == key {
+                    *newer_prior = prior;
+                }
+            }
+            if self.links.contains_key(&prior) {
+                self.addr_to_link.entry(key).or_insert(prior);
+            }
         }
         Some(link)
     }

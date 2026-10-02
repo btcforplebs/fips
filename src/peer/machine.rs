@@ -1184,6 +1184,7 @@ impl PeerMachine {
 
     /// Stored wire-format msg1 of the surviving carrier — the resend source for
     /// the outbound handshake retransmit, now that the leg no longer carries it.
+    /// On an inbound leg, the msg1 the leg answered.
     pub(crate) fn conn_handshake_msg1(&self) -> Option<&[u8]> {
         self.conn.handshake_msg1()
     }
@@ -1196,6 +1197,7 @@ impl PeerMachine {
 
     /// Store the wire-format msg1 for resend on the surviving carrier and record
     /// the first resend deadline, mirroring the leg's start-of-handshake write.
+    /// An inbound leg stores the msg1 it answered here; it never resends it.
     pub(crate) fn set_conn_handshake_msg1(&mut self, msg1: Vec<u8>, first_resend_at_ms: u64) {
         self.conn.set_handshake_msg1(msg1, first_resend_at_ms);
     }

@@ -106,7 +106,11 @@ pub struct ConnectionState {
     peer_profile: Option<NodeProfile>,
 
     // === Handshake Resend ===
-    /// Wire-format msg1 bytes for resend (initiator only).
+    /// Wire-format msg1 bytes. On an outbound leg, the msg1 we sent, kept for
+    /// resend. On an inbound leg, the msg1 the leg answered, compared with a
+    /// later msg1 from the same address to tell a resend from a new attempt;
+    /// every msg1 resend path runs only on a leg that sent msg1, so an inbound
+    /// leg's copy is never sent.
     handshake_msg1: Option<Vec<u8>>,
 
     /// Wire-format msg2 bytes for resend (responder only).
@@ -372,7 +376,8 @@ impl ConnectionState {
 
     // === Handshake Resend ===
 
-    /// Store the wire-format msg1 bytes for resend and reset the resend counter.
+    /// Store the wire-format msg1 bytes (see the field) and reset the resend
+    /// counter.
     /// The first-resend deadline is scheduled by the shell timer driver, not
     /// tracked here.
     pub fn set_handshake_msg1(&mut self, msg1: Vec<u8>, _first_resend_at_ms: u64) {

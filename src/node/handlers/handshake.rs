@@ -292,7 +292,13 @@ impl Node {
         //
         // With XX, we can't do identity-based checks in msg1 (no identity yet).
         // We can only detect duplicates by address: if we already have an inbound
-        // link from this address with a pending connection, resend msg2.
+        // link from this address with a pending connection that answered this
+        // same msg1, resend its msg2. A different msg1 is a new attempt (a
+        // rekey, a fresh dial after a restart, or a stale leg left by a replay
+        // or an abandoned attempt) and gets its own leg: XX msg2 is bound to
+        // the initiator's ephemeral in msg1, so the pending leg's msg2 cannot
+        // answer it. The pending leg is not replaced, so a msg1 from this
+        // address cannot discard a genuine leg awaiting its msg3.
         // If we have an active peer on this address, it could be a restart or
         // rekey — but we can't tell until msg3 reveals identity. For now, allow
         // the new handshake to proceed. Identity-based checks happen in handle_msg3.
@@ -304,7 +310,25 @@ impl Node {
                 // Check if this link belongs to an already-promoted active peer
                 let is_active_peer = self.peers.values().any(|p| p.link_id() == existing_link_id);
 
-                if !is_active_peer {
+                if is_active_peer {
+                    // Active peer on this address — allow the new handshake.
+                    // Identity checks (restart, rekey) deferred to handle_msg3.
+                    debug!(
+                        transport_id = %packet.transport_id,
+                        remote_addr = %packet.remote_addr,
+                        existing_link_id = %existing_link_id,
+                        "XX msg1 from address with active peer — proceeding (identity check deferred to msg3)"
+                    );
+                } else if self.is_new_msg1_attempt(existing_link_id, &packet.data) {
+                    // A pending handshake answered a different msg1 — give
+                    // this one its own leg and leave that one for its msg3.
+                    debug!(
+                        transport_id = %packet.transport_id,
+                        remote_addr = %packet.remote_addr,
+                        existing_link_id = %existing_link_id,
+                        "Msg1 differs from the one the pending handshake at this address answered; starting a new handshake"
+                    );
+                } else {
                     // Genuinely pending handshake — resend msg2
                     let msg2_bytes = self.find_stored_msg2(existing_link_id);
                     if let Some(msg2) = msg2_bytes {
@@ -332,14 +356,6 @@ impl Node {
                     }
                     return;
                 }
-                // Active peer on this address — allow the new handshake.
-                // Identity checks (restart, rekey) deferred to handle_msg3.
-                debug!(
-                    transport_id = %packet.transport_id,
-                    remote_addr = %packet.remote_addr,
-                    existing_link_id = %existing_link_id,
-                    "XX msg1 from address with active peer — proceeding (identity check deferred to msg3)"
-                );
             } else {
                 // Outbound link to this address — cross-connection.
                 // Allow the inbound handshake to proceed.
@@ -446,8 +462,11 @@ impl Node {
         // the Noise handles it carries.
         machine.park_inbound_msg2_sent(our_index);
         // Store the framed msg2 on the surviving carrier for duplicate-msg1
-        // resend while the handshake is still pending.
+        // resend while the handshake is still pending, and the msg1 it answers,
+        // which tells that resend apart from a new attempt. An inbound leg
+        // never resends msg1, so the resend deadline is moot.
         machine.set_conn_handshake_msg2(wire_msg2.clone());
+        machine.set_conn_handshake_msg1(packet.data.clone(), 0);
         self.peer_machines.insert(link_id, machine);
 
         if let Some(transport) = self.transports.get(&packet.transport_id) {
@@ -483,6 +502,17 @@ impl Node {
         // Store in pending_inbound for msg3 dispatch.
         self.pending_inbound
             .insert((packet.transport_id, our_index.as_u32()), link_id);
+    }
+
+    /// Whether `msg1` is a different attempt from the one the pending inbound
+    /// leg on `link` answered. A leg with no machine or no recorded msg1 is
+    /// treated as answering it, which keeps the duplicate path's behaviour for
+    /// it.
+    fn is_new_msg1_attempt(&self, link: LinkId, msg1: &[u8]) -> bool {
+        self.peer_machines
+            .get(&link)
+            .and_then(|machine| machine.conn_handshake_msg1())
+            .is_some_and(|answered| answered != msg1)
     }
 
     /// Find stored msg2 bytes for a given link (pre- or post-promotion).
