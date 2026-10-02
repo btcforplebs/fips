@@ -36,6 +36,7 @@
 #![cfg_attr(not(unix), allow(dead_code))]
 
 use crate::NodeAddr;
+use crate::node::worker_set::{WorkerLiveness, WorkerSet, worth_logging};
 use crate::transport::{TransportAddr, TransportId};
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use portable_atomic::{AtomicU64, Ordering};
@@ -220,24 +221,47 @@ pub(crate) enum WorkerMsg {
 /// shard.
 #[derive(Clone)]
 pub(crate) struct DecryptWorkerPool {
-    senders: Arc<[Sender<WorkerMsg>]>,
+    workers: Arc<WorkerSet<Sender<WorkerMsg>>>,
+}
+
+/// Start the production worker loop on `rx` in a named OS thread.
+fn spawn_worker(
+    idx: usize,
+    rx: Receiver<WorkerMsg>,
+) -> std::io::Result<std::thread::JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name(format!("fips-decrypt-{idx}"))
+        .spawn(move || run_worker(idx, rx))
 }
 
 impl DecryptWorkerPool {
+    /// Spawn `n` worker OS threads (at least one). A worker thread that
+    /// cannot be started is logged and left dead; the caller reads how
+    /// many started from [`Self::liveness`].
     pub fn spawn(n: usize) -> Self {
-        let n = n.max(1);
-        let mut senders = Vec::with_capacity(n);
-        for i in 0..n {
-            let (tx, rx) = bounded::<WorkerMsg>(WORKER_CHANNEL_CAP);
-            std::thread::Builder::new()
-                .name(format!("fips-decrypt-{i}"))
-                .spawn(move || run_worker(i, rx))
-                .expect("failed to spawn fips-decrypt OS thread");
-            senders.push(tx);
-        }
+        Self::start_with(n, spawn_worker)
+    }
+
+    /// Build the pool, starting each worker with `spawn`. Production passes
+    /// [`spawn_worker`]; tests pass workers that fail to start or exit on cue.
+    fn start_with(
+        n: usize,
+        spawn: impl FnMut(usize, Receiver<WorkerMsg>) -> std::io::Result<std::thread::JoinHandle<()>>,
+    ) -> Self {
         Self {
-            senders: senders.into(),
+            workers: Arc::new(WorkerSet::start(
+                "decrypt",
+                n,
+                || bounded::<WorkerMsg>(WORKER_CHANNEL_CAP),
+                spawn,
+            )),
         }
+    }
+
+    /// Whether each worker is still running, and how many dispatches a dead
+    /// one refused.
+    pub(crate) fn liveness(&self) -> &dyn WorkerLiveness {
+        &*self.workers
     }
 
     /// Stable hash from session key → worker index. Same hash is used
@@ -247,24 +271,37 @@ impl DecryptWorkerPool {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         cache_key.hash(&mut h);
-        (h.finish() as usize) % self.senders.len()
+        (h.finish() as usize) % self.workers.len()
+    }
+
+    /// Count a message refused by the exited worker `idx`, and log it at a
+    /// bounded rate.
+    fn note_refused(&self, idx: usize, what: &'static str) {
+        let n = self.workers.note_refused();
+        if worth_logging(n) {
+            warn!(
+                pool = "decrypt",
+                worker = idx,
+                refused = n + 1,
+                what,
+                "Decrypt worker has exited; message refused"
+            );
+        }
     }
 
     /// Dispatch a per-packet decrypt job. Drops if the per-worker
     /// channel is full (sustained rate overrun); the rx_loop's drain
     /// caps inbound at the same scale upstream so the cliff is
-    /// bounded.
+    /// bounded. A job for an exited worker is dropped, counted and
+    /// logged at WARN.
     pub fn dispatch_job(&self, job: DecryptJob) {
-        if self.senders.is_empty() {
-            return;
-        }
         let idx = self.worker_idx_for(job.cache_key);
-        match self.senders[idx].try_send(WorkerMsg::Job(job)) {
+        match self.workers.sender(idx).try_send(WorkerMsg::Job(job)) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
                 static FULL_COUNT: AtomicU64 = AtomicU64::new(0);
                 let n = FULL_COUNT.fetch_add(1, Ordering::Relaxed);
-                if n < 8 || n.is_multiple_of(10000) {
+                if worth_logging(n) {
                     warn!(
                         worker = idx,
                         drops = n + 1,
@@ -272,9 +309,7 @@ impl DecryptWorkerPool {
                     );
                 }
             }
-            Err(TrySendError::Disconnected(_)) => {
-                debug!(worker = idx, "DecryptWorker thread gone; dropping job");
-            }
+            Err(TrySendError::Disconnected(_)) => self.note_refused(idx, "inbound packet"),
         }
     }
 
@@ -303,11 +338,12 @@ impl DecryptWorkerPool {
         cache_key: (TransportId, u32),
         state: OwnedSessionState,
     ) -> bool {
-        if self.senders.is_empty() {
-            return false;
-        }
         let idx = self.worker_idx_for(cache_key);
-        match self.senders[idx].try_send(WorkerMsg::RegisterSession { cache_key, state }) {
+        match self
+            .workers
+            .sender(idx)
+            .try_send(WorkerMsg::RegisterSession { cache_key, state })
+        {
             Ok(()) => true,
             Err(TrySendError::Full(_)) => {
                 warn!(
@@ -317,10 +353,7 @@ impl DecryptWorkerPool {
                 false
             }
             Err(TrySendError::Disconnected(_)) => {
-                debug!(
-                    worker = idx,
-                    "DecryptWorker thread gone; ignoring registration"
-                );
+                self.note_refused(idx, "session registration");
                 false
             }
         }
@@ -329,11 +362,11 @@ impl DecryptWorkerPool {
     /// Drop a session from its worker (rekey, peer removed). Fire and
     /// forget — if the worker is gone we don't care.
     pub fn unregister_session(&self, cache_key: (TransportId, u32)) {
-        if self.senders.is_empty() {
-            return;
-        }
         let idx = self.worker_idx_for(cache_key);
-        let _ = self.senders[idx].try_send(WorkerMsg::UnregisterSession { cache_key });
+        let _ = self
+            .workers
+            .sender(idx)
+            .try_send(WorkerMsg::UnregisterSession { cache_key });
     }
 }
 
@@ -772,5 +805,124 @@ mod tests {
             }
             DecryptWorkerEvent::Plaintext(_) => panic!("expected decrypt failure report"),
         }
+    }
+}
+
+#[cfg(test)]
+impl DecryptWorkerPool {
+    /// A pool whose workers behave as `plan` says; `Run` workers are the
+    /// production loop.
+    pub(crate) fn for_test(plan: Vec<crate::node::worker_set::TestWorker>) -> Self {
+        Self::start_with(
+            plan.len(),
+            crate::node::worker_set::test_spawner(plan, spawn_worker),
+        )
+    }
+}
+
+/// The pool's view of its workers: which are live and what a dead one does to
+/// a dispatch or a registration. Every wait is bounded.
+#[cfg(test)]
+mod pool_tests {
+    use super::*;
+    use crate::node::worker_set::{TestWorker, wait_for};
+    use ring::aead::UnboundKey;
+    use std::sync::mpsc;
+
+    /// A session key the pool hashes to worker `idx`.
+    fn key_on_worker(pool: &DecryptWorkerPool, idx: usize) -> (TransportId, u32) {
+        (0u32..)
+            .map(|n| (TransportId::new(1), n))
+            .find(|key| pool.worker_idx_for(*key) == idx)
+            .expect("some key hashes to every worker")
+    }
+
+    fn session_state() -> OwnedSessionState {
+        let key = UnboundKey::new(&ring::aead::CHACHA20_POLY1305, &[0u8; 32]).unwrap();
+        OwnedSessionState {
+            fmp_cipher: LessSafeKey::new(key),
+            fmp_replay: ReplayWindow::new(),
+            source_npub: None,
+        }
+    }
+
+    fn job(cache_key: (TransportId, u32)) -> DecryptJob {
+        let (fallback_tx, _) = tokio::sync::mpsc::unbounded_channel::<DecryptWorkerEvent>();
+        DecryptJob {
+            packet_data: vec![0u8; 48],
+            cache_key,
+            _transport_id: cache_key.0,
+            _remote_addr: TransportAddr::from_string("127.0.0.1:1234"),
+            timestamp_ms: 1_000,
+            source_node_addr: NodeAddr::from_bytes([1u8; 16]),
+            fmp_counter: 1,
+            fmp_flags: 0,
+            fmp_header: [0u8; 16],
+            fmp_ciphertext_offset: 16,
+            fallback_tx,
+        }
+    }
+
+    #[test]
+    fn a_decrypt_worker_that_panics_is_counted_dead() {
+        let (die_tx, die_rx) = mpsc::channel::<()>();
+        let mut die_rx = Some(die_rx);
+        let pool = DecryptWorkerPool::start_with(2, |idx, rx| {
+            if idx != 1 {
+                return spawn_worker(idx, rx);
+            }
+            let die = die_rx.take().expect("worker 1 starts once");
+            std::thread::Builder::new().spawn(move || {
+                let _rx = rx;
+                let _ = die.recv();
+                panic!("simulated decrypt worker panic");
+            })
+        });
+        assert_eq!(pool.liveness().live_workers(), 2);
+        die_tx.send(()).expect("worker 1 gone before its signal");
+        assert!(
+            wait_for(|| pool.liveness().live_workers() == 1),
+            "a worker that panicked is still counted live"
+        );
+        assert_eq!(pool.liveness().dead_workers(), vec![1]);
+    }
+
+    #[test]
+    fn a_worker_that_fails_to_spawn_leaves_the_pool_serving_the_rest() {
+        let pool = DecryptWorkerPool::for_test(vec![TestWorker::Run, TestWorker::FailSpawn]);
+        assert_eq!(pool.liveness().worker_count(), 2);
+        assert_eq!(pool.liveness().live_workers(), 1);
+        let key = key_on_worker(&pool, 0);
+        assert!(
+            pool.register_session(key, session_state()),
+            "the live worker refused a registration"
+        );
+        pool.dispatch_job(job(key));
+        assert_eq!(pool.liveness().refused_dispatches(), 0);
+    }
+
+    #[test]
+    fn dispatch_to_an_exited_decrypt_worker_warns_and_counts() {
+        let pool = DecryptWorkerPool::for_test(vec![TestWorker::Run, TestWorker::FailSpawn]);
+        let key = key_on_worker(&pool, 1);
+        let ((), logs) = crate::testutil::capture_logs(|| pool.dispatch_job(job(key)));
+        let warnings = logs.warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains(" worker=1"), "{warnings:?}");
+        assert!(warnings[0].contains(" pool=\"decrypt\""), "{warnings:?}");
+        assert_eq!(pool.liveness().refused_dispatches(), 1);
+    }
+
+    #[test]
+    fn registration_with_an_exited_decrypt_worker_warns_counts_and_is_refused() {
+        let pool = DecryptWorkerPool::for_test(vec![TestWorker::Run, TestWorker::FailSpawn]);
+        let key = key_on_worker(&pool, 1);
+        let (registered, logs) =
+            crate::testutil::capture_logs(|| pool.register_session(key, session_state()));
+        assert!(!registered, "a dead worker cannot own a session");
+        let warnings = logs.warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains(" worker=1"), "{warnings:?}");
+        assert_eq!(pool.liveness().refused_dispatches(), 1);
     }
 }

@@ -33,6 +33,8 @@ pub(crate) mod stats_history;
 #[cfg(test)]
 mod tests;
 mod tree;
+#[cfg(unix)]
+pub(crate) mod worker_set;
 
 use self::peer_error_budget::PeerErrorBudget;
 use self::rate_limit::{HandshakeRateLimiter, LookupSignRateLimiter, SessionSetupRateLimiter};

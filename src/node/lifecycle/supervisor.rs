@@ -63,10 +63,11 @@
 //! - the degenerate no-children path now resolves to `Failed` (zero transports),
 //!   **not** the old immediate-`Running`.
 //!
-//! Runtime child-liveness monitoring (a `ChildExited` event re-routing health
-//! when a task/thread dies at runtime) is **deferred**: start-completion health
-//! resolution is start-framed, and liveness monitoring is a substantial unbuilt
-//! mechanism. This commit is start-time health only.
+//! Runtime child-liveness (a `ChildExited` event re-routing health when a
+//! task/thread dies at runtime) came later. Its producers are the children that
+//! report their own exit (TUN threads, the DNS task, the mDNS/Nostr monitor)
+//! and, for the crypto worker pools, the rx loop tick's liveness sweep, which
+//! reports a pool's child as exited when it loses a worker.
 //!
 //! ## Scope: interface presence, and `Degraded` as a level (this commit)
 //!
@@ -298,7 +299,8 @@ pub(crate) enum Health {
     Full,
     /// ≥1 transport is up, but one or more configured optional children failed
     /// to start (a transport beyond the first, Nostr, mDNS, TUN, DNS, or a
-    /// worker-pool spawn). The node is operational (serving) but degraded.
+    /// worker pool that did not start every worker). The node is operational
+    /// (serving) but degraded.
     Degraded {
         /// The configured children that failed to start.
         reasons: HashSet<Child>,
@@ -860,8 +862,8 @@ pub(crate) struct Supervisor {
 
     /// Off-task FMP-encrypt + UDP-send worker pool. Unix-only —
     /// the worker issues direct sendmmsg(2) / sendmsg+UDP_GSO calls
-    /// on raw fds via `AsRawFd`. None on Windows or when the worker
-    /// pool failed to spawn.
+    /// on raw fds via `AsRawFd`. None on Windows or when no worker
+    /// thread could be started.
     #[cfg(unix)]
     pub(crate) encrypt_workers: Option<crate::node::encrypt_worker::EncryptWorkerPool>,
 
@@ -869,8 +871,15 @@ pub(crate) struct Supervisor {
     /// `encrypt_workers`. Workers are shards: each owns its session
     /// state directly in a thread-local `HashMap` (no `RwLock`,
     /// no `Mutex` per packet). Hash-by-cache-key dispatch.
+    /// None on Windows, with `FIPS_DECRYPT_WORKERS=0`, or when no worker
+    /// thread could be started.
     #[cfg(unix)]
     pub(crate) decrypt_workers: Option<crate::node::decrypt_worker::DecryptWorkerPool>,
+
+    /// Pools a test has built for start-up to install in place of spawning
+    /// its own.
+    #[cfg(all(test, unix))]
+    pub(in crate::node) staged_pools: StagedPools,
 
     /// Transport-medium change detection: the receiver the rx loop drains and
     /// the detector task behind it.
@@ -887,6 +896,15 @@ pub(crate) struct Supervisor {
 
     /// The sans-IO lifecycle FSM authoring spawn/teardown ordering.
     pub(in crate::node) fsm: SupervisorFsm,
+}
+
+/// Crypto worker pools a test hands to start-up, each taken by the first
+/// start of its pool's child.
+#[cfg(all(test, unix))]
+#[derive(Default)]
+pub(in crate::node) struct StagedPools {
+    pub encrypt: Option<crate::node::encrypt_worker::EncryptWorkerPool>,
+    pub decrypt: Option<crate::node::decrypt_worker::DecryptWorkerPool>,
 }
 
 impl Supervisor {
@@ -914,6 +932,8 @@ impl Supervisor {
             encrypt_workers: None,
             #[cfg(unix)]
             decrypt_workers: None,
+            #[cfg(all(test, unix))]
+            staged_pools: StagedPools::default(),
             netmon_rx: None,
             netmon_task: None,
             fsm: SupervisorFsm::new(),
@@ -1794,6 +1814,39 @@ mod tests {
         }
         s.step(start_full());
         assert!(s.absent().is_empty());
+    }
+
+    /// The crypto worker pools are a performance offload with a main-loop path
+    /// behind them, so losing one degrades the node and can never be what
+    /// fails it.
+    #[test]
+    fn a_worker_pool_exit_is_degraded_and_never_failed() {
+        let mut s = SupervisorFsm::running_with([
+            Child::Transport(tid(1)),
+            Child::EncryptWorkers,
+            Child::DecryptWorkers,
+        ]);
+        assert_eq!(
+            s.step(Event::ChildExited {
+                child: Child::EncryptWorkers
+            }),
+            vec![Action::PublishState(NodeState::Degraded)]
+        );
+        assert_eq!(
+            s.step(Event::ChildExited {
+                child: Child::DecryptWorkers
+            }),
+            vec![Action::PublishState(NodeState::Degraded)]
+        );
+        assert!(matches!(
+            s.state(),
+            SupState::Running {
+                health: Health::Degraded { .. }
+            }
+        ));
+        let degraded = s.degraded_children();
+        assert!(degraded.contains(&Child::EncryptWorkers));
+        assert!(degraded.contains(&Child::DecryptWorkers));
     }
 
     #[test]

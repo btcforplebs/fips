@@ -1,6 +1,7 @@
 //! Node lifecycle management: start, stop, and peer connection initiation.
 
 pub(crate) mod supervisor;
+mod workers;
 
 use super::{Node, NodeError, NodeState};
 use supervisor::{Action, Child, Event, PeeringDesired, SupervisorFsm};
@@ -1609,44 +1610,33 @@ impl Node {
                     }
                 }
                 Child::EncryptWorkers => {
-                    // Hash-by-destination pins a TCP flow to one worker
-                    // (preserves wire ordering); additional workers light up
-                    // under multi-flow load. Infallible → always up.
+                    // A worker that cannot be started degrades the node; it
+                    // never stops start-up.
                     #[cfg(unix)]
-                    {
-                        self.supervisor.encrypt_workers = Some(
-                            super::encrypt_worker::EncryptWorkerPool::spawn(encrypt_worker_count),
-                        );
-                        info!(
-                            workers = encrypt_worker_count,
-                            "Spawned FMP-encrypt worker pool"
-                        );
+                    let start = self.start_encrypt_workers(encrypt_worker_count);
+                    #[cfg(not(unix))]
+                    let start = workers::PoolStart::ALL_LIVE;
 
-                        // `FIPS_DECRYPT_WORKERS=0` disables the pool entirely
-                        // and forces the in-line rx_loop decrypt path. When 0
-                        // no DecryptWorkers child is emitted, so this info!
-                        // sits here — exactly where the decrypt spawn would be
-                        // in today's sequence (after the encrypt spawn+info,
-                        // before nostr).
-                        if decrypt_worker_count == 0 {
-                            info!("FIPS_DECRYPT_WORKERS=0 → in-line decrypt in rx_loop");
-                        }
+                    // `FIPS_DECRYPT_WORKERS=0` disables the pool entirely
+                    // and forces the in-line rx_loop decrypt path. When 0
+                    // no DecryptWorkers child is emitted, so this info!
+                    // sits here — exactly where the decrypt spawn would be
+                    // in today's sequence (after the encrypt spawn+info,
+                    // before nostr).
+                    #[cfg(unix)]
+                    if decrypt_worker_count == 0 {
+                        info!("FIPS_DECRYPT_WORKERS=0 → in-line decrypt in rx_loop");
                     }
-                    Event::SubstrateUp { child }
+                    start.event(child)
                 }
                 Child::DecryptWorkers => {
-                    // Shard-owned decrypt pool. Infallible → always up.
+                    // Shard-owned decrypt pool. A worker that cannot be
+                    // started degrades the node; it never stops start-up.
                     #[cfg(unix)]
-                    {
-                        self.supervisor.decrypt_workers = Some(
-                            super::decrypt_worker::DecryptWorkerPool::spawn(decrypt_worker_count),
-                        );
-                        info!(
-                            workers = decrypt_worker_count,
-                            "Spawned FMP-decrypt worker pool"
-                        );
-                    }
-                    Event::SubstrateUp { child }
+                    let start = self.start_decrypt_workers(decrypt_worker_count);
+                    #[cfg(not(unix))]
+                    let start = workers::PoolStart::ALL_LIVE;
+                    start.event(child)
                 }
                 Child::Nostr => {
                     match NostrRendezvous::start(
@@ -2385,6 +2375,18 @@ impl Node {
     pub(in crate::node) fn retract_child_publications(&mut self, child: Child) {
         if matches!(child, Child::Dns) {
             self.supervisor.dns_local_addr.take();
+        }
+    }
+
+    /// Tell the supervisor FSM that `child` exited on its own at runtime, and
+    /// publish the health it resolves. Shared by the child-exit channel's arm
+    /// in the rx loop and the tick's worker-liveness sweep, which steps the FSM
+    /// directly because it runs on the loop that drains that channel.
+    pub(in crate::node) fn step_child_exited(&mut self, child: Child) {
+        for action in self.supervisor.fsm.step(Event::ChildExited { child }) {
+            if let Action::PublishState(ns) = action {
+                self.supervisor.state = ns;
+            }
         }
     }
 

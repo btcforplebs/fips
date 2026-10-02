@@ -345,17 +345,7 @@ impl Node {
                         // republishing health, so nothing outside the node can
                         // observe an address the listener no longer answers on.
                         self.retract_child_publications(child);
-                        let actions = self
-                            .supervisor
-                            .fsm
-                            .step(crate::node::lifecycle::supervisor::Event::ChildExited { child });
-                        for action in actions {
-                            if let crate::node::lifecycle::supervisor::Action::PublishState(ns) =
-                                action
-                            {
-                                self.supervisor.state = ns;
-                            }
-                        }
+                        self.step_child_exited(child);
                         // A transport child exiting leaves the bound set, so
                         // it can be the one that was holding the node's egress
                         // MTU down. `is_bound()` is `is_operational()` plus the
@@ -583,6 +573,10 @@ impl Node {
                         #[cfg(any(target_os = "linux", target_os = "macos"))]
                         instr_step!(instr_on, crate::instr::Domain::Tick, crate::instr::Step::ActivateConnectedUdpSessions,
                         self.activate_connected_udp_sessions().await);
+                        // Crypto worker threads that exited since the last tick.
+                        #[cfg(unix)]
+                        instr_step!(instr_on, crate::instr::Domain::Tick, crate::instr::Step::PollWorkerLiveness,
+                        self.poll_worker_liveness());
                         // Debug-build sweep of the peer-lifecycle map invariant
                         // (leaked machines / machine-less legs); two map scans,
                         // compiled out of release builds.
