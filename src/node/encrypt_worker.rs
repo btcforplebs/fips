@@ -52,6 +52,7 @@
 
 use crate::proto::fmp::wire::ESTABLISHED_HEADER_SIZE;
 use crate::proto::fsp::wire::FSP_HEADER_SIZE;
+use crate::transport::udp::UdpStats;
 use crate::transport::udp::io::AsyncUdpSocket;
 #[cfg(not(target_os = "macos"))]
 use crossbeam_channel::{Receiver, SendError, Sender, TrySendError, bounded};
@@ -137,6 +138,12 @@ pub(crate) struct FmpSendJob {
     /// strong ref remains.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub connected_socket: Option<std::sync::Arc<crate::transport::udp::ConnectedPeerSocket>>,
+    /// The sending UDP transport's counters. The worker's sends bypass
+    /// `UdpTransport::send_async`, so the worker counts each datagram it
+    /// hands the kernel, and each it gives up on, here; the transport's
+    /// send counters then cover every datagram it sends, on the wildcard
+    /// socket and on per-peer connected sockets alike.
+    pub stats: Arc<UdpStats>,
     /// Bulk endpoint data may be dropped when the kernel reports UDP
     /// send-queue exhaustion. Control/rekey frames keep retrying so
     /// congestion cannot strand the session.
@@ -621,6 +628,7 @@ impl MacSequencedSendFlows {
             job.socket.clone(),
             job.connected_socket.clone(),
             job.dest_addr,
+            job.stats.clone(),
             now_ms,
         );
         flows.insert(key, Arc::clone(&flow));
@@ -744,6 +752,9 @@ struct MacSequencedSendFlow {
     socket: AsyncUdpSocket,
     connected_socket: Option<std::sync::Arc<crate::transport::udp::ConnectedPeerSocket>>,
     dest_addr: SocketAddr,
+    /// The sending transport's counters, which this flow's sender thread
+    /// counts each datagram into.
+    stats: Arc<UdpStats>,
     next_seq: portable_atomic::AtomicU64,
     last_used_ms: portable_atomic::AtomicU64,
     state: Mutex<MacSendFlowState>,
@@ -852,6 +863,7 @@ impl MacSequencedSendFlow {
         socket: AsyncUdpSocket,
         connected_socket: Option<std::sync::Arc<crate::transport::udp::ConnectedPeerSocket>>,
         dest_addr: SocketAddr,
+        stats: Arc<UdpStats>,
         now_ms: u64,
     ) -> Arc<Self> {
         let flow = Arc::new(Self {
@@ -859,6 +871,7 @@ impl MacSequencedSendFlow {
             socket,
             connected_socket,
             dest_addr,
+            stats,
             next_seq: portable_atomic::AtomicU64::new(0),
             last_used_ms: portable_atomic::AtomicU64::new(now_ms),
             state: Mutex::new(MacSendFlowState::default()),
@@ -1008,6 +1021,7 @@ impl MacSequencedSendFlow {
                         &packet,
                         &mut backpressure,
                         drop_on_backpressure,
+                        &self.stats,
                     ) {
                         debug!(
                             socket_fd = self.key.socket_fd,
@@ -1148,6 +1162,7 @@ fn flush_batch_sync(
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         connected_socket: Option<std::sync::Arc<crate::transport::udp::ConnectedPeerSocket>>,
         dest_addr: SocketAddr,
+        stats: Arc<UdpStats>,
         wire_packets: Vec<Vec<u8>>,
         drop_on_backpressure: bool,
     }
@@ -1171,6 +1186,7 @@ fn flush_batch_sync(
             dest_addr,
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             connected_socket,
+            stats,
             drop_on_backpressure,
             queued_at,
         } = job;
@@ -1264,7 +1280,7 @@ fn flush_batch_sync(
                 if g.dest_addr != dest_addr {
                     return false;
                 }
-                if g.socket.as_raw_fd() != socket_fd {
+                if g.socket.as_raw_fd() != socket_fd || !Arc::ptr_eq(&g.stats, &stats) {
                     return false;
                 }
                 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1284,6 +1300,7 @@ fn flush_batch_sync(
                     #[cfg(any(target_os = "linux", target_os = "macos"))]
                     connected_socket,
                     dest_addr,
+                    stats,
                     wire_packets: vec![wire_buf],
                     drop_on_backpressure,
                 });
@@ -1294,7 +1311,7 @@ fn flush_batch_sync(
             // Windows: encrypt worker pool isn't spawned (see
             // lifecycle.rs); this function is unreachable. Drop
             // values explicitly so the compiler sees them as used.
-            let _ = (socket, dest_addr, wire_buf);
+            let _ = (socket, dest_addr, stats, wire_buf);
         }
     }
 
@@ -1328,13 +1345,27 @@ fn flush_batch_sync(
     // full so this is the cold path.
     let _t2 = crate::perf_profile::Timer::start(crate::perf_profile::Stage::UdpSend);
 
+    // Every datagram is counted once in its transport's stats: as sent
+    // when the kernel takes it, as a send error when it is given up on.
+    // A hard error ends the flush, so the groups after the failing one
+    // are never tried; `abandon` counts their datagrams as send errors.
+    #[cfg(unix)]
+    let mut groups = groups.into_iter();
+    #[cfg(unix)]
+    let abandon = |rest: std::vec::IntoIter<EncryptedGroup>| {
+        for group in rest {
+            group.stats.record_unsent(group.wire_packets.len() as u64);
+        }
+    };
+
     #[cfg(target_os = "linux")]
-    for group in groups {
+    while let Some(group) = groups.next() {
         let mut backpressure = SendBackpressurePacer::default();
         let EncryptedGroup {
             socket,
             connected_socket,
             dest_addr,
+            stats,
             wire_packets,
             drop_on_backpressure: _,
         } = group;
@@ -1351,6 +1382,7 @@ fn flush_batch_sync(
             match send_batch_gso(fd, &wire_packets, dest_addr, connected) {
                 Ok(()) => {
                     record_udp_send_path(connected, wire_packets.len() as u64);
+                    stats.record_sends(wire_packets.len() as u64, wire_bytes(&wire_packets));
                     continue;
                 }
                 Err(err)
@@ -1370,6 +1402,8 @@ fn flush_batch_sync(
                     // sendmmsg retry loop. No GSO_DISABLED toggle.
                 }
                 Err(err) => {
+                    stats.record_unsent(wire_packets.len() as u64);
+                    abandon(groups);
                     return Err(format!("sendmsg+UDP_GSO failed: {err}").into());
                 }
             }
@@ -1384,19 +1418,23 @@ fn flush_batch_sync(
                     continue;
                 }
                 Err(err) => {
+                    stats.record_unsent((wire_packets.len() - sent) as u64);
+                    abandon(groups);
                     return Err(format!("sendmmsg(2) failed: {err}").into());
                 }
             };
             if n == 0 {
+                stats.record_unsent((wire_packets.len() - sent) as u64);
                 break;
             }
+            stats.record_sends(n as u64, wire_bytes(&wire_packets[sent..sent + n]));
             sent += n;
             backpressure.record_success();
             record_udp_send_path(connected, n as u64);
         }
     }
     #[cfg(all(unix, not(target_os = "linux")))]
-    for group in groups {
+    while let Some(group) = groups.next() {
         let mut backpressure = SendBackpressurePacer::default();
         #[cfg(target_os = "macos")]
         let (fd, connected) = match group.connected_socket.as_ref() {
@@ -1405,7 +1443,7 @@ fn flush_batch_sync(
         };
         #[cfg(not(target_os = "macos"))]
         let (fd, connected) = (group.socket.as_raw_fd(), false);
-        for data in &group.wire_packets {
+        for (i, data) in group.wire_packets.iter().enumerate() {
             if let Err(err) = send_one_with_backpressure(
                 fd,
                 connected,
@@ -1413,10 +1451,14 @@ fn flush_batch_sync(
                 data,
                 &mut backpressure,
                 group.drop_on_backpressure,
+                &group.stats,
             ) {
                 if group.drop_on_backpressure && is_send_backpressure(&err) {
                     continue;
                 }
+                let rest = group.wire_packets.len() - i - 1;
+                group.stats.record_unsent(rest as u64);
+                abandon(groups);
                 return Err(format!("sendto failed: {err}").into());
             }
         }
@@ -1443,6 +1485,13 @@ fn record_udp_send_path(connected: bool, count: u64) {
         crate::perf_profile::Event::UdpSendWildcard
     };
     crate::perf_profile::record_event_count(event, count);
+}
+
+/// Total bytes in `packets`: the UDP payload bytes one batched send
+/// hands the kernel when it takes every packet in the slice.
+#[cfg(target_os = "linux")]
+fn wire_bytes(packets: &[Vec<u8>]) -> u64 {
+    packets.iter().map(|p| p.len() as u64).sum()
 }
 
 fn is_send_backpressure(err: &std::io::Error) -> bool {
@@ -1692,6 +1741,12 @@ impl MacSendRatePacer {
 #[cfg(target_os = "linux")]
 static GSO_DISABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// The most packets one UDP GSO send carries, the kernel's segment limit
+/// on older kernels. `send_batch_gso` reports a whole group as sent, so a
+/// larger group must not reach it.
+#[cfg(target_os = "linux")]
+const GSO_SEGMENTS: usize = 64;
+
 /// Size-only GSO eligibility check. Callers MUST ensure all packets
 /// share one destination + send target — `flush_batch_sync` does this
 /// by grouping. A batch is GSO-eligible iff every packet is the same
@@ -1703,6 +1758,10 @@ fn gso_eligible_sizes(packets: &[Vec<u8>]) -> bool {
     if packets.len() < 2 {
         // Single-packet groups don't benefit from GSO (no segmentation
         // saving) and just add cmsg overhead.
+        return false;
+    }
+    if packets.len() > GSO_SEGMENTS {
+        // More than one GSO send can carry; sendmmsg's loop sends them all.
         return false;
     }
     let seg = packets[0].len();
@@ -1734,8 +1793,8 @@ fn send_batch_gso(
     connected: bool,
 ) -> std::io::Result<()> {
     debug_assert!(!packets.is_empty());
-    const MAX_BATCH: usize = 64;
-    let n = packets.len().min(MAX_BATCH);
+    debug_assert!(packets.len() <= GSO_SEGMENTS);
+    let n = packets.len().min(GSO_SEGMENTS);
     if n == 0 {
         return Ok(());
     }
@@ -1744,7 +1803,7 @@ fn send_batch_gso(
     let sa: socket2::SockAddr = dest.into();
 
     // Stack-allocated arrays sized for the worst case in this batch.
-    let mut iovs: [libc::iovec; MAX_BATCH] = unsafe { std::mem::zeroed() };
+    let mut iovs: [libc::iovec; GSO_SEGMENTS] = unsafe { std::mem::zeroed() };
     for (i, data) in packets[..n].iter().enumerate() {
         iovs[i].iov_base = data.as_ptr() as *mut libc::c_void;
         iovs[i].iov_len = data.len();
@@ -1952,6 +2011,7 @@ mod unix_tests {
                 dest_addr: recv_addr,
                 #[cfg(any(target_os = "linux", target_os = "macos"))]
                 connected_socket: None,
+                stats: Arc::new(UdpStats::new()),
                 drop_on_backpressure: true,
                 queued_at: None,
             }];
@@ -2085,6 +2145,7 @@ mod unix_tests {
                 dest_addr: recv_addr,
                 #[cfg(any(target_os = "linux", target_os = "macos"))]
                 connected_socket: None,
+                stats: Arc::new(UdpStats::new()),
                 drop_on_backpressure: true,
                 queued_at: None,
             }];
@@ -2153,6 +2214,254 @@ mod unix_tests {
             assert_eq!(recovered_fsp_plaintext, fsp_plaintext);
         });
     }
+
+    /// A job carrying `plaintext_len` bytes of plaintext for `dest`, sent
+    /// on `socket` and counted in `stats`. Its wire packet is
+    /// `ESTABLISHED_HEADER_SIZE + plaintext_len + TAG_SIZE` bytes.
+    fn counted_job(
+        socket: &AsyncUdpSocket,
+        dest: SocketAddr,
+        plaintext_len: usize,
+        counter: u64,
+        stats: &Arc<UdpStats>,
+    ) -> FmpSendJob {
+        let mut wire_buf =
+            Vec::with_capacity(ESTABLISHED_HEADER_SIZE + plaintext_len + crate::noise::TAG_SIZE);
+        wire_buf.extend_from_slice(&[0xA5; ESTABLISHED_HEADER_SIZE]);
+        wire_buf.resize(ESTABLISHED_HEADER_SIZE + plaintext_len, 0);
+        FmpSendJob {
+            cipher: test_cipher(3),
+            counter,
+            wire_buf,
+            fsp_seal: None,
+            socket: socket.clone(),
+            dest_addr: dest,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            connected_socket: None,
+            stats: stats.clone(),
+            drop_on_backpressure: false,
+            queued_at: None,
+        }
+    }
+
+    /// The wire length of a `counted_job` carrying `plaintext_len` bytes.
+    fn wire_len(plaintext_len: usize) -> u64 {
+        (ESTABLISHED_HEADER_SIZE + plaintext_len + crate::noise::TAG_SIZE) as u64
+    }
+
+    /// Receive datagrams on `sock` until it goes quiet, returning how many
+    /// arrived.
+    fn count_received(sock: &UdpSocket) -> u64 {
+        sock.set_read_timeout(Some(std::time::Duration::from_millis(200)))
+            .expect("set_read_timeout");
+        let mut buf = [0u8; 2048];
+        let mut n = 0;
+        while sock.recv_from(&mut buf).is_ok() {
+            n += 1;
+        }
+        n
+    }
+
+    /// A nonblocking loopback send socket registered with `rt`'s reactor.
+    fn open_async(rt: &tokio::runtime::Runtime) -> AsyncUdpSocket {
+        let _enter = rt.enter();
+        UdpRawSocket::open("127.0.0.1:0".parse().unwrap(), 1 << 20, 1 << 20)
+            .expect("open send socket")
+            .into_async()
+            .expect("into_async")
+    }
+
+    /// The worker's sends bypass `UdpTransport::send_async`, so the worker
+    /// must count them itself: each datagram it hands the kernel counts
+    /// once, in the stats of the transport whose job it was. The batch
+    /// mixes a same-size run (the UDP GSO group on Linux), a lone packet
+    /// to a second destination (plain `sendmmsg`), and a job from a second
+    /// transport, whose datagram must land in that transport's stats only.
+    #[test]
+    fn each_datagram_a_flush_sends_counts_once_in_its_own_transports_stats() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .expect("tokio rt");
+        let recv_a = UdpSocket::bind("127.0.0.1:0").expect("bind recv_a");
+        let recv_b = UdpSocket::bind("127.0.0.1:0").expect("bind recv_b");
+        let addr_a = recv_a.local_addr().unwrap();
+        let addr_b = recv_b.local_addr().unwrap();
+        let first = open_async(&rt);
+        let second = open_async(&rt);
+        let stats = Arc::new(UdpStats::new());
+        let other = Arc::new(UdpStats::new());
+
+        const RUN: u64 = 6;
+        const RUN_LEN: usize = 100;
+        const LONE_LEN: usize = 40;
+        const OTHER_LEN: usize = 60;
+        let mut batch: Vec<FmpSendJob> = (0..RUN)
+            .map(|i| counted_job(&first, addr_a, RUN_LEN, i, &stats))
+            .collect();
+        batch.push(counted_job(&first, addr_b, LONE_LEN, RUN, &stats));
+        batch.push(counted_job(&second, addr_b, OTHER_LEN, RUN + 1, &other));
+        flush_direct_batch_sync(&mut batch).expect("flush ok");
+
+        assert_eq!(count_received(&recv_a), RUN);
+        assert_eq!(count_received(&recv_b), 2);
+        let counted = stats.snapshot();
+        assert_eq!(
+            counted.packets_sent,
+            RUN + 1,
+            "each datagram the worker sent must count once"
+        );
+        assert_eq!(
+            counted.bytes_sent,
+            RUN * wire_len(RUN_LEN) + wire_len(LONE_LEN)
+        );
+        assert_eq!(counted.send_errors, 0);
+        let counted = other.snapshot();
+        assert_eq!(
+            counted.packets_sent, 1,
+            "a datagram must count in the stats of the transport whose job it was"
+        );
+        assert_eq!(counted.bytes_sent, wire_len(OTHER_LEN));
+    }
+
+    /// Datagrams sent on a per-peer connected socket count in the stats
+    /// of the transport the job came from, as wildcard sends do.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn datagrams_sent_on_a_connected_socket_count_once_in_the_transports_stats() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .expect("tokio rt");
+        let recv = UdpSocket::bind("127.0.0.1:0").expect("bind recv");
+        let peer = recv.local_addr().unwrap();
+        let local: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let owned = crate::transport::udp::open_connected_fd(local, peer, 1 << 16, 1 << 16)
+            .expect("open a connected UDP socket");
+        let connected = Arc::new(crate::transport::udp::ConnectedPeerSocket::from_fd(
+            owned, peer, local,
+        ));
+        let wildcard = open_async(&rt);
+        let stats = Arc::new(UdpStats::new());
+
+        const N: u64 = 4;
+        const LEN: usize = 80;
+        let mut batch: Vec<FmpSendJob> = (0..N)
+            .map(|i| {
+                let mut job = counted_job(&wildcard, peer, LEN, i, &stats);
+                job.connected_socket = Some(connected.clone());
+                job
+            })
+            .collect();
+        flush_direct_batch_sync(&mut batch).expect("flush ok");
+
+        assert_eq!(count_received(&recv), N);
+        let counted = stats.snapshot();
+        assert_eq!(counted.packets_sent, N);
+        assert_eq!(counted.bytes_sent, N * wire_len(LEN));
+        assert_eq!(counted.send_errors, 0);
+    }
+
+    /// A hard send error ends the flush. The failing datagram and every
+    /// datagram the flush then never tries count as send errors, none as
+    /// sent. The failing destination is an IPv6 address on an IPv4
+    /// socket, which the kernel refuses outright; it is a single packet so
+    /// the Linux GSO path, whose refusal would switch GSO off for the
+    /// whole process, is not taken.
+    #[test]
+    fn datagrams_a_flush_abandons_on_a_send_error_count_as_send_errors() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .expect("tokio rt");
+        let recv = UdpSocket::bind("127.0.0.1:0").expect("bind recv");
+        let good = recv.local_addr().unwrap();
+        let bad: SocketAddr = "[::1]:9".parse().unwrap();
+        let socket = open_async(&rt);
+        let stats = Arc::new(UdpStats::new());
+
+        let mut batch = vec![
+            counted_job(&socket, bad, 40, 0, &stats),
+            counted_job(&socket, good, 50, 1, &stats),
+            counted_job(&socket, good, 70, 2, &stats),
+        ];
+        assert!(
+            flush_direct_batch_sync(&mut batch).is_err(),
+            "precondition: the kernel refuses the IPv6 destination"
+        );
+
+        assert_eq!(count_received(&recv), 0);
+        let counted = stats.snapshot();
+        assert_eq!(counted.packets_sent, 0);
+        assert_eq!(counted.bytes_sent, 0);
+        assert_eq!(
+            counted.send_errors, 3,
+            "the refused datagram and the two never tried must each count once"
+        );
+    }
+
+    /// A hard error on the Linux UDP GSO path ends the flush as one on
+    /// `sendmmsg` does: every datagram of the failing group and of the
+    /// groups after it counts as a send error, none as sent. The error is
+    /// the ECONNREFUSED a connected socket reports after an ICMP port
+    /// unreachable; unlike EINVAL, it does not switch GSO off for the
+    /// whole process. On a kernel without UDP GSO the group takes
+    /// `sendmmsg` and the counts must hold the same.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn datagrams_a_gso_send_error_abandons_count_as_send_errors() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .expect("tokio rt");
+        let closed = UdpSocket::bind("127.0.0.1:0").expect("bind closed");
+        let peer = closed.local_addr().unwrap();
+        drop(closed);
+        let recv = UdpSocket::bind("127.0.0.1:0").expect("bind recv");
+        let good = recv.local_addr().unwrap();
+        let local: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let owned = crate::transport::udp::open_connected_fd(local, peer, 1 << 16, 1 << 16)
+            .expect("open a connected UDP socket");
+        let connected = Arc::new(crate::transport::udp::ConnectedPeerSocket::from_fd(
+            owned, peer, local,
+        ));
+        let wildcard = open_async(&rt);
+        let to_peer = |len: usize, counter: u64, stats: &Arc<UdpStats>| {
+            let mut job = counted_job(&wildcard, peer, len, counter, stats);
+            job.connected_socket = Some(connected.clone());
+            job
+        };
+
+        // One datagram to the closed port draws the ICMP port unreachable
+        // that the socket's next send reports as ECONNREFUSED.
+        let mut prime = vec![to_peer(40, 0, &Arc::new(UdpStats::new()))];
+        flush_direct_batch_sync(&mut prime).expect("priming send ok");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        const RUN: u64 = 4;
+        const LEN: usize = 100;
+        let stats = Arc::new(UdpStats::new());
+        let mut batch: Vec<FmpSendJob> = (1..=RUN).map(|i| to_peer(LEN, i, &stats)).collect();
+        batch.push(counted_job(&wildcard, good, 40, RUN + 1, &stats));
+        let err = flush_direct_batch_sync(&mut batch)
+            .expect_err("precondition: the connected socket reports the refused port");
+        if !GSO_DISABLED.load(std::sync::atomic::Ordering::Relaxed) {
+            assert!(
+                err.to_string().contains("UDP_GSO"),
+                "precondition: the same-size group must fail on the GSO path, got: {err}"
+            );
+        }
+
+        assert_eq!(count_received(&recv), 0);
+        let counted = stats.snapshot();
+        assert_eq!(counted.packets_sent, 0);
+        assert_eq!(counted.bytes_sent, 0);
+        assert_eq!(
+            counted.send_errors,
+            RUN + 1,
+            "the failing group's datagrams and the one never tried must each count once"
+        );
+    }
 }
 
 /// Standalone tests for the GSO-eligibility predicate. The full
@@ -2184,6 +2493,14 @@ mod tests {
         let mut batch: Vec<_> = (0..18).map(|_| pkt(1500)).collect();
         batch.push(pkt(900)); // last shorter — kernel handles this
         assert!(gso_eligible_sizes(&batch));
+    }
+
+    #[test]
+    fn gso_eligible_rejects_a_group_larger_than_one_gso_send_carries() {
+        let at_cap: Vec<_> = (0..GSO_SEGMENTS).map(|_| pkt(1500)).collect();
+        assert!(gso_eligible_sizes(&at_cap));
+        let over: Vec<_> = (0..=GSO_SEGMENTS).map(|_| pkt(1500)).collect();
+        assert!(!gso_eligible_sizes(&over));
     }
 
     #[test]
@@ -2391,6 +2708,7 @@ mod tests {
                     dest_addr: dest,
                     #[cfg(any(target_os = "linux", target_os = "macos"))]
                     connected_socket: None,
+                    stats: Arc::new(UdpStats::new()),
                     drop_on_backpressure: true,
                     queued_at: None,
                 }
@@ -2458,6 +2776,9 @@ fn send_connected_raw(fd: std::os::unix::io::RawFd, data: &[u8]) -> std::io::Res
     }
 }
 
+/// Send one datagram, retrying while the kernel reports backpressure, and
+/// count it once in `stats`: as sent, or as a send error when it is
+/// dropped under backpressure or the send fails.
 #[cfg(all(unix, not(target_os = "linux")))]
 fn send_one_with_backpressure(
     fd: std::os::unix::io::RawFd,
@@ -2466,6 +2787,7 @@ fn send_one_with_backpressure(
     data: &[u8],
     backpressure: &mut SendBackpressurePacer,
     drop_on_backpressure: bool,
+    stats: &UdpStats,
 ) -> std::io::Result<()> {
     loop {
         let result = if connected {
@@ -2474,18 +2796,23 @@ fn send_one_with_backpressure(
             send_one_raw(fd, data, dest)
         };
         match result {
-            Ok(_) => {
+            Ok(bytes) => {
                 backpressure.record_success();
                 record_udp_send_path(connected, 1);
+                stats.record_send(bytes);
                 return Ok(());
             }
             Err(err) if is_send_backpressure(&err) => {
                 if backpressure.pause(&err) && drop_on_backpressure {
                     record_udp_send_backpressure_drop(&err);
+                    stats.record_send_error();
                     return Err(err);
                 }
             }
-            Err(err) => return Err(err),
+            Err(err) => {
+                stats.record_send_error();
+                return Err(err);
+            }
         }
     }
 }
@@ -2693,6 +3020,7 @@ mod mac_ordered_tests {
             socket: socket.clone(),
             dest_addr: dest,
             connected_socket: None,
+            stats: Arc::new(UdpStats::new()),
             drop_on_backpressure: false,
             queued_at: None,
         }

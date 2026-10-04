@@ -14,7 +14,7 @@ use super::resolve_socket_addr;
 use crate::config::UdpConfig;
 use crate::nostr::is_punch_packet;
 use io::{AsyncUdpSocket, UdpRawSocket};
-use stats::UdpStats;
+pub(crate) use stats::UdpStats;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex as StdMutex};

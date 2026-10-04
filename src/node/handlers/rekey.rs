@@ -455,9 +455,15 @@ impl Node {
 
         let wire_msg1 = build_msg1(our_index, &noise_msg1);
 
-        // Send msg1 on the existing link (same transport + address)
+        // Send msg1 on the existing link (same transport + address). This
+        // runs on the tick, so it never dials: with the connection gone it
+        // fails at once, the index is freed, and the next tick's trigger
+        // tries again, by then over any connection the failed send started.
         if let Some(transport) = self.transports.get(&transport_id) {
-            match transport.send(&remote_addr, &wire_msg1).await {
+            match self
+                .send_nowait(transport, link_id, &remote_addr, &wire_msg1)
+                .await
+            {
                 Ok(_) => {
                     debug!(
                         peer = %self.peer_display_name(node_addr),
@@ -556,16 +562,21 @@ impl Node {
                     bytes,
                     next_resend_at_ms,
                 } => {
-                    let (transport_id, remote_addr) = match self.peers.get(&node_addr) {
+                    let (link_id, transport_id, remote_addr) = match self.peers.get(&node_addr) {
                         Some(p) => match (p.transport_id(), p.current_addr()) {
-                            (Some(tid), Some(addr)) => (tid, addr.clone()),
+                            (Some(tid), Some(addr)) => (p.link_id(), tid, addr.clone()),
                             _ => continue,
                         },
                         None => continue,
                     };
 
+                    // A failed send records no resend, so the msg1 stays due
+                    // and is retried next tick, over any connection the
+                    // failed send started.
                     let sent = if let Some(transport) = self.transports.get(&transport_id) {
-                        transport.send(&remote_addr, &bytes).await.is_ok()
+                        self.send_nowait(transport, link_id, &remote_addr, &bytes)
+                            .await
+                            .is_ok()
                     } else {
                         false
                     };

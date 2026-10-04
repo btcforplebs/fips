@@ -14,6 +14,10 @@
 //! `bool` carries no `#[must_use]`, so discarding the return here is
 //! silent under `-D warnings`; the assertions below are what makes the
 //! difference between binding it and dropping it observable.
+//!
+//! The tests at the end check that datagrams the node receives through a
+//! connected socket's drain, and sends through the encrypt workers on
+//! either kind of socket, are counted once in the UDP transport's stats.
 
 use super::*;
 use crate::noise::NoiseSession;
@@ -129,6 +133,7 @@ fn install_connected_udp(node: &mut Node, addr: &NodeAddr, transport_id: Transpo
         transport_id,
         peer_sa,
         packet_tx,
+        std::sync::Arc::new(crate::transport::udp::UdpStats::new()),
     )
     .expect("spawn the peer recv drain");
 
@@ -216,4 +221,237 @@ async fn a_frame_from_the_address_the_peer_is_already_on_keeps_the_connected_soc
         peer.connected_udp().is_some(),
         "a frame from the address already in use must leave the socket alone"
     );
+}
+
+/// Datagrams a peer sends after its connected socket is installed reach
+/// the node through that socket's drain thread, not the wildcard listen
+/// socket, and must still be counted in the UDP transport's own stats:
+/// `packets_recv` means datagrams received on this transport.
+///
+/// The runtime thread is blocked while the count is read, so the
+/// wildcard socket's receive task (a task on this runtime) cannot be the
+/// one counting; only the drain thread can.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn datagrams_on_a_peers_connected_socket_are_counted_in_the_udp_transport_stats() {
+    use crate::config::UdpConfig;
+    use crate::transport::udp::UdpTransport;
+
+    const SENT: u64 = 5;
+    let transport_id = TransportId::new(1);
+    let (mut node, node_addr, _, _) = promoted_peer_with_the_far_side_session(transport_id);
+    let (tx, mut rx) = packet_channel(64);
+    let udp_cfg = UdpConfig {
+        bind_addr: Some("127.0.0.1:0".to_string()),
+        ..Default::default()
+    };
+    let mut udp = UdpTransport::new(transport_id, None, udp_cfg, tx);
+    udp.start_async().await.unwrap();
+    let local = udp.local_addr().unwrap();
+    let stats = udp.stats().clone();
+    node.transports
+        .insert(transport_id, TransportHandle::Udp(udp));
+
+    let remote = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    node.get_peer_mut(&node_addr).unwrap().set_current_addr(
+        transport_id,
+        TransportAddr::from_string(&remote.local_addr().unwrap().to_string()),
+    );
+    node.activate_connected_udp_sessions().await;
+    assert!(
+        node.get_peer(&node_addr).unwrap().connected_udp().is_some(),
+        "precondition: the tick activation installed a connected socket"
+    );
+
+    for i in 0..SENT {
+        remote.send_to(&[i as u8; 8], local).unwrap();
+    }
+    // Block the runtime thread: the wildcard receive task cannot run.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while stats.snapshot().packets_recv < SENT && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let counted = stats.snapshot();
+    assert_eq!(
+        counted.packets_recv, SENT,
+        "datagrams read by the connected socket's drain were not counted"
+    );
+    assert_eq!(counted.bytes_recv, SENT * 8);
+
+    for _ in 0..SENT {
+        let packet = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("a counted datagram was not delivered")
+            .expect("packet channel closed");
+        assert_eq!(packet.transport_id, transport_id);
+    }
+    node.clear_connected_udp_for_peer(&node_addr);
+    for (_, t) in node.transports.iter_mut() {
+        t.stop().await.ok();
+    }
+}
+
+/// A promoted peer reached over a real UDP transport on loopback, with an
+/// encrypt worker pool, so the node's sends to it take the worker path
+/// rather than `UdpTransport::send_async`. Returns the node, the peer's
+/// address, the UDP transport's stats, and the plain socket standing in
+/// for the peer.
+#[cfg(unix)]
+async fn peer_behind_the_encrypt_workers() -> (
+    Node,
+    NodeAddr,
+    std::sync::Arc<crate::transport::udp::UdpStats>,
+    std::net::UdpSocket,
+) {
+    use crate::config::UdpConfig;
+    use crate::transport::udp::UdpTransport;
+
+    let transport_id = TransportId::new(1);
+    let (mut node, node_addr, _, _) = promoted_peer_with_the_far_side_session(transport_id);
+    let (tx, _rx) = packet_channel(64);
+    let udp_cfg = UdpConfig {
+        bind_addr: Some("127.0.0.1:0".to_string()),
+        ..Default::default()
+    };
+    let mut udp = UdpTransport::new(transport_id, None, udp_cfg, tx);
+    udp.start_async().await.unwrap();
+    let stats = udp.stats().clone();
+    node.transports
+        .insert(transport_id, TransportHandle::Udp(udp));
+    node.supervisor.encrypt_workers =
+        Some(crate::node::encrypt_worker::EncryptWorkerPool::spawn(1));
+
+    let remote = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    remote
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    node.get_peer_mut(&node_addr).unwrap().set_current_addr(
+        transport_id,
+        TransportAddr::from_string(&remote.local_addr().unwrap().to_string()),
+    );
+    (node, node_addr, stats, remote)
+}
+
+/// Wait for the encrypt worker to count `sent` datagrams, then a little
+/// longer so a second count of any of them would show. The worker counts
+/// after its send returns, so a datagram can reach the peer just before
+/// its count lands.
+#[cfg(unix)]
+fn settle_sent(stats: &crate::transport::udp::UdpStats, sent: u64) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while stats.snapshot().packets_sent < sent && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    std::thread::sleep(Duration::from_millis(50));
+}
+
+/// A link message the encrypt worker sends counts once in the UDP
+/// transport's own stats, whether it leaves on the wildcard socket or on
+/// the peer's connected socket: `packets_sent` means datagrams sent on
+/// this transport, and the worker's sends never pass through
+/// `UdpTransport::send_async`, which counts the rest.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn a_link_message_the_encrypt_worker_sends_counts_once_in_the_udp_transport_stats() {
+    let (mut node, node_addr, stats, remote) = peer_behind_the_encrypt_workers().await;
+    let mut buf = [0u8; 2048];
+    // One tick publishes the transport rows `show transports` serves off
+    // the rx loop; no tick runs after this.
+    node.record_stats_history();
+    let handle = node.control_read_handle();
+
+    node.send_encrypted_link_message(&node_addr, &[0x51])
+        .await
+        .expect("send on the wildcard socket");
+    let (wildcard_len, _) = remote.recv_from(&mut buf).expect("the peer receives it");
+    settle_sent(&stats, 1);
+    let counted = stats.snapshot();
+    assert_eq!(
+        counted.packets_sent, 1,
+        "a datagram the worker sent on the wildcard socket must count once"
+    );
+    assert_eq!(counted.bytes_sent, wildcard_len as u64);
+
+    node.activate_connected_udp_sessions().await;
+    assert!(
+        node.get_peer(&node_addr).unwrap().connected_udp().is_some(),
+        "precondition: the tick activation installed a connected socket"
+    );
+    node.send_encrypted_link_message(&node_addr, &[0x51])
+        .await
+        .expect("send on the connected socket");
+    let (connected_len, _) = remote.recv_from(&mut buf).expect("the peer receives it");
+    settle_sent(&stats, 2);
+    let counted = stats.snapshot();
+    assert_eq!(
+        counted.packets_sent, 2,
+        "a datagram the worker sent on the connected socket must count once"
+    );
+    assert_eq!(counted.bytes_sent, (wildcard_len + connected_len) as u64);
+    assert_eq!(counted.send_errors, 0);
+
+    // `show transports`, on the rx loop and off it, reports the same counts.
+    let off_loop = crate::control::queries::show_transports_from_handle(&handle);
+    assert_eq!(off_loop, crate::control::queries::show_transports(&node));
+    let row = off_loop["transports"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["transport_id"] == 1)
+        .unwrap_or_else(|| panic!("no row for the UDP transport: {off_loop}"))
+        .clone();
+    assert_eq!(
+        row["stats"]["packets_sent"], 2,
+        "show transports must report the datagrams the worker sent"
+    );
+    assert_eq!(
+        row["stats"]["bytes_sent"],
+        (wildcard_len + connected_len) as u64
+    );
+
+    node.clear_connected_udp_for_peer(&node_addr);
+    for (_, t) in node.transports.iter_mut() {
+        t.stop().await.ok();
+    }
+}
+
+/// Session data takes the pipelined path, where the worker seals both
+/// layers and sends; its datagram counts once in the UDP transport's
+/// stats, as a link message's does.
+#[cfg(unix)]
+#[tokio::test]
+async fn session_data_the_encrypt_worker_sends_counts_once_in_the_udp_transport_stats() {
+    use crate::node::session::{EndToEndState, SessionEntry};
+
+    let (mut node, node_addr, stats, remote) = peer_behind_the_encrypt_workers().await;
+    let far_side = Identity::generate();
+    let session = super::session::make_noise_session(node.identity(), &far_side);
+    node.sessions.insert(
+        node_addr,
+        SessionEntry::new(
+            node_addr,
+            far_side.pubkey_full(),
+            EndToEndState::Established(session),
+            1_000,
+            true,
+        ),
+    );
+
+    node.send_session_data(&node_addr, 0, 0, b"counted once")
+        .await
+        .expect("send session data");
+    let mut buf = [0u8; 2048];
+    let (len, _) = remote.recv_from(&mut buf).expect("the peer receives it");
+    settle_sent(&stats, 1);
+    let counted = stats.snapshot();
+    assert_eq!(
+        counted.packets_sent, 1,
+        "a session datagram the worker sent must count once"
+    );
+    assert_eq!(counted.bytes_sent, len as u64);
+    assert_eq!(counted.send_errors, 0);
+
+    for (_, t) in node.transports.iter_mut() {
+        t.stop().await.ok();
+    }
 }

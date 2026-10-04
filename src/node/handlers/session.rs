@@ -2749,6 +2749,7 @@ impl Node {
         let Some(socket) = udp.async_socket() else {
             return Ok(false);
         };
+        let stats = udp.stats().clone();
 
         // FSP cipher + counter — separate session from next-hop FMP session.
         let (fsp_counter, fsp_cipher) = {
@@ -2889,6 +2890,7 @@ impl Node {
             dest_addr: socket_addr,
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             connected_socket,
+            stats,
             // Bulk endpoint data: drop on UDP backpressure so the
             // worker queue keeps moving instead of stranding under
             // sustained congestion.

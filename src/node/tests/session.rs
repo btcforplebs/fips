@@ -3087,7 +3087,7 @@ async fn test_tun_outbound_pending_queue_flush() {
 // ============================================================================
 
 /// Helper: complete a Noise IK handshake and return the initiator's NoiseSession.
-fn make_noise_session(
+pub(super) fn make_noise_session(
     our_identity: &Identity,
     remote_identity: &Identity,
 ) -> crate::noise::NoiseSession {

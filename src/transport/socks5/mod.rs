@@ -11,8 +11,8 @@ mod stats;
 
 pub use dialer::{DialError, Socks5Auth, Socks5Dialer, SocksTarget};
 pub(crate) use pool::{
-    ConnectingEntry, ConnectingPool, ProxiedConnection, ProxiedPool, ProxiedStats, poll_connecting,
-    proxied_receive_loop,
+    ConnectingEntry, ConnectingPool, ProxiedConnection, ProxiedPool, ProxiedStats, existing_writer,
+    poll_connecting, proxied_receive_loop,
 };
 pub(crate) use stats::ProxiedStatsBase;
 

@@ -21,6 +21,7 @@ use crate::transport::framing::read_fmp_packet;
 use crate::transport::tcp::InboundDeadline;
 use crate::transport::{
     ConnectionState, PacketTx, ReceivedPacket, TransportAddr, TransportError, TransportId,
+    take_finished_connect,
 };
 
 /// State for a single pooled connection to a peer.
@@ -52,6 +53,13 @@ pub(crate) type ProxiedPool<M> = Arc<Mutex<HashMap<TransportAddr, ProxiedConnect
 pub(crate) struct ConnectingEntry {
     /// Background task performing SOCKS5 connect + socket configuration.
     pub task: JoinHandle<Result<(TcpStream, u16), TransportError>>,
+}
+
+impl AsMut<JoinHandle<Result<(TcpStream, u16), TransportError>>> for ConnectingEntry {
+    /// The background connect task.
+    fn as_mut(&mut self) -> &mut JoinHandle<Result<(TcpStream, u16), TransportError>> {
+        &mut self.task
+    }
 }
 
 /// Map of addresses with background connection attempts in progress.
@@ -111,6 +119,42 @@ pub(crate) fn poll_connecting<M>(
         Some(Ok(Err(e))) => ConnectionState::Failed(format!("{}", e)),
         Some(Err(e)) => ConnectionState::Failed(format!("task failed: {}", e)),
         None => ConnectionState::Connecting,
+    }
+}
+
+/// The writer for an established connection to `addr`, promoting a
+/// background connect that has finished since it was started.
+///
+/// `promote` builds the pool entry for a finished connect and does the
+/// transport's own accounting; it runs with the pool lock held, so the
+/// connection cannot be inserted twice. A finished connect that failed is
+/// dropped, so the next `connect_async` starts a new attempt. Never dials.
+pub(crate) async fn existing_writer<M>(
+    pool: &ProxiedPool<M>,
+    connecting: &ConnectingPool,
+    addr: &TransportAddr,
+    promote: impl FnOnce(TcpStream, u16) -> ProxiedConnection<M>,
+) -> Option<Arc<Mutex<OwnedWriteHalf>>> {
+    let mut pool = pool.lock().await;
+    if let Some(conn) = pool.get(addr) {
+        return Some(conn.writer.clone());
+    }
+    let finished = take_finished_connect(&mut *connecting.lock().await, addr)?;
+    match finished {
+        Ok((stream, mtu)) => {
+            let conn = promote(stream, mtu);
+            let writer = conn.writer.clone();
+            pool.insert(addr.clone(), conn);
+            Some(writer)
+        }
+        Err(e) => {
+            debug!(
+                remote_addr = %addr,
+                error = %e,
+                "Background SOCKS5 connect failed, nothing to send on"
+            );
+            None
+        }
     }
 }
 

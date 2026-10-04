@@ -727,10 +727,18 @@ pub(crate) struct ConnectionRow {
     pub expected_peer: Option<String>,
 }
 
-/// One transport instance in `show_transports`. The `stats` and
-/// `tor_monitoring` fields are stored as already-projected `serde_json::Value`
-/// (data, produced by the transport handle), not as rendered `Response`
-/// envelopes.
+/// One transport instance in `show_transports`. The `tor_monitoring` field is
+/// stored as an already-projected `serde_json::Value` (data, produced by the
+/// transport handle), not as a rendered `Response` envelope.
+///
+/// `stats` is the exception to the snapshot being a point-in-time copy: it
+/// holds the transport's shared counters, which the query reads at request
+/// time. They are atomics the transport updates from its own tasks, so they
+/// stay current when the tick that publishes this row is late or held, which
+/// is when an operator most needs them. The rest of the row is copied at
+/// publish time like every other row. Equality compares the counters by
+/// identity, so a row whose other fields are unchanged is reused across
+/// publishes however much traffic the transport carried.
 #[derive(Clone, PartialEq)]
 pub(crate) struct TransportRow {
     pub transport_id: u32,
@@ -742,7 +750,7 @@ pub(crate) struct TransportRow {
     pub tor_mode: Option<String>,
     pub onion_address: Option<String>,
     pub tor_monitoring: Option<serde_json::Value>,
-    pub stats: serde_json::Value,
+    pub stats: crate::transport::LiveStats,
 }
 
 /// MMP trend labels for a peer's link-layer block in `show_mmp` (each present
