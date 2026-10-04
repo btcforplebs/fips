@@ -119,7 +119,7 @@ impl Node {
         // the UDP transport's DNS cache. This may await on a DNS
         // lookup the very first time we see a hostname; subsequent
         // calls hit the cache.
-        let (peer_socket_addr, local_addr, recv_buf, send_buf, packet_tx) = {
+        let (peer_socket_addr, local_addr, recv_buf, send_buf, packet_tx, stats) = {
             let Some(transport) = self.transports.get(&transport_id) else {
                 return Ok(());
             };
@@ -137,7 +137,7 @@ impl Node {
             let recv_buf = udp.recv_buf_size();
             let send_buf = udp.send_buf_size();
             let tx = udp.clone_packet_tx();
-            (peer_sa, local, recv_buf, send_buf, tx)
+            (peer_sa, local, recv_buf, send_buf, tx, udp.stats().clone())
         };
 
         // Open the connected socket on the kernel side, then adopt the
@@ -155,13 +155,15 @@ impl Node {
             local_addr,
         ));
 
-        // Spawn the drain thread. It feeds `packet_tx` exactly like
-        // the wildcard listen socket — rx_loop dispatches identically.
+        // Spawn the drain thread. It feeds `packet_tx` and counts into
+        // the transport's stats exactly like the wildcard listen socket,
+        // so rx_loop dispatches identically.
         let drain = crate::transport::udp::PeerRecvDrain::spawn(
             socket.clone(),
             transport_id,
             peer_socket_addr,
             packet_tx,
+            stats,
         )
         .map_err(|e| format!("PeerRecvDrain::spawn: {e}"))?;
 

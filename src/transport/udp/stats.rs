@@ -40,6 +40,21 @@ impl UdpStats {
         self.bytes_sent.fetch_add(bytes as u64, Ordering::Relaxed);
     }
 
+    /// Record `packets` datagrams totalling `bytes` handed to the kernel in
+    /// one batched send (`sendmmsg(2)` or UDP GSO), counted as that many
+    /// separate sends.
+    pub fn record_sends(&self, packets: u64, bytes: u64) {
+        self.packets_sent.fetch_add(packets, Ordering::Relaxed);
+        self.bytes_sent.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Record `packets` datagrams a batched send did not deliver to the
+    /// kernel, whether after an error or because the kernel took none of
+    /// them, counted as that many send errors.
+    pub fn record_unsent(&self, packets: u64) {
+        self.send_errors.fetch_add(packets, Ordering::Relaxed);
+    }
+
     /// Record a successful receive.
     pub fn record_recv(&self, bytes: usize) {
         self.packets_recv.fetch_add(1, Ordering::Relaxed);
@@ -61,11 +76,14 @@ impl UdpStats {
         self.mtu_exceeded.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Update kernel drop count from SO_MEMINFO.
+    /// Update the kernel drop count.
     ///
-    /// Not yet wired up — requires `getsockopt(SO_MEMINFO)` on the raw fd
-    /// (via socket2 or libc) to read `SK_MEMINFO_DROPS`. Linux-only.
-    /// Until implemented, this counter will always be zero.
+    /// The value is the cumulative `SO_RXQ_OVFL` count the kernel attaches
+    /// to datagrams read from the wildcard listen socket, so it covers that
+    /// socket only, not the per-peer connected sockets. It is updated only
+    /// as that socket is read, so it stops moving whenever the listen socket
+    /// is not being read. It is wired only on Linux; elsewhere (Darwin,
+    /// Windows, other Unix) it stays zero.
     pub fn set_kernel_drops(&self, drops: u64) {
         self.kernel_drops.store(drops, Ordering::Relaxed);
     }

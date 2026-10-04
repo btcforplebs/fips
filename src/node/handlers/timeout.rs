@@ -373,7 +373,10 @@ impl Node {
             };
 
             let sent = if let Some(transport) = self.transports.get(&transport_id) {
-                match transport.send(&remote_addr, &bytes).await {
+                match self
+                    .send_nowait(transport, link, &remote_addr, &bytes)
+                    .await
+                {
                     Ok(_) => true,
                     Err(e) => {
                         debug!(

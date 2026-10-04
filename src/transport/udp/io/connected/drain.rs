@@ -12,7 +12,9 @@
 //! `recvmsg_x(2)` on Darwin), push each packet into
 //! the existing `packet_tx` (the same channel that the wildcard listen
 //! socket feeds), and exit cleanly when the parent signals shutdown
-//! via a self-pipe.
+//! via a self-pipe. Each datagram is counted in the transport's
+//! `UdpStats`, as the wildcard socket counts its own, so the transport's
+//! receive counters cover every datagram it receives.
 //!
 //! Future: when the full data-plane shard lands, this per-peer thread
 //! becomes a `epoll_wait` arm inside the shard's event loop instead
@@ -20,6 +22,7 @@
 //! useful in either shape; only the wakeup mechanism differs.
 
 use super::socket::ConnectedPeerSocket;
+use crate::transport::udp::UdpStats;
 use crate::transport::{PacketTx, ReceivedPacket, TransportAddr, TransportId};
 use std::io;
 use std::net::SocketAddr;
@@ -53,12 +56,14 @@ impl PeerRecvDrain {
     /// kernel fd alive while it's running. When this handle drops,
     /// the stop pipe fires; the thread exits; its `Arc` releases.
     /// If the parent also releases its `Arc`, the socket's `Drop`
-    /// closes the kernel fd.
+    /// closes the kernel fd. `stats` is the owning UDP transport's, so
+    /// datagrams read here are counted with the rest of its traffic.
     pub fn spawn(
         socket: Arc<ConnectedPeerSocket>,
         transport_id: TransportId,
         peer_addr: SocketAddr,
         packet_tx: PacketTx,
+        stats: Arc<UdpStats>,
     ) -> io::Result<Self> {
         // Self-pipe for shutdown signaling. The drain thread polls
         // (socket_fd | pipe_rx) so a write to pipe_tx wakes it.
@@ -76,6 +81,7 @@ impl PeerRecvDrain {
                     transport_id,
                     peer_addr,
                     packet_tx,
+                    stats,
                     pipe_rx,
                     stop_clone,
                 );
@@ -137,6 +143,7 @@ fn drain_loop(
     transport_id: TransportId,
     peer_addr: SocketAddr,
     packet_tx: PacketTx,
+    stats: Arc<UdpStats>,
     stop_pipe_rx: RawFd,
     stop: Arc<AtomicBool>,
 ) {
@@ -231,6 +238,7 @@ fn drain_loop(
             if len == 0 {
                 continue;
             }
+            stats.record_recv(len);
             // Move the filled buffer out, refill the slot with a
             // fresh one. Same zero-copy pattern the wildcard listen
             // socket uses (see `transport/udp/mod.rs::run_receive_loop`).
@@ -452,7 +460,8 @@ mod tests {
 
     /// End-to-end: open a ConnectedPeerSocket, spawn a drain thread
     /// on it, send packets at it from a remote, verify they land in
-    /// the packet_tx mpsc with the correct transport_id + peer_addr.
+    /// the packet_tx mpsc with the correct transport_id + peer_addr,
+    /// and that each is counted in the stats the drain was given.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn drain_delivers_packets_to_packet_tx() {
         // Peer (remote) — sends packets at our connected socket.
@@ -499,8 +508,10 @@ mod tests {
         };
 
         // Spawn the drain.
-        let _drain = PeerRecvDrain::spawn(socket.clone(), transport_id, peer_addr, tx)
-            .expect("PeerRecvDrain::spawn");
+        let stats = Arc::new(UdpStats::new());
+        let _drain =
+            PeerRecvDrain::spawn(socket.clone(), transport_id, peer_addr, tx, stats.clone())
+                .expect("PeerRecvDrain::spawn");
 
         // Send a couple of packets from the peer to our socket.
         for i in 0u8..5 {
@@ -518,6 +529,12 @@ mod tests {
             assert_eq!(pkt.data.len(), 4);
             assert_eq!(pkt.data[0], i, "packet {i} payload mismatch");
         }
+        let counted = stats.snapshot();
+        assert_eq!(
+            counted.packets_recv, 5,
+            "the drain did not count what it delivered"
+        );
+        assert_eq!(counted.bytes_recv, 20);
         // Drop the drain handle — should stop the thread within one
         // poll iteration.
     }

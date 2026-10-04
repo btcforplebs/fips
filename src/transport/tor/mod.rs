@@ -31,7 +31,7 @@ use super::{
 use crate::config::TorConfig;
 use crate::transport::socks5::{
     ConnectingEntry, ConnectingPool, DialError, ProxiedConnection, ProxiedPool, SEND_QUEUE_DEPTH,
-    Socks5Auth, Socks5Dialer, SocksTarget, poll_connecting, proxied_receive_loop,
+    Socks5Auth, Socks5Dialer, SocksTarget, existing_sender, poll_connecting, proxied_receive_loop,
     proxied_send_loop,
 };
 use crate::transport::stream::{ConnId, WRITER_DRAIN_TIMEOUT, drain_writer, next_conn_id};
@@ -654,16 +654,7 @@ impl TorTransport {
         if !self.state.is_operational() {
             return Err(TransportError::NotStarted);
         }
-
-        // Pre-send MTU check
-        let mtu = self.config.mtu() as usize;
-        if data.len() > mtu {
-            self.stats.record_mtu_exceeded();
-            return Err(TransportError::MtuExceeded {
-                packet_size: data.len(),
-                mtu: self.config.mtu(),
-            });
-        }
+        self.check_mtu(data)?;
 
         // Get or create connection
         let send_tx = {
@@ -679,6 +670,54 @@ impl TorTransport {
             }
         };
 
+        self.enqueue(addr, &send_tx, data)
+    }
+
+    /// Send a packet only over a connection that already exists.
+    ///
+    /// Uses the pooled connection for `addr`, or one a finished background
+    /// connect has produced, which it moves into the pool. Never dials: with
+    /// neither, it fails at once with [`TransportError::NotConnected`]. Like
+    /// `send_async`, it only queues the frame for the connection's writer
+    /// task and never awaits the wire.
+    pub async fn send_existing(
+        &self,
+        addr: &TransportAddr,
+        data: &[u8],
+    ) -> Result<usize, TransportError> {
+        if !self.state.is_operational() {
+            return Err(TransportError::NotStarted);
+        }
+        self.check_mtu(data)?;
+        let send_tx = existing_sender(&self.pool, &self.connecting, addr, |stream, mtu| {
+            let conn = self.outbound_connection(addr, stream, mtu);
+            self.record_promoted(addr);
+            conn
+        })
+        .await
+        .ok_or(TransportError::NotConnected)?;
+        self.enqueue(addr, &send_tx, data)
+    }
+
+    /// Reject a packet larger than the transport MTU before queueing it.
+    fn check_mtu(&self, data: &[u8]) -> Result<(), TransportError> {
+        if data.len() > self.config.mtu() as usize {
+            self.stats.record_mtu_exceeded();
+            return Err(TransportError::MtuExceeded {
+                packet_size: data.len(),
+                mtu: self.config.mtu(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Queue one packet for the writer task of the connection to `addr`.
+    fn enqueue(
+        &self,
+        addr: &TransportAddr,
+        send_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
+        data: &[u8],
+    ) -> Result<usize, TransportError> {
         // Queue the frame for the connection's writer task. `try_send`, not
         // `send`: awaiting a full queue would reinstate the block this removes
         // one level up. The byte count is what was queued; bytes on the wire
@@ -924,6 +963,7 @@ impl TorTransport {
                     return Err(TransportError::ConnectionRefused);
                 }
                 Err(DialError::Timeout) => {
+                    stats.record_connect_timeout();
                     debug!(
                         transport_id = %transport_id,
                         remote_addr = %remote_addr,
@@ -964,6 +1004,33 @@ impl TorTransport {
     /// Splits the stream, spawns a receive loop, and inserts into the pool.
     /// Called from `connection_state_sync()` when a background task completes.
     fn promote_connection(&self, addr: &TransportAddr, stream: TcpStream, mtu: u16) {
+        let conn = self.outbound_connection(addr, stream, mtu);
+
+        // Use try_lock since we're in a sync context and the pool
+        // should be available (connection_state_sync already checked it)
+        if let Ok(mut pool) = self.pool.try_lock() {
+            pool.insert(addr.clone(), conn);
+            self.record_promoted(addr);
+        } else {
+            // Pool locked — abort the recv task, connection will be retried
+            conn.recv_task.abort();
+            conn.send_task.abort();
+            warn!(
+                transport_id = %self.transport_id,
+                remote_addr = %addr,
+                "Failed to promote Tor connection (pool locked)"
+            );
+        }
+    }
+
+    /// Build the pool entry for a finished background connect: split the
+    /// stream and spawn its receive loop and writer task.
+    fn outbound_connection(
+        &self,
+        addr: &TransportAddr,
+        stream: TcpStream,
+        mtu: u16,
+    ) -> ProxiedConnection<Direction> {
         let (read_half, write_half) = stream.into_split();
 
         let transport_id = self.transport_id;
@@ -1008,7 +1075,7 @@ impl TorTransport {
             },
         ));
 
-        let conn = ProxiedConnection {
+        ProxiedConnection {
             send_tx,
             send_task,
             recv_task,
@@ -1016,29 +1083,18 @@ impl TorTransport {
             established_at: Instant::now(),
             meta: Direction::Outbound,
             id,
-        };
-
-        // Use try_lock since we're in a sync context and the pool
-        // should be available (connection_state_sync already checked it)
-        if let Ok(mut pool) = self.pool.try_lock() {
-            pool.insert(addr.clone(), conn);
-            self.stats.record_connection_established();
-            self.stats.record_pool_outbound_added();
-            debug!(
-                transport_id = %self.transport_id,
-                remote_addr = %addr,
-                "Tor connection established (background connect)"
-            );
-        } else {
-            // Pool locked — abort the recv task, connection will be retried
-            conn.recv_task.abort();
-            conn.send_task.abort();
-            warn!(
-                transport_id = %self.transport_id,
-                remote_addr = %addr,
-                "Failed to promote Tor connection (pool locked)"
-            );
         }
+    }
+
+    /// Count and log a background connection that has entered the pool.
+    fn record_promoted(&self, addr: &TransportAddr) {
+        self.stats.record_connection_established();
+        self.stats.record_pool_outbound_added();
+        debug!(
+            transport_id = %self.transport_id,
+            remote_addr = %addr,
+            "Tor connection established (background connect)"
+        );
     }
 
     /// Close a specific connection asynchronously.
@@ -1391,6 +1447,7 @@ fn validate_host_port(addr: &str, field_name: &str) -> Result<(), TransportError
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::wait_until;
     use crate::transport::packet_channel;
     use tokio::io::AsyncWriteExt;
 
@@ -2049,20 +2106,6 @@ mod tests {
     // ========================================================================
     // Inbound first-frame deadline (onion listener)
     // ========================================================================
-
-    /// Poll `f` every 10ms until it holds or `limit` elapses.
-    async fn wait_until<F: FnMut() -> bool>(mut f: F, limit: Duration) -> bool {
-        let deadline = Instant::now() + limit;
-        loop {
-            if f() {
-                return true;
-            }
-            if Instant::now() >= deadline {
-                return false;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    }
 
     /// Drives `tor_accept_loop` directly: the only production path to it is
     /// `start_directory_mode`, which needs a Tor-managed hostname file and a
@@ -2756,5 +2799,205 @@ mod tests {
 
         tor.stop_async().await.unwrap();
         dest.stop_async().await.unwrap();
+    }
+
+    /// A destination TCP transport behind a mock SOCKS5 proxy, and a
+    /// started Tor transport pointed at the proxy.
+    async fn tor_behind_mock_proxy() -> (
+        TorTransport,
+        TcpTransport,
+        crate::transport::PacketRx,
+        TransportAddr,
+    ) {
+        let (dest_tx, dest_rx) = packet_channel(32);
+        let dest_config = TcpConfig {
+            bind_addr: Some("127.0.0.1:0".to_string()),
+            ..Default::default()
+        };
+        let mut dest = TcpTransport::new(TransportId::new(100), None, dest_config, dest_tx);
+        dest.start_async().await.unwrap();
+        let dest_addr = dest.local_addr().unwrap();
+
+        let mock = MockSocks5Server::new(dest_addr).await.unwrap();
+        let proxy_addr = mock.addr();
+        let _proxy_handle = mock.spawn();
+
+        let (tx, _rx) = packet_channel(32);
+        let config = TorConfig {
+            socks5_addr: Some(proxy_addr.to_string()),
+            ..Default::default()
+        };
+        let mut t = TorTransport::new(TransportId::new(200), None, config, tx);
+        t.start_async().await.unwrap();
+        let target = TransportAddr::from_string(&dest_addr.to_string());
+        (t, dest, dest_rx, target)
+    }
+
+    /// With no pooled connection and no connect under way, `send_existing`
+    /// fails with `NotConnected` and opens nothing.
+    #[tokio::test]
+    async fn send_existing_without_connection_fails_fast_and_dials_nothing() {
+        let (mut t, mut dest, _dest_rx, target) = tor_behind_mock_proxy().await;
+
+        let result = t.send_existing(&target, &build_msg1_frame()).await;
+
+        assert!(
+            matches!(result, Err(TransportError::NotConnected)),
+            "expected NotConnected, got {result:?}"
+        );
+        assert!(
+            t.connecting.lock().await.is_empty(),
+            "a connect was started"
+        );
+        assert_eq!(t.stats().snapshot().connections_established, 0);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            dest.stats().snapshot().connections_accepted,
+            0,
+            "the destination saw a connection"
+        );
+
+        t.stop_async().await.unwrap();
+        dest.stop_async().await.unwrap();
+    }
+
+    /// A background connect that has finished is moved into the pool and
+    /// carries the send, with no second connection opened.
+    #[tokio::test]
+    async fn send_existing_promotes_a_finished_background_connect_and_sends_on_it() {
+        let (mut t, mut dest, mut dest_rx, target) = tor_behind_mock_proxy().await;
+
+        t.connect_async(&target).await.unwrap();
+        let mut waited = 0;
+        while !t
+            .connecting
+            .try_lock()
+            .is_ok_and(|c| c.get(&target).is_some_and(|e| e.task.is_finished()))
+        {
+            assert!(waited < 150, "background connect never finished");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            waited += 1;
+        }
+        let frame = build_msg1_frame();
+        t.send_existing(&target, &frame).await.unwrap();
+
+        let received = tokio::time::timeout(Duration::from_secs(5), dest_rx.recv())
+            .await
+            .expect("timeout waiting for packet")
+            .expect("channel closed");
+        assert_eq!(received.data, frame);
+        assert!(
+            t.connecting.lock().await.is_empty(),
+            "the finished connect was left in the connecting map"
+        );
+        assert_eq!(t.stats().snapshot().connections_established, 1);
+        assert_eq!(
+            dest.stats().snapshot().connections_accepted,
+            1,
+            "the send used the background connection, not a new one"
+        );
+
+        t.stop_async().await.unwrap();
+        dest.stop_async().await.unwrap();
+    }
+
+    /// When the background connect fails because the SOCKS5 proxy is
+    /// unreachable, `send_existing` fails with `NotConnected`, drops the
+    /// failed connect, and `connect_async` can start a new attempt.
+    #[tokio::test]
+    async fn send_existing_after_a_failed_background_connect_drops_it_so_a_new_one_can_start() {
+        // A proxy port nothing listens on: every connect through it fails.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy_addr = closed.local_addr().unwrap();
+        drop(closed);
+        let (tx, _rx) = packet_channel(32);
+        let config = TorConfig {
+            socks5_addr: Some(proxy_addr.to_string()),
+            ..Default::default()
+        };
+        let mut t = TorTransport::new(TransportId::new(200), None, config, tx);
+        t.start_async().await.unwrap();
+        let target = TransportAddr::from_string("127.0.0.1:9");
+
+        t.connect_async(&target).await.unwrap();
+        let mut waited = 0;
+        while !t
+            .connecting
+            .try_lock()
+            .is_ok_and(|c| c.get(&target).is_some_and(|e| e.task.is_finished()))
+        {
+            assert!(waited < 150, "background connect never finished");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            waited += 1;
+        }
+        let result = t.send_existing(&target, &build_msg1_frame()).await;
+
+        assert!(
+            matches!(result, Err(TransportError::NotConnected)),
+            "expected NotConnected, got {result:?}"
+        );
+        assert!(
+            t.connecting.lock().await.get(&target).is_none(),
+            "the failed connect was left in the connecting map"
+        );
+        assert!(t.pool.lock().await.is_empty());
+        t.connect_async(&target).await.unwrap();
+        assert!(
+            t.connecting.lock().await.get(&target).is_some(),
+            "connect_async did not start a new attempt"
+        );
+
+        t.stop_async().await.unwrap();
+    }
+
+    /// Wait until the background connect to `target` has finished, leaving
+    /// it in the connecting map.
+    async fn wait_background_finished(t: &TorTransport, target: &TransportAddr) {
+        let finished = wait_until(
+            || {
+                t.connecting
+                    .try_lock()
+                    .is_ok_and(|c| c.get(target).is_some_and(|e| e.task.is_finished()))
+            },
+            Duration::from_secs(3),
+        )
+        .await;
+        assert!(finished, "background connect to {target} never finished");
+    }
+
+    /// A background connect through a proxy that accepts the TCP connection
+    /// but never answers the SOCKS5 greeting times out, and is counted in
+    /// `connect_timeouts` as an inline one is.
+    #[tokio::test]
+    async fn background_connect_timeout_is_counted() {
+        // Bound and listening, never accepted: the kernel completes the TCP
+        // handshake and nothing ever replies.
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let (tx, _rx) = packet_channel(32);
+        let config = TorConfig {
+            socks5_addr: Some(silent.local_addr().unwrap().to_string()),
+            connect_timeout_ms: Some(200),
+            ..Default::default()
+        };
+        let mut t = TorTransport::new(TransportId::new(200), None, config, tx);
+        t.start_async().await.unwrap();
+        let target = TransportAddr::from_string("127.0.0.1:9");
+
+        t.connect_async(&target).await.unwrap();
+        wait_background_finished(&t, &target).await;
+
+        let stats = t.stats().snapshot();
+        assert_eq!(stats.connect_timeouts, 1, "the timeout was not counted");
+        assert_eq!(stats.connect_refused, 0);
+        assert_eq!(stats.socks5_errors, 0);
+        let result = t.send_existing(&target, &build_msg1_frame()).await;
+        assert!(matches!(result, Err(TransportError::NotConnected)));
+        assert_eq!(
+            t.stats().snapshot().connect_timeouts,
+            1,
+            "taking the result counted the timeout again"
+        );
+
+        t.stop_async().await.unwrap();
     }
 }

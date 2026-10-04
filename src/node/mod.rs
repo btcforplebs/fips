@@ -85,7 +85,7 @@ use crate::transport::tcp::TcpTransport;
 use crate::transport::tor::TorTransport;
 use crate::transport::udp::UdpTransport;
 use crate::transport::{
-    ConnectionState, Link, LinkId, PacketRx, PacketTx, TransportAddr, TransportError,
+    Link, LinkDirection, LinkId, PacketRx, PacketTx, TransportAddr, TransportError,
     TransportHandle, TransportId,
 };
 use crate::upper::hosts::HostMap;
@@ -2591,6 +2591,8 @@ impl Node {
         // Ascending id, matching `show_transports`; see the note there. The
         // off-loop renderer reads this table verbatim, so the two paths would
         // otherwise disagree about ordering as well as being arbitrary.
+        // `stats` shares the transport's counters rather than copying them, so
+        // the query reads them live even if the next tick is held.
         let mut transport_ids: Vec<_> = self.transport_ids().copied().collect();
         transport_ids.sort_by_key(|id| id.as_u32());
         let transport_rows: Vec<snap::TransportRow> = transport_ids
@@ -2609,7 +2611,7 @@ impl Node {
                     tor_monitoring: handle
                         .tor_monitoring()
                         .map(|m| serde_json::to_value(&m).unwrap_or_default()),
-                    stats: handle.transport_stats(),
+                    stats: handle.live_stats(),
                     interface: handle.interface_presence().map(|p| snap::InterfaceRow {
                         name: handle.interface_name().unwrap_or_default().to_string(),
                         presence: p.presence,
@@ -3965,6 +3967,7 @@ impl Node {
                 node_addr: *node_addr,
                 reason: "no current_addr".into(),
             })?;
+        let link_id = peer.link_id();
 
         // Prepend 4-byte session-relative timestamp (inner header)
         let timestamp_ms = peer.session_elapsed_ms();
@@ -4056,6 +4059,7 @@ impl Node {
                         dest_addr: dest_socket_addr,
                         #[cfg(any(target_os = "linux", target_os = "macos"))]
                         connected_socket,
+                        stats: udp.stats().clone(),
                         drop_on_backpressure,
                         queued_at: None,
                     });
@@ -4070,7 +4074,7 @@ impl Node {
                                 reason: format!("encryption failed: {}", e),
                             })?;
                             transport
-                                .send(&remote_addr, &wire)
+                                .send_existing(&remote_addr, &wire)
                                 .await
                                 .map_err(|e| link_send_error(*node_addr, e))?
                         }
@@ -4113,29 +4117,15 @@ impl Node {
             .get(&transport_id)
             .ok_or(NodeError::TransportNotFound(transport_id))?;
 
-        // Gate: don't drive connect-on-send from the tick path. If the
-        // transport's connection isn't ready, kick off a non-blocking
-        // background connect (no-op if already in flight or pooled) and
-        // fail this send fast. A subsequent tick will retry once the
-        // pool entry exists. The historical connect-on-send wedged the
-        // rx_loop tick body for up to `connect_timeout_ms` (5 s default)
-        // per unreachable peer, which under convergence-phase mesh
-        // pressure cascaded into multi-tick stalls and control-RPC HOL.
-        match transport.connection_state(&remote_addr) {
-            ConnectionState::Connected => {}
-            other => {
-                if matches!(other, ConnectionState::None) {
-                    let _ = transport.connect(&remote_addr).await;
-                }
-                return Err(NodeError::SendFailed {
-                    node_addr: *node_addr,
-                    reason: format!("transport connection not ready: {:?}", other),
-                });
-            }
-        }
-
-        let bytes_sent = transport
-            .send(&remote_addr, &wire_packet)
+        // Never connect-on-send here: this runs on the tick and forwarding
+        // paths, and a dial held the rx loop for up to `connect_timeout_ms`
+        // (5 s default) per unreachable peer, which under convergence-phase
+        // mesh pressure cascaded into multi-tick stalls and control-RPC
+        // head-of-line blocking. With no connection the send fails fast,
+        // after starting a background connect if the address is one this
+        // node dialed; a later send uses the connection once it is up.
+        let bytes_sent = self
+            .send_nowait(transport, link_id, &remote_addr, &wire_packet)
             .await
             .map_err(|e| link_send_error(*node_addr, e))?;
 
@@ -4207,6 +4197,59 @@ impl Node {
                     reason: format!("transport send: {}", other),
                 },
             })
+    }
+
+    /// Send `data` to `addr` over a connection the transport already holds,
+    /// without ever waiting on a dial.
+    ///
+    /// When there is no connection the send fails at once with
+    /// [`TransportError::NotConnected`]. If `addr` is the address this node
+    /// dialed for `link_id` (see [`Self::may_dial`]), a background connect
+    /// is started first; it returns at once, and is a no-op while one is in
+    /// flight. A later send takes the finished connection into the pool and
+    /// uses it.
+    ///
+    /// This is the send for the tick, dial and forwarding paths, which the
+    /// rx loop awaits. Replies to a msg1 use
+    /// [`TransportHandle::send_existing`] directly: their address is the
+    /// sender's, and nothing should be dialed there.
+    pub(in crate::node) async fn send_nowait(
+        &self,
+        transport: &TransportHandle,
+        link_id: LinkId,
+        addr: &TransportAddr,
+        data: &[u8],
+    ) -> Result<usize, TransportError> {
+        let sent = transport.send_existing(addr, data).await;
+        if matches!(sent, Err(TransportError::NotConnected))
+            && self.may_dial(link_id, transport.transport_id(), addr)
+            && let Err(e) = transport.connect(addr).await
+        {
+            tracing::debug!(
+                link_id = %link_id,
+                remote_addr = %addr,
+                error = %e,
+                "Background connect not started"
+            );
+        }
+        sent
+    }
+
+    /// Whether a send for `link_id` may start a connect to `addr` on
+    /// `transport_id`: only when the link is outbound and `addr` is the
+    /// address it was dialed at.
+    ///
+    /// Direction alone is not enough. An inbound link's address is the
+    /// remote's source port, where nothing listens, and an outbound link's
+    /// current address follows the peer's authenticated frames, so it can
+    /// move to such a port too. The dial address recorded on the link is
+    /// the one address known to have a listener.
+    fn may_dial(&self, link_id: LinkId, transport_id: TransportId, addr: &TransportAddr) -> bool {
+        self.links.get(&link_id).is_some_and(|link| {
+            link.direction() == LinkDirection::Outbound
+                && link.transport_id() == transport_id
+                && link.remote_addr() == addr
+        })
     }
 }
 

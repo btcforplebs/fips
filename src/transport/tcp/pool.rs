@@ -139,5 +139,12 @@ pub(crate) struct ConnectingEntry {
     pub(crate) task: JoinHandle<Result<(TcpStream, u16), TransportError>>,
 }
 
+impl AsMut<JoinHandle<Result<(TcpStream, u16), TransportError>>> for ConnectingEntry {
+    /// The background connect task.
+    fn as_mut(&mut self) -> &mut JoinHandle<Result<(TcpStream, u16), TransportError>> {
+        &mut self.task
+    }
+}
+
 /// Map of addresses with background connection attempts in progress.
 pub(crate) type ConnectingPool = Arc<Mutex<HashMap<TransportAddr, ConnectingEntry>>>;

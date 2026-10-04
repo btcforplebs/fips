@@ -240,6 +240,12 @@ pub enum TransportError {
     #[error("connection refused")]
     ConnectionRefused,
 
+    /// No connection to the address exists, and the send did not open one.
+    /// The connection a reply was meant for has gone; the remote's next
+    /// attempt arrives on a new one.
+    #[error("not connected")]
+    NotConnected,
+
     #[error("transport not supported: {0}")]
     NotSupported(String),
 
@@ -284,6 +290,10 @@ impl TransportError {
             | Self::MtuExceeded { .. }
             | Self::Timeout
             | Self::ConnectionRefused
+            // The connection the frame was meant for has gone, and the send
+            // did not reopen it; the remote's next attempt arrives on a new
+            // connection.
+            | Self::NotConnected
             | Self::NotSupported(_)
             | Self::Io(_) => false,
         }
@@ -797,6 +807,46 @@ pub struct TransportCongestion {
 }
 
 // ============================================================================
+// Background Connects
+// ============================================================================
+
+/// What a background connect task yields: the connected stream and the MTU
+/// to use on it.
+pub(crate) type ConnectOutcome = Result<(tokio::net::TcpStream, u16), TransportError>;
+
+/// Take the background connect for `addr` out of `connecting` if its task
+/// has finished, and return what it produced.
+///
+/// Returns `None`, leaving the map untouched, when there is no attempt for
+/// the address or it is still running.
+pub(crate) fn take_finished_connect<E>(
+    connecting: &mut std::collections::HashMap<TransportAddr, E>,
+    addr: &TransportAddr,
+) -> Option<ConnectOutcome>
+where
+    E: AsMut<tokio::task::JoinHandle<ConnectOutcome>>,
+{
+    use futures::FutureExt;
+
+    let task = connecting.get_mut(addr)?.as_mut();
+    if !task.is_finished() {
+        return None;
+    }
+    // Polling a JoinHandle spends the caller's cooperative budget, and with
+    // none left it reads pending even though the task has finished. Poll it
+    // unconstrained, and remove the entry only once its output is in hand,
+    // so a connected stream is never dropped unread.
+    let joined = tokio::task::unconstrained(task).now_or_never()?;
+    connecting.remove(addr);
+    match joined {
+        Ok(outcome) => Some(outcome),
+        Err(e) => Some(Err(TransportError::LinkFailed(format!(
+            "connect task failed: {e}"
+        )))),
+    }
+}
+
+// ============================================================================
 // Transport Handle
 // ============================================================================
 
@@ -866,6 +916,36 @@ impl TransportHandle {
             TransportHandle::Tcp(t) => t.send_async(addr, data).await,
             TransportHandle::Tor(t) => t.send_async(addr, data).await,
             TransportHandle::Nym(t) => t.send_async(addr, data).await,
+            #[cfg(ble_available)]
+            TransportHandle::Ble(t) => t.send_async(addr, data).await,
+            #[cfg(test)]
+            TransportHandle::Loopback(t) => t.send_async(addr, data).await,
+        }
+    }
+
+    /// Send data only over a connection that already exists; never dial.
+    ///
+    /// On TCP, Tor and Nym, a background connect that has finished is taken
+    /// into the pool and used; otherwise the call fails at once with
+    /// [`TransportError::NotConnected`] and opens nothing. Connectionless
+    /// transports have no connection to look up and send as
+    /// [`send`](Self::send) does. BLE's send never waits on a connect and is
+    /// used as is.
+    ///
+    /// Use this from anything the rx loop awaits: a dial there holds every
+    /// other frame for up to the transport's connect timeout.
+    pub async fn send_existing(
+        &self,
+        addr: &TransportAddr,
+        data: &[u8],
+    ) -> Result<usize, TransportError> {
+        match self {
+            TransportHandle::Udp(t) => t.send_async(addr, data).await,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            TransportHandle::Ethernet(t) => t.send_async(addr, data).await,
+            TransportHandle::Tcp(t) => t.send_existing(addr, data).await,
+            TransportHandle::Tor(t) => t.send_existing(addr, data).await,
+            TransportHandle::Nym(t) => t.send_existing(addr, data).await,
             #[cfg(ble_available)]
             TransportHandle::Ble(t) => t.send_async(addr, data).await,
             #[cfg(test)]
@@ -1232,29 +1312,92 @@ impl TransportHandle {
     ///
     /// Returns a snapshot of counters for the specific transport type.
     pub fn transport_stats(&self) -> serde_json::Value {
+        self.live_stats().to_json()
+    }
+
+    /// The transport's shared counters, for reading live off the rx loop.
+    ///
+    /// The counters are atomics the transport updates from its own tasks and
+    /// threads, so a holder sees them move without anything republishing
+    /// them.
+    pub(crate) fn live_stats(&self) -> LiveStats {
         match self {
-            TransportHandle::Udp(t) => {
-                serde_json::to_value(t.stats().snapshot()).unwrap_or_default()
-            }
+            TransportHandle::Udp(t) => LiveStats::Udp(t.stats().clone()),
             #[cfg(any(target_os = "linux", target_os = "macos"))]
-            TransportHandle::Ethernet(t) => {
-                serde_json::to_value(t.stats().snapshot()).unwrap_or_default()
-            }
-            TransportHandle::Tcp(t) => {
-                serde_json::to_value(t.stats().snapshot()).unwrap_or_default()
-            }
-            TransportHandle::Tor(t) => {
-                serde_json::to_value(t.stats().snapshot()).unwrap_or_default()
-            }
-            TransportHandle::Nym(t) => {
-                serde_json::to_value(t.stats().snapshot()).unwrap_or_default()
-            }
+            TransportHandle::Ethernet(t) => LiveStats::Ethernet(t.stats().clone()),
+            TransportHandle::Tcp(t) => LiveStats::Tcp(t.stats().clone()),
+            TransportHandle::Tor(t) => LiveStats::Tor(t.stats().clone()),
+            TransportHandle::Nym(t) => LiveStats::Nym(t.stats().clone()),
             #[cfg(ble_available)]
-            TransportHandle::Ble(t) => {
-                serde_json::to_value(t.stats().snapshot()).unwrap_or_default()
-            }
+            TransportHandle::Ble(t) => LiveStats::Ble(t.stats().clone()),
             #[cfg(test)]
-            TransportHandle::Loopback(_) => serde_json::json!({}),
+            TransportHandle::Loopback(_) => LiveStats::Empty,
+        }
+    }
+}
+
+/// A transport's shared counters, held by reference rather than copied.
+///
+/// Cloning shares the counters. `show_transports` holds one per transport in
+/// its published row and reads it at request time, so the counters it shows
+/// are current even when nothing has republished the row.
+#[derive(Clone)]
+pub(crate) enum LiveStats {
+    /// UDP transport counters.
+    Udp(std::sync::Arc<udp::UdpStats>),
+    /// Ethernet transport counters.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    Ethernet(std::sync::Arc<ethernet::stats::EthernetStats>),
+    /// TCP transport counters.
+    Tcp(std::sync::Arc<tcp::stats::TcpStats>),
+    /// Tor transport counters.
+    Tor(std::sync::Arc<tor::stats::TorStats>),
+    /// Nym transport counters.
+    Nym(std::sync::Arc<nym::stats::NymStats>),
+    /// BLE transport counters.
+    #[cfg(ble_available)]
+    Ble(std::sync::Arc<ble::stats::BleStats>),
+    /// No counters (the test loopback transport).
+    #[cfg(test)]
+    Empty,
+}
+
+impl LiveStats {
+    /// Read the counters now, as the JSON `show_transports` reports under
+    /// `stats`.
+    pub(crate) fn to_json(&self) -> serde_json::Value {
+        match self {
+            LiveStats::Udp(s) => serde_json::to_value(s.snapshot()).unwrap_or_default(),
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            LiveStats::Ethernet(s) => serde_json::to_value(s.snapshot()).unwrap_or_default(),
+            LiveStats::Tcp(s) => serde_json::to_value(s.snapshot()).unwrap_or_default(),
+            LiveStats::Tor(s) => serde_json::to_value(s.snapshot()).unwrap_or_default(),
+            LiveStats::Nym(s) => serde_json::to_value(s.snapshot()).unwrap_or_default(),
+            #[cfg(ble_available)]
+            LiveStats::Ble(s) => serde_json::to_value(s.snapshot()).unwrap_or_default(),
+            #[cfg(test)]
+            LiveStats::Empty => serde_json::json!({}),
+        }
+    }
+}
+
+/// Two values are equal when they share the same counters, not when the
+/// counters happen to read the same.
+impl PartialEq for LiveStats {
+    fn eq(&self, other: &Self) -> bool {
+        use std::sync::Arc;
+        match (self, other) {
+            (LiveStats::Udp(a), LiveStats::Udp(b)) => Arc::ptr_eq(a, b),
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            (LiveStats::Ethernet(a), LiveStats::Ethernet(b)) => Arc::ptr_eq(a, b),
+            (LiveStats::Tcp(a), LiveStats::Tcp(b)) => Arc::ptr_eq(a, b),
+            (LiveStats::Tor(a), LiveStats::Tor(b)) => Arc::ptr_eq(a, b),
+            (LiveStats::Nym(a), LiveStats::Nym(b)) => Arc::ptr_eq(a, b),
+            #[cfg(ble_available)]
+            (LiveStats::Ble(a), LiveStats::Ble(b)) => Arc::ptr_eq(a, b),
+            #[cfg(test)]
+            (LiveStats::Empty, LiveStats::Empty) => true,
+            _ => false,
         }
     }
 }
@@ -1298,6 +1441,47 @@ pub(crate) async fn resolve_socket_addrs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A connecting-pool entry holding only its connect task.
+    struct TaskEntry(tokio::task::JoinHandle<ConnectOutcome>);
+
+    impl AsMut<tokio::task::JoinHandle<ConnectOutcome>> for TaskEntry {
+        /// The background connect task.
+        fn as_mut(&mut self) -> &mut tokio::task::JoinHandle<ConnectOutcome> {
+            &mut self.0
+        }
+    }
+
+    /// A finished connect is handed back even when the calling task has
+    /// spent its cooperative budget, which makes a plain poll of the task
+    /// read pending. Losing it there would close a connected stream unseen.
+    #[tokio::test]
+    async fn take_finished_connect_returns_the_outcome_when_the_caller_budget_is_spent() {
+        let addr = TransportAddr::from_socket_addr("192.0.2.1:2121".parse().unwrap());
+        let task = tokio::spawn(async { Err(TransportError::ConnectionRefused) });
+        while !task.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        let mut connecting = std::collections::HashMap::from([(addr.clone(), TaskEntry(task))]);
+
+        for _ in 0..10_000 {
+            if !tokio::task::coop::has_budget_remaining() {
+                break;
+            }
+            tokio::task::consume_budget().await;
+        }
+        assert!(
+            !tokio::task::coop::has_budget_remaining(),
+            "the test runtime must budget this task, or the case is not exercised"
+        );
+
+        let outcome = take_finished_connect(&mut connecting, &addr);
+        assert!(
+            matches!(outcome, Some(Err(TransportError::ConnectionRefused))),
+            "finished connect not returned: {outcome:?}"
+        );
+        assert!(connecting.is_empty());
+    }
 
     #[test]
     fn test_transport_id() {
@@ -1812,6 +1996,8 @@ mod tests {
             // answer, not this node's inability to transmit.
             TransportError::Timeout,
             TransportError::ConnectionRefused,
+            // The connection is gone and nothing will bring it back.
+            TransportError::NotConnected,
         ] {
             assert!(
                 !terminal.is_transient(),

@@ -167,11 +167,12 @@ impl Node {
     ///
     /// So a peer on TCP, Tor, Nym or BLE keeps the periodic heartbeat it had
     /// before this detector existed, and `link_dead_timeout_secs` remains the
-    /// backstop. Note that it does *not* recover by redialling: `send_async`
-    /// only dials when the pool holds no connection for the address, and a
-    /// connection stranded by a medium change is still in the pool. It is
-    /// evicted after a write to it fails, so the redial happens on the send
-    /// after the failure, not on the first one. Doing better for them means
+    /// backstop. Note that it does *not* recover by redialling. The link send
+    /// never dials, and a connection stranded by a medium change is still in
+    /// the pool until its writer's write to it fails. The send after that
+    /// finds no connection and fails, starting a background connect only if
+    /// this node dialed the peer at that address, and a later send uses it;
+    /// a peer that dialed in is never redialled. Doing better for them means
     /// dropping the stale connection
     /// rather than writing into it, which is a different change with a real
     /// cost behind it — a Tor peer pays a fresh circuit — and is not this one.

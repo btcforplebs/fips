@@ -27,7 +27,10 @@
 //!
 //! A projection is a point-in-time copy, not a live view. The entity tables in
 //! particular are mutated on the packet path between ticks, so a reader sees
-//! the state as of the last publish.
+//! the state as of the last publish. The exceptions are counters that live in
+//! shared atomics, which are read at request time: the `MetricsRegistry`
+//! families, and the transport counters `show_transports` reports, whose rows
+//! hold the transports' shared stats rather than a copy of them.
 //!
 //! [`snapshot_dispatch`] is the seam: it serves the commands in its match arms
 //! directly from the handle and returns `None` for everything else, so the

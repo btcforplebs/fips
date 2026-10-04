@@ -1443,9 +1443,11 @@ pub fn show_transports(node: &Node) -> Value {
 
 /// Off-loop variant of [`show_transports`]: renders from the tick-published
 /// [`EntitySnapshot`](super::snapshot::EntitySnapshot) transport table. The
-/// `stats` and `tor_monitoring` blocks are already-projected `serde_json::Value`
-/// data captured at publish time. Output is byte-identical to
-/// [`show_transports`].
+/// `tor_monitoring` block is already-projected `serde_json::Value` data
+/// captured at publish time. The `stats` block is read now from the
+/// transport's shared counters, as `show_status` reads `forwarding`, so it is
+/// current even when the tick has not run since the counters moved. Output
+/// is byte-identical to [`show_transports`].
 pub(crate) fn show_transports_from_handle(handle: &super::read_handle::ControlReadHandle) -> Value {
     let entities = handle.entities();
     let transports: Vec<Value> = entities
@@ -1488,7 +1490,7 @@ pub(crate) fn show_transports_from_handle(handle: &super::read_handle::ControlRe
                 });
             }
 
-            t_json["stats"] = t.stats.clone();
+            t_json["stats"] = t.stats.to_json();
 
             t_json
         })

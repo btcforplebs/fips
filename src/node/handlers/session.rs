@@ -2959,6 +2959,7 @@ impl Node {
         let Some(socket) = udp.async_socket() else {
             return Ok(false);
         };
+        let stats = udp.stats().clone();
 
         // FSP cipher + counter — separate session from next-hop FMP session.
         let (fsp_counter, fsp_cipher) = {
@@ -3099,6 +3100,7 @@ impl Node {
             dest_addr: socket_addr,
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             connected_socket,
+            stats,
             // Bulk endpoint data: drop on UDP backpressure so the
             // worker queue keeps moving instead of stranding under
             // sustained congestion.
@@ -3138,7 +3140,7 @@ impl Node {
             debug!(next_hop = %next_hop_addr, "Transport gone before inline send of session data");
             return;
         };
-        if let Err(error) = transport.send(remote_addr, &wire).await {
+        if let Err(error) = transport.send_existing(remote_addr, &wire).await {
             debug!(next_hop = %next_hop_addr, %error, "Inline send of session data failed");
         }
     }

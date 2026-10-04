@@ -722,6 +722,34 @@ with v0.5.x or earlier peers.
 - An Ethernet peer's address is always shown as a colon-separated MAC address
   in `fipsctl show links` and in log lines. An address whose six bytes happened
   to be valid UTF-8 was printed as text instead.
+- The node no longer dials from its receive loop. When a peer's TCP, Tor or
+  Nym connection closed before the node answered or resent a handshake or
+  rekey message on it, the send dialed the peer's address and the receive
+  loop waited out the whole connect timeout (5 s by default on TCP) before
+  handling anything else, one send after another. For an inbound connection
+  that address is the peer's source port, where nothing listens. Meanwhile
+  UDP receive queues filled, other peers' links timed out and dropped, and the
+  log showed a `transport timeout` warning on `Failed to send msg2` about
+  every 5 s (#176). These sends now use only a connection the transport
+  already holds, and fail at once without one. For a peer this node dialed, a
+  connect is started in the background and the next send uses it; an inbound
+  peer's address is never dialed.
+- `show_transports` (`fipsctl show transports`) reports transport counters as
+  they stand when asked. They were a copy refreshed by the node's periodic
+  tick, so when the receive loop was too busy for the tick to run they stopped
+  moving with nothing to show it: in #176, `connect_timeouts` read 0 while the
+  log recorded hundreds of timeouts. The output is unchanged.
+- The UDP transport's `packets_recv` and `bytes_recv` now count datagrams
+  received on per-peer connected sockets, and `packets_sent`, `bytes_sent` and
+  `send_errors` count the data frames the encrypt workers send. Both were
+  missed, so on a node with connected UDP on (the Linux and macOS default)
+  the counters were far below the traffic the transport carried.
+- A failed connect made in the background by TCP, Tor or Nym is now counted,
+  as a failed inline connect is. TCP counted none, Tor missed timeouts, and
+  Nym missed timeouts and SOCKS5 errors. TCP's `connect_refused` counts every
+  connect that fails before its timeout, not only a refused one: an
+  unreachable host or network, a reset or any other connect error lands there
+  too, with the error in the debug log.
 
 #### Gateway
 

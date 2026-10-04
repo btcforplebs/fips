@@ -21,7 +21,14 @@ pub struct TcpStats {
     pub connections_established: AtomicU64,
     pub connections_accepted: AtomicU64,
     pub connections_rejected: AtomicU64,
+    /// Outbound connects, inline or in the background, that did not complete
+    /// within `connect_timeout_ms`.
     pub connect_timeouts: AtomicU64,
+    /// Outbound connects, inline or in the background, that failed before
+    /// the timeout. Despite the name this counts every such failure, not
+    /// only `ECONNREFUSED`: an unreachable host or network, a reset or any
+    /// other connect error lands here too. The debug log "TCP connect
+    /// failed" carries the OS error for each one.
     pub connect_refused: AtomicU64,
     /// Inbound/outbound connection-pool occupancy. Inbound drives the
     /// `max_inbound_connections` admission check.
@@ -95,7 +102,8 @@ impl TcpStats {
         self.connect_timeouts.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Record a connection refused.
+    /// Record an outbound connect that failed before its timeout, for any
+    /// reason (see `connect_refused`).
     pub fn record_connect_refused(&self) {
         self.connect_refused.fetch_add(1, Ordering::Relaxed);
     }
