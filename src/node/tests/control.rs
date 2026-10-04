@@ -529,3 +529,101 @@ fn peer_connectivity_turns_stale_one_millisecond_past_the_heartbeat_interval() {
     assert_eq!(at(&node, seen + 1_000), ConnectivityState::Connected);
     assert_eq!(at(&node, seen + 1_001), ConnectivityState::Stale);
 }
+
+/// `show_transports` served off the rx loop reports the transport counters
+/// as they are now, not as the last tick published them: a counter that
+/// moves after the publish shows up without another tick, in the same
+/// fields and shape the on-loop render gives.
+#[tokio::test]
+async fn show_transports_off_loop_reports_counters_that_moved_since_the_last_tick() {
+    use crate::config::{TcpConfig, UdpConfig};
+    use crate::control::queries::{show_transports, show_transports_from_handle};
+    use crate::transport::tcp::TcpTransport;
+    use crate::transport::udp::UdpTransport;
+
+    let mut node = make_node();
+    let (tx, _rx) = packet_channel(16);
+    let udp_cfg = UdpConfig {
+        bind_addr: Some("127.0.0.1:0".to_string()),
+        ..Default::default()
+    };
+    let mut udp = UdpTransport::new(TransportId::new(1), None, udp_cfg, tx.clone());
+    udp.start_async().await.unwrap();
+    let udp_stats = udp.stats().clone();
+    let tcp_cfg = TcpConfig {
+        bind_addr: Some("127.0.0.1:0".to_string()),
+        ..Default::default()
+    };
+    let mut tcp = TcpTransport::new(TransportId::new(2), None, tcp_cfg, tx);
+    tcp.start_async().await.unwrap();
+    let tcp_stats = tcp.stats().clone();
+    node.transports
+        .insert(TransportId::new(1), TransportHandle::Udp(udp));
+    node.transports
+        .insert(TransportId::new(2), TransportHandle::Tcp(tcp));
+
+    // One tick publishes the transport rows.
+    node.record_stats_history();
+    let handle = node.control_read_handle();
+    let published = std::sync::Arc::clone(&*handle.entities());
+    let row = |v: &serde_json::Value, id: u32| {
+        v["transports"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["transport_id"] == id)
+            .unwrap_or_else(|| panic!("no row for transport {id}: {v}"))
+            .clone()
+    };
+    let before = show_transports_from_handle(&handle);
+    assert_eq!(row(&before, 1)["stats"]["packets_recv"], 0);
+    assert_eq!(row(&before, 2)["stats"]["connect_timeouts"], 0);
+
+    // The counters move; no tick runs.
+    for _ in 0..3 {
+        udp_stats.record_recv(100);
+    }
+    tcp_stats.record_connect_timeout();
+    tcp_stats.record_connect_refused();
+
+    let after = show_transports_from_handle(&handle);
+    assert!(
+        std::sync::Arc::ptr_eq(&published, &handle.entities()),
+        "precondition: nothing republished the snapshot"
+    );
+    let udp_row = row(&after, 1);
+    let tcp_row = row(&after, 2);
+    assert_eq!(
+        udp_row["stats"]["packets_recv"], 3,
+        "off-loop show_transports did not see the UDP counter move"
+    );
+    assert_eq!(udp_row["stats"]["bytes_recv"], 300);
+    assert_eq!(
+        tcp_row["stats"]["connect_timeouts"], 1,
+        "off-loop show_transports did not see the TCP counter move"
+    );
+    assert_eq!(tcp_row["stats"]["connect_refused"], 1);
+
+    // Same fields and shape as before: each block is its stats snapshot
+    // serialized whole, and the whole render matches the on-loop one.
+    assert_eq!(
+        udp_row["stats"],
+        serde_json::to_value(udp_stats.snapshot()).unwrap()
+    );
+    assert_eq!(
+        tcp_row["stats"],
+        serde_json::to_value(tcp_stats.snapshot()).unwrap()
+    );
+    assert_eq!(after, show_transports(&node));
+    let keys = |v: &serde_json::Value| {
+        let mut k: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
+        k.sort();
+        k
+    };
+    assert_eq!(keys(&udp_row), keys(&row(&before, 1)));
+    assert_eq!(keys(&tcp_row["stats"]), keys(&row(&before, 2)["stats"]));
+
+    for (_, t) in node.transports.iter_mut() {
+        t.stop().await.ok();
+    }
+}

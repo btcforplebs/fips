@@ -25,6 +25,7 @@ mod mmp_chartests;
 mod netmon;
 mod probe;
 mod routing;
+mod rx_stall;
 mod session;
 mod spanning_tree;
 mod tcp;
@@ -86,6 +87,7 @@ pub(super) fn install_connected_udp(
         transport_id,
         peer_sa,
         packet_tx,
+        std::sync::Arc::new(crate::transport::udp::UdpStats::new()),
     )
     .expect("spawn the peer recv drain");
 

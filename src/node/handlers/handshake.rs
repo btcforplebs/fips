@@ -17,7 +17,7 @@ use crate::proto::fmp::{
     EstablishSnapshot, EstablishView, InboundDecision, InboundReject, Msg1Digest, OutboundSnapshot,
     PromotionResult, RekeyAnswer, WireOutcome, cross_connection_winner,
 };
-use crate::transport::{Link, LinkDirection, LinkId, ReceivedPacket};
+use crate::transport::{Link, LinkDirection, LinkId, ReceivedPacket, TransportError, TransportId};
 use crate::utils::index::SessionIndex;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
@@ -312,8 +312,8 @@ impl Node {
             .is_none_or(|t| t.accept_connections())
     }
 
-    /// The transport and address of `peer`'s established link, where a rekey
-    /// msg2 is sent whatever address its msg1 arrived from.
+    /// The transport and address of `peer`'s established link, where a reply
+    /// to the peer's msg1 goes first, whatever address the msg1 arrived from.
     fn established_link(
         &self,
         peer: &NodeAddr,
@@ -323,6 +323,64 @@ impl Node {
     )> {
         let p = self.peers.get(peer)?;
         Some((p.transport_id()?, p.current_addr()?.clone()))
+    }
+
+    /// Send `reply`, an answer to `packet`'s msg1 from `peer`, on the peer's
+    /// established link, or on the connection the msg1 arrived on when the
+    /// established link's connection has gone. Returns the transport the
+    /// reply went out on.
+    ///
+    /// Neither send dials. The arrival connection is used only on a
+    /// connection-oriented transport: the remote opened it, so a reply on it
+    /// reaches only the remote. That is how a peer that redialed after its
+    /// old connection closed has its msg1 answered before the old link is
+    /// reaped. A connectionless source address is whatever the sender wrote,
+    /// so a msg1 that came that way is answered on the established link only.
+    ///
+    /// The arrival connection must also be on the established link's
+    /// transport. Session indices are looked up and retired by transport, and
+    /// the retirement paths use the transport the peer's link is on, so an
+    /// answer on another transport would leave the new index registered
+    /// where the peer's frames are not looked up, and never removed.
+    ///
+    /// The fallback needs the established connection to be gone from the
+    /// pool. A half-open one, whose path broke without a FIN or reset
+    /// reaching this node, still accepts writes, so the reply is lost there
+    /// until the link-dead reaper removes the peer.
+    async fn answer_msg1(
+        &self,
+        peer: &NodeAddr,
+        packet: &ReceivedPacket,
+        reply: &[u8],
+    ) -> Result<TransportId, String> {
+        let (tid, addr) = self
+            .established_link(peer)
+            .ok_or_else(|| "the peer has no established link".to_string())?;
+        let transport = self
+            .transports
+            .get(&tid)
+            .ok_or_else(|| "no transport for the peer's link".to_string())?;
+        match transport.send_existing(&addr, reply).await {
+            Ok(_) => return Ok(tid),
+            Err(TransportError::NotConnected) => {}
+            Err(e) => return Err(e.to_string()),
+        }
+        if packet.transport_id != tid
+            || packet.remote_addr == addr
+            || !transport.transport_type().connection_oriented
+        {
+            return Err(TransportError::NotConnected.to_string());
+        }
+        transport
+            .send_existing(&packet.remote_addr, reply)
+            .await
+            .map_err(|e| format!("established link not connected; msg1's connection: {e}"))?;
+        debug!(
+            peer = %self.peer_display_name(peer),
+            remote_addr = %packet.remote_addr,
+            "Established link not connected, answered on the msg1's connection"
+        );
+        Ok(tid)
     }
 
     /// Handle handshake message 1 (phase 0x1).
@@ -434,7 +492,7 @@ impl Node {
                     let msg2_bytes = self.find_stored_msg2(existing_link_id);
                     if let Some(msg2) = msg2_bytes {
                         if let Some(transport) = self.transports.get(&packet.transport_id) {
-                            match transport.send(&packet.remote_addr, &msg2).await {
+                            match transport.send_existing(&packet.remote_addr, &msg2).await {
                                 Ok(_) => debug!(
                                     remote_addr = %packet.remote_addr,
                                     "Resent msg2 for duplicate msg1"
@@ -650,13 +708,13 @@ impl Node {
                 // the classification touched no state. It goes on the peer's
                 // established link, as a rekey msg2 does: a genuine duplicate
                 // comes from the address the peering was just formed with,
-                // while a copy can come from anywhere.
+                // while a copy can come from anywhere. On a connection-oriented
+                // transport whose established connection has gone, it goes on
+                // the msg1's own connection on that transport instead
+                // (`answer_msg1`).
                 debug_assert!(actions.is_empty());
-                if let Some(msg2) = msg2.as_deref()
-                    && let Some((tid, addr)) = self.established_link(&peer_node_addr)
-                    && let Some(transport) = self.transports.get(&tid)
-                {
-                    match transport.send(&addr, msg2).await {
+                if let Some(msg2) = msg2.as_deref() {
+                    match self.answer_msg1(&peer_node_addr, &packet, msg2).await {
                         Ok(_) => debug!(
                             peer = %self.peer_display_name(&peer_node_addr),
                             "Resent msg2 for duplicate msg1 (same epoch)"
@@ -671,28 +729,19 @@ impl Node {
             }
             InboundDecision::ResendRekeyMsg2 { peer, msg2 } => {
                 // A resend of the msg1 that armed the pending we hold: our
-                // msg2 was lost, so give the same answer again, on the peer's
-                // established link as the first answer went.
+                // msg2 was lost, so give the same answer again, routed as the
+                // first answer was (`answer_msg1`).
                 debug_assert!(actions.is_empty());
-                if let Some((tid, addr)) = self.established_link(&peer)
-                    && let Some(transport) = self.transports.get(&tid)
-                {
-                    match transport.send(&addr, &msg2).await {
-                        Ok(_) => debug!(
-                            peer = %self.peer_display_name(&peer),
-                            "Resent rekey msg2 for a resent msg1"
-                        ),
-                        Err(e) => debug!(
-                            peer = %self.peer_display_name(&peer),
-                            error = %e,
-                            "Failed to resend rekey msg2"
-                        ),
-                    }
-                } else {
-                    debug!(
+                match self.answer_msg1(&peer, &packet, &msg2).await {
+                    Ok(_) => debug!(
                         peer = %self.peer_display_name(&peer),
-                        "No established link to resend rekey msg2 on"
-                    );
+                        "Resent rekey msg2 for a resent msg1"
+                    ),
+                    Err(e) => debug!(
+                        peer = %self.peer_display_name(&peer),
+                        error = %e,
+                        "Failed to resend rekey msg2"
+                    ),
                 }
             }
             InboundDecision::RekeyRespond {
@@ -750,19 +799,14 @@ impl Node {
                 // of a msg1 authenticates as the peer from any address, so
                 // answering its source would reflect to an address the
                 // sender chose. A peer whose address changed is answered at
-                // the old one until a frame from the new address moves it.
+                // the old one until a frame from the new address moves it,
+                // except that on a connection-oriented transport whose
+                // established connection has gone, the msg1's own connection
+                // on that transport is used (`answer_msg1`): a peer that
+                // redialed sends only msg1s on its new connection, so nothing
+                // else would move it.
                 let wire_msg2 = build_msg2(our_new_index, wire.their_index, &wire.msg2_payload);
-                let sent = match self.established_link(&peer) {
-                    Some((tid, addr)) => match self.transports.get(&tid) {
-                        Some(transport) => transport
-                            .send(&addr, &wire_msg2)
-                            .await
-                            .map(|_| tid)
-                            .map_err(|e| e.to_string()),
-                        None => Err("no transport for the peer's link".to_string()),
-                    },
-                    None => Err("the peer has no established link".to_string()),
-                };
+                let sent = self.answer_msg1(&peer, &packet, &wire_msg2).await;
                 let link_transport = match sent {
                     Ok(tid) => tid,
                     Err(e) => {

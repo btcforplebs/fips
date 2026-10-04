@@ -3,8 +3,9 @@
 //! The per-peer FSM in [`crate::peer::machine`] is a sans-IO reducer: it decides
 //! *what* must happen and returns a `Vec<PeerAction>`; this module is the *doing*
 //! half — the thin driver that maps each action onto the exact shell call it
-//! stands for (`build_msg2` + `transport.send`, `promote_connection`,
-//! `remove_active_peer`, `index_allocator.free`, `note_link_dead`, …).
+//! stands for (`build_msg2` + `send_existing`, `send_stored_msg1`,
+//! `promote_connection`, `remove_active_peer`, `index_allocator.free`,
+//! `note_link_dead`, …).
 //!
 //! ## Progressive cutover
 //!
@@ -179,11 +180,16 @@ impl Node {
                         // `if let Some(transport)` guard); a send *error* runs the
                         // pre-refactor msg2-send-failure cleanup (`handle_msg1`
                         // L494-503) and ABORTS the remaining queue so the queued
-                        // `PromoteToActive` never runs.
+                        // `PromoteToActive` never runs. The send never dials:
+                        // if the msg1's connection has closed, a dial to its
+                        // address (for an inbound connection, the initiator's
+                        // ephemeral port) would hold the rx loop for up to the
+                        // connect timeout.
                         let send_err = match self.transports.get(&ambient.transport_id) {
-                            Some(transport) => {
-                                transport.send(&ambient.remote_addr, &frame).await.err()
-                            }
+                            Some(transport) => transport
+                                .send_existing(&ambient.remote_addr, &frame)
+                                .await
+                                .err(),
                             None => None,
                         };
                         if let Some(e) = send_err {

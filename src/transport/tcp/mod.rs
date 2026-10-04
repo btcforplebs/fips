@@ -25,11 +25,11 @@
 mod pool;
 pub mod stats;
 
-use super::resolve_socket_addrs;
 use super::{
     ConnectionState, DiscoveredPeer, PacketTx, ReceivedPacket, Transport, TransportAddr,
     TransportError, TransportId, TransportState, TransportType,
 };
+use super::{resolve_socket_addrs, take_finished_connect};
 use crate::config::TcpConfig;
 use crate::transport::framing::read_fmp_packet;
 use crate::transport::stream::{
@@ -338,19 +338,7 @@ impl TcpTransport {
         if !self.state.is_operational() {
             return Err(TransportError::NotStarted);
         }
-
-        // Pre-send MTU check: reject oversize packets before writing them
-        // to the TCP stream. Without this, the receiver's FMP stream reader
-        // would see payload_len > max and close the connection, causing a
-        // disruptive reset-reconnect cycle.
-        let mtu = self.config.mtu() as usize;
-        if data.len() > mtu {
-            self.stats.record_mtu_exceeded();
-            return Err(TransportError::MtuExceeded {
-                packet_size: data.len(),
-                mtu: self.config.mtu(),
-            });
-        }
+        self.check_mtu(data)?;
 
         // Get or create connection. What comes back is the queue into the
         // connection's writer task, never the write half itself: this function
@@ -368,6 +356,87 @@ impl TcpTransport {
             }
         };
 
+        self.enqueue(addr, &send_tx, data)
+    }
+
+    /// Send a packet only over a connection that already exists.
+    ///
+    /// Uses the pooled connection for `addr`, or one a finished background
+    /// connect has produced, which it moves into the pool. Never dials: with
+    /// neither, it fails at once with [`TransportError::NotConnected`]. Like
+    /// `send_async`, it only queues the frame for the connection's writer
+    /// task and never awaits the wire.
+    pub async fn send_existing(
+        &self,
+        addr: &TransportAddr,
+        data: &[u8],
+    ) -> Result<usize, TransportError> {
+        if !self.state.is_operational() {
+            return Err(TransportError::NotStarted);
+        }
+        self.check_mtu(data)?;
+        let send_tx = self
+            .existing_sender(addr)
+            .await
+            .ok_or(TransportError::NotConnected)?;
+        self.enqueue(addr, &send_tx, data)
+    }
+
+    /// The writer queue for an established connection to `addr`, promoting
+    /// a background connect that has finished since it was started.
+    ///
+    /// Holds the pool lock across the promotion, so the connection cannot be
+    /// inserted twice. A finished connect that failed is dropped, so the next
+    /// `connect_async` starts a new attempt.
+    async fn existing_sender(&self, addr: &TransportAddr) -> Option<mpsc::Sender<Vec<u8>>> {
+        let mut pool = self.pool.lock().await;
+        if let Some(conn) = key_for_remote(&pool, addr).and_then(|key| pool.get(&key)) {
+            return Some(conn.send_tx.clone());
+        }
+        let finished = take_finished_connect(&mut *self.connecting.lock().await, addr)?;
+        match finished {
+            Ok((stream, mss_mtu)) => {
+                let conn = self.outbound_connection(addr, stream, mss_mtu);
+                let send_tx = conn.send_tx.clone();
+                pool.insert(PoolKey::outbound(addr.clone()), conn);
+                self.record_promoted(addr, mss_mtu);
+                Some(send_tx)
+            }
+            Err(e) => {
+                debug!(
+                    transport_id = %self.transport_id,
+                    remote_addr = %addr,
+                    error = %e,
+                    "Background TCP connect failed, nothing to send on"
+                );
+                None
+            }
+        }
+    }
+
+    /// Reject a packet larger than the transport MTU before queueing it.
+    ///
+    /// Without this, the receiver's FMP stream reader would see
+    /// payload_len > max and close the connection, causing a disruptive
+    /// reset-reconnect cycle.
+    fn check_mtu(&self, data: &[u8]) -> Result<(), TransportError> {
+        if data.len() > self.config.mtu() as usize {
+            self.stats.record_mtu_exceeded();
+            return Err(TransportError::MtuExceeded {
+                packet_size: data.len(),
+                mtu: self.config.mtu(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Queue one packet for the writer task of the connection to `addr`.
+    fn enqueue(
+        &self,
+        addr: &TransportAddr,
+        send_tx: &mpsc::Sender<Vec<u8>>,
+        data: &[u8],
+    ) -> Result<usize, TransportError> {
         // Hand the frame to the writer task. The copy buys the caller its
         // freedom from the wire: `write_all` borrows, a queue must own. One
         // memcpy of at most an MTU is a good trade for not stalling the rx
@@ -583,6 +652,7 @@ impl TcpTransport {
         let config = self.config.clone();
         let transport_id = self.transport_id;
         let remote_addr = addr.clone();
+        let stats = self.stats.clone();
 
         debug!(
             transport_id = %transport_id,
@@ -596,11 +666,18 @@ impl TcpTransport {
             let socket_addrs: Vec<_> = resolve_socket_addrs(&remote_addr).await?.collect();
 
             // A refusal is logged with its OS error by connect_to_any_addr.
+            // Failures are counted here, where they happen, as connect()
+            // counts them; whoever later takes the result does not.
             let connected =
                 connect_to_any_addr(transport_id, &remote_addr, &socket_addrs, timeout_ms).await;
             let stream = match connected {
                 Ok(stream) => stream,
+                Err(error @ TransportError::ConnectionRefused) => {
+                    stats.record_connect_refused();
+                    return Err(error);
+                }
                 Err(error @ TransportError::Timeout) => {
+                    stats.record_connect_timeout();
                     debug!(
                         transport_id = %transport_id,
                         remote_addr = %remote_addr,
@@ -698,6 +775,33 @@ impl TcpTransport {
     /// Splits the stream, spawns a receive loop, and inserts into the pool.
     /// Called from `connection_state_sync()` when a background task completes.
     fn promote_connection(&self, addr: &TransportAddr, stream: TcpStream, mss_mtu: u16) {
+        let conn = self.outbound_connection(addr, stream, mss_mtu);
+
+        // Use try_lock since we're in a sync context and the pool
+        // should be available (connection_state_sync already checked it)
+        if let Ok(mut pool) = self.pool.try_lock() {
+            pool.insert(PoolKey::outbound(addr.clone()), conn);
+            self.record_promoted(addr, mss_mtu);
+        } else {
+            // Pool locked — abort the recv task, connection will be retried
+            conn.recv_task.abort();
+            conn.send_task.abort();
+            warn!(
+                transport_id = %self.transport_id,
+                remote_addr = %addr,
+                "Failed to promote connection (pool locked)"
+            );
+        }
+    }
+
+    /// Build the pool entry for a finished background connect: split the
+    /// stream and spawn its receive loop and writer task.
+    fn outbound_connection(
+        &self,
+        addr: &TransportAddr,
+        stream: TcpStream,
+        mss_mtu: u16,
+    ) -> TcpConnection {
         let (read_half, write_half) = stream.into_split();
 
         let transport_id = self.transport_id;
@@ -706,7 +810,7 @@ impl TcpTransport {
         let recv_stats = self.stats.clone();
         let key = PoolKey::outbound(addr.clone());
         let recv_key = key.clone();
-        let send_key = key.clone();
+        let send_key = key;
         let id = next_conn_id();
 
         let recv_task = tokio::spawn(async move {
@@ -739,7 +843,7 @@ impl TcpTransport {
             self.stats.clone(),
         ));
 
-        let conn = TcpConnection {
+        TcpConnection {
             send_tx,
             send_task,
             recv_task,
@@ -747,30 +851,19 @@ impl TcpTransport {
             established_at: Instant::now(),
             direction: Direction::Outbound,
             id,
-        };
-
-        // Use try_lock since we're in a sync context and the pool
-        // should be available (connection_state_sync already checked it)
-        if let Ok(mut pool) = self.pool.try_lock() {
-            pool.insert(key, conn);
-            self.stats.record_connection_established();
-            self.stats.record_pool_outbound_added();
-            debug!(
-                transport_id = %self.transport_id,
-                remote_addr = %addr,
-                mtu = mss_mtu,
-                "TCP connection established (background connect)"
-            );
-        } else {
-            // Pool locked — abort the recv task, connection will be retried
-            conn.recv_task.abort();
-            conn.send_task.abort();
-            warn!(
-                transport_id = %self.transport_id,
-                remote_addr = %addr,
-                "Failed to promote connection (pool locked)"
-            );
         }
+    }
+
+    /// Count and log a background connection that has entered the pool.
+    fn record_promoted(&self, addr: &TransportAddr, mss_mtu: u16) {
+        self.stats.record_connection_established();
+        self.stats.record_pool_outbound_added();
+        debug!(
+            transport_id = %self.transport_id,
+            remote_addr = %addr,
+            mtu = mss_mtu,
+            "TCP connection established (background connect)"
+        );
     }
 }
 
@@ -1456,6 +1549,7 @@ fn read_mss_mtu(stream: &std::net::TcpStream, default_mtu: u16) -> u16 {
 mod tests {
     use super::pool::PoolMap;
     use super::*;
+    use crate::testutil::{Blackhole, wait_until};
     use crate::transport::framing::{build_established_frame, build_msg1_frame};
     use crate::transport::packet_channel;
     use crate::transport::stream::park_writer;
@@ -1468,20 +1562,6 @@ mod tests {
     fn conn_for<'a>(pool: &'a PoolMap, remote: &TransportAddr) -> Option<&'a TcpConnection> {
         let key = key_for_remote(pool, remote)?;
         pool.get(&key)
-    }
-
-    /// Poll `f` every 10ms until it holds or `limit` elapses.
-    async fn wait_until<F: FnMut() -> bool>(mut f: F, limit: Duration) -> bool {
-        let deadline = Instant::now() + limit;
-        loop {
-            if f() {
-                return true;
-            }
-            if Instant::now() >= deadline {
-                return false;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
     }
 
     fn capped_config(max_inbound: usize) -> TcpConfig {
@@ -3422,5 +3502,248 @@ mod tests {
 
         drop(peer);
         transport.stop_async().await.unwrap();
+    }
+
+    /// A minimal msg1-phase frame the receive loop accepts.
+    fn msg1_frame() -> Vec<u8> {
+        let mut frame = vec![0xAA; 114];
+        frame[0] = 0x01;
+        frame[1] = 0x00;
+        frame[2..4].copy_from_slice(&110u16.to_le_bytes());
+        frame
+    }
+
+    /// A minimal msg2-phase frame the receive loop accepts.
+    fn msg2_frame() -> Vec<u8> {
+        let mut frame = vec![0xBB; 69];
+        frame[0] = 0x02;
+        frame[1] = 0x00;
+        frame[2..4].copy_from_slice(&65u16.to_le_bytes());
+        frame
+    }
+
+    /// Wait until the background connect to `remote` has finished, leaving
+    /// it unpromoted in the connecting map.
+    async fn wait_connect_finished(t: &TcpTransport, remote: &TransportAddr) {
+        let finished = wait_until(
+            || {
+                t.connecting
+                    .try_lock()
+                    .is_ok_and(|c| c.get(remote).is_some_and(|e| e.task.is_finished()))
+            },
+            Duration::from_secs(3),
+        )
+        .await;
+        assert!(finished, "background connect to {remote} never finished");
+    }
+
+    /// With no pooled connection and no connect under way, `send_existing`
+    /// fails with `NotConnected` and opens nothing.
+    #[tokio::test]
+    async fn send_existing_without_connection_fails_fast_and_dials_nothing() {
+        let (tx1, _rx1) = packet_channel(100);
+        let (tx2, _rx2) = packet_channel(100);
+        let mut t1 = TcpTransport::new(TransportId::new(1), None, make_outbound_config(), tx1);
+        let mut t2 = TcpTransport::new(TransportId::new(2), None, make_config(), tx2);
+        t1.start_async().await.unwrap();
+        t2.start_async().await.unwrap();
+        // Reachable, so a send that dialed would succeed.
+        let remote = TransportAddr::from_string(&t2.local_addr().unwrap().to_string());
+
+        let result = t1.send_existing(&remote, &msg1_frame()).await;
+
+        assert!(
+            matches!(result, Err(TransportError::NotConnected)),
+            "expected NotConnected, got {result:?}"
+        );
+        assert!(
+            t1.connecting.lock().await.is_empty(),
+            "a connect was started"
+        );
+        assert_eq!(t1.connection_state_sync(&remote), ConnectionState::None);
+        assert_eq!(t1.stats().snapshot().connections_established, 0);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            t2.stats().snapshot().connections_accepted,
+            0,
+            "the remote saw a connection"
+        );
+
+        t1.stop_async().await.unwrap();
+        t2.stop_async().await.unwrap();
+    }
+
+    /// A background connect that has finished is moved into the pool and
+    /// carries the send, with no second connection opened.
+    #[tokio::test]
+    async fn send_existing_promotes_a_finished_background_connect_and_sends_on_it() {
+        let (tx1, _rx1) = packet_channel(100);
+        let (tx2, mut rx2) = packet_channel(100);
+        let mut t1 = TcpTransport::new(TransportId::new(1), None, make_outbound_config(), tx1);
+        let mut t2 = TcpTransport::new(TransportId::new(2), None, make_config(), tx2);
+        t1.start_async().await.unwrap();
+        t2.start_async().await.unwrap();
+        let remote = TransportAddr::from_string(&t2.local_addr().unwrap().to_string());
+
+        t1.connect_async(&remote).await.unwrap();
+        wait_connect_finished(&t1, &remote).await;
+        let frame = msg1_frame();
+        let sent = t1.send_existing(&remote, &frame).await.unwrap();
+        assert_eq!(sent, frame.len());
+
+        let packet = timeout(Duration::from_secs(2), rx2.recv())
+            .await
+            .expect("timeout")
+            .expect("channel closed");
+        assert_eq!(packet.data, frame);
+        assert!(
+            t1.connecting.lock().await.is_empty(),
+            "the finished connect was left in the connecting map"
+        );
+        let stats = t1.stats().snapshot();
+        assert_eq!(stats.connections_established, 1);
+        assert_eq!(stats.pool_outbound, 1);
+        assert_eq!(
+            t2.stats().snapshot().connections_accepted,
+            1,
+            "the send used the background connection, not a new one"
+        );
+
+        t1.stop_async().await.unwrap();
+        t2.stop_async().await.unwrap();
+    }
+
+    /// A background connect that failed is dropped from the connecting map,
+    /// the send fails with `NotConnected`, and `connect_async` can start again.
+    #[tokio::test]
+    async fn send_existing_after_a_failed_background_connect_drops_it_so_a_new_one_can_start() {
+        let (tx, _rx) = packet_channel(100);
+        let mut t = TcpTransport::new(TransportId::new(1), None, make_outbound_config(), tx);
+        t.start_async().await.unwrap();
+        // A port nothing listens on: the connect is refused.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let remote = TransportAddr::from_string(&closed.local_addr().unwrap().to_string());
+        drop(closed);
+
+        t.connect_async(&remote).await.unwrap();
+        wait_connect_finished(&t, &remote).await;
+        let result = t.send_existing(&remote, &msg1_frame()).await;
+
+        assert!(
+            matches!(result, Err(TransportError::NotConnected)),
+            "expected NotConnected, got {result:?}"
+        );
+        assert!(
+            t.connecting.lock().await.get(&remote).is_none(),
+            "the failed connect was left in the connecting map"
+        );
+        t.connect_async(&remote).await.unwrap();
+        assert!(
+            t.connecting.lock().await.get(&remote).is_some(),
+            "connect_async did not start a new attempt"
+        );
+
+        t.stop_async().await.unwrap();
+    }
+
+    /// A reply to a peer that connected in goes back on that inbound
+    /// connection.
+    #[tokio::test]
+    async fn send_existing_replies_on_a_live_inbound_connection() {
+        let (tx1, mut rx1) = packet_channel(100);
+        let (tx2, mut rx2) = packet_channel(100);
+        let mut t1 = TcpTransport::new(TransportId::new(1), None, make_outbound_config(), tx1);
+        let mut t2 = TcpTransport::new(TransportId::new(2), None, make_config(), tx2);
+        t1.start_async().await.unwrap();
+        t2.start_async().await.unwrap();
+        let remote = TransportAddr::from_string(&t2.local_addr().unwrap().to_string());
+
+        t1.send_async(&remote, &msg1_frame()).await.unwrap();
+        let inbound = timeout(Duration::from_secs(2), rx2.recv())
+            .await
+            .expect("timeout")
+            .expect("channel closed");
+        // The frame is only forwarded once the accept loop has pooled the
+        // connection, so a reply to its address finds it.
+        let reply = msg2_frame();
+        t2.send_existing(&inbound.remote_addr, &reply)
+            .await
+            .unwrap();
+
+        let packet = timeout(Duration::from_secs(2), rx1.recv())
+            .await
+            .expect("timeout")
+            .expect("channel closed");
+        assert_eq!(packet.data, reply);
+        assert_eq!(
+            t2.stats().snapshot().connections_established,
+            0,
+            "the reply dialed"
+        );
+
+        t1.stop_async().await.unwrap();
+        t2.stop_async().await.unwrap();
+    }
+
+    /// A background connect that times out is counted in `connect_timeouts`,
+    /// as an inline one is.
+    #[tokio::test]
+    async fn background_connect_timeout_is_counted() {
+        let bh = Blackhole::silent();
+        let (tx, _rx) = packet_channel(100);
+        let config = TcpConfig {
+            connect_timeout_ms: Some(200),
+            ..make_outbound_config()
+        };
+        let mut t = TcpTransport::new(TransportId::new(1), None, config, tx);
+        t.start_async().await.unwrap();
+        let remote = bh.transport_addr();
+
+        t.connect_async(&remote).await.unwrap();
+        wait_connect_finished(&t, &remote).await;
+
+        let stats = t.stats().snapshot();
+        assert_eq!(stats.connect_timeouts, 1, "the timeout was not counted");
+        assert_eq!(stats.connect_refused, 0);
+        assert_eq!(
+            t.connection_state_sync(&remote),
+            ConnectionState::Failed("transport timeout".into())
+        );
+        assert_eq!(
+            t.stats().snapshot().connect_timeouts,
+            1,
+            "taking the result counted the timeout again"
+        );
+
+        t.stop_async().await.unwrap();
+    }
+
+    /// A background connect that is refused is counted in `connect_refused`,
+    /// as an inline one is.
+    #[tokio::test]
+    async fn background_connect_refusal_is_counted() {
+        let (tx, _rx) = packet_channel(100);
+        let mut t = TcpTransport::new(TransportId::new(1), None, make_outbound_config(), tx);
+        t.start_async().await.unwrap();
+        // A port nothing listens on: the connect is refused.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let remote = TransportAddr::from_string(&closed.local_addr().unwrap().to_string());
+        drop(closed);
+
+        t.connect_async(&remote).await.unwrap();
+        wait_connect_finished(&t, &remote).await;
+
+        let stats = t.stats().snapshot();
+        assert_eq!(stats.connect_refused, 1, "the refusal was not counted");
+        assert_eq!(stats.connect_timeouts, 0);
+        let result = t.send_existing(&remote, &msg1_frame()).await;
+        assert!(matches!(result, Err(TransportError::NotConnected)));
+        assert_eq!(
+            t.stats().snapshot().connect_refused,
+            1,
+            "taking the result counted the refusal again"
+        );
+
+        t.stop_async().await.unwrap();
     }
 }

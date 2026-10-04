@@ -586,3 +586,157 @@ async fn api_disconnect_delivers_the_disconnect_before_closing() {
 
     cleanup_nodes(&mut nodes).await;
 }
+
+/// A peer that redials over TCP after its connection closed, at the same
+/// epoch, has its rekey answered on the new connection and completes it,
+/// without waiting for the link-dead reaper to remove the stale peering.
+///
+/// node 0 dialed node 1. node 0's connection closes, and node 1 still holds
+/// the peering at node 0's old source port, where nothing answers. node 0's
+/// rekey finds no connection, starts a background connect, and sends its
+/// msg1 on the new connection a tick later. node 1 answers on that
+/// connection, node 0 completes the rekey and cuts over, and its first frame
+/// on the new session moves node 1's link to the new connection.
+#[tokio::test]
+async fn same_epoch_tcp_redial_completes_its_rekey_without_waiting_for_the_reaper() {
+    use crate::proto::link::LinkMessageType;
+    use std::time::Instant;
+
+    const REKEY_AFTER_SECS: u64 = 60;
+    let age = Duration::from_secs(REKEY_AFTER_SECS + crate::node::REKEY_JITTER_SECS as u64 + 1);
+    let mut cfg0 = Config::new();
+    cfg0.node.rekey.after_secs = REKEY_AFTER_SECS;
+    cfg0.node.rekey.after_messages = u64::MAX;
+    let mut cfg1 = Config::new();
+    cfg1.node.rekey.after_secs = u64::MAX;
+    cfg1.node.rekey.after_messages = u64::MAX;
+    let mut nodes = vec![
+        make_test_node_tcp_with(cfg0).await,
+        make_test_node_tcp_with(cfg1).await,
+    ];
+    initiate_handshake(&mut nodes, 0, 1).await;
+    drain_all_packets(&mut nodes, false).await;
+    let addr0 = *nodes[0].node.node_addr();
+    let addr1 = *nodes[1].node.node_addr();
+    assert!(nodes[0].node.get_peer(&addr1).is_some(), "node 0 peers");
+    let old_addr = nodes[1]
+        .node
+        .get_peer(&addr0)
+        .expect("node 1 peers")
+        .current_addr()
+        .cloned()
+        .unwrap();
+    nodes[0]
+        .node
+        .get_peer_mut(&addr1)
+        .unwrap()
+        .test_backdate_session_established(age);
+    nodes[1]
+        .node
+        .get_peer_mut(&addr0)
+        .unwrap()
+        .test_backdate_session_established(age);
+
+    // node 0's connection closes; node 1's receive task drops its end.
+    let node1_listen = nodes[1].addr.clone();
+    let t0 = nodes[0].transport_id;
+    let t1 = nodes[1].transport_id;
+    nodes[0]
+        .node
+        .transports
+        .get(&t0)
+        .unwrap()
+        .close_connection(&node1_listen)
+        .await;
+    let start = Instant::now();
+    while nodes[1]
+        .node
+        .transports
+        .get(&t1)
+        .unwrap()
+        .connection_state(&old_addr)
+        != ConnectionState::None
+    {
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "node 1 never dropped the closed connection"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // node 0's rekey: the tick retries until the msg1 goes out.
+    let start = Instant::now();
+    while !nodes[0].node.get_peer(&addr1).unwrap().rekey_in_progress() {
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "node 0's rekey msg1 never went out"
+        );
+        nodes[0].node.check_rekey().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // The msg1 reaches node 1 on the new connection, the msg2 node 0.
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        process_available_packets(&mut nodes).await;
+        if nodes[0]
+            .node
+            .get_peer(&addr1)
+            .unwrap()
+            .pending_new_session()
+            .is_some()
+        {
+            break;
+        }
+    }
+    let pending_idx = nodes[1]
+        .node
+        .get_peer(&addr0)
+        .unwrap()
+        .pending_our_index()
+        .expect("node 1 must answer the redialed rekey and hold its new session");
+    assert!(
+        nodes[0]
+            .node
+            .get_peer(&addr1)
+            .unwrap()
+            .pending_new_session()
+            .is_some(),
+        "node 0 must complete its rekey on the answer"
+    );
+
+    // node 0 cuts over; its first frame on the new session promotes node 1's
+    // pending and moves node 1's link to the new connection.
+    nodes[0].node.check_rekey().await;
+    nodes[0]
+        .node
+        .send_encrypted_link_message(&addr1, &[LinkMessageType::Heartbeat.to_byte()])
+        .await
+        .expect("node 0 sends on the new connection");
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        process_available_packets(&mut nodes).await;
+        if nodes[1].node.get_peer(&addr0).unwrap().our_index() == Some(pending_idx) {
+            break;
+        }
+    }
+    let peer = nodes[1].node.get_peer(&addr0).unwrap();
+    assert_eq!(
+        peer.our_index(),
+        Some(pending_idx),
+        "node 1 must promote the session it answered with"
+    );
+    assert_ne!(
+        peer.current_addr(),
+        Some(&old_addr),
+        "node 1's link must move to the new connection"
+    );
+    let took = start.elapsed();
+    println!("redial rekey completed {took:?} after node 0's first rekey tick");
+    assert!(
+        took < Duration::from_secs(5),
+        "the rekey took {took:?}; the link-dead reaper is 30 s"
+    );
+
+    cleanup_nodes(&mut nodes).await;
+}
