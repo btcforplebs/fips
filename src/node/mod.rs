@@ -3941,7 +3941,7 @@ impl Node {
                                 reason: format!("encryption failed: {}", e),
                             })?;
                             transport
-                                .send(&remote_addr, &wire)
+                                .send_existing(&remote_addr, &wire)
                                 .await
                                 .map_err(|e| link_send_error(*node_addr, e))?
                         }

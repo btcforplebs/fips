@@ -417,6 +417,7 @@ pub(crate) async fn proxied_receive_loop<S: ProxiedStats, M>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::wait_until;
     use crate::transport::packet_channel;
     use crate::transport::stream::{next_conn_id, park_writer};
     use portable_atomic::{AtomicU64, Ordering};
@@ -460,20 +461,6 @@ mod tests {
             established_at: Instant::now(),
             meta: (),
             id: next_conn_id(),
-        }
-    }
-
-    /// Poll `f` every 10ms until it holds or `limit` elapses.
-    async fn wait_until<F: FnMut() -> bool>(mut f: F, limit: Duration) -> bool {
-        let deadline = Instant::now() + limit;
-        loop {
-            if f() {
-                return true;
-            }
-            if Instant::now() >= deadline {
-                return false;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
 

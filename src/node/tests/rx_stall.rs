@@ -148,11 +148,7 @@ async fn prime_link(node: &Node, bh: &Blackhole) -> std::net::TcpStream {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     let (accepted, _) = bh.listener.accept().unwrap();
-    let accepted = std::net::TcpStream::from(accepted);
-    accepted
-        .set_read_timeout(Some(Duration::from_millis(1000)))
-        .unwrap();
-    accepted
+    std::net::TcpStream::from(accepted)
 }
 
 /// Close the node's connection to `bh` from the far end, after taking the
@@ -581,9 +577,6 @@ async fn msg1_resend_to_dead_outbound_leg_recovers_after_background_connect() {
     }
     let (accepted, _) = bh.listener.accept().unwrap();
     let mut accepted = std::net::TcpStream::from(accepted);
-    accepted
-        .set_read_timeout(Some(Duration::from_millis(1000)))
-        .unwrap();
     println!(
         "msg1 resend  sent after {:?} over the background connect",
         start.elapsed()

@@ -1286,45 +1286,11 @@ mod tests {
         dest.stop_async().await.unwrap();
     }
 
-    /// A destination TCP transport behind a mock SOCKS5 proxy, and a
-    /// started Nym transport pointed at the proxy.
-    async fn nym_behind_mock_proxy() -> (
-        NymTransport,
-        TcpTransport,
-        crate::transport::PacketRx,
-        TransportAddr,
-    ) {
-        let (dest_tx, dest_rx) = packet_channel(32);
-        let dest_config = TcpConfig {
-            bind_addr: Some("127.0.0.1:0".to_string()),
-            ..Default::default()
-        };
-        let mut dest = TcpTransport::new(TransportId::new(100), None, dest_config, dest_tx);
-        dest.start_async().await.unwrap();
-        let dest_addr = dest.local_addr().unwrap();
-
-        let mock = MockSocks5Server::new(dest_addr).await.unwrap();
-        let proxy_addr = mock.addr();
-        let _proxy_handle = mock.spawn();
-
-        let (tx, _rx) = packet_channel(32);
-        let config = NymConfig {
-            socks5_addr: Some(proxy_addr.to_string()),
-            startup_timeout_secs: Some(5),
-            connect_timeout_ms: Some(5000),
-            ..Default::default()
-        };
-        let mut t = NymTransport::new(TransportId::new(200), None, config, tx);
-        t.start_async().await.unwrap();
-        let target = TransportAddr::from_string(&dest_addr.to_string());
-        (t, dest, dest_rx, target)
-    }
-
     /// With no pooled connection and no connect under way, `send_existing`
     /// fails with `NotConnected` and opens nothing.
     #[tokio::test]
     async fn send_existing_without_connection_fails_fast_and_dials_nothing() {
-        let (mut t, mut dest, _dest_rx, target) = nym_behind_mock_proxy().await;
+        let (mut dest, _dest_rx, mut t, target) = nym_via_mock_proxy().await;
 
         let result = t.send_existing(&target, &build_msg1_frame()).await;
 
@@ -1352,7 +1318,7 @@ mod tests {
     /// carries the send, with no second connection opened.
     #[tokio::test]
     async fn send_existing_promotes_a_finished_background_connect_and_sends_on_it() {
-        let (mut t, mut dest, mut dest_rx, target) = nym_behind_mock_proxy().await;
+        let (mut dest, mut dest_rx, mut t, target) = nym_via_mock_proxy().await;
 
         t.connect_async(&target).await.unwrap();
         let mut waited = 0;

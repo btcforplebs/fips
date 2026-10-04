@@ -1996,6 +1996,8 @@ mod tests {
             // answer, not this node's inability to transmit.
             TransportError::Timeout,
             TransportError::ConnectionRefused,
+            // The connection is gone and nothing will bring it back.
+            TransportError::NotConnected,
         ] {
             assert!(
                 !terminal.is_transient(),

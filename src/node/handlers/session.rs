@@ -2930,7 +2930,7 @@ impl Node {
             debug!(next_hop = %next_hop_addr, "Transport gone before inline send of session data");
             return;
         };
-        if let Err(error) = transport.send(remote_addr, &wire).await {
+        if let Err(error) = transport.send_existing(remote_addr, &wire).await {
             debug!(next_hop = %next_hop_addr, %error, "Inline send of session data failed");
         }
     }
