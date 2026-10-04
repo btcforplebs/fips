@@ -619,7 +619,7 @@ impl Node {
     /// Process a single received packet.
     ///
     /// Dispatches based on the phase field in the 4-byte common prefix.
-    async fn process_packet(&mut self, packet: ReceivedPacket) {
+    pub(in crate::node) async fn process_packet(&mut self, packet: ReceivedPacket) {
         if packet.data.len() < COMMON_PREFIX_SIZE {
             return; // Drop packets too short for common prefix
         }

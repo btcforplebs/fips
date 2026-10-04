@@ -329,11 +329,15 @@ impl Node {
                         "Msg1 differs from the one the pending handshake at this address answered; starting a new handshake"
                     );
                 } else {
-                    // Genuinely pending handshake — resend msg2
+                    // Genuinely pending handshake — resend msg2. Like every
+                    // reply on the rx loop it never dials: with the msg1's
+                    // connection gone, a dial to its address (an inbound
+                    // connection's ephemeral port) would hold the loop for up
+                    // to the connect timeout.
                     let msg2_bytes = self.find_stored_msg2(existing_link_id);
                     if let Some(msg2) = msg2_bytes {
                         if let Some(transport) = self.transports.get(&packet.transport_id) {
-                            match transport.send(&packet.remote_addr, &msg2).await {
+                            match transport.send_existing(&packet.remote_addr, &msg2).await {
                                 Ok(_) => debug!(
                                     remote_addr = %packet.remote_addr,
                                     "Resent msg2 for duplicate msg1"
@@ -469,8 +473,15 @@ impl Node {
         machine.set_conn_handshake_msg1(packet.data.clone(), 0);
         self.peer_machines.insert(link_id, machine);
 
+        // The msg2 goes back on the msg1's connection and never dials: if that
+        // connection has closed, a dial to its address (for an inbound
+        // connection, the initiator's ephemeral port) would hold the rx loop
+        // for up to the connect timeout. The failure tears the leg down below.
         if let Some(transport) = self.transports.get(&packet.transport_id) {
-            match transport.send(&packet.remote_addr, &wire_msg2).await {
+            match transport
+                .send_existing(&packet.remote_addr, &wire_msg2)
+                .await
+            {
                 Ok(bytes) => {
                     debug!(
                         link_id = %link_id,
@@ -686,14 +697,18 @@ impl Node {
                                         peer.set_remote_epoch(remote_epoch);
                                     }
 
-                                    // Send msg3 before setting pending session
+                                    // Send msg3 before setting pending session.
+                                    // A reply on the rx loop, so it never dials;
+                                    // with the link's connection gone the send
+                                    // fails at once and the rekey is abandoned
+                                    // below, as on any send failure.
                                     let wire_msg3 =
                                         build_msg3(our_index, header.sender_idx, &msg3_bytes);
                                     let msg3_sent = if let (Some(tid), Some(addr)) =
                                         (transport_id, &remote_addr)
                                         && let Some(transport) = self.transports.get(&tid)
                                     {
-                                        match transport.send(addr, &wire_msg3).await {
+                                        match transport.send_existing(addr, &wire_msg3).await {
                                             Ok(_) => {
                                                 debug!(
                                                     peer = %display_name,
@@ -1117,12 +1132,17 @@ impl Node {
             return;
         }
 
-        // Build and send msg3
+        // Build and send msg3, on the msg2's connection. A reply on the rx
+        // loop, so it never dials: with that connection gone the send fails
+        // at once and the sweep reclaims the handshake, as on any send failure.
         let our_index = our_index.unwrap_or(header.receiver_idx);
         let wire_msg3 = build_msg3(our_index, header.sender_idx, &msg3_bytes);
 
         if let Some(transport) = self.transports.get(&packet.transport_id) {
-            match transport.send(&packet.remote_addr, &wire_msg3).await {
+            match transport
+                .send_existing(&packet.remote_addr, &wire_msg3)
+                .await
+            {
                 Ok(bytes) => {
                     debug!(
                         peer = %self.peer_display_name(&peer_node_addr),
@@ -1886,11 +1906,11 @@ impl Node {
                 // Not a rekey — duplicate handshake from same epoch. Resend the
                 // stored msg2 bytes as-is (a driver mechanism: replaying the
                 // stored frame, not rebuilding it), leaving the active peer
-                // untouched.
+                // untouched. On the msg3's connection, never dialing.
                 if let Some(msg2) = msg2
                     && let Some(transport) = self.transports.get(&packet.transport_id)
                 {
-                    match transport.send(&packet.remote_addr, &msg2).await {
+                    match transport.send_existing(&packet.remote_addr, &msg2).await {
                         Ok(_) => debug!(
                             peer = %self.peer_display_name(&peer_node_addr),
                             "Resent msg2 for duplicate handshake (same epoch)"

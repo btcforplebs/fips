@@ -4182,8 +4182,11 @@ impl Node {
             .get(&transport_id)
             .ok_or(NodeError::TransportNotFound(transport_id))?;
 
+        // The one caller answers a msg3 on the rx loop, so this never dials:
+        // a dial to the msg3's address, with its connection gone, would hold
+        // the loop for up to the connect timeout.
         transport
-            .send(remote_addr, &wire_packet)
+            .send_existing(remote_addr, &wire_packet)
             .await
             .map(|_| ())
             .map_err(|e| match e {

@@ -782,7 +782,7 @@ impl Node {
     /// connect-resolution). Anonymous discovery (no `peer_identity`) leaves
     /// identity to be learned from the XX msg2, which crystallizes it onto the
     /// leg-born machine.
-    pub(super) async fn start_handshake(
+    pub(in crate::node) async fn start_handshake(
         &mut self,
         link_id: LinkId,
         transport_id: TransportId,
@@ -877,9 +877,15 @@ impl Node {
         // already carry the msg1-prep provenance.
         self.peer_machines.insert(link_id, machine);
 
-        // Send the wire format handshake message
+        // Send the wire format handshake message. It never dials: if the
+        // connection the dial resolved to has gone, the send fails at once
+        // into the failure path below, after starting a background connect
+        // to the dial address.
         if let Some(transport) = self.transports.get(&transport_id) {
-            match transport.send(&remote_addr, &wire_msg1).await {
+            match self
+                .send_nowait(transport, link_id, &remote_addr, &wire_msg1)
+                .await
+            {
                 Ok(bytes) => {
                     debug!(
                         link_id = %link_id,

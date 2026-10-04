@@ -650,16 +650,20 @@ impl Node {
         }
 
         for (node_addr, payload) in to_resend {
-            let (transport_id, remote_addr) = match self.peers.get(&node_addr) {
+            let (link_id, transport_id, remote_addr) = match self.peers.get(&node_addr) {
                 Some(p) => match (p.transport_id(), p.current_addr()) {
-                    (Some(tid), Some(addr)) => (tid, addr.clone()),
+                    (Some(tid), Some(addr)) => (p.link_id(), tid, addr.clone()),
                     _ => continue,
                 },
                 None => continue,
             };
 
+            // A failed send records no resend, so the msg3 stays due and is
+            // retried next tick, over any connection the failed send started.
             let sent = if let Some(transport) = self.transports.get(&transport_id) {
-                transport.send(&remote_addr, &payload).await.is_ok()
+                self.send_nowait(transport, link_id, &remote_addr, &payload)
+                    .await
+                    .is_ok()
             } else {
                 false
             };
