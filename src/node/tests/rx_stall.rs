@@ -17,12 +17,13 @@
 //! it does not start toward an inbound peer's address, and that a later send
 //! uses the connection once it is up.
 //!
-//! The unanswered SYN is constructed locally: a listener with a backlog of
-//! zero whose single accept slot is already taken. Linux drops further SYNs to
-//! a listener whose accept queue is full, so a connect to it times out rather
-//! than being refused. `Blackhole::silent()` checks that before any test
-//! relies on it, which is what lets a regression show up at its real size:
-//! one connect timeout per reply, counted in `connect_timeouts`.
+//! The unanswered SYN is constructed locally by `Blackhole`: a listener whose
+//! accept queue is full, which Linux, macOS and Windows leave unanswered, or
+//! on FreeBSD a bound port with no listener and the kernel's blackhole
+//! settings on (see `Blackhole`). A connect to it times out rather than being
+//! refused. `Blackhole` checks that before any test relies on it, which is
+//! what lets a regression show up at its real size: one connect timeout per
+//! reply, counted in `connect_timeouts`.
 //!
 //! The tests print their measurements; run with `--nocapture` to see them.
 
@@ -36,7 +37,6 @@ use crate::transport::tcp::TcpTransport;
 use crate::transport::tcp::stats::TcpStatsSnapshot;
 use crate::transport::udp::UdpTransport;
 use crate::transport::{ConnectionState, PacketTx, TransportHandle, TransportId};
-use std::io::Read;
 use std::net::SocketAddr;
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -151,38 +151,42 @@ async fn prime_link(node: &Node, bh: &Blackhole) -> std::net::TcpStream {
     std::net::TcpStream::from(accepted)
 }
 
-/// Close the node's connection to `bh` from the far end, after taking the
-/// listener's accept slot so that any later dial to the address hangs.
+/// Close the node's connection to `bh` from the far end, after filling `bh`
+/// so that any later dial to the address hangs.
 async fn kill_link(node: &Node, bh: &mut Blackhole, accepted: std::net::TcpStream) {
     bh.fill();
     drop(accepted);
     wait_pool_gone(node, &bh.transport_addr()).await;
 }
 
-/// Read one frame's worth of bytes the node wrote to `far_end`, if any
-/// arrive within a second.
+/// Read one FMP frame the node wrote to `far_end`, if one arrives within
+/// `limit`.
 ///
-/// A TCP send only queues the frame for the connection's writer task, so the
-/// read must not block the test's runtime thread: it polls the socket and
-/// sleeps on the runtime between polls, which lets the writer run.
-async fn read_frame(far_end: &mut std::net::TcpStream) -> Option<Vec<u8>> {
-    far_end.set_nonblocking(true).expect("set_nonblocking");
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(1000);
-    let mut buf = [0u8; 2048];
-    let frame = loop {
-        match far_end.read(&mut buf) {
-            Ok(n) if n > 0 => break Some(buf[..n].to_vec()),
-            Err(e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    && tokio::time::Instant::now() < deadline =>
-            {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-            _ => break None,
-        }
-    };
+/// The frame is read by its own length, with the transport's frame reader,
+/// not by what one `read` returns: TCP may hand over two frames in one read or
+/// one across two, and which it does differs by kernel (FreeBSD delivered the
+/// announce that follows a msg2 in a read of its own, where Linux returned the
+/// two together). A TCP send only queues the frame for the connection's
+/// writer task, so the read must not block the test's runtime thread: it reads
+/// a tokio stream on a duplicate of the socket, which lets the writer run.
+async fn read_frame_within(far_end: &mut std::net::TcpStream, limit: Duration) -> Option<Vec<u8>> {
+    let dup = far_end.try_clone().expect("try_clone");
+    dup.set_nonblocking(true).expect("set_nonblocking");
+    let mut stream = tokio::net::TcpStream::from_std(dup).expect("from_std");
+    let frame = timeout(
+        limit,
+        crate::transport::framing::read_fmp_packet(&mut stream, u16::MAX),
+    )
+    .await;
+    // The duplicate shares the socket's file status flags, so blocking reads
+    // on `far_end` need the flag cleared again.
     far_end.set_nonblocking(false).expect("set_nonblocking");
-    frame
+    frame.ok().and_then(Result::ok)
+}
+
+/// [`read_frame_within`] a second.
+async fn read_frame(far_end: &mut std::net::TcpStream) -> Option<Vec<u8>> {
+    read_frame_within(far_end, Duration::from_millis(1000)).await
 }
 
 /// [`read_frame`] on `far_end` when there is one.
@@ -191,6 +195,17 @@ async fn read_maybe(far_end: Option<&mut std::net::TcpStream>) -> Option<Vec<u8>
         Some(stream) => read_frame(stream).await,
         None => None,
     }
+}
+
+/// Read and discard every frame the node writes to `far_end` until none
+/// arrives for a while, so a later read sees only what a later send wrote.
+/// Promotion follows the msg2 with link announces, which would otherwise be
+/// read in place of the frame a test is waiting for.
+async fn drain_frames(far_end: &mut std::net::TcpStream) {
+    while read_frame_within(far_end, Duration::from_millis(200))
+        .await
+        .is_some()
+    {}
 }
 
 /// What one handler call against a TCP reply address did.
@@ -366,9 +381,12 @@ async fn peer_on_tcp(bh: &Blackhole) -> (Node, Identity, NodeAddr, std::net::Tcp
     assert_eq!(p.transport_id(), Some(TransportId::new(TCP_ID)));
     assert_eq!(p.current_addr(), Some(&link));
     assert!(
-        read_frame(&mut far_end).await.is_some(),
+        read_frame(&mut far_end)
+            .await
+            .is_some_and(|f| CommonPrefix::parse(&f).is_some_and(|p| p.phase == PHASE_MSG2)),
         "the msg2 went out on the connection"
     );
+    drain_frames(&mut far_end).await;
     (node, sender, sender_addr, far_end)
 }
 
@@ -559,8 +577,8 @@ async fn msg1_resend_to_dead_outbound_leg_recovers_after_background_connect() {
         "no background connect toward the dial address"
     );
 
-    // The address starts answering: empty the accept queue, and the
-    // background connect's retransmitted SYN completes.
+    // The address starts answering (`Blackhole::drain`), and the background
+    // connect's retransmitted SYN completes.
     let _filler_ends = bh.drain();
     let start = Instant::now();
     let mut tick = 1;

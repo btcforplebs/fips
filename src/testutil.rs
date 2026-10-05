@@ -99,12 +99,22 @@ pub(crate) async fn wait_until<F: FnMut() -> bool>(mut f: F, limit: std::time::D
 /// A local TCP address whose SYNs go unanswered once filled.
 ///
 /// A listener with a backlog of one whose accept queue is filled: Linux,
-/// macOS and the BSDs drop further SYNs to a listener whose accept queue is
+/// macOS and Windows drop further SYNs to a listener whose accept queue is
 /// full, so a connect to it times out rather than completing or being
 /// refused. How many connects the queue takes before it is full differs by
 /// kernel (one on Linux, more on macOS), so filling stops at the first
 /// connect that times out. The listener and the fillers must be kept alive
 /// for as long as that is relied on.
+///
+/// FreeBSD answers a SYN to a full queue from its syncache and then resets
+/// the connection, so its queue never goes silent. There, filling replaces
+/// the listener with a socket bound to the same address that does not
+/// listen, and the kernel must be set not to reset a SYN to a port nobody
+/// listens on: `net.inet.tcp.blackhole=2` and `net.inet.tcp.blackhole_local=1`
+/// (root). Those settings also stop every refused connect on the host, so a
+/// test that needs one cannot run in the same pass; the FreeBSD package
+/// workflow runs the tests that use a filled `Blackhole` in a pass of their
+/// own.
 pub(crate) struct Blackhole {
     pub(crate) listener: socket2::Socket,
     fillers: Vec<std::net::TcpStream>,
@@ -143,6 +153,7 @@ impl Blackhole {
     /// Fill the listener's accept queue, stopping at the first connect that
     /// times out, which shows a further connect now times out instead of
     /// completing or being refused.
+    #[cfg(not(target_os = "freebsd"))]
     pub(crate) fn fill(&mut self) {
         const MAX_FILLERS: usize = 64;
         for _ in 0..=MAX_FILLERS {
@@ -163,11 +174,43 @@ impl Blackhole {
     /// answers again: the next connect to it, or the next retransmitted SYN
     /// of one already waiting, completes. Returns the accepted far ends,
     /// which the caller keeps alive while it relies on that.
+    #[cfg(not(target_os = "freebsd"))]
     pub(crate) fn drain(&mut self) -> Vec<std::net::TcpStream> {
         self.fillers
             .iter()
             .map(|_| std::net::TcpStream::from(self.listener.accept().unwrap().0))
             .collect()
+    }
+
+    /// Close the listener and bind a socket that does not listen to the same
+    /// address, then check that a connect to it now times out. Connections
+    /// the listener already accepted are left as they are.
+    #[cfg(target_os = "freebsd")]
+    pub(crate) fn fill(&mut self) {
+        use socket2::{Domain, Socket, Type};
+        let quiet = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+        quiet.set_reuse_address(true).unwrap();
+        drop(std::mem::replace(&mut self.listener, quiet));
+        self.listener.bind(&self.addr.into()).unwrap();
+        let probe =
+            std::net::TcpStream::connect_timeout(&self.addr, std::time::Duration::from_millis(200));
+        match probe {
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {}
+            other => panic!(
+                "blackhole is not silent: probe connect returned {other:?}; on FreeBSD \
+                 this needs net.inet.tcp.blackhole=2 and net.inet.tcp.blackhole_local=1, \
+                 and a test using it belongs in package-freebsd.yml's blackhole pass"
+            ),
+        }
+    }
+
+    /// Start listening on the bound socket, so the address answers again: the
+    /// next connect to it, or the next retransmitted SYN of one already
+    /// waiting, completes. Nothing was queued, so there are no far ends.
+    #[cfg(target_os = "freebsd")]
+    pub(crate) fn drain(&mut self) -> Vec<std::net::TcpStream> {
+        self.listener.listen(1).unwrap();
+        Vec::new()
     }
 
     /// The address in the transport form.
