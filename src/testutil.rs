@@ -28,11 +28,12 @@ pub(crate) fn make_node_addr(val: u8) -> NodeAddr {
 /// gets to say yes. Lib tests must not set a tracing global default of their
 /// own; use [`capture_logs`] or [`capture_logs_scoped`].
 ///
-/// One case is still open: a thread that registers a callsite while the
-/// quiet default is being installed can read "no global" and store "never"
-/// after the first capture has already rebuilt interest. Closing it would
-/// mean installing the default before any test runs, which libtest has no
-/// hook for.
+/// One case is still open: a thread that began registering a callsite before
+/// the quiet default was installed can store "never" after the first capture
+/// has already rebuilt interest. The next capture's registration rebuilds it
+/// again and clears that, so only a capture live at that moment can lose an
+/// event. Closing it would mean installing the default before any test runs,
+/// which libtest has no hook for.
 #[derive(Clone, Default)]
 pub(crate) struct LogCapture(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
 
@@ -326,15 +327,34 @@ mod tests {
 
     /// Once a capture has run, a thread with no subscriber of its own falls
     /// back to the quiet default rather than to no subscriber at all. Fails in
-    /// any process, whatever else is running, if the capture helpers stop
+    /// any process, whatever else is running, if both capture helpers stop
     /// installing it.
     #[test]
     fn a_thread_without_a_subscriber_gets_the_quiet_default() {
         let ((), _logs) = capture_logs(|| ());
-        let quiet =
-            std::thread::spawn(|| tracing::dispatcher::get_default(|d| d.is::<QuietDefault>()))
-                .join()
-                .unwrap();
-        assert!(quiet, "the capture helpers did not install QuietDefault");
+        assert!(
+            other_thread_sees_quiet_default(),
+            "capture_logs did not install QuietDefault"
+        );
+    }
+
+    /// The same for [`capture_logs_scoped`]. Run alone it fails if that
+    /// helper stops installing the default; in the full suite any
+    /// `capture_logs` call installs it first, so there it cannot tell.
+    #[test]
+    fn a_thread_without_a_subscriber_gets_the_quiet_default_after_a_scoped_capture() {
+        let (_logs, _guard) = capture_logs_scoped();
+        assert!(
+            other_thread_sees_quiet_default(),
+            "capture_logs_scoped did not install QuietDefault"
+        );
+    }
+
+    /// Whether a fresh thread, with no subscriber of its own, falls back to
+    /// [`QuietDefault`].
+    fn other_thread_sees_quiet_default() -> bool {
+        std::thread::spawn(|| tracing::dispatcher::get_default(|d| d.is::<QuietDefault>()))
+            .join()
+            .unwrap()
     }
 }
