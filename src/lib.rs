@@ -14,12 +14,14 @@ pub mod config;
 pub mod control;
 #[cfg(target_os = "linux")]
 pub mod gateway;
+pub mod hosts;
 pub mod identity;
 // Declared before `node` (and named to sort there) because it carries
 // `#[macro_use]`: the tick instrumentation macro must be in scope for the
 // modules that follow.
 #[macro_use]
 pub(crate) mod instr;
+pub mod ipv6tun;
 pub mod mdns;
 pub mod native;
 pub mod node;
@@ -34,9 +36,12 @@ pub(crate) mod proto;
 pub(crate) mod testutil;
 mod time;
 pub mod transport;
-pub mod upper;
 pub mod utils;
 pub mod version;
+
+// `upper` is the former name of `ipv6tun`; the alias keeps `crate::upper::`
+// and `fips::upper::` paths resolving.
+pub use ipv6tun as upper;
 
 // Re-export identity types
 pub use identity::{

@@ -7,9 +7,14 @@
 
 pub mod config;
 pub mod dns;
-pub mod hosts;
 pub mod icmp;
 pub mod icmp_rate_limit;
 pub mod ipv6_shim;
+pub(crate) mod lifecycle;
+pub(crate) mod outbound;
 pub mod tcp_mss;
 pub mod tun;
+
+// The hosts file moved to `crate::hosts`; re-exported so `crate::upper::hosts`
+// and `fips::upper::hosts` still resolve.
+pub use crate::hosts;

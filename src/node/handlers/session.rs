@@ -6,6 +6,8 @@
 //! encrypted data, and error signals (CoordsRequired, PathBroken).
 
 use crate::NodeAddr;
+use crate::ipv6tun::icmp::IcmpContext;
+use crate::ipv6tun::outbound::{Mesh, Outcome, Route};
 use crate::node::handlers::mmp::format_throughput;
 use crate::node::rate_limit::Msg1Class;
 use crate::node::reject::{RejectReason, SessionReject};
@@ -462,7 +464,7 @@ impl Node {
                                     mark_ipv6_ecn_ce(&mut packet);
                                     self.metrics().congestion.ce_received.inc();
                                 }
-                                if let Some(tun_tx) = &self.supervisor.tun_tx {
+                                if let Some(tun_tx) = &self.supervisor.ipv6tun.tun_tx {
                                     if let Err(e) = tun_tx.send(packet) {
                                         debug!(error = %e, "Failed to deliver decompressed IPv6 packet to TUN");
                                     }
@@ -3242,63 +3244,44 @@ impl Node {
 
     /// Handle an outbound IPv6 packet from the TUN reader.
     ///
-    /// Extracts the destination FipsAddress, looks up the NodeAddr and PublicKey
-    /// from the identity cache, and either sends through an established session
-    /// or initiates a new one (queuing the packet until established).
+    /// The host-side checks and ICMPv6 replies are in
+    /// [`crate::ipv6tun::outbound::forward`], which reaches back into the
+    /// node through its [`Mesh`] impl: the destination prefix is resolved
+    /// in the identity cache, and the packet is sent on an established
+    /// session or queued while one is set up.
     ///
     /// Also performs MTU checking: if the packet (plus FIPS overhead) exceeds
     /// the transport MTU, an ICMP Packet Too Big message is sent back to the
     /// source and the packet is dropped.
     pub(in crate::node) async fn handle_tun_outbound(&mut self, ipv6_packet: Vec<u8>) {
-        // Validate IPv6 header
-        if ipv6_packet.len() < 40 || ipv6_packet[0] >> 4 != 6 {
-            return;
-        }
+        crate::ipv6tun::outbound::forward(self, ipv6_packet).await;
+    }
 
-        // Check if packet will fit after FIPS encapsulation
-        let effective_mtu = self.effective_ipv6_mtu() as usize;
-        if ipv6_packet.len() > effective_mtu {
-            self.send_icmpv6_packet_too_big(&ipv6_packet, effective_mtu as u32);
-            return;
-        }
-
-        // Extract destination FipsAddress prefix (IPv6 dest bytes 1-15)
-        // IPv6 header: bytes 24-39 are dest addr, so prefix = bytes 25-39
-        let mut prefix = [0u8; 15];
-        prefix.copy_from_slice(&ipv6_packet[25..40]);
-
-        // Look up in identity cache
-        let (dest_addr, dest_pubkey) = match self.lookup_by_fips_prefix(&prefix) {
-            Some((addr, pk)) => (addr, pk),
-            None => {
-                self.send_icmpv6_dest_unreachable(&ipv6_packet);
-                return;
-            }
-        };
-
+    /// Send a TUN packet to a resolved destination, or queue it while the
+    /// destination's session is set up.
+    ///
+    /// Sends through an established session, queues behind one still being
+    /// set up, and otherwise initiates a session and queues. With no route
+    /// for the initiation it starts discovery and still queues. Refuses the
+    /// packet, handing it back, when a new session would exceed the session
+    /// table.
+    async fn send_outbound(
+        &mut self,
+        dest_addr: NodeAddr,
+        dest_pubkey: PublicKey,
+        ipv6_packet: Vec<u8>,
+    ) -> Outcome {
         // Check for established session
         if let Some(entry) = self.sessions.get(&dest_addr) {
             if entry.is_established() {
-                // Check per-destination path MTU learned from MtuExceeded signals.
-                // The first oversized packet is forwarded normally and triggers
-                // the MtuExceeded signal; subsequent packets are caught here and
-                // generate ICMPv6 Packet Too Big back to the application.
-                if let Some(mmp) = entry.mmp() {
-                    let path_mtu = mmp.path_mtu.current_mtu();
-                    let path_ipv6_mtu = crate::upper::icmp::effective_ipv6_mtu(path_mtu) as usize;
-                    if path_ipv6_mtu < effective_mtu && ipv6_packet.len() > path_ipv6_mtu {
-                        self.send_icmpv6_packet_too_big(&ipv6_packet, path_ipv6_mtu as u32);
-                        return;
-                    }
-                }
                 if let Err(e) = self.send_ipv6_packet(&dest_addr, &ipv6_packet).await {
                     debug!(dest = %self.peer_display_name(&dest_addr), error = %e, "Failed to send TUN packet via session");
                 }
-                return;
+                return Outcome::Sent;
             }
             // Session exists but not yet established — queue the packet
             self.queue_pending_packet(dest_addr, ipv6_packet);
-            return;
+            return Outcome::Queued;
         }
 
         // No session, so this one would grow the table. Answer the local
@@ -3308,8 +3291,7 @@ impl Node {
         // queued packet, which is outbound traffic on a node already at its
         // limit.
         if !self.admit_new_session(&dest_addr) {
-            self.send_icmpv6_dest_unreachable(&ipv6_packet);
-            return;
+            return Outcome::TableFull(ipv6_packet);
         }
 
         // No session: initiate one and queue the packet.
@@ -3319,71 +3301,21 @@ impl Node {
             debug!(dest = %self.peer_display_name(&dest_addr), error = %e, "Failed to initiate session, trying discovery");
             self.maybe_initiate_lookup(&dest_addr).await;
             self.queue_pending_packet(dest_addr, ipv6_packet);
-            return;
+            return Outcome::Queued;
         }
         self.queue_pending_packet(dest_addr, ipv6_packet);
+        Outcome::Queued
     }
 
-    /// Send ICMPv6 Destination Unreachable back through TUN.
-    pub(in crate::node) fn send_icmpv6_dest_unreachable(&self, original_packet: &[u8]) {
-        use crate::FipsAddress;
-        use crate::upper::icmp::{
-            DestUnreachableCode, build_dest_unreachable, should_send_icmp_error,
-        };
-
-        if !should_send_icmp_error(original_packet) {
-            return;
-        }
-
-        let our_ipv6 = FipsAddress::from_node_addr(self.node_addr()).to_ipv6();
-        if let Some(response) =
-            build_dest_unreachable(original_packet, DestUnreachableCode::NoRoute, our_ipv6)
-            && let Some(tun_tx) = &self.supervisor.tun_tx
-        {
-            let _ = tun_tx.send(response);
-        }
-    }
-
-    /// Send ICMPv6 Packet Too Big back through TUN.
-    ///
-    /// Rate-limited per source address to prevent ICMP floods from
-    /// misconfigured applications sending repeated oversized packets.
-    pub(in crate::node) fn send_icmpv6_packet_too_big(&mut self, original_packet: &[u8], mtu: u32) {
-        use crate::upper::icmp::build_packet_too_big;
-        use std::net::Ipv6Addr;
-
-        // Extract source address for rate limiting
-        if original_packet.len() < 40 {
-            return;
-        }
-        let src_addr = Ipv6Addr::from(<[u8; 16]>::try_from(&original_packet[8..24]).unwrap());
-
-        // Rate limit ICMP PTB messages per source
-        if !self.icmp_rate_limiter.should_send(src_addr) {
-            debug!(
-                src = %src_addr,
-                "Rate limiting ICMP Packet Too Big"
-            );
-            return;
-        }
-
-        // Use the original packet's *destination* as the ICMP source so the
-        // kernel sees the PTB coming from a remote router, not from itself.
-        // Linux ignores PTBs whose source matches a local address, which
-        // causes a PMTUD blackhole when both src and ICMP-src are local.
-        let dest_addr = Ipv6Addr::from(<[u8; 16]>::try_from(&original_packet[24..40]).unwrap());
-        if let Some(response) = build_packet_too_big(original_packet, mtu, dest_addr)
-            && let Some(tun_tx) = &self.supervisor.tun_tx
-        {
-            debug!(
-                original_src = %src_addr,
-                original_dst = %dest_addr,
-                packet_size = original_packet.len(),
-                reported_mtu = mtu,
-                "Sending ICMP Packet Too Big"
-            );
-            let _ = tun_tx.send(response);
-        }
+    /// Borrow the host-facing ICMPv6 sender: the TUN channel, our address
+    /// and the Packet Too Big rate limiter.
+    pub(in crate::node) fn host_icmp(&mut self) -> IcmpContext<'_> {
+        let our_ipv6 = crate::FipsAddress::from_node_addr(self.node_addr()).to_ipv6();
+        IcmpContext::new(
+            self.supervisor.ipv6tun.tun_tx.as_ref(),
+            our_ipv6,
+            &mut self.icmp_rate_limiter,
+        )
     }
 
     /// Queue a packet while waiting for session establishment.
@@ -3451,5 +3383,38 @@ impl Node {
                 debug!(dest = %self.peer_display_name(&dest_addr), error = %e, "Session retry after discovery failed");
             }
         }
+    }
+}
+
+/// The mesh side of TUN outbound forwarding.
+impl Mesh for Node {
+    type Dest = (NodeAddr, PublicKey);
+
+    fn ipv6_mtu(&self) -> u16 {
+        self.effective_ipv6_mtu()
+    }
+
+    fn resolve(&mut self, prefix: &[u8; 15]) -> Option<Route<Self::Dest>> {
+        // Look up in identity cache
+        let (dest_addr, dest_pubkey) = self.lookup_by_fips_prefix(prefix)?;
+        let path_mtu = self
+            .sessions
+            .get(&dest_addr)
+            .filter(|entry| entry.is_established())
+            .and_then(|entry| entry.mmp())
+            .map(|mmp| mmp.path_mtu.current_mtu());
+        Some(Route {
+            dest: (dest_addr, dest_pubkey),
+            path_mtu,
+        })
+    }
+
+    fn send(&mut self, dest: Self::Dest, packet: Vec<u8>) -> impl Future<Output = Outcome> + Send {
+        let (dest_addr, dest_pubkey) = dest;
+        self.send_outbound(dest_addr, dest_pubkey, packet)
+    }
+
+    fn icmp(&mut self) -> IcmpContext<'_> {
+        self.host_icmp()
     }
 }
