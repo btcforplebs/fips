@@ -3383,8 +3383,9 @@ impl Node {
     /// Retry session initiation after discovery provided coordinates.
     ///
     /// Called when a LookupResponse arrives and we have pending TUN packets
-    /// for the discovered target. The coord_cache now has coords, so
-    /// `find_next_hop()` should succeed and the SessionSetup can be sent.
+    /// or native datagrams for the discovered target. The coord_cache now
+    /// has coords, so `find_next_hop()` should succeed and the SessionSetup
+    /// can be sent.
     pub(in crate::node) async fn retry_session_after_discovery(&mut self, dest_addr: NodeAddr) {
         // Look up the destination's public key from the identity cache
         let mut prefix = [0u8; 15];

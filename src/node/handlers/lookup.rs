@@ -483,13 +483,17 @@ impl Node {
                     }
                 }
                 LookupAction::RetryQueuedPackets { target } => {
-                    // If we have pending TUN packets for this target, retry session
-                    // initiation. The coord_cache now has coords, so find_next_hop()
-                    // should succeed.
-                    if let Some(packets) = self.pending_tun_packets.get(&target) {
+                    // If we hold TUN packets or native datagrams for this target,
+                    // retry session initiation. The coord_cache now has coords, so
+                    // find_next_hop() should succeed. Native datagrams are held in
+                    // their own queue, and nothing else re-initiates for them.
+                    let packets = self.pending_tun_packets.get(&target).map(|q| q.len());
+                    let native = self.pending_native.get(&target).map(|q| q.len());
+                    if packets.is_some() || native.is_some() {
                         debug!(
                             dest = %self.peer_display_name(&target),
-                            queued_packets = packets.len(),
+                            queued_packets = packets.unwrap_or(0),
+                            queued_native = native.unwrap_or(0),
                             "Retrying queued packets after discovery"
                         );
                         self.retry_session_after_discovery(target).await;
