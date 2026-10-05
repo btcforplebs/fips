@@ -24,12 +24,13 @@
 //! frames off the socket and answers them with the XX messages a peer would
 //! send.
 //!
-//! The unanswered SYN is constructed locally: a listener with a backlog of
-//! zero whose single accept slot is already taken. Linux drops further SYNs to
-//! a listener whose accept queue is full, so a connect to it times out rather
-//! than being refused. `Blackhole::silent()` checks that before any test
-//! relies on it, which is what lets a regression show up at its real size:
-//! one connect timeout per reply, counted in `connect_timeouts`.
+//! The unanswered SYN is constructed locally by `Blackhole`: a listener whose
+//! accept queue is full, which Linux, macOS and Windows leave unanswered, or
+//! on FreeBSD a bound port with no listener and the kernel's blackhole
+//! settings on (see `Blackhole`). A connect to it times out rather than being
+//! refused. `Blackhole` checks that before any test relies on it, which is
+//! what lets a regression show up at its real size: one connect timeout per
+//! reply, counted in `connect_timeouts`.
 //!
 //! The tests print their measurements; run with `--nocapture` to see them.
 
@@ -238,8 +239,8 @@ async fn prime_link(node: &Node, bh: &Blackhole) -> TcpStream {
     accept_end(bh)
 }
 
-/// Close the node's connection to `bh` from the far end, after taking the
-/// listener's accept slot so that any later dial to the address hangs.
+/// Close the node's connection to `bh` from the far end, after filling `bh`
+/// so that any later dial to the address hangs.
 async fn kill_link(node: &Node, bh: &mut Blackhole, far_end: TcpStream) {
     bh.fill();
     drop(far_end);
@@ -695,8 +696,8 @@ async fn msg1_resend_to_dead_outbound_leg_recovers_after_background_connect() {
         "no background connect toward the dial address"
     );
 
-    // The address starts answering: empty the accept queue, and the
-    // background connect's retransmitted SYN completes.
+    // The address starts answering (`Blackhole::drain`), and the background
+    // connect's retransmitted SYN completes.
     let _filler_ends = bh.drain();
     let start = Instant::now();
     let mut tick = 1;
