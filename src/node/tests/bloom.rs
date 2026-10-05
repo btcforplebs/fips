@@ -2113,3 +2113,45 @@ async fn test_tree_lost_announce_is_resent_after_the_fallback_when_no_receiver_r
     );
     cleanup_nodes(&mut line.nodes).await;
 }
+
+/// The filter-announce debounce is stamped on the monotonic clock, so a step
+/// back of the wall clock cannot hold announces for the size of the step.
+#[tokio::test]
+async fn filter_announce_debounce_stamps_the_monotonic_clock() {
+    let mut nodes = run_tree_test(2, &[(0, 1)], false).await;
+    let peer = *nodes[1].node.node_addr();
+    let node = &mut nodes[0].node;
+
+    node.bloom_state.set_update_debounce_ms(0);
+    node.bloom_state.mark_update_needed(peer);
+    let sent = node.metrics().bloom.sent.get();
+    let before = crate::time::mono_ms();
+    node.send_pending_filter_announces().await;
+    let after = crate::time::mono_ms();
+
+    assert_eq!(
+        node.metrics().bloom.sent.get(),
+        sent + 1,
+        "setup: the pending announce must be sent"
+    );
+    let stamp = node.bloom_state.last_update_sent(&peer);
+    assert!(
+        stamp.is_some_and(|t| before <= t && t <= after),
+        "stamp {stamp:?} not in [{before}, {after}]"
+    );
+
+    // Regression guard for the ready-set read: with the debounce window
+    // still open, the peer must not even reach the send path, where the
+    // re-check would count it as suppressed.
+    node.bloom_state.set_update_debounce_ms(60_000);
+    node.bloom_state.mark_update_needed(peer);
+    let suppressed = node.metrics().bloom.debounce_suppressed.get();
+    node.send_pending_filter_announces().await;
+    assert_eq!(
+        node.metrics().bloom.debounce_suppressed.get(),
+        suppressed,
+        "a peer inside the debounce window must not enter the ready set"
+    );
+
+    cleanup_nodes(&mut nodes).await;
+}

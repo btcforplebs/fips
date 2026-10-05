@@ -128,13 +128,20 @@ impl BloomState {
     }
 
     /// Check if we should send an update to a peer (respecting debounce).
+    ///
+    /// A time earlier than the last send permits the send rather than holding
+    /// the update until the clock catches up; the send then restamps and the
+    /// ordinary debounce resumes. The comparison takes a difference rather
+    /// than adding the debounce, so a very large debounce cannot overflow.
     pub fn should_send_update(&self, peer_id: &NodeAddr, current_time_ms: u64) -> bool {
         if !self.pending_updates.contains(peer_id) {
             return false;
         }
 
         match self.last_update_sent.get(peer_id) {
-            Some(&last_time) => current_time_ms >= last_time + self.update_debounce_ms,
+            Some(&last_time) => current_time_ms
+                .checked_sub(last_time)
+                .is_none_or(|elapsed| elapsed >= self.update_debounce_ms),
             None => true,
         }
     }
@@ -143,6 +150,12 @@ impl BloomState {
     pub fn record_update_sent(&mut self, peer_id: NodeAddr, current_time_ms: u64) {
         self.last_update_sent.insert(peer_id, current_time_ms);
         self.pending_updates.remove(&peer_id);
+    }
+
+    /// Read back the time of the last update sent to a peer, if any.
+    #[cfg(test)]
+    pub(crate) fn last_update_sent(&self, peer_id: &NodeAddr) -> Option<u64> {
+        self.last_update_sent.get(peer_id).copied()
     }
 
     /// Clear all pending updates.
