@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
+#[cfg(target_os = "linux")]
 use std::time::Duration;
 
 use nostr::nips::nip17;
@@ -14,10 +15,12 @@ use super::signal::{
     estimate_clock_skew, validate_offer_freshness, validate_traversal_answer_for_offer,
 };
 use super::stun::{parse_stun_binding_success, parse_stun_url};
+#[cfg(target_os = "linux")]
+use super::traversal::run_punch_attempt;
 use super::traversal::{
     PunchStrategy, SourceRank, build_punch_packet, is_doc_ip, is_never_punchable_ip, is_private_ip,
     now_ms, parse_punch_packet, plan_punch_targets, planned_remote_endpoints, rank_punch_source,
-    run_punch_attempt, session_hash,
+    session_hash,
 };
 use super::traversal_machine::suppress_responder_for_own_initiator;
 use super::types::BootstrapError;
@@ -1401,6 +1404,7 @@ fn punch_socket(host: &str) -> std::net::UdpSocket {
 
 /// A hint that starts punching immediately. `start_at_ms` is absolute wall
 /// clock, so anything plausible-looking in the future would sleep out the test.
+#[cfg(target_os = "linux")]
 fn immediate_punch_hint(duration_ms: u64) -> PunchHint {
     PunchHint {
         start_at_ms: 0,

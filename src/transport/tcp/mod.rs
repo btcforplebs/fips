@@ -1537,6 +1537,7 @@ mod tests {
 
     /// Listener on every local address, so that two connections can reach
     /// it from one source port on two different local addresses.
+    #[cfg(target_os = "linux")]
     fn wildcard_config() -> TcpConfig {
         TcpConfig {
             bind_addr: Some("0.0.0.0:0".to_string()),
