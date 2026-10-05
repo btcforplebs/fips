@@ -15,6 +15,25 @@ pub(crate) fn make_node_addr(val: u8) -> NodeAddr {
 /// greps on is part of the contract even when no counter or return value
 /// carries it. Installed with `tracing::subscriber::with_default`, which is
 /// thread-local, so tests running in parallel do not see each other's events.
+///
+/// Thread-local capture alone is not enough. tracing caches whether anyone is
+/// interested in a callsite when the callsite is first used, and while a
+/// single subscriber exists it asks only the thread that got there first. A
+/// test thread with no subscriber of its own falls back to the global
+/// default, and with none set that answers "never", so a capture on another
+/// thread that later reaches the same callsite never sees its event. The
+/// capture helpers therefore install a quiet global default once per test
+/// process. It records nothing, but it answers "sometimes", so the callsite
+/// is checked again on every event and the capturing thread's subscriber
+/// gets to say yes. Lib tests must not set a tracing global default of their
+/// own; use [`capture_logs`] or [`capture_logs_scoped`].
+///
+/// One case is still open: a thread that began registering a callsite before
+/// the quiet default was installed can store "never" after the first capture
+/// has already rebuilt interest. The next capture's registration rebuilds it
+/// again and clears that, so only a capture live at that moment can lose an
+/// event. Closing it would mean installing the default before any test runs,
+/// which libtest has no hook for.
 #[derive(Clone, Default)]
 pub(crate) struct LogCapture(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
 
@@ -55,10 +74,64 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for LogCapture {
     }
 }
 
+/// The process-wide default the capture helpers install; see [`LogCapture`].
+///
+/// Interested in every callsite but enabled for none, so it records nothing
+/// and never makes tracing cache a callsite as uninteresting.
+struct QuietDefault;
+
+impl tracing::Subscriber for QuietDefault {
+    fn register_callsite(
+        &self,
+        _: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        tracing::subscriber::Interest::sometimes()
+    }
+
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        false
+    }
+
+    fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+        None
+    }
+
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+    fn event(&self, _: &tracing::Event<'_>) {}
+
+    fn enter(&self, _: &tracing::span::Id) {}
+
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// Install [`QuietDefault`] as the global default, once per test process.
+///
+/// Panics, on every call, if another global default got there first: capture
+/// is then no longer reliable, and a quiet fallback here would bring back the
+/// lost-event race without saying so.
+fn install_quiet_default() {
+    static INSTALLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let installed =
+        *INSTALLED.get_or_init(|| tracing::subscriber::set_global_default(QuietDefault).is_ok());
+    assert!(
+        installed,
+        "another tracing global default was set in the lib tests, so log capture \
+         is no longer reliable; capture logs with testutil::capture_logs instead"
+    );
+}
+
 /// Run `f` with a capturing subscriber installed, returning its value and the capture.
 pub(crate) fn capture_logs<T>(f: impl FnOnce() -> T) -> (T, LogCapture) {
     use tracing_subscriber::layer::SubscriberExt;
 
+    install_quiet_default();
     let capture = LogCapture::default();
     let subscriber = tracing_subscriber::registry().with(capture.clone());
     let out = tracing::subscriber::with_default(subscriber, f);
@@ -73,6 +146,7 @@ pub(crate) fn capture_logs<T>(f: impl FnOnce() -> T) -> (T, LogCapture) {
 pub(crate) fn capture_logs_scoped() -> (LogCapture, tracing::subscriber::DefaultGuard) {
     use tracing_subscriber::layer::SubscriberExt;
 
+    install_quiet_default();
     let capture = LogCapture::default();
     let subscriber = tracing_subscriber::registry().with(capture.clone());
     let guard = tracing::subscriber::set_default(subscriber);
@@ -216,5 +290,71 @@ impl Blackhole {
     /// The address in the transport form.
     pub(crate) fn transport_addr(&self) -> crate::transport::TransportAddr {
         crate::transport::TransportAddr::from_string(&self.addr.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The only use of this `warn!` callsite, so the test below controls
+    /// which thread reaches it first.
+    fn emit() {
+        tracing::warn!("first emitted elsewhere");
+    }
+
+    /// A callsite first reached by a thread with no subscriber while a
+    /// capture is live must still reach the capture when the capturing thread
+    /// emits it.
+    ///
+    /// tracing-core caches a callsite's interest when it is first used. If
+    /// the thread that registers it falls back to no subscriber at all, the
+    /// cached interest is `never`, and the capturing thread's event is
+    /// dropped before its subscriber sees it. Run alone, this test fails
+    /// every time without the quiet global default. In the full suite it
+    /// fails only when no other capture is live as it runs, so there it
+    /// guards the fix without being certain to catch its removal;
+    /// `a_thread_without_a_subscriber_gets_the_quiet_default` is the
+    /// deterministic guard.
+    #[test]
+    fn capture_sees_a_warning_first_emitted_by_a_thread_without_a_subscriber() {
+        let ((), logs) = capture_logs(|| {
+            std::thread::spawn(emit).join().unwrap();
+            emit();
+        });
+        assert_eq!(logs.warnings().len(), 1, "{:?}", logs.lines());
+    }
+
+    /// Once a capture has run, a thread with no subscriber of its own falls
+    /// back to the quiet default rather than to no subscriber at all. Fails in
+    /// any process, whatever else is running, if both capture helpers stop
+    /// installing it.
+    #[test]
+    fn a_thread_without_a_subscriber_gets_the_quiet_default() {
+        let ((), _logs) = capture_logs(|| ());
+        assert!(
+            other_thread_sees_quiet_default(),
+            "capture_logs did not install QuietDefault"
+        );
+    }
+
+    /// The same for [`capture_logs_scoped`]. Run alone it fails if that
+    /// helper stops installing the default; in the full suite any
+    /// `capture_logs` call installs it first, so there it cannot tell.
+    #[test]
+    fn a_thread_without_a_subscriber_gets_the_quiet_default_after_a_scoped_capture() {
+        let (_logs, _guard) = capture_logs_scoped();
+        assert!(
+            other_thread_sees_quiet_default(),
+            "capture_logs_scoped did not install QuietDefault"
+        );
+    }
+
+    /// Whether a fresh thread, with no subscriber of its own, falls back to
+    /// [`QuietDefault`].
+    fn other_thread_sees_quiet_default() -> bool {
+        std::thread::spawn(|| tracing::dispatcher::get_default(|d| d.is::<QuietDefault>()))
+            .join()
+            .unwrap()
     }
 }
