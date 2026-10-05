@@ -99,7 +99,7 @@ jobs:
             cargo build --release
 
             # The only place the FreeBSD cfg arms' unit tests ever run in
-            # CI — the main CI matrix is Linux-only, and a release build
+            # CI — the main CI matrix runs no FreeBSD job, and a release build
             # compiles no #[cfg(test)] code (AF-prefix strip round-trips,
             # platform module, config path gates).
             #
@@ -116,12 +116,33 @@ jobs:
             # This bounds the damage; it does not fix anything. A test that can
             # block for ever is a defect at the test, and the ones this suite
             # has are bounded where they are written.
-            if ! timeout -s KILL 900 cargo test; then
+            #
+            # The tests that need a TCP address whose SYNs go unanswered
+            # (`testutil::Blackhole`) run in a second pass. FreeBSD resets a
+            # connect to a full accept queue, so it gets that address only
+            # from the kernel's blackhole settings, and those also stop every
+            # refused connect on the host, which other tests need. So the
+            # first pass skips them and the second runs only them, with the
+            # settings on.
+            BLACKHOLE_TESTS="node::tests::rx_stall:: transport::tcp::tests::background_connect_timeout_is_counted"
+            skips=""
+            for t in $BLACKHOLE_TESTS; do skips="$skips --skip $t"; done
+            if ! timeout -s KILL 900 cargo test -- $skips; then
               echo "FAIL: cargo test failed, or did not finish within its 900s bound." >&2
               echo "      If the output above stops mid-run, look for libtest's" >&2
               echo "      'has been running for over' lines: they name the test" >&2
               echo "      that blocked, and the tests that never reported at all" >&2
               echo "      are the rest of the answer." >&2
+              exit 1
+            fi
+            bh_was=$(sysctl -n net.inet.tcp.blackhole)
+            bh_local_was=$(sysctl -n net.inet.tcp.blackhole_local)
+            sysctl net.inet.tcp.blackhole=2 net.inet.tcp.blackhole_local=1
+            bh_rc=0
+            timeout -s KILL 300 cargo test --lib -- $BLACKHOLE_TESTS || bh_rc=$?
+            sysctl net.inet.tcp.blackhole="$bh_was" net.inet.tcp.blackhole_local="$bh_local_was"
+            if [ "$bh_rc" -ne 0 ]; then
+              echo "FAIL: the blackhole pass failed, or did not finish within its 300s bound." >&2
               exit 1
             fi
 
