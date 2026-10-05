@@ -496,6 +496,23 @@ with v0.5.x or earlier peers.
   identity msg2 carried, dropping the leg on a mismatch. Two situations that
   used to end in a connection no longer do, both of them intended.
 
+- Tracing targets of the TUN adapter, DNS responder and ICMPv6 code move from
+  `fips::upper::*` to `fips::ipv6tun::*`, because the module they log from is
+  now `ipv6tun` (for example `fips::upper::tun` becomes `fips::ipv6tun::tun`).
+  The hosts-file loader and reloader log as `fips::hosts` rather than
+  `fips::upper::hosts`, since the hosts file is now a top-level module. The
+  ICMPv6 Packet Too Big debug lines ("Sending ICMP Packet Too Big", "Rate
+  limiting ICMP Packet Too Big") log as `fips::ipv6tun::icmp` rather than
+  `fips::node::handlers::session`, so a `fips::node=debug` filter no longer
+  shows them. All logging from TUN and DNS start and stop (for example "TUN
+  device active", "Shutting down TUN interface" and "DNS responder started",
+  with their failure warnings) logs as `fips::ipv6tun::lifecycle` rather than
+  `fips::node::lifecycle`, so a filter on `fips::node::lifecycle` or
+  `fips::node` no longer selects it. An existing `RUST_LOG` filter naming an
+  old target still parses and simply stops matching, so the symptom is missing
+  log lines rather than an error. Update `RUST_LOG` filters, journal-watch
+  recipes and any log-scraping alert accordingly.
+
 #### Packaging
 
 - The glibc floor is 2.34, one step below the 2.35 Ubuntu 22.04 sets. Both

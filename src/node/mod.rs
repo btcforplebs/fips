@@ -15,7 +15,7 @@ pub(crate) mod decrypt_worker;
 #[cfg(unix)]
 pub(crate) mod encrypt_worker;
 mod handlers;
-mod lifecycle;
+pub(crate) mod lifecycle;
 pub(crate) mod metrics;
 pub(crate) mod netmon;
 pub use netmon::NetmonTrigger;
@@ -634,8 +634,6 @@ pub struct Node {
     // === TUN Interface ===
     /// TUN device state.
     tun_state: TunState,
-    /// TUN interface name (for cleanup).
-    tun_name: Option<String>,
 
     /// Slot the embedder installs its BLE radio into, armed by
     /// [`Self::enable_app_owned_ble_radio`]. `None` unless armed.
@@ -950,7 +948,6 @@ impl Node {
                 crate::control::snapshot::NativeSnapshot::empty(),
             )),
             tun_state,
-            tun_name: None,
             #[cfg(all(ble_available, any(target_os = "android", test)))]
             ble_radio: None,
             index_allocator: IndexAllocator::new(),
@@ -1128,7 +1125,6 @@ impl Node {
                 crate::control::snapshot::NativeSnapshot::empty(),
             )),
             tun_state,
-            tun_name: None,
             #[cfg(all(ble_available, any(target_os = "android", test)))]
             ble_radio: None,
             index_allocator: IndexAllocator::new(),
@@ -1546,9 +1542,7 @@ impl Node {
         tracing::debug!(entries = base.len(), "Rebuilding peer alias maps");
         self.host_map.set_base(base.clone());
         self.peer_acl.rebase(base.clone()).await;
-        if let Some(tx) = &self.supervisor.dns_aliases {
-            tx.send_replace(base);
-        }
+        self.supervisor.ipv6tun.publish_aliases(base);
     }
 
     /// Return a human-readable display name for a NodeAddr.
@@ -2018,7 +2012,7 @@ impl Node {
             estimated_mesh_size: self.estimated_mesh_size,
             state: self.supervisor.state,
             tun_state: self.tun_state,
-            tun_name: self.tun_name.clone(),
+            tun_name: self.supervisor.ipv6tun.tun_name.clone(),
             effective_ipv6_mtu: self.effective_ipv6_mtu(),
             connection_count: self.connection_count(),
             peer_count: self.peers.len(),
@@ -2723,7 +2717,7 @@ impl Node {
 
     /// Get the TUN interface name, if active.
     pub fn tun_name(&self) -> Option<&str> {
-        self.tun_name.as_deref()
+        self.supervisor.ipv6tun.tun_name.as_deref()
     }
 
     // === Resource Limits ===
@@ -3693,7 +3687,14 @@ impl Node {
     ///
     /// Returns None if TUN is not active or the node hasn't been started.
     pub fn tun_tx(&self) -> Option<&TunTx> {
-        self.supervisor.tun_tx.as_ref()
+        self.supervisor.ipv6tun.tun_tx.as_ref()
+    }
+
+    /// Install a TUN packet sender, standing in for the TUN writer, so a
+    /// test can read what the node delivers toward the host.
+    #[cfg(test)]
+    pub(crate) fn install_tun(&mut self, tun_tx: TunTx) {
+        self.supervisor.ipv6tun.tun_tx = Some(tun_tx);
     }
 
     /// Set up an **app-owned TUN**: rather than FIPS creating a system TUN
@@ -3720,8 +3721,8 @@ impl Node {
         let (outbound_tx, outbound_rx) = tokio::sync::mpsc::channel(tun_channel_size);
         // mesh → app: the node writes inbound packets to `tun_tx`; the app pulls.
         let (tun_tx, tun_rx) = std::sync::mpsc::channel();
-        self.supervisor.tun_tx = Some(tun_tx);
-        self.supervisor.tun_outbound_rx = Some(outbound_rx);
+        self.supervisor.ipv6tun.tun_tx = Some(tun_tx);
+        self.supervisor.ipv6tun.tun_outbound_rx = Some(outbound_rx);
         self.tun_state = TunState::Active;
         (outbound_tx, tun_rx)
     }
@@ -3894,7 +3895,7 @@ impl Node {
     /// Reading live node state from a backgrounded loop is a general gap, not
     /// one this accessor tries to close.
     pub fn dns_local_addr(&self) -> Option<std::net::SocketAddr> {
-        self.supervisor.dns_local_addr
+        self.supervisor.ipv6tun.dns_local_addr
     }
 
     /// A handle that wakes the medium-change detector (`node.netmon.*`) now
