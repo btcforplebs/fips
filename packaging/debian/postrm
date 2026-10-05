@@ -3,21 +3,16 @@
 set -e
 
 case "$1" in
-    purge)
-        # Remove configuration and identity keys
-        rm -rf /etc/fips/
-
-        # Remove tmpfiles.d entry
-        rm -f /usr/lib/tmpfiles.d/fips.conf
-
-        # Remove runtime directory
-        rm -rf /run/fips/
-
+    remove|purge)
         # Remove the DNS routing fips-dns-setup may have written, in case
         # fips-dns-teardown did not run (prerm's stop runs it only when
-        # fips-dns.service was active), and make the resolver drop it. The
-        # paths match packaging/common/fips-dns-teardown, which dpkg has
-        # already removed, so it cannot be called from here.
+        # fips-dns.service was active), and make the resolver drop it. This
+        # runs on remove as well as purge: a removed package leaves nothing
+        # listening behind the routing, and purging a package already removed
+        # runs only postrm purge. On a purge of an installed package the
+        # purge pass finds nothing left and restarts nothing. The paths match
+        # packaging/common/fips-dns-teardown, which dpkg has already removed,
+        # so it cannot be called from here.
         restart_resolved=0
         if [ -f /etc/systemd/dns-delegate.d/fips.dns-delegate ]; then
             rm -f /etc/systemd/dns-delegate.d/fips.dns-delegate
@@ -52,6 +47,19 @@ case "$1" in
                     || echo "fips: warning: could not reload NetworkManager; reload it to drop the .fips route"
             fi
         fi
+        ;;
+esac
+
+case "$1" in
+    purge)
+        # Remove configuration and identity keys
+        rm -rf /etc/fips/
+
+        # Remove tmpfiles.d entry
+        rm -f /usr/lib/tmpfiles.d/fips.conf
+
+        # Remove runtime directory
+        rm -rf /run/fips/
 
         # Remove fips system group
         if getent group fips >/dev/null 2>&1; then

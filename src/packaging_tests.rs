@@ -391,17 +391,19 @@ fn freebsd_newsyslog_entry_signals_the_daemon8_supervisor_started_with_sighup_re
     );
 }
 
-/// Pins the DNS cleanup in `postrm purge` and `uninstall.sh` to the files
-/// `fips-dns-setup` writes, so a purge after a `fips-dns` that never ran its
-/// teardown does not leave the resolver sending `.fips` to a dead responder.
+/// Pins the DNS cleanup in `postrm remove` and `postrm purge` and in
+/// `uninstall.sh` to the files `fips-dns-setup` writes, so a remove or purge
+/// after a `fips-dns` that never ran its teardown does not leave the resolver
+/// sending `.fips` to a dead responder.
 ///
 /// This is a text test. Each path must appear on an `rm -f` line, but a
 /// resolver command passes wherever it appears on a code line, including in a
-/// message. What `postrm` actually does is covered by the deb-install purge
-/// check. No suite runs `uninstall.sh`: its two resolved paths were run once,
-/// by hand in a container, and its dnsmasq and NetworkManager paths by nothing.
+/// message. What `postrm` actually does is covered by the deb-install remove
+/// and purge checks. No suite runs `uninstall.sh`: its two resolved paths were
+/// run once, by hand in a container, and its dnsmasq and NetworkManager paths
+/// by nothing.
 #[test]
-fn dns_cleanup_in_postrm_purge_and_uninstall_removes_every_file_fips_dns_setup_writes_and_restarts_its_resolver()
+fn dns_cleanup_in_postrm_remove_and_purge_and_uninstall_removes_every_file_fips_dns_setup_writes_and_restarts_its_resolver()
  {
     let setup = rc_vars(&repo_file("packaging/common/fips-dns-setup"));
     let teardown = rc_vars(&repo_file("packaging/common/fips-dns-teardown"));
@@ -433,8 +435,8 @@ fn dns_cleanup_in_postrm_purge_and_uninstall_removes_every_file_fips_dns_setup_w
 
     let scripts = [
         (
-            "packaging/debian/postrm purge)",
-            case_branch(&repo_file("packaging/debian/postrm"), "purge"),
+            "packaging/debian/postrm remove|purge)",
+            case_branch(&repo_file("packaging/debian/postrm"), "remove|purge"),
         ),
         (
             "packaging/systemd/uninstall.sh",
