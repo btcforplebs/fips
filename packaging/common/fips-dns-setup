@@ -224,7 +224,7 @@ log "To resolve .fips domains, configure your DNS resolver to forward"
 log "the .fips domain to [${FIPS_DNS_LOOPBACK_V6}]:${FIPS_DNS_PORT} (matches the daemon's default bind)."
 log ""
 log "Examples:"
-log "  systemd-resolved: sudo apt install systemd-resolved"
+log "  systemd-resolved: install it if needed (a separate package on some distributions), run 'sudo systemctl enable --now systemd-resolved', then 'sudo systemctl restart fips-dns.service'"
 log "  dnsmasq:          echo 'server=/fips/${FIPS_DNS_LOOPBACK_V6}#${FIPS_DNS_PORT}' | sudo tee /etc/dnsmasq.d/fips.conf"
 save_backend "none"
 exit 0

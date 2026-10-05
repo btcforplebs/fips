@@ -1258,3 +1258,60 @@ fn openwrt_config_offers_no_ble_block_because_musl_builds_have_no_ble() {
          where the BLE transport is not compiled: {found:?}"
     );
 }
+
+/// `fips-dns-setup` is shared by the Debian package, the Arch packages, the
+/// systemd tarball and, where it is packaged, the RPM, so the hint it prints
+/// when it finds no DNS resolver must not tell the host to use one
+/// distribution's package manager.
+///
+/// Every systemd-resolved backend in the script gates on the unit being active
+/// (`is_active`), so the hint must say to start it (`enable --now`), not only to
+/// install or enable it, and then to restart `fips-dns.service` so detection
+/// runs again. `test_no_resolver` in `testing/dns-resolver/test.sh` asserts the
+/// same on the script's real output.
+#[test]
+fn fips_dns_setup_no_resolver_hint_starts_resolved_and_names_no_package_manager_because_the_script_is_not_debian_only()
+ {
+    const SETUP: &str = "packaging/common/fips-dns-setup";
+    const BANNED: [&str; 6] = [
+        "apt install",
+        "apt-get install",
+        "dnf install",
+        "yum install",
+        "zypper install",
+        "pacman -S",
+    ];
+    let lines = code_lines(&repo_file(SETUP));
+    let mut problems = Vec::new();
+
+    let hints: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.starts_with("log \"  systemd-resolved:"))
+        .collect();
+    match hints.as_slice() {
+        [hint] => {
+            for needed in ["enable --now", "restart fips-dns.service"] {
+                if !hint.contains(needed) {
+                    problems.push(format!("hint lacks '{needed}': {hint}"));
+                }
+            }
+        }
+        _ => problems.push(format!(
+            "expected one systemd-resolved hint line, found {}: {hints:?}",
+            hints.len()
+        )),
+    }
+    for line in &lines {
+        for banned in BANNED {
+            if line.contains(banned) {
+                problems.push(format!("names a package manager ('{banned}'): {line}"));
+            }
+        }
+    }
+
+    assert!(
+        problems.is_empty(),
+        "{SETUP}'s no-resolver hint is wrong:\n  {}",
+        problems.join("\n  ")
+    );
+}
