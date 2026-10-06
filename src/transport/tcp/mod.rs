@@ -31,7 +31,8 @@ use super::{
 };
 use super::{resolve_socket_addrs, take_finished_connect};
 use crate::config::TcpConfig;
-use crate::transport::framing::read_fmp_packet;
+use crate::proto::fmp::wire::{FMP_VERSION, PHASE_MSG2};
+use crate::transport::framing::{StreamError, read_fmp_packet};
 use crate::transport::stream::{
     ConnId, WRITER_DRAIN_TIMEOUT, drain_writer, next_conn_id, remove_own,
 };
@@ -44,8 +45,9 @@ use stats::TcpStats;
 use futures::FutureExt;
 use socket2::TcpKeepalive;
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
@@ -523,6 +525,8 @@ impl TcpTransport {
         let send_key = key.clone();
         let mtu = mss_mtu;
         let id = next_conn_id();
+        let msg2_sent = Arc::new(AtomicBool::new(false));
+        let recv_msg2_sent = msg2_sent.clone();
 
         let recv_task = tokio::spawn(async move {
             tcp_receive_loop(
@@ -539,6 +543,7 @@ impl TcpTransport {
                 // gated on an accept-loop insert.
                 None,
                 None,
+                recv_msg2_sent,
             )
             .await;
         });
@@ -552,6 +557,7 @@ impl TcpTransport {
             id,
             self.pool.clone(),
             self.stats.clone(),
+            msg2_sent,
         ));
 
         let conn = TcpConnection {
@@ -812,6 +818,8 @@ impl TcpTransport {
         let recv_key = key.clone();
         let send_key = key;
         let id = next_conn_id();
+        let msg2_sent = Arc::new(AtomicBool::new(false));
+        let recv_msg2_sent = msg2_sent.clone();
 
         let recv_task = tokio::spawn(async move {
             tcp_receive_loop(
@@ -828,6 +836,7 @@ impl TcpTransport {
                 // gated on an accept-loop insert.
                 None,
                 None,
+                recv_msg2_sent,
             )
             .await;
         });
@@ -841,6 +850,7 @@ impl TcpTransport {
             id,
             self.pool.clone(),
             self.stats.clone(),
+            msg2_sent,
         ));
 
         TcpConnection {
@@ -1108,6 +1118,8 @@ async fn accept_loop(
                 // a permanently incremented inbound counter.
                 let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
                 let id = next_conn_id();
+                let msg2_sent = Arc::new(AtomicBool::new(false));
+                let recv_msg2_sent = msg2_sent.clone();
 
                 let recv_task = tokio::spawn(async move {
                     tcp_receive_loop(
@@ -1122,6 +1134,7 @@ async fn accept_loop(
                         Direction::Inbound,
                         Some(deadline),
                         Some(ready_rx),
+                        recv_msg2_sent,
                     )
                     .await;
                 });
@@ -1136,6 +1149,7 @@ async fn accept_loop(
                     id,
                     pool.clone(),
                     stats.clone(),
+                    msg2_sent,
                 ));
 
                 let conn = TcpConnection {
@@ -1150,6 +1164,13 @@ async fn accept_loop(
 
                 let mut pool_guard = pool.lock().await;
                 pool_guard.insert(key, conn);
+                // Counted under the lock already held for the insert, and
+                // only when the line below will be logged.
+                let open_from_source = if tracing::enabled!(tracing::Level::DEBUG) {
+                    inbound_from_source(&pool_guard, peer_addr.ip())
+                } else {
+                    0
+                };
                 drop(pool_guard);
 
                 stats.record_connection_accepted();
@@ -1164,6 +1185,8 @@ async fn accept_loop(
                     remote_addr = %remote_addr,
                     local_addr = %local_addr,
                     mtu = conn_mtu,
+                    open_from_source,
+                    open_total = stats.pool_inbound_count(),
                     "Accepted inbound TCP connection"
                 );
             }
@@ -1175,6 +1198,91 @@ async fn accept_loop(
                 );
             }
         }
+    }
+}
+
+/// The source an inbound connection is counted under: an IPv4 address as
+/// itself, an IPv4-mapped IPv6 address as its IPv4 form, and any other IPv6
+/// address as its /64, since one host commonly holds a whole /64.
+fn source_of(ip: IpAddr) -> IpAddr {
+    match ip.to_canonical() {
+        IpAddr::V6(v6) => {
+            let prefix = u128::from(v6) & !((1u128 << 64) - 1);
+            IpAddr::V6(prefix.into())
+        }
+        v4 => v4,
+    }
+}
+
+/// How many pooled inbound connections come from the same source as `ip`.
+fn inbound_from_source(pool: &pool::PoolMap, ip: IpAddr) -> usize {
+    let source = source_of(ip);
+    pool.iter()
+        .filter(|(key, conn)| {
+            conn.direction == Direction::Inbound
+                && key
+                    .remote
+                    .as_str()
+                    .and_then(|a| a.parse::<SocketAddr>().ok())
+                    .is_some_and(|a| source_of(a.ip()) == source)
+        })
+        .count()
+}
+
+/// Whether `frame` is a msg2, by its version and phase nibbles.
+fn is_msg2(frame: &[u8]) -> bool {
+    frame
+        .first()
+        .is_some_and(|b| b >> 4 == FMP_VERSION && b & 0x0F == PHASE_MSG2)
+}
+
+/// The close reason for a receive that failed with `e`.
+fn read_failure_reason(e: &StreamError) -> &'static str {
+    match e {
+        StreamError::Io(io) => match io.kind() {
+            std::io::ErrorKind::UnexpectedEof
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted => "remote-closed",
+            _ => "read-error",
+        },
+        _ => "framing",
+    }
+}
+
+/// The record of one connection's receive loop, logged as its close line
+/// when the loop ends, however it ends.
+///
+/// It is logged from `Drop` because a loop can also end by being aborted:
+/// closing the connection, a failed write and stopping the transport all
+/// abort the receive task, which drops the loop at its await point and runs
+/// nothing after it. The frame count lives in the loop, so no other site can
+/// log it.
+struct CloseNote {
+    transport_id: TransportId,
+    remote_addr: TransportAddr,
+    direction: Direction,
+    started: Instant,
+    /// Complete frames received.
+    frames: u64,
+    /// Set by the writer once it has written a msg2 on the connection.
+    msg2_sent: Arc<AtomicBool>,
+    /// Why the loop ended. Left at `local` when it is aborted, which only
+    /// this node does.
+    reason: &'static str,
+}
+
+impl Drop for CloseNote {
+    fn drop(&mut self) {
+        debug!(
+            transport_id = %self.transport_id,
+            remote_addr = %self.remote_addr,
+            direction = ?self.direction,
+            lifetime_s = self.started.elapsed().as_secs(),
+            frames = self.frames,
+            msg2_sent = self.msg2_sent.load(Ordering::Relaxed),
+            reason = %self.reason,
+            "Closed TCP connection"
+        );
     }
 }
 
@@ -1205,6 +1313,10 @@ async fn accept_loop(
 /// Frames are written whole. A partial write followed by an error takes the
 /// connection down with it, so the peer never sees a frame it cannot
 /// resynchronise from.
+///
+/// `msg2_sent` is set once a msg2 has been written, for the receive loop's
+/// close line.
+#[allow(clippy::too_many_arguments)]
 async fn tcp_send_loop(
     mut writer: tokio::net::tcp::OwnedWriteHalf,
     mut frames: mpsc::Receiver<Vec<u8>>,
@@ -1213,11 +1325,15 @@ async fn tcp_send_loop(
     id: ConnId,
     pool: ConnectionPool,
     stats: Arc<TcpStats>,
+    msg2_sent: Arc<AtomicBool>,
 ) {
     let remote_addr = &key.remote;
     while let Some(frame) = frames.recv().await {
         match writer.write_all(&frame).await {
             Ok(()) => {
+                if is_msg2(&frame) {
+                    msg2_sent.store(true, Ordering::Relaxed);
+                }
                 stats.record_send(frame.len());
                 trace!(
                     transport_id = %transport_id,
@@ -1283,6 +1399,9 @@ async fn tcp_send_loop(
 /// entry's writer: the loop ended on EOF, a read error or a missed deadline,
 /// and frames still queued for a connection in that state are not worth
 /// writing.
+///
+/// Every loop logs one close line when it ends, through a [`CloseNote`]
+/// created on entry; `msg2_sent` is shared with the connection's writer.
 #[allow(clippy::too_many_arguments)]
 async fn tcp_receive_loop(
     mut reader: tokio::net::tcp::OwnedReadHalf,
@@ -1296,8 +1415,18 @@ async fn tcp_receive_loop(
     direction: Direction,
     deadline: Option<InboundDeadline>,
     ready_rx: Option<tokio::sync::oneshot::Receiver<()>>,
+    msg2_sent: Arc<AtomicBool>,
 ) {
     let remote_addr = &key.remote;
+    let mut note = CloseNote {
+        transport_id,
+        remote_addr: remote_addr.clone(),
+        direction,
+        started: Instant::now(),
+        frames: 0,
+        msg2_sent,
+        reason: "local",
+    };
     debug!(
         transport_id = %transport_id,
         remote_addr = %remote_addr,
@@ -1334,6 +1463,7 @@ async fn tcp_receive_loop(
                                 timeout_secs = limit.as_secs_f64(),
                                 "No complete frame within the inbound deadline, dropping inbound connection"
                             );
+                            note.reason = InboundDeadline::phase(first);
                             break;
                         }
                     }
@@ -1344,6 +1474,7 @@ async fn tcp_receive_loop(
 
             match read {
                 Ok(data) => {
+                    note.frames += 1;
                     stats.record_recv(data.len());
 
                     trace!(
@@ -1360,6 +1491,7 @@ async fn tcp_receive_loop(
                             transport_id = %transport_id,
                             "Packet channel closed, stopping TCP receive loop"
                         );
+                        note.reason = "channel-closed";
                         break;
                     }
                 }
@@ -1372,6 +1504,7 @@ async fn tcp_receive_loop(
                         error = %e,
                         "TCP receive error, removing connection"
                     );
+                    note.reason = read_failure_reason(&e);
                     break;
                 }
             }
@@ -2822,6 +2955,7 @@ mod tests {
                 idle: Duration::from_millis(50),
             }),
             Some(ready_rx),
+            Arc::default(),
         )
         .await;
 
@@ -2981,6 +3115,7 @@ mod tests {
             next_conn_id(),
             pool.clone(),
             stats.clone(),
+            Arc::default(),
         ));
 
         let frame = build_msg1_frame();
@@ -3157,6 +3292,7 @@ mod tests {
             Direction::Outbound,
             None,
             None,
+            Arc::default(),
         )
         .await;
         assert_eq!(
@@ -3745,5 +3881,327 @@ mod tests {
         );
 
         t.stop_async().await.unwrap();
+    }
+
+    // ========================================================================
+    // Accept and close lines
+    // ========================================================================
+
+    /// Every captured line whose message is exactly `message`.
+    fn lines_with(logs: &crate::testutil::LogCapture, message: &str) -> Vec<String> {
+        let needle = format!(" message={message}");
+        logs.lines()
+            .into_iter()
+            .filter(|line| {
+                line.match_indices(&needle).any(|(at, _)| {
+                    let rest = &line[at + needle.len()..];
+                    rest.is_empty()
+                        || rest
+                            .strip_prefix(' ')
+                            .and_then(|r| r.split(' ').next())
+                            .is_some_and(|t| t.contains('='))
+                })
+            })
+            .collect()
+    }
+
+    /// The value of `name` on `line`, or a panic naming the line.
+    fn field(line: &str, name: &str) -> String {
+        crate::testutil::log_field(line, name)
+            .unwrap_or_else(|| panic!("no field {name} on {line}"))
+            .to_string()
+    }
+
+    /// Wait for the close line of the connection whose remote address is
+    /// `remote`, or panic listing what was captured.
+    async fn close_line(logs: &crate::testutil::LogCapture, remote: &str) -> String {
+        let find = || {
+            lines_with(logs, "Closed TCP connection")
+                .into_iter()
+                .find(|l| crate::testutil::log_field(l, "remote_addr") == Some(remote))
+        };
+        wait_until(|| find().is_some(), Duration::from_secs(3)).await;
+        find().unwrap_or_else(|| panic!("no close line for {remote} in {:#?}", logs.lines()))
+    }
+
+    /// The transport's accept lines are counted per source address, and the
+    /// whole pool's inbound count is given beside it.
+    #[tokio::test]
+    async fn an_accepted_connection_logs_how_many_inbound_connections_its_source_holds() {
+        let (tx, _rx) = packet_channel(100);
+        let mut transport = TcpTransport::new(TransportId::new(1), None, make_config(), tx);
+        transport.start_async().await.unwrap();
+        let listen = transport.local_addr().unwrap();
+        let (logs, guard) = crate::testutil::capture_logs_scoped();
+
+        let first = TcpStream::connect(listen).await.unwrap();
+        let second = TcpStream::connect(listen).await.unwrap();
+        assert!(
+            wait_until(
+                || transport.stats().pool_inbound_count() == 2,
+                Duration::from_secs(2)
+            )
+            .await
+        );
+        let lines = lines_with(&logs, "Accepted inbound TCP connection");
+        assert_eq!(lines.len(), 2, "{lines:#?}");
+        assert_eq!(field(&lines[0], "open_from_source"), "1", "{}", lines[0]);
+        assert_eq!(field(&lines[1], "open_from_source"), "2", "{}", lines[1]);
+        assert_eq!(field(&lines[1], "open_total"), "2", "{}", lines[1]);
+
+        // A third connection from another address of the same host is a
+        // different source.
+        #[cfg(target_os = "linux")]
+        let third = {
+            let socket = tokio::net::TcpSocket::new_v4().unwrap();
+            socket.bind("127.0.0.2:0".parse().unwrap()).unwrap();
+            let stream = socket.connect(listen).await.unwrap();
+            assert!(
+                wait_until(
+                    || transport.stats().pool_inbound_count() == 3,
+                    Duration::from_secs(2)
+                )
+                .await
+            );
+            let lines = lines_with(&logs, "Accepted inbound TCP connection");
+            assert_eq!(lines.len(), 3, "{lines:#?}");
+            assert_eq!(field(&lines[2], "open_from_source"), "1", "{}", lines[2]);
+            assert_eq!(field(&lines[2], "open_total"), "3", "{}", lines[2]);
+            stream
+        };
+        drop(guard);
+
+        drop((first, second));
+        #[cfg(target_os = "linux")]
+        drop(third);
+        transport.stop_async().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_silent_inbound_connection_logs_its_close_at_the_first_frame_deadline() {
+        let (tx, _rx) = packet_channel(100);
+        let mut transport = TcpTransport::new(TransportId::new(1), None, make_config(), tx);
+        transport.set_first_frame_timeout(Duration::from_millis(100));
+        transport.start_async().await.unwrap();
+        let listen = transport.local_addr().unwrap();
+        let (logs, guard) = crate::testutil::capture_logs_scoped();
+
+        let client = TcpStream::connect(listen).await.unwrap();
+        let remote = client.local_addr().unwrap().to_string();
+        let line = close_line(&logs, &remote).await;
+        drop(guard);
+        assert!(line.starts_with("DEBUG"), "{line}");
+        assert_eq!(field(&line, "reason"), "first-frame", "{line}");
+        assert_eq!(field(&line, "frames"), "0", "{line}");
+        assert_eq!(field(&line, "msg2_sent"), "false", "{line}");
+        assert_eq!(field(&line, "direction"), "Inbound", "{line}");
+        assert_eq!(field(&line, "transport_id"), "transport:1", "{line}");
+        assert_eq!(field(&line, "lifetime_s"), "0", "{line}");
+
+        drop(client);
+        transport.stop_async().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_connection_that_falls_silent_after_a_frame_logs_an_idle_close() {
+        let (tx, _rx) = packet_channel(100);
+        let mut transport = TcpTransport::new(TransportId::new(1), None, make_config(), tx);
+        transport.set_inbound_idle_timeout(Duration::from_millis(100));
+        transport.start_async().await.unwrap();
+        let listen = transport.local_addr().unwrap();
+        let (logs, guard) = crate::testutil::capture_logs_scoped();
+
+        let mut client = TcpStream::connect(listen).await.unwrap();
+        client.write_all(&msg1_frame()).await.unwrap();
+        let remote = client.local_addr().unwrap().to_string();
+        let line = close_line(&logs, &remote).await;
+        drop(guard);
+        assert_eq!(field(&line, "reason"), "idle", "{line}");
+        assert_eq!(field(&line, "frames"), "1", "{line}");
+
+        drop(client);
+        transport.stop_async().await.unwrap();
+    }
+
+    /// An inbound connection that this node answered with a msg2 says so when
+    /// it closes, and one it never answered does not.
+    #[tokio::test]
+    async fn an_inbound_connection_answered_with_a_msg2_logs_msg2_sent_when_the_remote_closes() {
+        let (tx, mut rx) = packet_channel(100);
+        let mut transport = TcpTransport::new(TransportId::new(1), None, make_config(), tx);
+        transport.start_async().await.unwrap();
+        let listen = transport.local_addr().unwrap();
+        let (logs, guard) = crate::testutil::capture_logs_scoped();
+
+        let mut answered = TcpStream::connect(listen).await.unwrap();
+        answered.write_all(&msg1_frame()).await.unwrap();
+        let packet = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timeout waiting for the msg1")
+            .expect("packet channel closed");
+        transport
+            .send_async(&packet.remote_addr, &msg2_frame())
+            .await
+            .unwrap();
+        let mut reply = vec![0u8; msg2_frame().len()];
+        timeout(
+            Duration::from_secs(2),
+            tokio::io::AsyncReadExt::read_exact(&mut answered, &mut reply),
+        )
+        .await
+        .expect("timeout waiting for the msg2")
+        .unwrap();
+        let answered_addr = answered.local_addr().unwrap().to_string();
+        drop(answered);
+
+        let mut unanswered = TcpStream::connect(listen).await.unwrap();
+        unanswered.write_all(&msg1_frame()).await.unwrap();
+        timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timeout waiting for the second msg1")
+            .expect("packet channel closed");
+        let unanswered_addr = unanswered.local_addr().unwrap().to_string();
+        drop(unanswered);
+
+        let line = close_line(&logs, &answered_addr).await;
+        assert_eq!(field(&line, "reason"), "remote-closed", "{line}");
+        assert_eq!(field(&line, "frames"), "1", "{line}");
+        assert_eq!(field(&line, "msg2_sent"), "true", "{line}");
+        let line = close_line(&logs, &unanswered_addr).await;
+        drop(guard);
+        assert_eq!(field(&line, "reason"), "remote-closed", "{line}");
+        assert_eq!(field(&line, "frames"), "1", "{line}");
+        assert_eq!(field(&line, "msg2_sent"), "false", "{line}");
+
+        transport.stop_async().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_connection_closed_by_the_node_logs_a_local_close() {
+        let (tx, mut rx) = packet_channel(100);
+        let mut transport = TcpTransport::new(TransportId::new(1), None, make_config(), tx);
+        transport.start_async().await.unwrap();
+        let listen = transport.local_addr().unwrap();
+        let (logs, guard) = crate::testutil::capture_logs_scoped();
+
+        let mut client = TcpStream::connect(listen).await.unwrap();
+        client.write_all(&msg1_frame()).await.unwrap();
+        let packet = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timeout waiting for the frame")
+            .expect("packet channel closed");
+        transport.close_connection_async(&packet.remote_addr).await;
+        let line = close_line(&logs, &packet.remote_addr.to_string()).await;
+        drop(guard);
+        assert_eq!(field(&line, "reason"), "local", "{line}");
+        assert_eq!(field(&line, "frames"), "1", "{line}");
+
+        drop(client);
+        transport.stop_async().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_connection_sending_a_non_fmp_stream_logs_a_framing_close() {
+        let (tx, _rx) = packet_channel(100);
+        let mut transport = TcpTransport::new(TransportId::new(1), None, make_config(), tx);
+        transport.start_async().await.unwrap();
+        let listen = transport.local_addr().unwrap();
+        let (logs, guard) = crate::testutil::capture_logs_scoped();
+
+        // The first bytes of a TLS ClientHello: version nibble 1.
+        let mut client = TcpStream::connect(listen).await.unwrap();
+        client
+            .write_all(&[0x16, 0x03, 0x01, 0x02, 0x00, 0x01, 0x00, 0x01])
+            .await
+            .unwrap();
+        let remote = client.local_addr().unwrap().to_string();
+        let line = close_line(&logs, &remote).await;
+        drop(guard);
+        assert_eq!(field(&line, "reason"), "framing", "{line}");
+        assert_eq!(field(&line, "frames"), "0", "{line}");
+
+        drop(client);
+        transport.stop_async().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_connection_whose_node_stopped_receiving_logs_a_channel_closed_close() {
+        let (tx, rx) = packet_channel(100);
+        let mut transport = TcpTransport::new(TransportId::new(1), None, make_config(), tx);
+        transport.start_async().await.unwrap();
+        let listen = transport.local_addr().unwrap();
+        drop(rx);
+        let (logs, guard) = crate::testutil::capture_logs_scoped();
+
+        let mut client = TcpStream::connect(listen).await.unwrap();
+        client.write_all(&msg1_frame()).await.unwrap();
+        let remote = client.local_addr().unwrap().to_string();
+        let line = close_line(&logs, &remote).await;
+        drop(guard);
+        assert_eq!(field(&line, "reason"), "channel-closed", "{line}");
+        assert_eq!(field(&line, "frames"), "1", "{line}");
+
+        drop(client);
+        transport.stop_async().await.unwrap();
+    }
+
+    /// Connections this node dialled log their close too, whether opened by a
+    /// send or by a background connect.
+    #[tokio::test]
+    async fn outbound_connections_log_their_close_with_the_outbound_direction() {
+        let (tx, _rx) = packet_channel(100);
+        let mut t = TcpTransport::new(TransportId::new(1), None, make_outbound_config(), tx);
+        t.start_async().await.unwrap();
+        let (logs, guard) = crate::testutil::capture_logs_scoped();
+
+        // Opened by a send.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let on_send = TransportAddr::from_string(&listener.local_addr().unwrap().to_string());
+        t.send_async(&on_send, &msg1_frame()).await.unwrap();
+        let (accepted, _) = timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(accepted);
+        let line = close_line(&logs, &on_send.to_string()).await;
+        assert_eq!(field(&line, "direction"), "Outbound", "{line}");
+        assert_eq!(field(&line, "reason"), "remote-closed", "{line}");
+        assert_eq!(field(&line, "frames"), "0", "{line}");
+
+        // Opened by a background connect, then promoted by a send.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let background = TransportAddr::from_string(&listener.local_addr().unwrap().to_string());
+        t.connect_async(&background).await.unwrap();
+        wait_connect_finished(&t, &background).await;
+        t.send_existing(&background, &msg1_frame()).await.unwrap();
+        let (accepted, _) = timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(accepted);
+        let line = close_line(&logs, &background.to_string()).await;
+        drop(guard);
+        assert_eq!(field(&line, "direction"), "Outbound", "{line}");
+        assert_eq!(field(&line, "reason"), "remote-closed", "{line}");
+
+        t.stop_async().await.unwrap();
+    }
+
+    #[test]
+    fn inbound_sources_are_ipv4_addresses_and_ipv6_slash_64s() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        assert_ne!(source_of(ip("10.0.0.1")), source_of(ip("10.0.0.2")));
+        assert_eq!(source_of(ip("::ffff:10.0.0.1")), ip("10.0.0.1"));
+        assert_eq!(
+            source_of(ip("2001:db8:1:2::1")),
+            source_of(ip("2001:db8:1:2:ffff:ffff:ffff:ffff")),
+            "one /64 is one source"
+        );
+        assert_ne!(
+            source_of(ip("2001:db8:1:2::1")),
+            source_of(ip("2001:db8:1:3::1")),
+            "neighbouring /64s are different sources"
+        );
+        assert_eq!(source_of(ip("2001:db8:1:2::1")), ip("2001:db8:1:2::"));
     }
 }

@@ -897,6 +897,7 @@ pub fn show_bloom(node: &Node) -> Value {
                 "display_name": node.peer_display_name(&addr),
                 "has_filter": peer.filter_sequence() > 0,
                 "filter_sequence": peer.filter_sequence(),
+                "tree_role": node.tree_role(&addr).to_string(),
             });
             if let Some(filter) = peer.inbound_filter() {
                 let max_fpr = node.config().node.bloom.max_inbound_fpr;
@@ -965,6 +966,7 @@ pub(crate) fn show_bloom_from_handle(handle: &super::read_handle::ControlReadHan
                 "display_name": peer.display_name,
                 "has_filter": peer.has_filter,
                 "filter_sequence": peer.filter_sequence,
+                "tree_role": peer.tree_role.to_string(),
             });
             if let Some(filter) = &peer.filter {
                 pf["estimated_count"] = json!(filter.estimated_count);

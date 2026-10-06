@@ -2,6 +2,7 @@
 
 use crate::NodeAddr;
 use crate::node::Node;
+use std::time::Instant;
 use tracing::{debug, info, trace};
 
 impl Node {
@@ -59,7 +60,16 @@ impl Node {
                 trace!(peer = %self.peer_display_name(from), "Received heartbeat");
             }
             _ => {
-                debug!(msg_type = msg_type, "Unknown link message type");
+                if tracing::enabled!(tracing::Level::DEBUG)
+                    && let Some(suppressed) = self.msgtype_budget.admit(Instant::now())
+                {
+                    debug!(
+                        peer = %self.peer_display_name(from),
+                        msg_type = msg_type,
+                        suppressed,
+                        "Unknown link message type"
+                    );
+                }
             }
         }
     }

@@ -641,14 +641,19 @@ use crate::proto::lookup::{MAX_RECENT_LOOKUP_REQUESTS, MIN_RECENT_PER_PEER};
 /// Encode a LookupRequest for `target` carrying `request_id`, ready for
 /// `handle_lookup_request` (which is handed the payload without the
 /// msg_type byte).
-fn lookup_request_payload(request_id: u64, target: &crate::NodeAddr) -> Vec<u8> {
+pub(super) fn lookup_request_payload(request_id: u64, target: &crate::NodeAddr) -> Vec<u8> {
     let origin = make_node_addr(0xCC);
     let coords = TreeCoordinate::from_addrs(vec![origin, make_node_addr(0)]).unwrap();
     LookupRequest::new(request_id, *target, origin, coords, 5, 0).encode()[1..].to_vec()
 }
 
 /// Deliver `count` distinct requests from `from`, ids starting at `first_id`.
-async fn flood_requests(node: &mut Node, from: &crate::NodeAddr, first_id: u64, count: u64) {
+pub(super) async fn flood_requests(
+    node: &mut Node,
+    from: &crate::NodeAddr,
+    first_id: u64,
+    count: u64,
+) {
     let target = make_node_addr(0xBB);
     for i in 0..count {
         let payload = lookup_request_payload(first_id + i, &target);
@@ -658,7 +663,7 @@ async fn flood_requests(node: &mut Node, from: &crate::NodeAddr, first_id: u64, 
 
 /// Register `count` peers so the per-peer share of the dedup cache is the
 /// floor rather than the whole cache, and return their addresses.
-fn register_peers(node: &mut Node, count: usize) -> Vec<crate::NodeAddr> {
+pub(super) fn register_peers(node: &mut Node, count: usize) -> Vec<crate::NodeAddr> {
     (0..count)
         .map(|i| {
             let identity = Identity::generate();
@@ -680,7 +685,7 @@ fn register_peers(node: &mut Node, count: usize) -> Vec<crate::NodeAddr> {
 /// tests below measure capacity, not expiry, and a 4096-request flood on a
 /// loaded host can take longer than the default, so the earliest entries
 /// would be purged before the test reads the cache.
-fn unexpiring_node() -> Node {
+pub(super) fn unexpiring_node() -> Node {
     let mut config = Config::new();
     config.node.lookup.recent_expiry_secs = 86_400;
     make_node_with(config)

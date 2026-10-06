@@ -184,6 +184,14 @@ pub(crate) struct Eviction {
     pub peer: NodeAddr,
     /// The per-peer share in force at the time, for the log line.
     pub share: usize,
+    /// How long the entry had been cached, on the cache's own clock.
+    /// `None`, as is `answered`, only if the cache index had drifted and
+    /// held an id the cache did not.
+    pub age_ms: Option<u64>,
+    /// Whether a response had already gone back on the entry's reverse
+    /// path. False with an age inside the dedup window means a response
+    /// still in flight has lost its way back.
+    pub answered: Option<bool>,
 }
 
 /// The result of classifying an inbound LookupRequest: the route decision,
@@ -208,6 +216,7 @@ fn make_room(
     from: &NodeAddr,
     max_recent: usize,
     peer_count: usize,
+    now_ms: u64,
 ) -> Option<Eviction> {
     let share = Lookup::peer_share(max_recent, peer_count);
     let victim = if lookup.peer_entries(from) >= share {
@@ -219,11 +228,15 @@ fn make_room(
     } else {
         return None;
     };
-    let request_id = lookup.evict_oldest_from(&victim)?;
+    let (request_id, entry) = lookup.evict_oldest_from(&victim)?;
     Some(Eviction {
         request_id,
         peer: victim,
         share,
+        age_ms: entry
+            .as_ref()
+            .map(|e| now_ms.saturating_sub(e.timestamp_ms)),
+        answered: entry.map(|e| e.response_forwarded),
     })
 }
 
@@ -305,7 +318,7 @@ pub(crate) fn classify_request(
         };
     }
 
-    let evicted = make_room(lookup, from, max_recent, peer_count);
+    let evicted = make_room(lookup, from, max_recent, peer_count, now_ms);
     lookup.record_recent(request.request_id, *from, now_ms);
 
     let outcome = if request.target == *my_addr {
@@ -780,5 +793,89 @@ mod dedup_eviction_tests {
             lookup.recent_by_peer.is_empty(),
             "the index must not keep entries the cache no longer holds"
         );
+    }
+
+    /// Deliver one transit request from `from` at `now_ms`, with a share at
+    /// the floor (one peer per floor's worth of cache) and a long window.
+    fn deliver_at(
+        lookup: &mut Lookup,
+        request_id: u64,
+        from: &NodeAddr,
+        now_ms: u64,
+    ) -> Classification {
+        classify_request(
+            lookup,
+            &request(request_id, make_node_addr(0xBB)),
+            from,
+            &make_node_addr(0x99),
+            now_ms,
+            600_000,
+            CACHE,
+            usize::MAX,
+        )
+    }
+
+    #[test]
+    fn an_eviction_carries_the_evicted_entrys_age_and_whether_it_was_answered() {
+        let mut lookup = empty();
+        let peer = make_node_addr(0x01);
+        // Request 0 arrives at 1_000, the rest of the floor later.
+        deliver_at(&mut lookup, 0, &peer, 1_000);
+        for i in 1..MIN_RECENT_PER_PEER as u64 {
+            deliver_at(&mut lookup, i, &peer, 2_000);
+        }
+        lookup
+            .recent_requests
+            .get_mut(&1)
+            .unwrap()
+            .response_forwarded = true;
+
+        let first = deliver_at(&mut lookup, 500, &peer, 5_500)
+            .evicted
+            .expect("the entry past the floor evicts");
+        assert_eq!(first.request_id, 0);
+        assert_eq!(first.age_ms, Some(4_500), "arrival to eviction");
+        assert_eq!(first.answered, Some(false));
+
+        let second = deliver_at(&mut lookup, 501, &peer, 7_000)
+            .evicted
+            .expect("and the next one evicts again");
+        assert_eq!(second.request_id, 1);
+        assert_eq!(second.age_ms, Some(5_000));
+        assert_eq!(second.answered, Some(true), "a response went back on it");
+    }
+
+    #[test]
+    fn evicted_ids_are_remembered_up_to_the_ring_size_and_the_oldest_forgotten() {
+        use super::super::state::EVICTED_KEPT;
+        let mut lookup = empty();
+        let peer = make_node_addr(0x01);
+        let floor = MIN_RECENT_PER_PEER as u64;
+        // Fill the floor, then evict one entry per further arrival.
+        for i in 0..floor + EVICTED_KEPT as u64 + 1 {
+            deliver_at(&mut lookup, i, &peer, 1_000);
+        }
+        // Ids 0 to EVICTED_KEPT were evicted; the ring holds the last
+        // EVICTED_KEPT of them.
+        assert!(!lookup.was_evicted(0), "the oldest eviction is forgotten");
+        assert!(lookup.was_evicted(1));
+        assert!(lookup.was_evicted(EVICTED_KEPT as u64));
+        assert!(
+            !lookup.was_evicted(EVICTED_KEPT as u64 + 1),
+            "an id still cached was not evicted"
+        );
+    }
+
+    #[test]
+    fn an_expiry_purge_is_not_recorded_as_an_eviction() {
+        let mut lookup = empty();
+        let peer = make_node_addr(0x01);
+        deliver_at(&mut lookup, 7, &peer, 1_000);
+        lookup.purge_recent(1_000 + 600_001, 600_000);
+        assert!(
+            lookup.recent_requests.is_empty(),
+            "setup: request 7 expired"
+        );
+        assert!(!lookup.was_evicted(7));
     }
 }

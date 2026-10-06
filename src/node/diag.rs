@@ -11,21 +11,25 @@
 //! Lines about a frame that failed to decrypt also say which of the peer's
 //! sessions its index names and what key state the peer held, and a
 //! per-packet line with no peer to suppress on shares one node-wide budget.
+//!
+//! Lines about filters carry an 8-byte digest of the filter bits, which the
+//! sender and the receiver of one announce compute alike, and a peer's place
+//! in the spanning tree as `tree_role`.
 
 use super::rate_limit::TokenBucket;
 use crate::noise::NoiseSession;
 use crate::peer::ActivePeer;
+use crate::proto::bloom::BloomFilter;
 use crate::proto::fmp::{Msg1Digest, RekeyRole};
 use crate::transport::{TransportAddr, TransportId};
 use crate::utils::index::SessionIndex;
 use std::fmt;
 use std::time::Instant;
 
-/// A 4-byte prefix of a digest or hash, displayed as 8 lowercase hex digits.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Tag4([u8; 4]);
+/// Bytes displayed as lowercase hex, two digits per byte, no separators.
+pub(crate) struct Hex<'a>(pub(crate) &'a [u8]);
 
-impl fmt::Display for Tag4 {
+impl fmt::Display for Hex<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for b in self.0 {
             write!(f, "{b:02x}")?;
@@ -34,16 +38,88 @@ impl fmt::Display for Tag4 {
     }
 }
 
+/// An `N`-byte prefix of a digest or hash, displayed as hex.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Tag<const N: usize>([u8; N]);
+
+impl<const N: usize> fmt::Display for Tag<N> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Hex(&self.0).fmt(f)
+    }
+}
+
+/// A 4-byte prefix, displayed as 8 hex digits.
+pub(crate) type Tag4 = Tag<4>;
+
 /// The session's tag: the first four bytes of its handshake hash. Both ends
 /// of a session derive the same hash, so both ends' lines carry the same tag.
 pub(crate) fn epoch_tag(session: &NoiseSession) -> Tag4 {
     let h = session.handshake_hash();
-    Tag4([h[0], h[1], h[2], h[3]])
+    Tag([h[0], h[1], h[2], h[3]])
 }
 
 /// The msg1's tag: the first four bytes of its digest.
 pub(crate) fn msg1_tag(digest: &Msg1Digest) -> Tag4 {
-    Tag4(digest.prefix())
+    Tag(digest.prefix())
+}
+
+/// How many leading bytes of a dropped frame a line shows.
+const HEAD_BYTES: usize = 8;
+
+/// The first bytes of a frame, up to eight, for a line about a frame that
+/// was dropped before it could be parsed.
+pub(crate) fn head(data: &[u8]) -> Hex<'_> {
+    Hex(&data[..data.len().min(HEAD_BYTES)])
+}
+
+/// The filter's digest: the first eight bytes of a SHA-256 over its bits.
+/// The sender and the receiver of one announce hash the same bits, so both
+/// ends' lines carry the same digest.
+pub(crate) fn filter_tag(filter: &BloomFilter) -> Tag<8> {
+    use sha2::{Digest, Sha256};
+    let h = Sha256::digest(filter.as_bytes());
+    let mut tag = [0u8; 8];
+    tag.copy_from_slice(&h[..8]);
+    Tag(tag)
+}
+
+/// A peer's place in this node's spanning tree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TreeRole {
+    /// The peer is this node's parent.
+    Parent,
+    /// The peer has declared this node its parent.
+    Child,
+    /// Neither: a link the tree does not use.
+    None,
+}
+
+impl fmt::Display for TreeRole {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Parent => "parent",
+            Self::Child => "child",
+            Self::None => "none",
+        })
+    }
+}
+
+/// A ratio, displayed with three decimals.
+pub(crate) struct Ratio(pub(crate) f64);
+
+impl fmt::Display for Ratio {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:.3}", self.0)
+    }
+}
+
+/// Names displayed joined by `,`, with no spaces.
+pub(crate) struct Names(pub(crate) Vec<String>);
+
+impl fmt::Display for Names {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0.join(","))
+    }
 }
 
 /// Displays the value, or `none` when there is none.
@@ -263,7 +339,7 @@ mod tests {
         };
         let want: String = full[..4].iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(msg1_tag(&digest).to_string(), want);
-        assert_eq!(Tag4([0x00, 0x0a, 0xb0, 0xff]).to_string(), "000ab0ff");
+        assert_eq!(Tag([0x00, 0x0a, 0xb0, 0xff]).to_string(), "000ab0ff");
     }
 
     #[test]
@@ -331,5 +407,46 @@ mod tests {
         ] {
             assert_eq!(value, "none");
         }
+    }
+
+    #[test]
+    fn hex_and_an_eight_byte_tag_render_exactly_their_bytes() {
+        assert_eq!(Hex(&[0x00, 0x0a, 0xb0, 0xff]).to_string(), "000ab0ff");
+        assert_eq!(Hex(&[]).to_string(), "");
+        let tag = Tag([0x00, 0x0a, 0xb0, 0xff, 0x01, 0x10, 0x7f, 0x80]);
+        assert_eq!(tag.to_string(), "000ab0ff01107f80");
+    }
+
+    #[test]
+    fn the_head_of_a_frame_is_at_most_its_first_eight_bytes() {
+        let frame: Vec<u8> = (0x10..0x24).collect();
+        assert_eq!(head(&frame[..4]).to_string(), "10111213");
+        assert_eq!(head(&frame).to_string(), "1011121314151617");
+    }
+
+    #[test]
+    fn a_filter_tag_is_the_first_eight_bytes_of_the_hash_of_its_bits() {
+        use sha2::{Digest, Sha256};
+        let mut filter = BloomFilter::new();
+        filter.insert(&crate::testutil::make_node_addr(0x31));
+        let full: [u8; 32] = Sha256::digest(filter.as_bytes()).into();
+        let want: String = full[..8].iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(filter_tag(&filter).to_string(), want);
+        assert_ne!(
+            filter_tag(&filter),
+            filter_tag(&BloomFilter::new()),
+            "different bits give different tags"
+        );
+    }
+
+    #[test]
+    fn tree_roles_ratios_and_names_render_without_spaces() {
+        assert_eq!(TreeRole::Parent.to_string(), "parent");
+        assert_eq!(TreeRole::Child.to_string(), "child");
+        assert_eq!(TreeRole::None.to_string(), "none");
+        assert_eq!(Ratio(1.0).to_string(), "1.000");
+        assert_eq!(Ratio(2.0 / 3.0).to_string(), "0.667");
+        assert_eq!(Names(vec!["a".into(), "b".into()]).to_string(), "a,b");
+        assert_eq!(Names(vec![]).to_string(), "");
     }
 }

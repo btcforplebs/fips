@@ -631,6 +631,15 @@ pub struct Node {
     /// Budget for the line logged for a frame naming an index that is not in
     /// `peers_by_index`; its sender is not authenticated.
     index_budget: diag::LogBudget,
+    /// Budget for the line logged for a frame with an unknown FMP version;
+    /// its sender is not authenticated.
+    version_budget: diag::LogBudget,
+    /// Budget for the line logged for a frame whose payload length disagrees
+    /// with its size; its sender is not authenticated.
+    length_budget: diag::LogBudget,
+    /// Budget for the line logged for an unknown link message type. One
+    /// node-wide budget rather than one per peer, so it adds no per-peer state.
+    msgtype_budget: diag::LogBudget,
     /// Pending outbound handshakes by our sender_idx.
     /// Tracks which LinkId corresponds to which session index.
     pending_outbound: HashMap<(TransportId, u32), LinkId>,
@@ -924,6 +933,9 @@ impl Node {
             index_allocator: IndexAllocator::new(),
             peers_by_index: HashMap::new(),
             index_budget: diag::LogBudget::new(std::time::Instant::now()),
+            version_budget: diag::LogBudget::new(std::time::Instant::now()),
+            length_budget: diag::LogBudget::new(std::time::Instant::now()),
+            msgtype_budget: diag::LogBudget::new(std::time::Instant::now()),
             pending_outbound: HashMap::new(),
             restart_dampener: HashMap::new(),
             msg1_rate_limiter,
@@ -1094,6 +1106,9 @@ impl Node {
             index_allocator: IndexAllocator::new(),
             peers_by_index: HashMap::new(),
             index_budget: diag::LogBudget::new(std::time::Instant::now()),
+            version_budget: diag::LogBudget::new(std::time::Instant::now()),
+            length_budget: diag::LogBudget::new(std::time::Instant::now()),
+            msgtype_budget: diag::LogBudget::new(std::time::Instant::now()),
             pending_outbound: HashMap::new(),
             restart_dampener: HashMap::new(),
             msg1_rate_limiter,
@@ -2166,6 +2181,7 @@ impl Node {
                     display_name: self.peer_display_name(&addr),
                     has_filter: peer.filter_sequence() > 0,
                     filter_sequence: peer.filter_sequence(),
+                    tree_role: self.tree_role(&addr),
                     filter,
                 }
             })
@@ -3425,17 +3441,21 @@ impl Node {
     /// Returns true if the peer is our current tree parent, or if the peer
     /// has declared us as their parent (making them our child).
     pub(crate) fn is_tree_peer(&self, peer_addr: &NodeAddr) -> bool {
-        // Peer is our parent
+        self.tree_role(peer_addr) != diag::TreeRole::None
+    }
+
+    /// The peer's place in the spanning tree: our parent, our child (its
+    /// declaration names us as parent), or neither.
+    pub(crate) fn tree_role(&self, peer_addr: &NodeAddr) -> diag::TreeRole {
         if !self.tree_state.is_root() && self.tree_state.my_declaration().parent_id() == peer_addr {
-            return true;
+            return diag::TreeRole::Parent;
         }
-        // Peer is our child (their declaration names us as parent)
         if let Some(decl) = self.tree_state.peer_declaration(peer_addr)
             && decl.parent_id() == self.node_addr()
         {
-            return true;
+            return diag::TreeRole::Child;
         }
-        false
+        diag::TreeRole::None
     }
 
     /// Find next hop for a destination node address.

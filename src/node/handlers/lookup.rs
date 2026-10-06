@@ -5,8 +5,8 @@
 //! bloom filter contains the target. TTL and request_id dedup provide
 //! safety bounds.
 
-use crate::node::Node;
 use crate::node::reject::DiscoveryReject;
+use crate::node::{Node, diag};
 use crate::proto::fsp::should_apply_path_mtu;
 use crate::proto::lookup::{
     LookupAction, LookupRequest, LookupResponse, MAX_RECENT_LOOKUP_REQUESTS,
@@ -77,6 +77,13 @@ impl crate::proto::lookup::RoutingView for NodeRoutingView<'_> {
     }
 }
 
+/// Whether any of `actions` sends to `peer`.
+fn sends_to(actions: &[LookupAction], peer: &NodeAddr) -> bool {
+    actions
+        .iter()
+        .any(|a| matches!(a, LookupAction::SendLink { peer: p, .. } if p == peer))
+}
+
 impl Node {
     /// Handle an incoming LookupRequest from a peer.
     ///
@@ -126,6 +133,8 @@ impl Node {
                 evicted_from = %self.peer_display_name(&evicted.peer),
                 admitting = %self.peer_display_name(from),
                 share = evicted.share,
+                evicted_age_ms = %diag::OrNone(evicted.age_ms),
+                evicted_forwarded = %diag::OrNone(evicted.answered),
                 "Lookup dedup cache full, evicting the oldest entry to make room"
             );
         }
@@ -186,7 +195,7 @@ impl Node {
             }
             RequestOutcome::Forward => {
                 self.metrics().lookup.req_forwarded.inc();
-                self.forward_lookup_request(request).await;
+                self.forward_lookup_request(from, request).await;
             }
             RequestOutcome::ForwardRateLimited => {
                 self.metrics().lookup.req_forward_rate_limited.inc();
@@ -291,6 +300,7 @@ impl Node {
                 debug!(
                     request_id = response.request_id,
                     target = %self.peer_display_name(&response.target),
+                    evicted_recently = self.lookup.was_evicted(response.request_id),
                     "LookupResponse does not match an outstanding request, dropping"
                 );
             }
@@ -590,7 +600,7 @@ impl Node {
     /// Fallback: if no tree peer's bloom matches, try non-tree peers whose
     /// bloom contains the target. This recovers from dead ends caused by
     /// stale bloom filters, tree restructuring, or transit node failures.
-    async fn forward_lookup_request(&mut self, mut request: LookupRequest) {
+    async fn forward_lookup_request(&mut self, from: &NodeAddr, mut request: LookupRequest) {
         // Plan the forward with the sans-IO decision core. The core owns the
         // TTL decrement, tree/fallback peer selection, and single-encode
         // fan-out; the shell keeps all metrics/logging and drives the sends.
@@ -619,6 +629,10 @@ impl Node {
                         target = %self.peer_display_name(&request.target),
                         ttl = request.ttl,
                         peer_count,
+                        from = %self.peer_display_name(from),
+                        origin = %self.peer_display_name(&request.origin),
+                        to = %self.recipient_names(&actions),
+                        to_sender = sends_to(&actions, from),
                         "Forwarding LookupRequest via non-tree fallback"
                     );
                 } else {
@@ -627,6 +641,10 @@ impl Node {
                         target = %self.peer_display_name(&request.target),
                         ttl = request.ttl,
                         peer_count,
+                        from = %self.peer_display_name(from),
+                        origin = %self.peer_display_name(&request.origin),
+                        to = %self.recipient_names(&actions),
+                        to_sender = sends_to(&actions, from),
                         "Forwarding LookupRequest"
                     );
                 }
@@ -643,6 +661,19 @@ impl Node {
                 }
             }
         }
+    }
+
+    /// The display names of the peers `actions` sends to, in order.
+    fn recipient_names(&self, actions: &[LookupAction]) -> diag::Names {
+        diag::Names(
+            actions
+                .iter()
+                .filter_map(|a| match a {
+                    LookupAction::SendLink { peer, .. } => Some(self.peer_display_name(peer)),
+                    _ => None,
+                })
+                .collect(),
+        )
     }
 
     /// Initiate a discovery lookup for a target node.

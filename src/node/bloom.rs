@@ -9,7 +9,7 @@ use crate::proto::bloom::FilterAnnounce;
 use crate::proto::mmp::delivery::{LinkEvidence, RrCounters};
 
 use super::reject::BloomReject;
-use super::{Node, NodeError};
+use super::{Node, NodeError, diag};
 use std::collections::BTreeMap;
 use tracing::{debug, warn};
 
@@ -123,6 +123,7 @@ impl Node {
             set_bits = sent_filter.count_ones(),
             fill = format_args!("{:.1}%", sent_filter.fill_ratio() * 100.0),
             tree_peer = self.is_tree_peer(peer_addr),
+            digest = %diag::filter_tag(&sent_filter),
             "Sent FilterAnnounce"
         );
         self.bloom_state.record_update_sent(*peer_addr, now_ms);
@@ -267,6 +268,9 @@ impl Node {
             set_bits = announce.filter.count_ones(),
             fill = format_args!("{:.1}%", announce.filter.fill_ratio() * 100.0),
             tree_peer = self.is_tree_peer(from),
+            digest = %diag::filter_tag(&announce.filter),
+            tree_role = %self.tree_role(from),
+            overlap = %self.overlap_with_sent(from, &announce.filter),
             "Received FilterAnnounce"
         );
 
@@ -282,6 +286,17 @@ impl Node {
         let peer_filters = self.peer_inbound_filters();
         self.bloom_state
             .mark_changed_peers(from, &peer_addrs, &peer_filters);
+    }
+
+    /// How much of the filter last sent to `from` the filter it announced
+    /// contains, for a tree peer; `none` for a non-tree peer, or before
+    /// anything was sent to it.
+    fn overlap_with_sent(&self, from: &NodeAddr, got: &BloomFilter) -> diag::OrNone<diag::Ratio> {
+        if self.tree_role(from) == diag::TreeRole::None {
+            return diag::OrNone(None);
+        }
+        let sent = self.bloom_state.last_sent_filter(from);
+        diag::OrNone(sent.and_then(|s| got.overlap(s)).map(diag::Ratio))
     }
 
     /// Read what `peer_addr`'s link shows about delivery of our frames: the

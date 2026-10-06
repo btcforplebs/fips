@@ -31,6 +31,7 @@ mod rx_stall;
 mod session;
 mod spanning_tree;
 mod tcp;
+mod traffic_diag;
 mod udp_dns;
 mod unit;
 mod update_peers;

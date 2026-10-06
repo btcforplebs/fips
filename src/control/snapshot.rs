@@ -312,6 +312,8 @@ pub(crate) struct BloomPeerRow {
     pub display_name: String,
     pub has_filter: bool,
     pub filter_sequence: u64,
+    /// The peer's place in the spanning tree.
+    pub tree_role: crate::node::diag::TreeRole,
     /// Present only when the peer has supplied an inbound filter.
     pub filter: Option<BloomPeerFilter>,
 }

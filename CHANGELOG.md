@@ -262,6 +262,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   10 lines and then one a second; each line reports how many were withheld
   before it (`suppressed`). Message texts are unchanged.
 
+- "Unknown FMP version, dropping" and "FMP payload_len disagrees with frame
+  length, dropping" now name the sender's address and the frame's first 8
+  bytes (`remote_addr`, `head`), and "Unknown link message type" names the
+  peer (`peer`). Each of the three is limited by its own node-wide budget of
+  10 lines and then one a second, and reports how many lines were withheld
+  before it (`suppressed`). "Accepted inbound TCP connection" says how many
+  inbound connections its source holds, counting an IPv6 source by its /64
+  (`open_from_source`), and how many the pool holds (`open_total`). A new
+  debug line, "Closed TCP connection", gives each connection's lifetime, the
+  frames received on it, whether this node wrote a msg2 on it, and why it
+  ended (`lifetime_s`, `frames`, `msg2_sent`, `reason`). "Sent FilterAnnounce"
+  and "Received FilterAnnounce" carry an 8-byte digest of the filter bits
+  (`digest`); a received one also gives the peer's tree role (`tree_role`)
+  and, from a tree peer, the share of the filter last sent to that peer that
+  the new one contains (`overlap`). "Forwarding LookupRequest" names the
+  sender, origin and recipients and says whether the request went back to
+  its sender (`from`, `origin`, `to`, `to_sender`). A dedup eviction logs the
+  evicted entry's age and whether a response had already gone back on it
+  (`evicted_age_ms`, `evicted_forwarded`), and an unsolicited LookupResponse
+  says whether its request was among the recently evicted ones
+  (`evicted_recently`). `show_bloom` peer rows carry `tree_role` (`parent`,
+  `child` or `none`). Message texts are unchanged.
+
 - The Windows service log is rolled at `node.log_max_size_mb` and keeps
   `node.log_max_files` old files. The defaults are the 10 MiB and four files it
   used before.
