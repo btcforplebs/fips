@@ -623,6 +623,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unreachable host or network, a reset or any other connect error lands there
   too, with the error in the debug log.
 
+- Two BLE nodes that can each reach the other no longer fail to link when only
+  one of them can dial. The node with the smaller address stood every inbound
+  link down so that its own outbound would win, and when that outbound could
+  not succeed — on a platform that assigns listener PSMs, it was dialled at the
+  wrong one — it dropped a working link every thirty seconds in favour of one it
+  could never build; seen between two Android phones. A lone link is now always
+  admitted, whichever side dialled it. Node order only settles a race: when a
+  second link to the same peer completes within one connect timeout of the
+  first, both ends keep the one the smaller node dialled, so a simultaneous
+  dial cannot leave each side holding the link the other closed. Outside that
+  window the established link is kept, and a second link at the same address
+  no longer overwrites it. The `tiebreaker_yields` and `tiebreaker_drops`
+  counters are gone; `duplicate_link_replacements` counts races settled in the
+  newcomer's favour.
+
+- Every BLE dial now goes to the PSM the peer advertised. Only the scan loop's
+  probe used it; a node-initiated dial — an auto-connect, a path probe — went to
+  the configured PSM, which a platform that assigns listener PSMs never listens
+  on. A learned PSM is forgotten only when a dial to that same PSM is refused,
+  not when a dial times out or went out at another value, so an unreachable
+  peer keeps the PSM it advertised.
+
 #### Gateway
 
 - The gateway retries failed firewall rebuilds every ten seconds without

@@ -40,6 +40,13 @@ pub struct BleConnection<S> {
     pub established_at: tokio::time::Instant,
     /// Whether this is a static (configured) peer.
     pub is_static: bool,
+    /// Whether this node dialled the link, rather than accepted it.
+    ///
+    /// The two ends of one link disagree on this and agree on everything
+    /// else, which is what lets both decide alike which of two links to the
+    /// same peer to keep: the one the smaller node dialled is outbound on the
+    /// smaller side and inbound on the larger.
+    pub outbound: bool,
     /// Parsed remote address.
     pub addr: BleAddr,
     /// The peer's node address, once the pubkey exchange has learned it.
@@ -262,6 +269,7 @@ mod tests {
             recv_mtu: 2048,
             established_at: tokio::time::Instant::now(),
             is_static,
+            outbound: false,
             addr: test_ble_addr(n),
             node_addr: None,
         }
