@@ -5,7 +5,7 @@ The FIPS mesh network daemon.
 ## Synopsis
 
 ```text
-fips [-c FILE]
+fips [-c FILE] [--log-file FILE]
 ```
 
 On Windows the same binary additionally accepts `--install-service`,
@@ -19,7 +19,8 @@ identity, brings up the TUN adapter, listens on configured transports,
 authenticates peers, maintains the spanning tree, and forwards mesh
 traffic. There is one daemon per node.
 
-The daemon stays in the foreground, logging to stderr, until it
+The daemon stays in the foreground, logging to stderr (or to the file
+named by `--log-file` or `node.log_file`), until it
 receives `SIGINT` or `SIGTERM`. On Windows, the service variant is
 controlled through the standard service control manager.
 
@@ -28,6 +29,7 @@ controlled through the standard service control manager.
 | Flag | Argument | Description |
 | ---- | -------- | ----------- |
 | `-c`, `--config` | `FILE` | Use `FILE` as the configuration. Skips the default search paths. |
+| `--log-file` | `FILE` | Log to `FILE` instead of stdout, rolled by size at `node.log_max_size_mb` and kept to `node.log_max_files` rolled files. Overrides `node.log_file`, and is opened before the configuration loads, so a configuration error is logged there too. The macOS package passes it from the launchd plist. See [configuration.md](configuration.md). |
 | `-V` | — | Print the short version, `<version> (rev <git-hash>)`. The `rev` part is omitted when the build could not read a git revision, as in a package built from a git worktree. |
 | `--version` | — | Print the long version: short version plus build target triple. |
 | `-h`, `--help` | — | Print usage and exit. |
@@ -35,8 +37,8 @@ controlled through the standard service control manager.
 | `--uninstall-service` | — | (Windows only) Uninstall the Windows service. Requires Administrator. |
 | `--service` | — | (Windows only, internal) Run as a Windows service. Invoked by the service control manager — not for direct use. |
 
-There are no other CLI flags; all daemon behaviour is governed by the
-YAML configuration. See [configuration.md](configuration.md).
+There are no other CLI flags; all other daemon behaviour is governed by
+the YAML configuration. See [configuration.md](configuration.md).
 
 ## Exit Codes
 
