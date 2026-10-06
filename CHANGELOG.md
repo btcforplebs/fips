@@ -613,6 +613,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 #### Data plane and transports
 
+- Two nodes that started a handshake to each other at once over Bluetooth LE
+  no longer drop the link between them. Resolving the crossed handshake, or
+  reaping a stale handshake leg, closed the losing leg's connection by its
+  address. On TCP that is a socket of its own, but BLE carries both legs on
+  the one L2CAP link to the peer, so the close took down the link the
+  surviving session ran on; the nodes then redialled, and a peer that still
+  held the first link closed the second, so the pair churned. A leg's
+  connection is now left open when an active peer runs on it.
+
 - A peer that stops reading can no longer stall the node. TCP, Tor, Nym and
   BLE wrote to their links directly from the caller's task, and a write
   blocks once the peer's receive window and this node's send buffer are both
