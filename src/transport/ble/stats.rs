@@ -33,6 +33,12 @@ pub struct BleStats {
     pub pool_evictions: AtomicU64,
     pub advertisements_sent: AtomicU64,
     pub scan_results: AtomicU64,
+    /// Channels held beside another channel at the same address, which is
+    /// what two nodes dialling each other at once produce.
+    pub duplicates_held: AtomicU64,
+    /// Channels retired because another channel at the same address was
+    /// kept.
+    pub duplicates_closed: AtomicU64,
 }
 
 impl BleStats {
@@ -54,6 +60,8 @@ impl BleStats {
             pool_evictions: AtomicU64::new(0),
             advertisements_sent: AtomicU64::new(0),
             scan_results: AtomicU64::new(0),
+            duplicates_held: AtomicU64::new(0),
+            duplicates_closed: AtomicU64::new(0),
         }
     }
 
@@ -128,6 +136,16 @@ impl BleStats {
         self.scan_results.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record a channel held beside another at its address.
+    pub fn record_duplicate_held(&self) {
+        self.duplicates_held.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a channel retired in favour of another at its address.
+    pub fn record_duplicate_closed(&self) {
+        self.duplicates_closed.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Take a snapshot of all counters.
     pub fn snapshot(&self) -> BleStatsSnapshot {
         BleStatsSnapshot {
@@ -146,6 +164,8 @@ impl BleStats {
             pool_evictions: self.pool_evictions.load(Ordering::Relaxed),
             advertisements_sent: self.advertisements_sent.load(Ordering::Relaxed),
             scan_results: self.scan_results.load(Ordering::Relaxed),
+            duplicates_held: self.duplicates_held.load(Ordering::Relaxed),
+            duplicates_closed: self.duplicates_closed.load(Ordering::Relaxed),
         }
     }
 }
@@ -174,4 +194,6 @@ pub struct BleStatsSnapshot {
     pub pool_evictions: u64,
     pub advertisements_sent: u64,
     pub scan_results: u64,
+    pub duplicates_held: u64,
+    pub duplicates_closed: u64,
 }

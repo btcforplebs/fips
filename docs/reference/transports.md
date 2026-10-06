@@ -90,19 +90,16 @@ Nym is outbound-only (no inbound listener), so there are no
 | `packets_recv` / `bytes_recv` | Successful L2CAP CoC receives |
 | `send_errors` / `recv_errors` | Send/receive failures |
 | `mtu_exceeded` | Packets rejected for MTU violation |
-| `connections_established` | Successful outbound L2CAP connections |
-| `connections_accepted` | Accepted inbound L2CAP connections |
-| `connections_rejected` | Rejected inbound (limit exceeded) |
-| `handshakes_aborted` | Inbound handshakes aborted to free an in-flight slot |
+| `connections_established` | Outbound L2CAP channels kept, including one held beside another |
+| `connections_accepted` | Inbound L2CAP channels kept, including one held beside another |
+| `connections_rejected` | Channels dropped because the pool was full and nothing could be evicted |
 | `connect_timeouts` | Connection timeout count |
 | `connect_errors` | Outbound connects that failed with an error rather than timing out |
-| `pubkey_exchange_failures` | Connections dropped because the pre-handshake pubkey exchange failed |
-| `tiebreaker_yields` | Outbound connections stood down by the cross-probe tie-breaker |
-| `tiebreaker_drops` | Inbound connections stood down by the cross-probe tie-breaker |
 | `pool_evictions` | Connection-pool entries evicted |
 | `advertisements_sent` | BLE advertisements emitted |
 | `scan_results` | BLE scan results observed |
-| `duplicate_node_declines` | Connections declined because the peer was already linked on another link address |
+| `duplicates_held` | Channels held beside another at the same address, as when two nodes dial each other at once |
+| `duplicates_closed` | Channels retired because another at the same address was kept |
 
 ## See also
 

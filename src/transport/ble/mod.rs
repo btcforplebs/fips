@@ -59,12 +59,13 @@ use crate::config::BleConfig;
 use addr::BleAddr;
 use io::{BleIo, BleScanner, BleStream};
 use neighbor::NeighborBuffer;
-use pool::{BleConnection, ConnectionPool};
+use pool::{Admission, Admitted, BleConnection, ConnectionPool};
 use stats::BleStats;
 use stream_read::BleStreamRead;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, trace, warn};
@@ -156,6 +157,8 @@ pub struct BleTransport<I: BleIo> {
     /// node's [`connect_async`](Self::connect_async) alike, goes there. A
     /// peer that advertises nothing is dialled at the configured PSM.
     learned_psm: LearnedPsm,
+    /// Source of channel ids, which tell channels at one address apart.
+    next_id: Arc<AtomicU64>,
 }
 
 /// Advertised listener PSM by link address, shared between the scan loop
@@ -196,6 +199,147 @@ struct ConnectingEntry {
     task: JoinHandle<()>,
 }
 
+/// Everything a channel needs from its transport, shared by every path
+/// that builds one: the accept loop, the scan loop's probe, and the node's
+/// own dials. One place spawns a channel's tasks and offers it to the pool,
+/// so the paths cannot drift apart.
+struct Channels<S> {
+    pool: Arc<Mutex<ConnectionPool<Arc<S>>>>,
+    packet_tx: PacketTx,
+    transport_id: TransportId,
+    stats: Arc<BleStats>,
+    next_id: Arc<AtomicU64>,
+    /// How long a retired channel stays open for the peer's last frames
+    /// before it is dropped.
+    linger: std::time::Duration,
+}
+
+impl<S> Clone for Channels<S> {
+    fn clone(&self) -> Self {
+        Self {
+            pool: Arc::clone(&self.pool),
+            packet_tx: self.packet_tx.clone(),
+            transport_id: self.transport_id,
+            stats: Arc::clone(&self.stats),
+            next_id: Arc::clone(&self.next_id),
+            linger: self.linger,
+        }
+    }
+}
+
+impl<S: BleStream + 'static> Channels<S> {
+    /// Start a channel's reader and writer and offer it to the pool at
+    /// `addr`: the address dialled for an outbound channel, the stream's
+    /// remote address for an inbound one.
+    ///
+    /// Records the outcome in the counters: a dial that is kept counts as
+    /// established and an inbound as accepted, whether it is the address's
+    /// only channel or held beside another; a channel retired on arrival
+    /// counts only as a duplicate closed. On `Err` the pool was full and the
+    /// channel is gone. Only [`Admission::Admit`] is a newly linked address
+    /// that the node layer has not been told about.
+    async fn admit(
+        &self,
+        stream: S,
+        addr: BleAddr,
+        outbound: bool,
+    ) -> Result<Admitted, TransportError> {
+        let ta = addr.to_transport_addr();
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let send_mtu = stream.send_mtu();
+        let recv_mtu = stream.recv_mtu();
+        let stream = Arc::new(stream);
+        // One reader for the life of the channel: it buffers what one `recv`
+        // left over, so packet boundaries come from the FMP length prefix
+        // rather than from the L2CAP SDU boundary.
+        let reader = BleStreamRead::new(Arc::clone(&stream), recv_mtu);
+
+        let recv_task = tokio::spawn(receive_loop(
+            reader,
+            ta.clone(),
+            id,
+            Arc::clone(&self.pool),
+            self.packet_tx.clone(),
+            self.transport_id,
+            Arc::clone(&self.stats),
+            recv_mtu,
+        ));
+        let (send_tx, send_rx) = tokio::sync::mpsc::channel(pool::SEND_QUEUE_DEPTH);
+        let send_task = tokio::spawn(send_loop(
+            Arc::clone(&stream),
+            send_rx,
+            ta.clone(),
+            id,
+            Arc::clone(&self.pool),
+            Arc::clone(&self.stats),
+        ));
+
+        let conn = BleConnection {
+            stream,
+            send_tx,
+            send_task: Some(send_task),
+            recv_task: Some(recv_task),
+            send_mtu,
+            recv_mtu,
+            established_at: tokio::time::Instant::now(),
+            is_static: false,
+            addr,
+            outbound,
+            id,
+        };
+
+        let role = if outbound { "central" } else { "peripheral" };
+        let admitted = self.pool.lock().await.insert(ta.clone(), conn);
+        let admitted = match admitted {
+            Ok(admitted) => admitted,
+            Err(e) => {
+                self.stats.record_connection_rejected();
+                warn!(
+                    addr = %ta, role, outcome = "pool-rejected", error = %e,
+                    "BLE pool full, connection dropped"
+                );
+                return Err(e);
+            }
+        };
+        if let Some(evicted) = &admitted.evicted {
+            self.stats.record_pool_eviction();
+            debug!(addr = %ta, evicted = %evicted, "BLE connection evicted a peer");
+        }
+        if admitted.admission != Admission::Retire {
+            if outbound {
+                self.stats.record_connection_established();
+            } else {
+                self.stats.record_connection_accepted();
+            }
+        }
+        if admitted.admission == Admission::Hold {
+            self.stats.record_duplicate_held();
+        }
+        debug!(
+            addr = %ta, role, channel = id, admission = ?admitted.admission,
+            send_mtu, recv_mtu, "BLE channel admitted"
+        );
+        self.linger(&ta, &admitted.retired);
+        Ok(admitted)
+    }
+
+    /// Drop each retired channel once the linger passes, unless its reader
+    /// has already seen the peer close it.
+    fn linger(&self, addr: &TransportAddr, ids: &[u64]) {
+        for &id in ids {
+            self.stats.record_duplicate_closed();
+            debug!(addr = %addr, channel = id, "BLE channel retired");
+            let pool = Arc::clone(&self.pool);
+            let addr = addr.clone();
+            let linger = self.linger;
+            tokio::spawn(async move {
+                tokio::time::sleep(linger).await;
+                pool.lock().await.remove_channel(&addr, id);
+            });
+        }
+    }
+}
+
 impl<I: BleIo> BleTransport<I> {
     /// Create a new BLE transport.
     pub fn new(
@@ -220,6 +364,7 @@ impl<I: BleIo> BleTransport<I> {
             neighbor_buffer: Arc::new(NeighborBuffer::new(transport_id)),
             stats: Arc::new(BleStats::new()),
             learned_psm: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            next_id: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -236,6 +381,18 @@ impl<I: BleIo> BleTransport<I> {
     /// Get the I/O implementation (for test injection).
     pub fn io(&self) -> &Arc<I> {
         &self.io
+    }
+
+    /// The handle every channel-building path uses.
+    fn channels(&self) -> Channels<I::Stream> {
+        Channels {
+            pool: Arc::clone(&self.pool),
+            packet_tx: self.packet_tx.clone(),
+            transport_id: self.transport_id,
+            stats: Arc::clone(&self.stats),
+            next_id: Arc::clone(&self.next_id),
+            linger: std::time::Duration::from_millis(self.config.connect_timeout_ms()),
+        }
     }
 
     /// Start the transport asynchronously.
@@ -258,19 +415,9 @@ impl<I: BleIo> BleTransport<I> {
             match self.io.listen(configured_psm).await {
                 Ok((acceptor, bound_psm)) => {
                     listener_psm = bound_psm;
-                    let pool = Arc::clone(&self.pool);
-                    let packet_tx = self.packet_tx.clone();
-                    let transport_id = self.transport_id;
-                    let stats = Arc::clone(&self.stats);
-                    let max_conns = self.config.max_connections();
-
                     self.accept_task = Some(tokio::spawn(accept_loop(
                         acceptor,
-                        pool,
-                        packet_tx,
-                        transport_id,
-                        stats,
-                        max_conns,
+                        self.channels(),
                         Arc::clone(&self.neighbor_buffer),
                     )));
                     debug!(
@@ -309,15 +456,12 @@ impl<I: BleIo> BleTransport<I> {
                     self.scan_probe_task = Some(tokio::spawn(scan_probe_loop::<I>(
                         scanner,
                         Arc::clone(&self.io),
-                        Arc::clone(&self.pool),
+                        self.channels(),
                         Arc::clone(&self.neighbor_buffer),
-                        Arc::clone(&self.stats),
                         Arc::clone(&self.learned_psm),
                         self.config.psm(),
                         self.config.connect_timeout_ms(),
                         self.config.probe_cooldown_secs(),
-                        self.packet_tx.clone(),
-                        self.transport_id,
                     )));
                     debug!(adapter = %adapter, "BLE scan+probe loop started");
                 }
@@ -478,78 +622,14 @@ impl<I: BleIo> BleTransport<I> {
             }
         };
 
-        // One reader for the life of the connection: it buffers what one
-        // `recv` left over, so packet boundaries come from the FMP length
-        // prefix rather than from the L2CAP SDU boundary.
-        let stream = Arc::new(stream);
-        let recv_mtu = stream.recv_mtu();
-        let reader = BleStreamRead::new(Arc::clone(&stream), recv_mtu);
-
-        self.neighbor_buffer.add_peer(&ble_addr);
-        self.promote_connection(addr, &ble_addr, stream, reader)
+        let admitted = self
+            .channels()
+            .admit(stream, ble_addr.clone(), true)
             .await
-    }
-
-    /// Promote a newly established stream into the connection pool.
-    ///
-    /// Spawns the receive loop and inserts into the pool with eviction.
-    async fn promote_connection(
-        &self,
-        addr: &TransportAddr,
-        ble_addr: &BleAddr,
-        stream: Arc<I::Stream>,
-        reader: BleStreamRead<I::Stream>,
-    ) -> Result<(), TransportError> {
-        let send_mtu = stream.send_mtu();
-        let recv_mtu = stream.recv_mtu();
-
-        let recv_task = tokio::spawn(receive_loop(
-            reader,
-            addr.clone(),
-            Arc::clone(&self.pool),
-            self.packet_tx.clone(),
-            self.transport_id,
-            Arc::clone(&self.stats),
-            recv_mtu,
-        ));
-
-        let (send_tx, send_rx) = tokio::sync::mpsc::channel(pool::SEND_QUEUE_DEPTH);
-        let send_task = tokio::spawn(send_loop(
-            Arc::clone(&stream),
-            send_rx,
-            addr.clone(),
-            Arc::clone(&self.pool),
-            Arc::clone(&self.stats),
-        ));
-
-        let conn = BleConnection {
-            stream,
-            send_tx,
-            send_task: Some(send_task),
-            recv_task: Some(recv_task),
-            send_mtu,
-            recv_mtu,
-            established_at: tokio::time::Instant::now(),
-            is_static: false,
-            addr: ble_addr.clone(),
-        };
-
-        let mut pool = self.pool.lock().await;
-        match pool.insert(addr.clone(), conn) {
-            Ok(Some(evicted)) => {
-                self.stats.record_pool_eviction();
-                debug!(addr = %addr, evicted = %evicted, "BLE connection established (evicted peer)");
-            }
-            Ok(None) => {
-                debug!(addr = %addr, "BLE connection established");
-            }
-            Err(e) => {
-                warn!(addr = %addr, error = %e, "BLE pool full, connection dropped");
-                self.stats.record_connection_rejected();
-                return Err(TransportError::SendFailed("pool full".into()));
-            }
+            .map_err(|_| TransportError::SendFailed("pool full".into()))?;
+        if admitted.admission == Admission::Admit {
+            self.neighbor_buffer.add_peer(&ble_addr);
         }
-        self.stats.record_connection_established();
         Ok(())
     }
 
@@ -580,10 +660,8 @@ impl<I: BleIo> BleTransport<I> {
         )?;
 
         let io = Arc::clone(&self.io);
-        let pool = Arc::clone(&self.pool);
+        let channels = self.channels();
         let connecting = Arc::clone(&self.connecting);
-        let packet_tx = self.packet_tx.clone();
-        let transport_id = self.transport_id;
         let stats = Arc::clone(&self.stats);
         let learned_psm = Arc::clone(&self.learned_psm);
         let psm = psm_for(&learned_psm, &ble_addr, self.config.psm());
@@ -603,61 +681,13 @@ impl<I: BleIo> BleTransport<I> {
 
             match result {
                 Ok(Ok(stream)) => {
-                    let send_mtu = stream.send_mtu();
-                    let recv_mtu = stream.recv_mtu();
-                    let stream = Arc::new(stream);
-                    // Boundaries come from the FMP length prefix, not from
-                    // the L2CAP SDU boundary.
-                    let reader = BleStreamRead::new(Arc::clone(&stream), recv_mtu);
-                    neighbor_buffer.add_peer(&ble_addr);
-
-                    let recv_task = tokio::spawn(receive_loop(
-                        reader,
-                        addr_clone.clone(),
-                        Arc::clone(&pool),
-                        packet_tx,
-                        transport_id,
-                        Arc::clone(&stats),
-                        recv_mtu,
-                    ));
-
-                    let (send_tx, send_rx) = tokio::sync::mpsc::channel(pool::SEND_QUEUE_DEPTH);
-                    let send_task = tokio::spawn(send_loop(
-                        Arc::clone(&stream),
-                        send_rx,
-                        addr_clone.clone(),
-                        Arc::clone(&pool),
-                        Arc::clone(&stats),
-                    ));
-
-                    let conn = BleConnection {
-                        stream,
-                        send_tx,
-                        send_task: Some(send_task),
-                        recv_task: Some(recv_task),
-                        send_mtu,
-                        recv_mtu,
-                        established_at: tokio::time::Instant::now(),
-                        is_static: false,
-                        addr: ble_addr,
-                    };
-
-                    let mut pool = pool.lock().await;
-                    match pool.insert(addr_clone.clone(), conn) {
-                        Ok(Some(evicted)) => {
-                            stats.record_pool_eviction();
-                            debug!(addr = %addr_clone, evicted = %evicted, "BLE connection established (evicted peer)");
-                        }
-                        Ok(None) => {
-                            debug!(addr = %addr_clone, "BLE connection established");
-                        }
-                        Err(e) => {
-                            warn!(addr = %addr_clone, error = %e, "BLE pool full, connection dropped");
-                            stats.record_connection_rejected();
-                            return;
-                        }
+                    // Reported only as a newly linked address: one held
+                    // beside another, or retired, is already known.
+                    if let Ok(admitted) = channels.admit(stream, ble_addr.clone(), true).await
+                        && admitted.admission == Admission::Admit
+                    {
+                        neighbor_buffer.add_peer(&ble_addr);
                     }
-                    stats.record_connection_established();
                 }
                 Ok(Err(e)) => {
                     stats.record_connect_error();
@@ -707,9 +737,11 @@ impl<I: BleIo> BleTransport<I> {
     /// Close a specific connection.
     pub async fn close_connection_async(&self, addr: &TransportAddr) {
         let mut pool = self.pool.lock().await;
-        if let Some(conn) = pool.remove(addr) {
-            debug!(addr = %addr, "BLE connection closed");
-            drop(conn); // recv and writer tasks aborted via Drop
+        // Every channel at the address goes; recv and writer tasks are
+        // aborted via Drop.
+        let closed = pool.remove(addr);
+        if closed > 0 {
+            debug!(addr = %addr, channels = closed, "BLE connection closed");
         }
     }
 
@@ -788,19 +820,15 @@ impl<I: BleIo> Transport for BleTransport<I> {
 // in start_async, stopped in stop_async). BLE advertising overhead
 // is negligible (~0.15% duty cycle on advertising channels).
 
-/// Accept loop: accepts inbound L2CAP connections and adds them to the pool.
+/// Accept loop: accepts inbound L2CAP connections and offers them to the
+/// pool.
 ///
-/// One reader is built per connection and handed to the receive loop, so
-/// packet boundaries come from the FMP length prefix rather than from the
-/// L2CAP SDU boundary.
-#[allow(clippy::too_many_arguments)]
+/// An inbound at an address that already has a channel is not dropped: the
+/// pool decides, and holds it if the peer dialled while we did (see
+/// [`pool::admit`]). Only a newly linked address is reported to the node.
 async fn accept_loop<A>(
     mut acceptor: A,
-    pool: Arc<Mutex<ConnectionPool<Arc<A::Stream>>>>,
-    packet_tx: PacketTx,
-    transport_id: TransportId,
-    stats: Arc<BleStats>,
-    _max_conns: usize,
+    channels: Channels<A::Stream>,
     neighbor_buffer: Arc<NeighborBuffer>,
 ) where
     A: io::BleAcceptor,
@@ -810,76 +838,13 @@ async fn accept_loop<A>(
         match acceptor.accept().await {
             Ok(stream) => {
                 let addr = stream.remote_addr().clone();
-                let ta = addr.to_transport_addr();
-
-                // Skip if already connected (outbound won the race)
-                {
-                    let pool_guard = pool.lock().await;
-                    if pool_guard.contains(&ta) {
-                        debug!(addr = %ta, "BLE inbound: already connected, skipping");
-                        continue;
+                match channels.admit(stream, addr.clone(), false).await {
+                    Ok(admitted) if admitted.admission == Admission::Admit => {
+                        info!(addr = %addr.to_transport_addr(), "BLE inbound connection accepted");
+                        neighbor_buffer.add_peer(&addr);
                     }
+                    Ok(_) | Err(_) => {}
                 }
-
-                let send_mtu = stream.send_mtu();
-                let recv_mtu = stream.recv_mtu();
-
-                neighbor_buffer.add_peer(&addr);
-
-                let stream = Arc::new(stream);
-                let reader = BleStreamRead::new(Arc::clone(&stream), recv_mtu);
-
-                // Spawn receive loop
-                let recv_task = tokio::spawn(receive_loop(
-                    reader,
-                    ta.clone(),
-                    Arc::clone(&pool),
-                    packet_tx.clone(),
-                    transport_id,
-                    Arc::clone(&stats),
-                    recv_mtu,
-                ));
-
-                let (send_tx, send_rx) = tokio::sync::mpsc::channel(pool::SEND_QUEUE_DEPTH);
-                let send_task = tokio::spawn(send_loop(
-                    Arc::clone(&stream),
-                    send_rx,
-                    ta.clone(),
-                    Arc::clone(&pool),
-                    Arc::clone(&stats),
-                ));
-
-                let conn = BleConnection {
-                    stream,
-                    send_tx,
-                    send_task: Some(send_task),
-                    recv_task: Some(recv_task),
-                    send_mtu,
-                    recv_mtu,
-                    established_at: tokio::time::Instant::now(),
-                    is_static: false,
-                    addr,
-                };
-
-                let mut pool_guard = pool.lock().await;
-                match pool_guard.insert(ta.clone(), conn) {
-                    Ok(Some(evicted)) => {
-                        stats.record_pool_eviction();
-                        info!(addr = %ta, evicted = %evicted, "BLE inbound accepted (evicted peer)");
-                    }
-                    Ok(None) => {
-                        info!(addr = %ta, send_mtu, recv_mtu, "BLE inbound connection accepted");
-                    }
-                    Err(e) => {
-                        stats.record_connection_rejected();
-                        warn!(
-                            addr = %ta, role = "peripheral", outcome = "pool-rejected",
-                            error = %e, "BLE pool full, inbound connection rejected"
-                        );
-                        continue;
-                    }
-                }
-                stats.record_connection_accepted();
             }
             Err(e) => {
                 warn!(error = %e, "BLE accept error");
@@ -899,15 +864,20 @@ async fn accept_loop<A>(
 /// both halves of that: the caller enqueues and returns, and the pool lock is
 /// never held across the link.
 ///
-/// On a write error the connection is removed from the pool, which is where
+/// On a write error the channel is removed from the pool, which is where
 /// the old inline path put it too. Dropping the pool entry aborts this task
 /// and the receive task through `BleConnection`'s `Drop`; the abort does not
 /// block and nothing is awaited after the `return`, so aborting ourselves here
-/// is benign.
+/// is benign. Only this channel is removed, by its id, never another channel
+/// at the same address.
+///
+/// When the channel is retired its queue's sender is dropped, so this loop
+/// writes what is already queued and then ends on its own.
 async fn send_loop<S: BleStream + 'static>(
     stream: Arc<S>,
     mut frames: tokio::sync::mpsc::Receiver<Vec<u8>>,
     addr: TransportAddr,
+    id: u64,
     pool: Arc<Mutex<ConnectionPool<Arc<S>>>>,
     stats: Arc<BleStats>,
 ) {
@@ -917,7 +887,7 @@ async fn send_loop<S: BleStream + 'static>(
             Err(e) => {
                 stats.record_send_error();
                 warn!(addr = %addr, error = %e, "BLE send failed, connection removed");
-                pool.lock().await.remove(&addr);
+                pool.lock().await.remove_channel(&addr, id);
                 return;
             }
         }
@@ -926,14 +896,19 @@ async fn send_loop<S: BleStream + 'static>(
 
 /// Receive loop: reads packets from a BLE stream and delivers to node.
 ///
-/// Takes the connection's `BleStreamRead` — already positioned past the
-/// pubkey exchange, and still holding anything the peer coalesced behind it
-/// — and pulls whole FIPS packets out of it using the FMP length prefix.
-/// Boundaries come from the bytes, not from the backend's socket type, so a
-/// fragment is reassembled and a coalesced tail is not lost.
+/// Takes the connection's `BleStreamRead` and pulls whole FIPS packets out
+/// of it using the FMP length prefix. Boundaries come from the bytes, not
+/// from the backend's socket type, so a fragment is reassembled and a
+/// coalesced tail is not lost.
+///
+/// When the channel ends, only this channel is removed from the pool, by its
+/// id. A retired channel's reader keeps running until then, so frames the
+/// peer sent on it before it settled are still delivered.
+#[allow(clippy::too_many_arguments)]
 async fn receive_loop<S: BleStream + 'static>(
     mut reader: BleStreamRead<S>,
     addr: TransportAddr,
+    id: u64,
     pool: Arc<Mutex<ConnectionPool<Arc<S>>>>,
     packet_tx: PacketTx,
     transport_id: TransportId,
@@ -962,9 +937,9 @@ async fn receive_loop<S: BleStream + 'static>(
         }
     }
 
-    // Remove from pool
+    // Remove this channel, and only this one, from the pool
     let mut pool = pool.lock().await;
-    pool.remove(&addr);
+    pool.remove_channel(&addr, id);
 }
 
 /// Consecutive-failure backoff ceiling for a pending address, as a power of
@@ -1122,16 +1097,15 @@ impl PendingProbes {
 async fn scan_probe_loop<I: io::BleIo>(
     mut scanner: I::Scanner,
     io: Arc<I>,
-    pool: Arc<Mutex<ConnectionPool<Arc<I::Stream>>>>,
+    channels: Channels<I::Stream>,
     buffer: Arc<NeighborBuffer>,
-    stats: Arc<BleStats>,
     learned_psm: LearnedPsm,
     configured_psm: u16,
     connect_timeout_ms: u64,
     cooldown_secs: u64,
-    packet_tx: PacketTx,
-    transport_id: TransportId,
 ) {
+    let pool = Arc::clone(&channels.pool);
+    let stats = Arc::clone(&channels.stats);
     // Addresses discovered but not yet connected — retried after cooldown even
     // if the scanner doesn't fire again (BlueZ deduplicates), on a per-address
     // backoff that widens with consecutive failures. Also the cooldown record:
@@ -1236,78 +1210,25 @@ async fn scan_probe_loop<I: io::BleIo>(
             }
         };
 
-        // Promote the connection to the pool.
-        let ta = addr.to_transport_addr();
-        let send_mtu = stream.send_mtu();
-        let recv_mtu = stream.recv_mtu();
-        let stream = Arc::new(stream);
-        // Boundaries come from the FMP length prefix, not the SDU boundary.
-        let reader = BleStreamRead::new(Arc::clone(&stream), recv_mtu);
-
-        let recv_task = tokio::spawn(receive_loop(
-            reader,
-            ta.clone(),
-            Arc::clone(&pool),
-            packet_tx.clone(),
-            transport_id,
-            Arc::clone(&stats),
-            recv_mtu,
-        ));
-
-        let (send_tx, send_rx) = tokio::sync::mpsc::channel(pool::SEND_QUEUE_DEPTH);
-        let send_task = tokio::spawn(send_loop(
-            Arc::clone(&stream),
-            send_rx,
-            ta.clone(),
-            Arc::clone(&pool),
-            Arc::clone(&stats),
-        ));
-
-        let conn = BleConnection {
-            stream,
-            send_tx,
-            send_task: Some(send_task),
-            recv_task: Some(recv_task),
-            send_mtu,
-            recv_mtu,
-            established_at: tokio::time::Instant::now(),
-            is_static: false,
-            addr: addr.clone(),
-        };
-
-        let mut pool_guard = pool.lock().await;
-        match pool_guard.insert(ta.clone(), conn) {
-            Ok(Some(evicted)) => {
-                stats.record_pool_eviction();
-                debug!(addr = %ta, evicted = %evicted, "BLE probe promoted (evicted peer)");
-            }
-            Ok(None) => {
+        // Offer the channel to the pool. Any channel the pool keeps or
+        // retires is conclusive for the probe; only a full pool leaves the
+        // address in the retry book, since a slot may free before the peer
+        // is advertised again.
+        match channels.admit(stream, addr.clone(), true).await {
+            Ok(admitted) => {
+                pending.resolve(&addr);
                 debug!(
-                    addr = %ta, role = "central", outcome = "connected",
+                    addr = %addr.to_transport_addr(), role = "central", outcome = "connected",
                     discovery_ms = probe_started.elapsed().as_millis() as u64,
-                    "BLE probe promoted to pool"
+                    admission = ?admitted.admission, "BLE probe connected"
                 );
+                // Report to node layer for auto-connect / handshake
+                if admitted.admission == Admission::Admit {
+                    buffer.add_peer(&addr);
+                }
             }
-            Err(e) => {
-                stats.record_connection_rejected();
-                warn!(
-                    addr = %ta, role = "central", outcome = "pool-rejected",
-                    error = %e, "BLE pool full, probe connection dropped"
-                );
-                // The connection is dropped with `conn`, so there is nothing to
-                // report and nothing to resolve. Leaving the address in the
-                // retry book is the point: a slot may free before the peer is
-                // advertised again. The inbound path already continues here
-                // rather than falling through.
-                continue;
-            }
+            Err(_) => continue,
         }
-        drop(pool_guard);
-        stats.record_connection_established();
-        pending.resolve(&addr);
-
-        // Report to node layer for auto-connect / handshake
-        buffer.add_peer(&addr);
     }
 }
 
@@ -1567,6 +1488,7 @@ mod tests {
         let task = tokio::spawn(receive_loop(
             reader,
             addr,
+            0,
             Arc::clone(&pool),
             tx,
             TransportId::new(1),
@@ -1795,7 +1717,8 @@ mod tests {
         let ta = test_addr(2).to_transport_addr();
         let (task, _rx, pool) = spawn_receive_loop(local);
 
-        // Put a pool entry in place so its removal is observable.
+        // Put a pool entry in place so its removal is observable. It carries
+        // the loop's channel id, because a loop removes only its own channel.
         let (parked, _other) = MockBleStream::pair(test_addr(1), test_addr(2), 2048);
         pool.lock()
             .await
@@ -1813,6 +1736,8 @@ mod tests {
                     established_at: tokio::time::Instant::now(),
                     is_static: false,
                     addr: test_addr(2),
+                    outbound: false,
+                    id: 0,
                 },
             )
             .unwrap();
@@ -2285,6 +2210,7 @@ mod tests {
             Arc::clone(&stream),
             send_rx,
             ta.clone(),
+            0,
             Arc::clone(&transport.pool),
             Arc::clone(&transport.stats),
         ));
@@ -2305,6 +2231,8 @@ mod tests {
                     established_at: tokio::time::Instant::now(),
                     is_static: false,
                     addr: test_addr(2),
+                    outbound: false,
+                    id: 0,
                 },
             )
             .unwrap();
@@ -2339,6 +2267,322 @@ mod tests {
             "a BLE peer that never drains must eventually have sends refused rather \
              than queued without bound: queued={queued}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Two channels to one address
+    // ------------------------------------------------------------------
+
+    /// One end of a two-sided test: a transport whose dials are served from
+    /// a queue of pre-built channel ends and held at a connect gate, and
+    /// whose inbound channels the test injects when it chooses.
+    struct Side {
+        transport: BleTransport<MockBleIo>,
+        rx: tokio::sync::mpsc::Receiver<ReceivedPacket>,
+        gate: tokio::sync::watch::Sender<bool>,
+    }
+
+    impl Side {
+        /// Build and start a side at `local` whose dials are served, in
+        /// order, from `dials`; a dial beyond those is refused, so a redial
+        /// cannot rescue a lost link.
+        async fn start(local: BleAddr, dials: Vec<MockBleStream>, config: BleConfig) -> Self {
+            let io = MockBleIo::new("hci0", local);
+            let queue = std::sync::Mutex::new(std::collections::VecDeque::from(dials));
+            io.set_connect_handler(move |_addr, _psm| {
+                queue
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .ok_or(TransportError::ConnectionRefused)
+            });
+            let (gate, gate_rx) = tokio::sync::watch::channel(false);
+            io.set_connect_gate(gate_rx);
+            let (tx, rx) = tokio::sync::mpsc::channel(64);
+            let mut transport = BleTransport::new(TransportId::new(1), None, config, io, tx);
+            transport.start_async().await.unwrap();
+            Self {
+                transport,
+                rx,
+                gate,
+            }
+        }
+
+        /// Let held dials through and wait until `n` of them completed.
+        async fn complete_dials(&self, n: u64) {
+            self.gate.send(true).unwrap();
+            let stats = Arc::clone(&self.transport.stats);
+            wait_for("the dial to complete", || {
+                stats.snapshot().connections_established == n
+            })
+            .await;
+        }
+
+        /// Hand the transport an inbound channel and let it be admitted.
+        async fn accept(&self, stream: MockBleStream) {
+            self.transport.io.inject_inbound(stream).await;
+            settle().await;
+        }
+
+        /// Whether `frame`, sent by the peer, arrives here.
+        async fn receives(&mut self, frame: &[u8]) -> bool {
+            matches!(
+                tokio::time::timeout(Duration::from_secs(1), self.rx.recv()).await,
+                Ok(Some(packet)) if packet.data == frame
+            )
+        }
+    }
+
+    /// The configuration both ends of a two-sided test run with.
+    fn race_config() -> BleConfig {
+        BleConfig {
+            adapter: Some("hci0".to_string()),
+            scan: Some(false),
+            advertise: Some(false),
+            accept_connections: Some(true),
+            ..Default::default()
+        }
+    }
+
+    /// Two nodes that dial each other at once must be left with a link that
+    /// carries traffic both ways. Before, each side kept the channel it had
+    /// dialled: an inbound at a pooled address was dropped, and a dial
+    /// completing at a pooled address overwrote whatever was there. Each
+    /// side then held the channel the other had closed, and both died.
+    ///
+    /// L1 is the channel A dials and L2 the one B dials. Every order is
+    /// driven: on each side, its own dial completes first or the peer's
+    /// arrives first.
+    #[tokio::test(start_paused = true)]
+    async fn a_simultaneous_dial_at_one_address_leaves_a_working_link() {
+        let (a, b) = (test_addr(1), test_addr(2));
+        let mut failures = Vec::new();
+        for (a_dial_first, b_dial_first) in
+            [(true, true), (true, false), (false, true), (false, false)]
+        {
+            let (l1_a, l1_b) = MockBleStream::pair(a.clone(), b.clone(), 2048);
+            let (l2_b, l2_a) = MockBleStream::pair(b.clone(), a.clone(), 2048);
+            let mut side_a = Side::start(a.clone(), vec![l1_a], race_config()).await;
+            let mut side_b = Side::start(b.clone(), vec![l2_b], race_config()).await;
+            side_a
+                .transport
+                .connect_async(&b.to_transport_addr())
+                .await
+                .unwrap();
+            side_b
+                .transport
+                .connect_async(&a.to_transport_addr())
+                .await
+                .unwrap();
+            settle().await;
+
+            let (mut l2_a, mut l1_b) = (Some(l2_a), Some(l1_b));
+            if a_dial_first {
+                side_a.complete_dials(1).await;
+            } else {
+                side_a.accept(l2_a.take().unwrap()).await;
+            }
+            if b_dial_first {
+                side_b.complete_dials(1).await;
+            } else {
+                side_b.accept(l1_b.take().unwrap()).await;
+            }
+            match l2_a.take() {
+                Some(inbound) => side_a.accept(inbound).await,
+                None => side_a.complete_dials(1).await,
+            }
+            match l1_b.take() {
+                Some(inbound) => side_b.accept(inbound).await,
+                None => side_b.complete_dials(1).await,
+            }
+            settle().await;
+
+            let order = format!("A dial first: {a_dial_first}, B dial first: {b_dial_first}");
+            let to_b = build_established_frame(16);
+            let to_a = build_established_frame(24);
+            let sent_a = side_a
+                .transport
+                .send_async(&b.to_transport_addr(), &to_b)
+                .await;
+            let sent_b = side_b
+                .transport
+                .send_async(&a.to_transport_addr(), &to_a)
+                .await;
+            let b_got = side_b.receives(&to_b).await;
+            let a_got = side_a.receives(&to_a).await;
+            if sent_a.is_err() || sent_b.is_err() || !a_got || !b_got {
+                failures.push(format!(
+                    "{order}: A sent {sent_a:?}, B sent {sent_b:?}, \
+                     B received A's frame: {b_got}, A received B's frame: {a_got}"
+                ));
+            }
+
+            side_a.transport.stop_async().await.unwrap();
+            side_b.transport.stop_async().await.unwrap();
+        }
+        assert!(
+            failures.is_empty(),
+            "orders left without a working link:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    /// `(held, retiring)` channel counts at `addr` on this side.
+    async fn channel_counts(side: &Side, addr: &BleAddr) -> (usize, usize) {
+        let pool = side.transport.pool.lock().await;
+        let ta = addr.to_transport_addr();
+        (pool.held(&ta).len(), pool.retiring(&ta).len())
+    }
+
+    /// The MTU of the channel sends to `addr` use. The tests below build
+    /// each channel with its own MTU, so this names the channel.
+    async fn sending_mtu(side: &Side, addr: &BleAddr) -> Option<u16> {
+        let pool = side.transport.pool.lock().await;
+        pool.get(&addr.to_transport_addr()).map(|c| c.send_mtu)
+    }
+
+    /// A node that dials one address twice (the scan loop's probe and its
+    /// own dial, both in flight) keeps one channel, and so does the peer
+    /// that accepted both. Only the dialler decides: it retires its second
+    /// dial, and the acceptor holds both until it reads end-of-stream on
+    /// the retired one. Both accept orders are driven, the one matching the
+    /// dialler's completion order and the inverse; if the acceptor also
+    /// decided, the inverse would leave each end holding a channel the
+    /// other closed.
+    #[tokio::test(start_paused = true)]
+    async fn a_double_dial_to_one_address_leaves_one_channel_on_both_ends() {
+        let (a, b) = (test_addr(1), test_addr(2));
+        for inverted in [false, true] {
+            let (p1_a, p1_b) = MockBleStream::pair(a.clone(), b.clone(), 2048);
+            let (p2_a, p2_b) = MockBleStream::pair(a.clone(), b.clone(), 1024);
+            let mut far_ends = HashMap::from([(2048u16, p1_b), (1024u16, p2_b)]);
+            let scanning = BleConfig {
+                scan: Some(true),
+                probe_cooldown_secs: Some(1),
+                ..race_config()
+            };
+            let mut side_a = Side::start(a.clone(), vec![p1_a, p2_a], scanning).await;
+            let mut side_b = Side::start(b.clone(), Vec::new(), race_config()).await;
+
+            // Both of A's dials are in flight at once, held at its gate.
+            side_a.transport.io.inject_scan_result(b.clone()).await;
+            {
+                let stats = Arc::clone(&side_a.transport.stats);
+                wait_for("the probe", || stats.snapshot().scan_results == 1).await;
+            }
+            side_a
+                .transport
+                .connect_async(&b.to_transport_addr())
+                .await
+                .unwrap();
+            settle().await;
+            side_a.gate.send(true).unwrap();
+            {
+                let stats = Arc::clone(&side_a.transport.stats);
+                wait_for("both of A's dials", || {
+                    let snap = stats.snapshot();
+                    snap.connections_established + snap.duplicates_closed == 2
+                })
+                .await;
+            }
+            // A sends on the channel it keeps; the other is retiring.
+            let kept = sending_mtu(&side_a, &b).await.unwrap();
+            let retired = if kept == 2048 { 1024 } else { 2048 };
+
+            let order = if inverted {
+                [retired, kept]
+            } else {
+                [kept, retired]
+            };
+            for mtu in order {
+                side_b.accept(far_ends.remove(&mtu).unwrap()).await;
+            }
+
+            tokio::time::advance(Duration::from_millis(
+                side_a.transport.config.connect_timeout_ms() + 1,
+            ))
+            .await;
+            settle().await;
+
+            let case = format!("inverted accept order: {inverted}");
+            assert_eq!(
+                channel_counts(&side_a, &b).await,
+                (1, 0),
+                "A keeps one channel ({case})"
+            );
+            assert_eq!(
+                channel_counts(&side_b, &a).await,
+                (1, 0),
+                "B keeps one channel ({case})"
+            );
+            assert_eq!(sending_mtu(&side_a, &b).await, Some(kept), "{case}");
+            assert_eq!(
+                sending_mtu(&side_b, &a).await,
+                Some(kept),
+                "both ends keep the same channel ({case})"
+            );
+
+            let to_b = build_established_frame(16);
+            let to_a = build_established_frame(24);
+            side_a
+                .transport
+                .send_async(&b.to_transport_addr(), &to_b)
+                .await
+                .unwrap();
+            side_b
+                .transport
+                .send_async(&a.to_transport_addr(), &to_a)
+                .await
+                .unwrap();
+            assert!(side_b.receives(&to_b).await, "A's frame reaches B ({case})");
+            assert!(side_a.receives(&to_a).await, "B's frame reaches A ({case})");
+
+            side_a.transport.stop_async().await.unwrap();
+            side_b.transport.stop_async().await.unwrap();
+        }
+    }
+
+    /// A lone link is admitted and reported whichever side dialled it. On
+    /// an earlier design a tie-breaker stood a lone inbound down so that its
+    /// own outbound would win, which dropped a working link in favour of
+    /// one that might never be built.
+    #[tokio::test(start_paused = true)]
+    async fn a_lone_inbound_link_is_admitted_whichever_side_dialled() {
+        let (a, b) = (test_addr(1), test_addr(2));
+
+        // The peer dialled: one inbound, nothing else.
+        let (theirs, ours) = MockBleStream::pair(b.clone(), a.clone(), 2048);
+        let mut side = Side::start(a.clone(), Vec::new(), race_config()).await;
+        side.accept(ours).await;
+        assert_eq!(
+            channel_counts(&side, &b).await,
+            (1, 0),
+            "the inbound is kept"
+        );
+        assert_eq!(
+            side.transport.neighbor_buffer.take().len(),
+            1,
+            "and reported"
+        );
+        drop(theirs);
+        side.transport.stop_async().await.unwrap();
+
+        // This side's probe dialled: one outbound, nothing else.
+        let (ours, _theirs) = MockBleStream::pair(a.clone(), b.clone(), 2048);
+        let scanning = BleConfig {
+            scan: Some(true),
+            ..race_config()
+        };
+        let mut side = Side::start(a.clone(), vec![ours], scanning).await;
+        side.transport.io.inject_scan_result(b.clone()).await;
+        side.complete_dials(1).await;
+        assert_eq!(channel_counts(&side, &b).await, (1, 0), "the probe is kept");
+        assert_eq!(
+            side.transport.neighbor_buffer.take().len(),
+            1,
+            "and reported"
+        );
+        side.transport.stop_async().await.unwrap();
     }
 
     /// An oversized packet is a caller bug, not a property of the peer's
@@ -2376,6 +2620,8 @@ mod tests {
                     established_at: tokio::time::Instant::now(),
                     is_static: false,
                     addr: test_addr(2),
+                    outbound: false,
+                    id: 0,
                 },
             )
             .unwrap();
@@ -2410,6 +2656,8 @@ mod tests {
             "pool_evictions",
             "advertisements_sent",
             "scan_results",
+            "duplicates_held",
+            "duplicates_closed",
         ];
         for key in expected {
             assert!(object.contains_key(key), "snapshot lost `{key}`");
