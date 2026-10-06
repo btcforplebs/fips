@@ -2018,8 +2018,10 @@ async fn a_resent_rekey_msg1_draws_the_held_msg2_and_the_rekey_completes() {
 }
 
 /// A copy of the msg1 that armed a responder's pending, arriving from an
-/// address that is not the peer's, draws the held msg2 only on the peer's
-/// established link. Nothing goes back to the address the copy came from.
+/// address that is not the peer's current one but that maps to the peer's
+/// link, draws the held msg2 only on the peer's established link. Nothing
+/// goes back to the address the copy came from. A copy from an address that
+/// does not map to the link is refused outright, while the link works.
 ///
 /// A captured msg1 still authenticates as the peer when replayed, so the
 /// responder cannot tell a replay from a resend; answering the datagram's
@@ -2049,6 +2051,9 @@ async fn a_held_rekey_msg2_is_resent_only_on_the_peers_established_link() {
         .try_recv()
         .expect("node 0's resent msg1 must be queued at node 1");
     msg1.remote_addr = third[0].addr.clone();
+    let link = nodes[1].node.get_peer(&node0_addr).unwrap().link_id();
+    let key = (nodes[1].transport_id, third[0].addr.clone());
+    nodes[1].node.addr_to_link.insert(key, link);
     nodes[1].node.handle_msg1(msg1).await;
 
     assert!(
@@ -2571,13 +2576,15 @@ async fn a_link_msg1_replayed_from_the_peers_address_does_not_suppress_the_nodes
     assert_eq!(outcome, REPLAY_HARMLESS);
 }
 
-/// A link msg1 from an earlier cycle than the last one, replayed from an
-/// address the node has no link with, is refused as well: the node keeps
-/// the msg1s of its ended cycles, not only the latest.
+/// A link msg1 from an earlier cycle than the last one, replayed from the
+/// peer's own address, is refused as well: the node keeps the msg1s of its
+/// ended cycles, not only the latest. From the peer's address the replay is
+/// on the link, so it reaches that record; from an address off the link it
+/// is refused before the record is read.
 #[tokio::test]
 async fn a_link_msg1_replayed_from_an_earlier_cycle_does_not_block_the_peers_next_rekey() {
     let outcome =
-        replay_link_msg1_after_its_cycle(ReplaySource::ThirdAddress, ReplayProbe::PeerRekey, 3)
+        replay_link_msg1_after_its_cycle(ReplaySource::PeerAddress, ReplayProbe::PeerRekey, 3)
             .await;
     assert_eq!(outcome, REPLAY_HARMLESS);
 }
@@ -2598,11 +2605,13 @@ async fn a_link_msg1_replayed_inside_the_rekey_floor_draws_nothing_to_its_source
     assert_eq!(outcome, REPLAY_HARMLESS);
 }
 
-/// A fresh rekey msg1 that arrives from an address other than the peer's is
-/// answered on the peer's established link, not at the address it came from,
-/// and the rekey completes there.
+/// A fresh rekey msg1 that arrives from an address other than the peer's
+/// current one, but that maps to the peer's link, is answered on the peer's
+/// established link, not at the address it came from, and the rekey
+/// completes there. From an address that does not map to the link the msg1
+/// is refused while the link works.
 #[tokio::test]
-async fn a_rekey_msg2_answers_on_the_peers_established_link_whatever_the_msg1_source() {
+async fn a_rekey_msg2_answers_on_the_peers_established_link_when_the_msg1_source_maps_to_it() {
     use crate::node::tests::spanning_tree::make_test_node;
     use crate::proto::fmp::wire::{CommonPrefix, PHASE_MSG2};
 
@@ -2629,6 +2638,9 @@ async fn a_rekey_msg2_answers_on_the_peers_established_link_whatever_the_msg1_so
         .try_recv()
         .expect("node 0's rekey msg1 must be queued at node 1");
     msg1.remote_addr = third[0].addr.clone();
+    let link = nodes[1].node.get_peer(&node0_addr).unwrap().link_id();
+    let key = (nodes[1].transport_id, third[0].addr.clone());
+    nodes[1].node.addr_to_link.insert(key, link);
     nodes[1].node.handle_msg1(msg1).await;
 
     assert!(
@@ -2671,10 +2683,13 @@ async fn a_rekey_msg2_answers_on_the_peers_established_link_whatever_the_msg1_so
     cleanup_nodes(&mut third).await;
 }
 
-/// A rekey msg1 that arrives on a transport other than the peer's link is
-/// answered on the link, and the pending session's index is registered under
-/// the link's transport: the peer's frames on the new session arrive there,
-/// and retirement removes the entry by the peer's transport.
+/// A rekey msg1 that arrives on a transport other than the peer's link, from
+/// an address that maps to the link, is answered on the link, and the
+/// pending session's index is registered under the link's transport: the
+/// peer's frames on the new session arrive there, and retirement removes the
+/// entry by the peer's transport. Such a msg1 is answered only when it maps
+/// to the link, or while a finished connect to the link's address waits to
+/// be pooled; the mapping reaches the answer deterministically.
 #[tokio::test]
 async fn a_rekey_answered_on_the_established_link_registers_its_index_on_that_transport() {
     use crate::transport::TransportId;
@@ -2706,6 +2721,9 @@ async fn a_rekey_answered_on_the_established_link_registers_its_index_on_that_tr
         .try_recv()
         .expect("node 0's rekey msg1 must be queued at node 1");
     msg1.transport_id = other_transport;
+    let link = nodes[1].node.get_peer(&node0_addr).unwrap().link_id();
+    let key = (other_transport, nodes[0].addr.clone());
+    nodes[1].node.addr_to_link.insert(key, link);
     nodes[1].node.handle_msg1(msg1).await;
     let pending_idx = nodes[1]
         .node

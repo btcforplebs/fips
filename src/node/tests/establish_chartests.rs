@@ -39,7 +39,7 @@ use tokio::time::timeout;
 /// Build a genuine wire-format Noise IK msg1 addressed to `node`, carrying a
 /// chosen startup `epoch` and `sender_index`, from `sender`'s identity. Returns
 /// the opaque wire bytes ready to place in a `ReceivedPacket`.
-fn craft_msg1_wire(
+pub(super) fn craft_msg1_wire(
     node: &Node,
     sender: &Identity,
     epoch: [u8; 8],
@@ -59,7 +59,7 @@ fn craft_msg1_wire(
 /// Register a real UDP transport on `node` and return an independent socket
 /// (plus its addr) that plays the peer: the node's msg2 responses are sent to
 /// this addr, so a test can observe wire-level output.
-async fn register_udp_with_peer_socket(
+pub(super) async fn register_udp_with_peer_socket(
     node: &mut Node,
     transport_id: TransportId,
 ) -> (tokio::net::UdpSocket, TransportAddr) {
@@ -679,7 +679,7 @@ async fn chartest_cross_connection_tiebreak_winner_and_loser() {
 /// Drive a real inbound msg1 through `handle_msg1` so `node` promotes an active
 /// peer for `sender` at startup `epoch`, draining the msg2 the promotion emits.
 /// Returns the sender's NodeAddr.
-async fn establish_active_peer_via_msg1(
+pub(super) async fn establish_active_peer_via_msg1(
     node: &mut Node,
     sender: &Identity,
     epoch: [u8; 8],
@@ -712,7 +712,7 @@ async fn establish_active_peer_via_msg1(
 /// or less-than the node's own NodeAddr, so the dual-init tie-break outcome is
 /// deterministic. The comparison invariant is enforced, so the test outcome is
 /// deterministic even though the identity draw is random.
-fn sender_with_addr_relation(node: &Node, want_greater: bool) -> Identity {
+pub(super) fn sender_with_addr_relation(node: &Node, want_greater: bool) -> Identity {
     let node_addr = *node.node_addr();
     loop {
         let s = Identity::generate();
@@ -726,7 +726,7 @@ fn sender_with_addr_relation(node: &Node, want_greater: bool) -> Identity {
 /// Arm a local in-flight (initiator) rekey on `node`'s peer for `sender`, with a
 /// real allocated index registered in `peers_by_index`/`pending_outbound` (as a
 /// genuine in-flight rekey would be). Returns the armed rekey index.
-fn arm_local_rekey(
+pub(super) fn arm_local_rekey(
     node: &mut Node,
     sender: &Identity,
     sender_addr: &NodeAddr,

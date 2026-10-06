@@ -14,8 +14,8 @@ use crate::peer::machine::{
 };
 use crate::proto::fmp::wire::{Msg1Header, Msg2Header, build_msg2};
 use crate::proto::fmp::{
-    EstablishSnapshot, EstablishView, InboundDecision, InboundReject, Msg1Digest, OutboundSnapshot,
-    PromotionResult, RekeyAnswer, WireOutcome, cross_connection_winner,
+    EstablishSnapshot, EstablishView, InboundDecision, InboundReject, Msg1Arrival, Msg1Digest,
+    OutboundSnapshot, PromotionResult, RekeyAnswer, WireOutcome, cross_connection_winner,
 };
 use crate::transport::{Link, LinkDirection, LinkId, ReceivedPacket, TransportError, TransportId};
 use crate::utils::index::SessionIndex;
@@ -69,7 +69,12 @@ pub(in crate::node) enum Msg1Waiver {
 }
 
 impl EstablishView for Node {
-    fn establish_snapshot(&self, peer_addr: &NodeAddr, msg1: &Msg1Digest) -> EstablishSnapshot {
+    fn establish_snapshot(
+        &self,
+        peer_addr: &NodeAddr,
+        msg1: &Msg1Digest,
+        arrival: &Msg1Arrival<'_>,
+    ) -> EstablishSnapshot {
         let existing = self.peers.get(peer_addr);
         let max_peers = self.max_peers();
         EstablishSnapshot {
@@ -86,6 +91,18 @@ impl EstablishView for Node {
             rekey_in_progress: existing.map(|p| p.rekey_in_progress()).unwrap_or(false),
             held_answer: existing.and_then(|p| p.rekey_answer().cloned()),
             msg1_answered_before: existing.is_some_and(|p| p.answered_before(msg1)),
+            // On this peer's link, by its transport and current address or by
+            // an `addr_to_link` entry for its link, such as a hostname-keyed
+            // dial address beside a numeric current address.
+            msg1_on_link: existing.is_some_and(|p| {
+                (p.transport_id() == Some(arrival.transport_id)
+                    && p.current_addr() == Some(arrival.remote_addr))
+                    || self
+                        .addr_to_link
+                        .get(&(arrival.transport_id, arrival.remote_addr.clone()))
+                        == Some(&p.link_id())
+            }),
+            link_reachable: existing.is_some() && arrival.link_reachable,
             existing_msg2: existing.and_then(|p| p.handshake_msg2().map(|m| m.to_vec())),
             at_max_peers: max_peers > 0 && self.peers.len() >= max_peers,
             has_pending_outbound_to_peer: self.connections().any(|(_, machine)| {
@@ -324,6 +341,24 @@ impl Node {
     )> {
         let p = self.peers.get(peer)?;
         Some((p.transport_id()?, p.current_addr()?.clone()))
+    }
+
+    /// Whether `peer`'s established link can carry a reply now: its transport
+    /// is connectionless, or the transport still pools a connection to the
+    /// link's address. False when the peer, its link or its transport is
+    /// missing.
+    ///
+    /// Reads only, through `has_connection`: a finished background connect
+    /// is not promoted and the pool lock is awaited, so the answer does not
+    /// depend on lock contention.
+    async fn link_reachable(&self, peer: &NodeAddr) -> bool {
+        let Some((tid, addr)) = self.established_link(peer) else {
+            return false;
+        };
+        match self.transports.get(&tid) {
+            Some(transport) => transport.has_connection(&addr).await,
+            None => false,
+        }
     }
 
     /// Send `reply`, an answer to `packet`'s msg1 from `peer`, on the peer's
@@ -635,7 +670,15 @@ impl Node {
         // session age resolved here, the max-peers cap, our own address for the
         // tie-break). Taken before this connection is inserted into the
         // registry, matching the pre-refactor read points.
-        let est = self.establish_snapshot(&peer_node_addr, &wire.msg1_digest);
+        // Where the msg1 arrived and whether the peer's established link can
+        // still carry a reply, resolved here because the transport pools are
+        // behind async locks the snapshot cannot await.
+        let arrival = Msg1Arrival {
+            transport_id: packet.transport_id,
+            remote_addr: &packet.remote_addr,
+            link_reachable: self.link_reachable(&peer_node_addr).await,
+        };
+        let est = self.establish_snapshot(&peer_node_addr, &wire.msg1_digest, &arrival);
 
         // === PHASE C: structured classification ===
         // Evaluate the inbound decision once on a local establish leg and route
@@ -676,7 +719,8 @@ impl Node {
                 reason:
                     reason @ (InboundReject::PendingSession
                     | InboundReject::DualRekeyWon
-                    | InboundReject::AnsweredBefore),
+                    | InboundReject::AnsweredBefore
+                    | InboundReject::OffLink),
             } => {
                 // Existing-peer rekey rejects: the classification took the
                 // fresh-context fail path (no actions) and the local machine is
@@ -695,6 +739,12 @@ impl Node {
                         peer = %self.peer_display_name(&peer_node_addr),
                         remote_addr = %packet.remote_addr,
                         "Rekey msg1 answered in an ended cycle, dropping the copy"
+                    ),
+                    InboundReject::OffLink => debug!(
+                        peer = %self.peer_display_name(&peer_node_addr),
+                        transport_id = %packet.transport_id,
+                        remote_addr = %packet.remote_addr,
+                        "Same-epoch msg1 off the established link while that link is up, dropping"
                     ),
                     InboundReject::AtMaxPeers => unreachable!(),
                 }

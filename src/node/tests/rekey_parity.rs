@@ -48,7 +48,7 @@ fn trigger_age() -> Duration {
 
 /// Send one heartbeat from `from` to its peer `to` on `from`'s current
 /// session.
-async fn heartbeat(from: &mut TestNode, to: &NodeAddr) {
+pub(super) async fn heartbeat(from: &mut TestNode, to: &NodeAddr) {
     from.node
         .send_encrypted_link_message(to, &[LinkMessageType::Heartbeat.to_byte()])
         .await
@@ -56,7 +56,7 @@ async fn heartbeat(from: &mut TestNode, to: &NodeAddr) {
 }
 
 /// Process every packet queued at `tn`, and only there.
-async fn deliver(tn: &mut TestNode) -> usize {
+pub(super) async fn deliver(tn: &mut TestNode) -> usize {
     process_available_packets(std::slice::from_mut(tn)).await
 }
 
@@ -72,7 +72,7 @@ async fn pump(nodes: &mut [TestNode]) {
 
 /// `tn`'s consecutive decryption failure count for `peer`. A peer that is no
 /// longer held panics here, which the caller's test counts as a failure.
-fn failures(tn: &TestNode, peer: &NodeAddr) -> u32 {
+pub(super) fn failures(tn: &TestNode, peer: &NodeAddr) -> u32 {
     tn.node
         .get_peer(peer)
         .expect("the receiver still holds the sender as a peer")
@@ -80,7 +80,7 @@ fn failures(tn: &TestNode, peer: &NodeAddr) -> u32 {
 }
 
 /// Age the link session each node holds for the other by `age`.
-fn age_link(nodes: &mut [TestNode], a: usize, b: usize, age: Duration) {
+pub(super) fn age_link(nodes: &mut [TestNode], a: usize, b: usize, age: Duration) {
     let a_addr = *nodes[a].node.node_addr();
     let b_addr = *nodes[b].node.node_addr();
     nodes[a]

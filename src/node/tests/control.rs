@@ -154,29 +154,49 @@ async fn test_api_connect_on_current_fresh_path_is_a_no_op() {
 /// nothing — the fix.
 ///
 /// The existing peer stays put while that handshake runs: promotion is the
-/// handshake's job, not the command's.
+/// handshake's job, not the command's. Both sessions are past the 30 s rekey
+/// floor, so the peer answers the alternate-path msg1 as a rekey of the link;
+/// once the handshake resolves, each end's frames must still authenticate at
+/// the other, whether the dialer is the smaller address (which swaps to the
+/// new session) or the larger (which keeps its own).
 #[tokio::test]
 async fn test_api_connect_starts_alternate_path_for_active_peer() {
+    for dialer_smaller in [true, false] {
+        alternate_path_for_active_peer(dialer_smaller).await;
+    }
+}
+
+/// One orientation of [`test_api_connect_starts_alternate_path_for_active_peer`].
+async fn alternate_path_for_active_peer(dialer_smaller: bool) {
+    use super::rekey_parity::{age_link, deliver, failures, heartbeat};
+
     let mut nodes = run_tree_test(2, &[(0, 1)], false).await;
+    let zero_smaller = nodes[0].node.node_addr() < nodes[1].node.node_addr();
+    let (d, p) = if zero_smaller == dialer_smaller {
+        (0, 1)
+    } else {
+        (1, 0)
+    };
+    let dialer_addr = *nodes[d].node.node_addr();
+    let peer_addr = *nodes[p].node.node_addr();
+    let peer_npub = nodes[p].node.npub();
+    let transport_id = nodes[d].transport_id;
+    age_link(&mut nodes, d, p, Duration::from_secs(31));
 
-    let node1_addr = *nodes[1].node.node_addr();
-    let node1_npub = nodes[1].node.npub();
-    let transport_id = nodes[0].transport_id;
-
-    // A second address that reaches node 1, standing in for a second path
+    // A second address that reaches the peer, standing in for a second path
     // coming up.
-    let alternate = add_loopback_alias(&nodes[1].addr);
-    assert_ne!(alternate, nodes[1].addr);
+    let alternate = add_loopback_alias(&nodes[p].addr);
+    assert_ne!(alternate, nodes[p].addr);
 
-    let link_before = nodes[0]
+    let link_before = nodes[d]
         .node
-        .get_peer(&node1_addr)
-        .expect("node 0 should have node 1")
+        .get_peer(&peer_addr)
+        .expect("the dialer should have the peer")
         .link_id();
 
-    let data = nodes[0]
+    let data = nodes[d]
         .node
-        .api_connect(&node1_npub, &alternate.to_string(), "loopback")
+        .api_connect(&peer_npub, &alternate.to_string(), "loopback")
         .await
         .expect("api_connect on an alternate path should succeed");
 
@@ -185,14 +205,14 @@ async fn test_api_connect_starts_alternate_path_for_active_peer() {
         "a new path for an active peer must start a refresh"
     );
     assert!(
-        nodes[0]
+        nodes[d]
             .node
-            .is_connecting_to_peer_on_path(&node1_addr, transport_id, &alternate),
+            .is_connecting_to_peer_on_path(&peer_addr, transport_id, &alternate),
         "an outbound leg should exist on the alternate path"
     );
-    let peer = nodes[0]
+    let peer = nodes[d]
         .node
-        .get_peer(&node1_addr)
+        .get_peer(&peer_addr)
         .expect("the existing peer must survive the parallel handshake");
     assert_eq!(
         peer.link_id(),
@@ -208,9 +228,39 @@ async fn test_api_connect_starts_alternate_path_for_active_peer() {
         }
     }
     assert!(
-        nodes[0].node.get_peer(&node1_addr).is_some(),
-        "node 1 should still be a peer after the alternate path resolves"
+        nodes[d].node.get_peer(&peer_addr).is_some(),
+        "the peer should still be a peer after the alternate path resolves (dialer smaller: {dialer_smaller})"
     );
+
+    // Each end's next frame must authenticate at the other.
+    for (from, to, from_addr, to_addr) in [
+        (d, p, dialer_addr, peer_addr),
+        (p, d, peer_addr, dialer_addr),
+    ] {
+        let recv_before = nodes[to]
+            .node
+            .get_peer(&from_addr)
+            .expect("the receiver still holds the sender as a peer")
+            .link_stats()
+            .packets_recv;
+        heartbeat(&mut nodes[from], &to_addr).await;
+        deliver(&mut nodes[to]).await;
+        assert_eq!(
+            failures(&nodes[to], &from_addr),
+            0,
+            "decrypt failures at node {to} after node {from}'s heartbeat (dialer smaller: {dialer_smaller})"
+        );
+        assert_eq!(
+            nodes[to]
+                .node
+                .get_peer(&from_addr)
+                .unwrap()
+                .link_stats()
+                .packets_recv,
+            recv_before + 1,
+            "node {from}'s heartbeat must authenticate at node {to} (dialer smaller: {dialer_smaller})"
+        );
+    }
 
     cleanup_nodes(&mut nodes).await;
 }

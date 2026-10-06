@@ -18,7 +18,7 @@
 //! shell-side.
 
 use super::state::Fmp;
-use crate::transport::LinkId;
+use crate::transport::{LinkId, TransportAddr, TransportId};
 use crate::utils::index::SessionIndex;
 use crate::{NodeAddr, PeerIdentity};
 use std::collections::VecDeque;
@@ -352,6 +352,12 @@ pub(crate) struct EstablishSnapshot {
     /// This msg1 armed a responder cycle of this peer's that has since ended
     /// (pre-evaluated shell-side against the peer's [`AnsweredMsg1s`]).
     pub msg1_answered_before: bool,
+    /// The msg1 arrived on the existing peer's established link: its
+    /// transport and current address, or an address mapped to its link.
+    pub msg1_on_link: bool,
+    /// The existing peer's established link can still carry an answer: a
+    /// connectionless transport, or its connection still pooled.
+    pub link_reachable: bool,
     /// The existing peer's stored msg2 wire bytes (an opaque blob), resent on a
     /// same-epoch duplicate msg1. `None` when there is no existing peer or it
     /// has no stored msg2.
@@ -368,6 +374,21 @@ pub(crate) struct EstablishSnapshot {
     pub rekey_enabled: bool,
     /// This node's own address, for the dual-initiation tie-break.
     pub our_node_addr: NodeAddr,
+}
+
+/// Where an inbound msg1 arrived, and the shell's answer to whether the
+/// sending peer's established link can still carry a reply.
+///
+/// Reachability is resolved before the snapshot is taken because the
+/// transport pools sit behind async locks, which the snapshot cannot await.
+pub(crate) struct Msg1Arrival<'a> {
+    /// The transport the msg1 arrived on.
+    pub transport_id: TransportId,
+    /// The address the msg1 arrived from.
+    pub remote_addr: &'a TransportAddr,
+    /// The established link of the peer the msg1 claims to be from can
+    /// still carry a reply. False when there is no such peer or link.
+    pub link_reachable: bool,
 }
 
 /// A snapshot of the registry state the *outbound* establish decision reads
@@ -512,8 +533,8 @@ pub(crate) enum InboundDecision {
 }
 
 /// Why an inbound msg1 was rejected. Distinguishes only the diagnostic log
-/// message; all four reject identically (BadState stat, rate-limiter complete,
-/// the local not-yet-registered connection dropped).
+/// message; every variant rejects identically (BadState stat, rate-limiter
+/// complete, the local not-yet-registered connection dropped).
 #[derive(Debug)]
 pub(crate) enum InboundReject {
     /// At `max_peers` and this is a net-new identity with no pending outbound to
@@ -529,6 +550,10 @@ pub(crate) enum InboundReject {
     /// The msg1 armed a rekey cycle with this peer that has already ended: a
     /// copy, not a fresh request, and it must not arm a pending.
     AnsweredBefore,
+    /// A same-epoch msg1 on a session old enough to rekey arrived off the
+    /// peer's established link while that link works: a second path, not a
+    /// rekey of this link.
+    OffLink,
 }
 
 /// The classification outcome for one outbound `handle_msg2` completion, decided
@@ -559,7 +584,9 @@ pub(crate) enum OutboundDecision {
 /// peer is treated as a rekey rather than a duplicate. Guards against
 /// misreading a simultaneous cross-connection msg1 as a rekey (both sides
 /// promote within a tick, so a genuine rekey cannot fire that fast). Unchanged
-/// from the pre-refactor literal.
+/// from the pre-refactor literal. The age separates only that simultaneous
+/// case; a second path the peer opens later is told by where its msg1
+/// arrived.
 const REKEY_MIN_SESSION_AGE_SECS: u64 = 30;
 
 /// Read-only view of the `Node` registry state the inbound establish decision
@@ -576,8 +603,15 @@ pub(crate) trait EstablishView {
     /// session age resolved shell-side), the max-peers cap, and this node's own
     /// address for the tie-break.
     /// `msg1` is the digest of the msg1 being classified, checked against the
-    /// peer's record of answered msg1s.
-    fn establish_snapshot(&self, peer_addr: &NodeAddr, msg1: &Msg1Digest) -> EstablishSnapshot;
+    /// peer's record of answered msg1s. `arrival` is where it arrived and
+    /// whether the peer's established link is reachable, from which the
+    /// snapshot tells a msg1 on that link from one off it.
+    fn establish_snapshot(
+        &self,
+        peer_addr: &NodeAddr,
+        msg1: &Msg1Digest,
+        arrival: &Msg1Arrival<'_>,
+    ) -> EstablishSnapshot;
 
     /// Snapshot the registry state relevant to classifying an outbound msg2
     /// completion for `peer_addr`: whether the identity is already an active
@@ -775,6 +809,20 @@ impl Fmp {
                         // Duplicate msg1 — resend the stored msg2.
                         return InboundDecision::ResendMsg2 {
                             msg2: snap.existing_msg2.clone(),
+                        };
+                    }
+                    if !snap.msg1_on_link && snap.link_reachable {
+                        // A peer that is already linked and dials a second
+                        // path sends a link-setup msg1 there. Answered as a
+                        // rekey, it arms a pending the dialer never adopts,
+                        // which then refuses the peer's genuine rekeys and
+                        // vetoes ours for the whole hold. Decided before the
+                        // held answer and the tie-break, so it neither
+                        // resends that answer nor abandons our own rekey.
+                        // With the established connection gone the msg1 is a
+                        // redial, and keeps the rekey path.
+                        return InboundDecision::Reject {
+                            reason: InboundReject::OffLink,
                         };
                     }
                     if snap.pending_new_session {

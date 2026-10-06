@@ -1926,6 +1926,8 @@ mod tests {
             rekey_in_progress: false,
             held_answer: None,
             msg1_answered_before: false,
+            msg1_on_link: false,
+            link_reachable: false,
             existing_msg2: None,
             at_max_peers: false,
             has_pending_outbound_to_peer: false,

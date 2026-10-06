@@ -26,6 +26,7 @@ mod probe;
 mod rekey_parity;
 mod routing;
 mod rx_stall;
+mod second_path_msg1;
 mod session;
 mod spanning_tree;
 mod tcp;
