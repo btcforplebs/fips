@@ -600,13 +600,15 @@ impl Node {
     /// Fallback: if no tree peer's bloom matches, try non-tree peers whose
     /// bloom contains the target. This recovers from dead ends caused by
     /// stale bloom filters, tree restructuring, or transit node failures.
+    ///
+    /// Neither path sends the request back to `from`, the peer it came from.
     async fn forward_lookup_request(&mut self, from: &NodeAddr, mut request: LookupRequest) {
         // Plan the forward with the sans-IO decision core. The core owns the
         // TTL decrement, tree/fallback peer selection, and single-encode
         // fan-out; the shell keeps all metrics/logging and drives the sends.
         let outcome = {
             let rv = NodeRoutingView { node: self };
-            crate::proto::lookup::plan_forward(&mut request, &rv)
+            crate::proto::lookup::plan_forward(&mut request, from, &rv)
         };
         match outcome {
             crate::proto::lookup::ForwardOutcome::TtlExhausted => {}

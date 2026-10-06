@@ -170,6 +170,12 @@ async fn report_conntrack_source() {
 #[cfg(target_os = "linux")]
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    // Register the stop signals before set-up. Until a handler exists a
+    // SIGTERM takes the default action, which as PID 1 in a container means
+    // the kernel discards it; registered here, a stop during set-up is held.
+    let mut sigterm = signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
+    let mut sigint = signal(SignalKind::interrupt()).expect("failed to register SIGINT handler");
+
     let args = Args::parse();
 
     // Initialize logging
@@ -343,42 +349,59 @@ async fn main() {
 
         let mut buf = [0u8; 512];
         let mut last_failure: Option<String> = None;
-        let mut succeeded = false;
-        for attempt in 1..=MAX_PROBE_ATTEMPTS {
-            if let Err(e) = sock.send_to(&query, upstream_addr).await {
-                last_failure = Some(format!("send_to failed: {}", e));
-            } else {
-                match tokio::time::timeout(
-                    std::time::Duration::from_secs(PROBE_TIMEOUT_SECS),
-                    sock.recv_from(&mut buf),
-                )
-                .await
-                {
-                    Ok(Ok(_)) => {
-                        info!(
-                            upstream = %upstream, attempt = attempt,
-                            "DNS upstream is reachable"
-                        );
-                        succeeded = true;
-                        break;
-                    }
-                    Ok(Err(e)) => {
-                        last_failure = Some(format!("recv_from failed: {}", e));
-                    }
-                    Err(_) => {
-                        last_failure = Some(format!("no response within {}s", PROBE_TIMEOUT_SECS));
+        let probe = async {
+            for attempt in 1..=MAX_PROBE_ATTEMPTS {
+                if let Err(e) = sock.send_to(&query, upstream_addr).await {
+                    last_failure = Some(format!("send_to failed: {}", e));
+                } else {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(PROBE_TIMEOUT_SECS),
+                        sock.recv_from(&mut buf),
+                    )
+                    .await
+                    {
+                        Ok(Ok(_)) => {
+                            info!(
+                                upstream = %upstream, attempt = attempt,
+                                "DNS upstream is reachable"
+                            );
+                            return true;
+                        }
+                        Ok(Err(e)) => {
+                            last_failure = Some(format!("recv_from failed: {}", e));
+                        }
+                        Err(_) => {
+                            last_failure =
+                                Some(format!("no response within {}s", PROBE_TIMEOUT_SECS));
+                        }
                     }
                 }
+                if attempt < MAX_PROBE_ATTEMPTS {
+                    info!(
+                        upstream = %upstream, attempt = attempt,
+                        last = ?last_failure,
+                        "DNS upstream probe attempt failed; retrying"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(PROBE_RETRY_DELAY_SECS))
+                        .await;
+                }
             }
-            if attempt < MAX_PROBE_ATTEMPTS {
-                info!(
-                    upstream = %upstream, attempt = attempt,
-                    last = ?last_failure,
-                    "DNS upstream probe attempt failed; retrying"
-                );
-                tokio::time::sleep(std::time::Duration::from_secs(PROBE_RETRY_DELAY_SECS)).await;
+            false
+        };
+        // A stop during the probe ends it at once. Nothing that needs
+        // tearing down exists yet: the probe socket is the only resource.
+        let succeeded = tokio::select! {
+            biased;
+            _ = sigterm.recv() => {
+                info!("Received SIGTERM during start-up, exiting");
+                std::process::exit(0);
             }
-        }
+            _ = sigint.recv() => {
+                info!("Received SIGINT during start-up, exiting");
+                std::process::exit(0);
+            }
+            succeeded = probe => succeeded,
+        };
         if !succeeded {
             error!(
                 upstream = %upstream,
@@ -564,8 +587,6 @@ async fn main() {
 
     // --- Event processing loop ---
 
-    let mut sigterm = signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
-
     info!("fips-gateway running");
 
     let mut exit_code = 0;
@@ -622,7 +643,7 @@ async fn main() {
                 exit_code = 1;
                 break;
             }
-            _ = tokio::signal::ctrl_c() => {
+            _ = sigint.recv() => {
                 info!("Received SIGINT, shutting down");
                 break;
             }

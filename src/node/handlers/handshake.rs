@@ -15,8 +15,8 @@ use crate::peer::machine::{
 };
 use crate::proto::fmp::wire::{Msg1Header, Msg2Header, build_msg2};
 use crate::proto::fmp::{
-    EstablishSnapshot, EstablishView, InboundDecision, InboundReject, Msg1Digest, OutboundSnapshot,
-    PromotionResult, RekeyAnswer, WireOutcome, cross_connection_winner,
+    EstablishSnapshot, EstablishView, InboundDecision, InboundReject, Msg1Arrival, Msg1Digest,
+    OutboundSnapshot, PromotionResult, RekeyAnswer, WireOutcome, cross_connection_winner,
 };
 use crate::transport::{Link, LinkDirection, LinkId, ReceivedPacket, TransportError, TransportId};
 use crate::utils::index::SessionIndex;
@@ -45,6 +45,11 @@ use tracing::{debug, info, warn};
 /// Raising it lengthens the outage an attacker's accepted replay causes,
 /// because the genuine peer's recovery msg1 hits the same arm. Lowering it
 /// weakens both halves and, below the resend ladder, buys nothing.
+///
+/// The same two conditions gate replacing a peering on a same-epoch msg1
+/// that is not a resend of its link-setup msg1, which is just as replayable.
+/// The dampener is per peer and shared by both, so a restart and a
+/// replacement of one peer inside the interval count as two teardowns.
 const EPOCH_RESTART_MIN_INTERVAL_SECS: u64 = 15;
 
 /// Why an inbound msg1 got past the `accept_connections` gate, and against
@@ -70,7 +75,12 @@ pub(in crate::node) enum Msg1Waiver {
 }
 
 impl EstablishView for Node {
-    fn establish_snapshot(&self, peer_addr: &NodeAddr, msg1: &Msg1Digest) -> EstablishSnapshot {
+    fn establish_snapshot(
+        &self,
+        peer_addr: &NodeAddr,
+        msg1: &Msg1Digest,
+        arrival: &Msg1Arrival<'_>,
+    ) -> EstablishSnapshot {
         let existing = self.peers.get(peer_addr);
         let max_peers = self.max_peers();
         EstablishSnapshot {
@@ -86,6 +96,19 @@ impl EstablishView for Node {
             rekey_in_progress: existing.map(|p| p.rekey_in_progress()).unwrap_or(false),
             held_answer: existing.and_then(|p| p.rekey_answer().cloned()),
             msg1_answered_before: existing.is_some_and(|p| p.answered_before(msg1)),
+            // On this peer's link, by its transport and current address or by
+            // an `addr_to_link` entry for its link, such as a hostname-keyed
+            // dial address beside a numeric current address.
+            msg1_on_link: existing.is_some_and(|p| {
+                (p.transport_id() == Some(arrival.transport_id)
+                    && p.current_addr() == Some(arrival.remote_addr))
+                    || self
+                        .addr_to_link
+                        .get(&(arrival.transport_id, arrival.remote_addr.clone()))
+                        == Some(&p.link_id())
+            }),
+            link_reachable: existing.is_some() && arrival.link_reachable,
+            setup_match: existing.is_some_and(|p| p.is_setup(msg1)),
             existing_msg2: existing.and_then(|p| p.handshake_msg2().map(|m| m.to_vec())),
             at_max_peers: max_peers > 0 && self.peers.len() >= max_peers,
             has_pending_outbound_to_peer: self.connections().any(|(_, machine)| {
@@ -324,6 +347,24 @@ impl Node {
     )> {
         let p = self.peers.get(peer)?;
         Some((p.transport_id()?, p.current_addr()?.clone()))
+    }
+
+    /// Whether `peer`'s established link can carry a reply now: its transport
+    /// is connectionless, or the transport still pools a connection to the
+    /// link's address. False when the peer, its link or its transport is
+    /// missing.
+    ///
+    /// Reads only, through `has_connection`: a finished background connect
+    /// is not promoted and the pool lock is awaited, so the answer does not
+    /// depend on lock contention.
+    async fn link_reachable(&self, peer: &NodeAddr) -> bool {
+        let Some((tid, addr)) = self.established_link(peer) else {
+            return false;
+        };
+        match self.transports.get(&tid) {
+            Some(transport) => transport.has_connection(&addr).await,
+            None => false,
+        }
     }
 
     /// Send `reply`, an answer to `packet`'s msg1 from `peer`, on the peer's
@@ -646,7 +687,15 @@ impl Node {
         // session age resolved here, the max-peers cap, our own address for the
         // tie-break). Taken before this connection is inserted into the
         // registry, matching the pre-refactor read points.
-        let est = self.establish_snapshot(&peer_node_addr, &wire.msg1_digest);
+        // Where the msg1 arrived and whether the peer's established link can
+        // still carry a reply, resolved here because the transport pools are
+        // behind async locks the snapshot cannot await.
+        let arrival = Msg1Arrival {
+            transport_id: packet.transport_id,
+            remote_addr: &packet.remote_addr,
+            link_reachable: self.link_reachable(&peer_node_addr).await,
+        };
+        let est = self.establish_snapshot(&peer_node_addr, &wire.msg1_digest, &arrival);
 
         // What the classification lines below log, read once here so each
         // arm's only change is its log call. The snapshot values are copied
@@ -683,11 +732,13 @@ impl Node {
         // on it. The single `establish_inbound` evaluation lives in
         // `inbound_msg1`, which also returns the machine-phase actions the
         // Promote/Restart arms drive; the effect-bearing arm bodies stay inline
-        // in the shell below. `Promote`/`RestartThenPromote` fall through to the
-        // shared authorize → allocate → send-msg2 → promote tail; the other
+        // in the shell below. `Promote`, `RestartThenPromote` and
+        // `ReplaceThenPromote` fall through to the shared authorize → allocate →
+        // send-msg2 → promote tail; the other
         // variants complete the rate-limiter and return here. The local machine
         // enters `peer_machines` only at the promote tails.
         let (decision, actions) = machine.inbound_msg1(link_id, &wire, est, packet.timestamp_ms);
+        let replacing = matches!(decision, InboundDecision::ReplaceThenPromote { .. });
         match decision {
             InboundDecision::Reject {
                 reason: InboundReject::AtMaxPeers,
@@ -717,7 +768,8 @@ impl Node {
                 reason:
                     reason @ (InboundReject::PendingSession
                     | InboundReject::DualRekeyWon
-                    | InboundReject::AnsweredBefore),
+                    | InboundReject::AnsweredBefore
+                    | InboundReject::OffLink),
             } => {
                 // Existing-peer rekey rejects: the classification took the
                 // fresh-context fail path (no actions) and the local machine is
@@ -750,6 +802,14 @@ impl Node {
                         msg1_dg = %msg1_dg,
                         "Rekey msg1 answered in an ended cycle, dropping the copy"
                     ),
+                    InboundReject::OffLink => debug!(
+                        peer = %self.peer_display_name(&peer_node_addr),
+                        transport_id = %packet.transport_id,
+                        remote_addr = %packet.remote_addr,
+                        same_path = path.same_path(),
+                        msg1_dg = %msg1_dg,
+                        "Same-epoch msg1 off the established link while that link is up, dropping"
+                    ),
                     InboundReject::AtMaxPeers => unreachable!(),
                 }
                 // `conn`/`link_id` were never inserted into the registry, so the
@@ -758,8 +818,8 @@ impl Node {
                     .record_reject(RejectReason::Handshake(HandshakeReject::BadState));
             }
             InboundDecision::ResendMsg2 { msg2 } => {
-                // Duplicate msg1 at the same epoch: the decision carries the
-                // stored msg2 bytes and the inline resend below owns the send;
+                // A resend of the msg1 the peering was promoted from: the
+                // decision carries the stored msg2 bytes and the inline resend below owns the send;
                 // the classification touched no state. It goes on the peer's
                 // established link, as a rekey msg2 does: a genuine duplicate
                 // comes from the address the peering was just formed with,
@@ -951,7 +1011,8 @@ impl Node {
                 // as rekeys (not new connections). The temporary `conn`/`link_id`
                 // were never inserted into the registry, so no cleanup is needed.
             }
-            InboundDecision::RestartThenPromote { peer } => {
+            InboundDecision::RestartThenPromote { peer }
+            | InboundDecision::ReplaceThenPromote { peer } => {
                 // === Restart inbound establish, driven by the machine. ===
                 // Epoch mismatch — the peer restarted. The fresh leg is promoted
                 // exactly like a net-new inbound (two-phase authorize); the OLD
@@ -980,6 +1041,12 @@ impl Node {
                 // refresh it, so a peer that genuinely restarted clears this by
                 // having stopped sending. The interval half bounds the churn
                 // one peer can drive on its own.
+                //
+                // A same-epoch replacement is the same teardown and just as
+                // replayable: a captured msg1 of an earlier peering at the same
+                // epoch is not in the answered record, which starts empty at
+                // each peering. So it is gated by the same two conditions and
+                // the same per-peer dampener.
                 let now_ms = Self::now_ms();
                 let peering_idle_ms = self
                     .peers
@@ -991,12 +1058,21 @@ impl Node {
                     .get(&peer)
                     .is_some_and(|t| t.elapsed().as_secs() < EPOCH_RESTART_MIN_INTERVAL_SECS);
                 if peering_idle_ms < EPOCH_RESTART_MIN_INTERVAL_SECS * 1000 || dampened {
-                    debug!(
-                        peer = %self.peer_display_name(&peer),
-                        idle_ms = peering_idle_ms,
-                        dampened,
-                        "Epoch mismatch dampened, dropping msg1"
-                    );
+                    if replacing {
+                        debug!(
+                            peer = %self.peer_display_name(&peer),
+                            idle_ms = peering_idle_ms,
+                            dampened,
+                            "Same-epoch msg1 from a peer heard from within the interval, dropping"
+                        );
+                    } else {
+                        debug!(
+                            peer = %self.peer_display_name(&peer),
+                            idle_ms = peering_idle_ms,
+                            dampened,
+                            "Epoch mismatch dampened, dropping msg1"
+                        );
+                    }
                     // Silent drop: the stored msg2 is bound to the original
                     // msg1's ephemeral, and answering an address the sender
                     // chose is free amplification.
@@ -1022,10 +1098,17 @@ impl Node {
                 self.restart_dampener.retain(|_, t| t.elapsed() < cutoff);
                 self.restart_dampener.insert(peer, Instant::now());
 
-                debug!(
-                    peer = %self.peer_display_name(&peer),
-                    "Peer restart detected (epoch mismatch), removing stale session"
-                );
+                if replacing {
+                    debug!(
+                        peer = %self.peer_display_name(&peer),
+                        "Same-epoch msg1 from a silent peer, replacing its session"
+                    );
+                } else {
+                    debug!(
+                        peer = %self.peer_display_name(&peer),
+                        "Peer restart detected (epoch mismatch), removing stale session"
+                    );
+                }
 
                 // Snapshot the msg2 framing inputs (`their_index` and the opaque
                 // payload) for the `build_msg2` call at the promote tail below.
@@ -1184,9 +1267,12 @@ impl Node {
                     self.peer_machines.get(&link_id).map(|m| m.state()),
                     Some(PeerState::Established { .. })
                 ) {
-                    // Store msg2 on peer for resend on duplicate msg1
+                    // Store msg2 on peer for resend on duplicate msg1, and
+                    // record the msg1 itself: a copy of it after the session
+                    // can rekey is not a rekey, and must not arm a pending.
                     if let Some(peer) = self.peers.get_mut(&peer_node_addr) {
                         peer.set_handshake_msg2(wire_msg2.clone());
+                        peer.note_setup(wire.msg1_digest);
                     }
                     // Send initial tree announce to new peer
                     if let Err(e) = self.send_tree_announce_to_peer(&peer_node_addr).await {
@@ -1320,9 +1406,12 @@ impl Node {
                     self.peer_machines.get(&link_id).map(|m| m.state()),
                     Some(PeerState::Established { .. })
                 ) {
-                    // Store msg2 on peer for resend on duplicate msg1
+                    // Store msg2 on peer for resend on duplicate msg1, and
+                    // record the msg1 itself: a copy of it after the session
+                    // can rekey is not a rekey, and must not arm a pending.
                     if let Some(peer) = self.peers.get_mut(&peer_node_addr) {
                         peer.set_handshake_msg2(wire_msg2.clone());
+                        peer.note_setup(wire.msg1_digest);
                     }
                     // Send initial tree announce to new peer
                     if let Err(e) = self.send_tree_announce_to_peer(&peer_node_addr).await {
@@ -1441,6 +1530,7 @@ impl Node {
                             }
 
                             if remote_epoch_changed {
+                                peer.note_restart();
                                 if self.sessions.remove(&peer_node_addr).is_some() {
                                     debug!(
                                         peer = %display_name,

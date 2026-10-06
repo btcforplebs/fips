@@ -21,8 +21,8 @@ use super::{
 use crate::config::NymConfig;
 use crate::transport::socks5::{
     ConnectingEntry, ConnectingPool, DialError, ProxiedConnection, ProxiedPool, SEND_QUEUE_DEPTH,
-    Socks5Auth, Socks5Dialer, SocksTarget, existing_sender, poll_connecting, proxied_receive_loop,
-    proxied_send_loop,
+    Socks5Auth, Socks5Dialer, SocksTarget, existing_sender, is_pooled, poll_connecting,
+    proxied_receive_loop, proxied_send_loop,
 };
 use crate::transport::stream::{ConnId, WRITER_DRAIN_TIMEOUT, drain_writer, next_conn_id};
 use stats::NymStats;
@@ -291,6 +291,16 @@ impl NymTransport {
         .await
         .ok_or(TransportError::NotConnected)?;
         self.enqueue(addr, &send_tx, data)
+    }
+
+    /// Whether the pool holds a connection to `addr`: true exactly when
+    /// [`send_existing`](Self::send_existing) finds one there without
+    /// promoting a finished background connect.
+    ///
+    /// Reads only: a finished background connect is not moved into the pool,
+    /// and the pool lock is awaited rather than tried.
+    pub async fn has_connection(&self, addr: &TransportAddr) -> bool {
+        is_pooled(&self.pool, addr).await
     }
 
     /// Reject a packet larger than the transport MTU before queueing it.
@@ -1309,6 +1319,61 @@ mod tests {
             0,
             "the destination saw a connection"
         );
+
+        t.stop_async().await.unwrap();
+        dest.stop_async().await.unwrap();
+    }
+
+    /// `has_connection` reports only what the pool holds. A finished
+    /// background connect is not a pooled connection and is left where it
+    /// is; once `send_existing` has promoted it, the connection is reported.
+    #[tokio::test]
+    async fn has_connection_reports_the_pool_and_never_promotes_a_finished_connect() {
+        let (mut dest, mut dest_rx, mut t, target) = nym_via_mock_proxy().await;
+
+        assert!(
+            !t.has_connection(&target).await,
+            "no connection before any connect"
+        );
+        t.connect_async(&target).await.unwrap();
+        let mut waited = 0;
+        while !t
+            .connecting
+            .try_lock()
+            .is_ok_and(|c| c.get(&target).is_some_and(|e| e.task.is_finished()))
+        {
+            assert!(waited < 150, "background connect never finished");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            waited += 1;
+        }
+        assert!(
+            !t.has_connection(&target).await,
+            "a finished connect that is not pooled is not a connection"
+        );
+        assert!(
+            t.connecting.lock().await.contains_key(&target),
+            "the query moved the finished connect out of the connecting map"
+        );
+        assert!(
+            t.pool.lock().await.is_empty(),
+            "the query put a connection in the pool"
+        );
+        assert_eq!(
+            t.stats().snapshot().connections_established,
+            0,
+            "the query promoted the finished connect"
+        );
+
+        let frame = build_msg1_frame();
+        t.send_existing(&target, &frame).await.unwrap();
+        assert!(
+            t.has_connection(&target).await,
+            "the promoted connection is pooled"
+        );
+        tokio::time::timeout(Duration::from_secs(5), dest_rx.recv())
+            .await
+            .expect("timeout waiting for packet")
+            .expect("channel closed");
 
         t.stop_async().await.unwrap();
         dest.stop_async().await.unwrap();

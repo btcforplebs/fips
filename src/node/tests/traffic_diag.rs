@@ -564,14 +564,6 @@ fn transit_request(request_id: u64, target: NodeAddr) -> LookupRequest {
     )
 }
 
-/// The names a `to` field lists, sorted, so the order of the forward does
-/// not decide the comparison.
-fn sorted_names(list: &str) -> Vec<String> {
-    let mut names: Vec<String> = list.split(',').map(str::to_string).collect();
-    names.sort();
-    names
-}
-
 #[tokio::test]
 async fn a_forwarded_lookup_names_its_sender_origin_and_recipients() {
     // node1 — node0 — node2: node 0 carries node 1's request on to node 2.
@@ -605,7 +597,7 @@ async fn a_forwarded_lookup_names_its_sender_origin_and_recipients() {
 }
 
 #[tokio::test]
-async fn a_lookup_whose_matching_tree_peers_include_its_sender_logs_the_echo() {
+async fn a_lookup_whose_matching_tree_peers_include_its_sender_is_not_sent_back_to_it() {
     // node3 — node1 — node0 — node2. Node 3's filter at node 1 is made to
     // carry node 2, as a filter reflected back through a child would.
     let mut nodes = run_tree_test(4, &[(0, 1), (0, 2), (1, 3)], false).await;
@@ -636,13 +628,8 @@ async fn a_lookup_whose_matching_tree_peers_include_its_sender_logs_the_echo() {
         node.peer_display_name(&node3),
         "{line}"
     );
-    let mut want = vec![
-        node.peer_display_name(&node0),
-        node.peer_display_name(&node3),
-    ];
-    want.sort();
-    assert_eq!(sorted_names(&field(&line, "to")), want, "{line}");
-    assert_eq!(field(&line, "to_sender"), "true", "{line}");
+    assert_eq!(field(&line, "to"), node.peer_display_name(&node0), "{line}");
+    assert_eq!(field(&line, "to_sender"), "false", "{line}");
 
     cleanup_nodes(&mut nodes).await;
 }

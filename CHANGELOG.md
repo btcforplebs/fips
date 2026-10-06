@@ -247,20 +247,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `remote_addr`), its K-bit and ours (`kbit_frame`, `kbit_ours`), the session
   slot its index names (`slot`), and the tags of the current, previous and
   pending sessions (`epoch`, `prev_epoch`, `pending_epoch`); the first also
-  says whether the pending session was tried (`trial`). "Excessive decryption
-  failures, removing peer" carries the same key state for the last failing
-  index, with how long the pending session has been held (`pending_age_s`) and
-  the time since the last cutover (`since_cutover_ms`). The rekey completion,
-  both cutover lines and the rekey answer log the new session's tag (`epoch`)
-  and this node's K-bit after the change (`kbit_ours`). "Removing peer: link
-  dead timeout" says whether the silence was measured from the last received
-  frame or from the session start (`basis`, `basis_age_ms`), the time since
-  the last cutover, the K-bit, how many frames arrived on the previous session
-  since then (`prev_slot_frames`), and the peer's link (`link_tid`,
-  `link_addr`). "Unknown session index, dropping" is now logged at debug
-  rather than trace, with the sender's address, under one node-wide budget of
-  10 lines and then one a second; each line reports how many were withheld
-  before it (`suppressed`). Message texts are unchanged.
+  says whether the pending session was tried (`trial`); a run of failures on
+  one peer logs at most twenty of either, until a frame from it authenticates.
+  "Excessive decryption failures, peer kept" carries the same key state for
+  the last failing index, with how long the pending session has been held
+  (`pending_age_s`) and the time since the last cutover (`since_cutover_ms`).
+  The rekey completion, both cutover lines and the rekey answer log the new
+  session's tag (`epoch`) and this node's K-bit after the change
+  (`kbit_ours`). "Removing peer: link dead timeout" says whether the silence
+  was measured from the last received frame or from the session start
+  (`basis`, `basis_age_ms`), the time since the last cutover, the K-bit, how
+  many frames arrived on the previous session since then (`prev_slot_frames`),
+  and the peer's link (`link_tid`, `link_addr`). "Unknown session index,
+  dropping" is now logged at debug rather than trace, with the sender's
+  address, under one node-wide budget of 10 lines and then one a second; each
+  line reports how many were withheld before it (`suppressed`). Message texts
+  are unchanged.
 
 - "Unknown FMP version, dropping" and "FMP payload_len disagrees with frame
   length, dropping" now name the sender's address and the frame's first 8
@@ -600,6 +602,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   already queued to the exited worker are lost. With the macOS ordered sender,
   a packet sent this way can arrive out of order with the rest of its flow.
 
+- A stop sent while the daemon is starting is no longer lost. The shutdown
+  handler was installed only once start-up finished, so a stop during start-up
+  killed the daemon at once, or, with `fips` as a container's PID 1, was
+  discarded until the container's stop timeout killed it with no drain. The
+  handlers are now registered first; a stop during start-up lets start-up
+  finish for up to five seconds and then drains as usual. The example compose
+  files now run their containers under an init, so a stop reaches `fips`.
+
 #### Data plane and transports
 
 - A peer that stops reading can no longer stall the node. TCP, Tor, Nym and
@@ -728,6 +738,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not when a dial times out or went out at another value, so an unreachable
   peer keeps the PSM it advertised.
 
+- A peer is no longer removed when frames carrying its index fail to
+  decrypt. Twenty such frames removed the peer and marked its link dead, and
+  the index travels in clear, so anyone who had seen one frame of a link could
+  tear it down from any address, again after every reconnect. Such frames are
+  now dropped; the node logs one "Excessive decryption failures" warning when
+  the old threshold is reached and keeps the peer. A real key mismatch still
+  ends at the link-dead timeout. Against a 0.5.2 peer, recovery from a genuine
+  desynchronisation now takes the link-dead timeout rather than twenty
+  frames.
+
 #### Gateway
 
 - The gateway retries failed firewall rebuilds every ten seconds without
@@ -739,6 +759,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mapping's source rewrite used to take it first, so the target saw the
   peer's pool address instead, which changed as mappings came and went and
   could be answered only by a host that routes the pool to the gateway.
+
+- `fips-gateway` now acts on a stop sent while it is still setting up. Its
+  shutdown handler was installed only after set-up, which can spend seconds
+  probing the daemon's DNS responder, so a stop in that window was lost when
+  the gateway ran as a container's PID 1 and killed it part-way through set-up
+  otherwise. A stop during the probe now ends it and exits before any NAT
+  table or route exists.
 
 #### Identity and config
 
@@ -849,6 +876,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`node.bloom.update_debounce_ms`, 500 ms by default) is now measured on a
   monotonic clock.
 
+- A transit lookup request is no longer forwarded back to the peer it came
+  from. That copy was always a duplicate, and a tree child announcing a filter
+  that covers most of the mesh turned every lookup between it and the parent
+  into a two-way echo, multiplying duplicate traffic and dedup-cache evictions.
+
 #### Sessions and rekey
 
 - A link rekey whose msg2 is lost now completes on the initiator's next msg1
@@ -879,6 +911,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - An unreadable SessionMsg3 no longer discards the half-open session of an
   initial handshake, which left the initiator's genuine msg3 to an unknown
   session.
+
+- A link whose ends had fallen out of step on the K-bit, for example after a
+  peer restart, no longer loses every rekey the peer starts. Frames on the
+  peer's new session were tried against it only when their K-bit differed from
+  ours, so they failed decryption until the peer was removed. Frames on the
+  pending session's index now always get that trial, and the K-bits are put
+  back in step at the cutover after a restart.
+
+- A same-epoch msg1 that arrives off a peer's live established link, such as a
+  TCP dial from a peer already linked over UDP, or a second address on the same
+  transport, is no longer taken as a rekey of that link. It was answered on the
+  established link, held a pending session for 120 s, refused the peer's
+  genuine rekeys meanwhile, and could cancel our own. A replayed copy of the
+  msg1 a link was set up from is also refused once the link is old enough to
+  rekey, instead of arming a 120 s hold for each copy.
+
+- For 30 s after a link came up or rekeyed, every same-epoch msg1 from the
+  peer got the msg2 stored for the link's setup msg1, which completes no other
+  handshake, so a peer that lost its side of the link and dialled again could
+  not reconnect until the link-dead timeout. The stored msg2 now answers only
+  the msg1 it was made for. Any other msg1 replaces the session as a peer
+  restart does, once nothing authenticated has arrived from the peer for 15 s.
 
 #### Windows
 

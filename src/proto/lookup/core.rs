@@ -62,7 +62,8 @@ pub(crate) enum LookupAction {
 pub(crate) enum ForwardOutcome {
     /// TTL was exhausted — nothing to do.
     TtlExhausted,
-    /// No eligible peer had the target in its bloom filter.
+    /// No eligible peer had the target in its bloom filter, or the only one
+    /// that did was the sender.
     NoPeers,
     /// Forward: one SendLink per selected peer. `used_fallback` is true when
     /// the non-tree bloom-match fallback set was used (no tree peer matched).
@@ -75,9 +76,14 @@ pub(crate) enum ForwardOutcome {
 /// Plan the transit forward of an inbound LookupRequest.
 ///
 /// Decrements TTL; selects tree peers whose bloom matches the target, else a
-/// non-tree bloom-match fallback; encodes the (decremented) request once and
-/// emits one SendLink per selected peer. Pure — no I/O, metrics, or logs.
-pub(crate) fn plan_forward(request: &mut LookupRequest, rv: &impl RoutingView) -> ForwardOutcome {
+/// non-tree bloom-match fallback, never the peer the request came from;
+/// encodes the (decremented) request once and emits one SendLink per selected
+/// peer. Pure — no I/O, metrics, or logs.
+pub(crate) fn plan_forward(
+    request: &mut LookupRequest,
+    from: &NodeAddr,
+    rv: &impl RoutingView,
+) -> ForwardOutcome {
     if !request.forward() {
         return ForwardOutcome::TtlExhausted;
     }
@@ -88,18 +94,25 @@ pub(crate) fn plan_forward(request: &mut LookupRequest, rv: &impl RoutingView) -
         .copied()
         .filter(|a| rv.is_tree_peer(a))
         .collect();
-    let (targets, used_fallback) = if tree.is_empty() {
+    // Choose between the tree and the fallback before removing the sender. A
+    // request whose only matching tree peer is its sender has already been
+    // carried by the tree; handing it to the fallback would replace one echo
+    // with a send to every non-tree peer whose stored filter matches.
+    let (candidates, used_fallback) = if tree.is_empty() {
         let fallback: Vec<NodeAddr> = reaching
             .into_iter()
             .filter(|a| !rv.is_tree_peer(a))
             .collect();
-        if fallback.is_empty() {
-            return ForwardOutcome::NoPeers;
-        }
         (fallback, true)
     } else {
         (tree, false)
     };
+    // The sender already holds this request id, so a copy sent back to it is
+    // always a duplicate there.
+    let targets: Vec<NodeAddr> = candidates.into_iter().filter(|a| a != from).collect();
+    if targets.is_empty() {
+        return ForwardOutcome::NoPeers;
+    }
     let bytes: Arc<[u8]> = Arc::from(request.encode());
     let actions = targets
         .into_iter()

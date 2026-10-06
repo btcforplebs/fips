@@ -155,12 +155,12 @@ async fn arm_pending(e: &mut Established, sender_index: u32) -> Vec<u8> {
     x
 }
 
-/// A duplicate msg1 inside the rekey age is answered with the stored msg2.
-/// When the msg1 is not the one that msg2 answers, the line says so, which
-/// is the case an initiator cannot complete from the reply.
+/// A resend of the setup msg1 inside the rekey age is answered with the
+/// stored msg2, and the line says that msg2 answers it. A fresh msg1 at the
+/// same epoch is not answered with that msg2, which could not complete it.
 #[tokio::test]
-async fn a_fresh_msg1_inside_the_rekey_age_is_answered_with_a_stored_msg2_that_does_not_answer_it()
-{
+async fn a_resent_setup_msg1_inside_the_rekey_age_is_answered_with_the_stored_msg2_and_a_fresh_one_is_not()
+ {
     let mut node = make_node();
     let tid = TransportId::new(1);
     let (sock, addr) = register_udp_with_peer_socket(&mut node, tid).await;
@@ -174,28 +174,35 @@ async fn a_fresh_msg1_inside_the_rekey_age_is_answered_with_a_stored_msg2_that_d
         .expect("the first msg1 promoted the peer")
         .test_backdate_session_established(Duration::from_secs(12));
 
-    let fresh = craft_msg1_wire(&node, &sender, EPOCH, SessionIndex::new(2), 2000);
-    let logs = msg1_logged(&mut node, packet(tid, &addr, fresh.clone(), 2000)).await;
+    // Healthy path: the promoting msg1 itself, byte for byte.
+    let logs = msg1_logged(&mut node, packet(tid, &addr, first.clone(), 2000)).await;
     let line = expect_line(&logs, "Resent msg2 for duplicate msg1 (same epoch)");
-    assert_eq!(field(&line, "msg1_sidx"), "00000002", "{line}");
+    assert_eq!(field(&line, "msg1_sidx"), "00000001", "{line}");
     assert_eq!(field(&line, "stored_ridx"), "00000001", "{line}");
-    assert_eq!(field(&line, "answers_it"), "false", "{line}");
+    assert_eq!(field(&line, "answers_it"), "true", "{line}");
     assert_eq!(field(&line, "age_s"), "12", "{line}");
     assert_eq!(field(&line, "same_path"), "true", "{line}");
-    assert_eq!(field(&line, "msg1_dg"), msg1_tag(&fresh), "{line}");
+    assert_eq!(field(&line, "msg1_dg"), msg1_tag(&first), "{line}");
     assert_eq!(field(&line, "transport_id"), "transport:1", "{line}");
     assert_eq!(field(&line, "remote_addr"), addr.to_string(), "{line}");
     assert_eq!(field(&line, "link_tid"), "transport:1", "{line}");
     assert_eq!(field(&line, "link_addr"), addr.to_string(), "{line}");
 
-    // Healthy path: the promoting msg1 itself, byte for byte.
+    // A fresh msg1 takes the replacement path instead of the stored msg2.
     drain(&sock).await;
-    let logs = msg1_logged(&mut node, packet(tid, &addr, first.clone(), 3000)).await;
-    let line = expect_line(&logs, "Resent msg2 for duplicate msg1 (same epoch)");
-    assert_eq!(field(&line, "msg1_sidx"), "00000001", "{line}");
-    assert_eq!(field(&line, "stored_ridx"), "00000001", "{line}");
-    assert_eq!(field(&line, "answers_it"), "true", "{line}");
-    assert_eq!(field(&line, "msg1_dg"), msg1_tag(&first), "{line}");
+    let fresh = craft_msg1_wire(&node, &sender, EPOCH, SessionIndex::new(2), 3000);
+    let logs = msg1_logged(&mut node, packet(tid, &addr, fresh, 3000)).await;
+    assert!(
+        logs.lines()
+            .iter()
+            .all(|l| !l.contains("Resent msg2 for duplicate msg1")),
+        "a fresh msg1 drew the stored msg2: {:#?}",
+        logs.lines()
+    );
+    expect_line(
+        &logs,
+        "Same-epoch msg1 from a silent peer, replacing its session",
+    );
 
     stop_transport(&mut node, tid).await;
 }
@@ -227,32 +234,33 @@ async fn a_failed_duplicate_resend_logs_the_msg1_path() {
 }
 
 /// A rekey msg1 that arrives on a transport other than the peer's
-/// established link is answered on the link, and the line records that the
-/// two paths differ. A rekey msg1 on the link itself reads as the same path.
+/// established link, while that link works, is refused, and the line records
+/// that the two paths differ. A rekey msg1 on the link itself reads as the
+/// same path and is answered.
 #[tokio::test]
-async fn a_rekey_msg1_on_a_second_transport_logs_that_it_is_off_the_established_path() {
+async fn a_rekey_msg1_on_a_second_transport_is_refused_and_logs_that_it_is_off_the_established_path()
+ {
     let mut e = established(31).await;
     let tid2 = TransportId::new(2);
     let (_sock2, addr2) = register_udp_with_peer_socket(&mut e.node, tid2).await;
     let rekey = craft_msg1_wire(&e.node, &e.sender, EPOCH, SessionIndex::new(0x0B0B), 2000);
     let logs = msg1_logged(&mut e.node, packet(tid2, &addr2, rekey.clone(), 2000)).await;
 
-    let line = expect_line(&logs, "Sent rekey msg2 response");
-    let p = e.node.get_peer(&e.peer).expect("peer present");
-    let pending = p.pending_new_session().expect("the rekey armed a pending");
+    let line = expect_line(
+        &logs,
+        "Same-epoch msg1 off the established link while that link is up, dropping",
+    );
     assert_eq!(field(&line, "same_path"), "false", "{line}");
     assert_eq!(field(&line, "transport_id"), "transport:2", "{line}");
     assert_eq!(field(&line, "remote_addr"), addr2.to_string(), "{line}");
-    assert_eq!(field(&line, "link_tid"), "transport:1", "{line}");
-    assert_eq!(field(&line, "link_addr"), e.addr.to_string(), "{line}");
-    assert_eq!(field(&line, "age_s"), "31", "{line}");
-    assert_eq!(field(&line, "msg1_sidx"), "00000b0b", "{line}");
     assert_eq!(field(&line, "msg1_dg"), msg1_tag(&rekey), "{line}");
-    assert_eq!(field(&line, "epoch"), session_tag(pending), "{line}");
-    assert_eq!(
-        field(&line, "new_our_index"),
-        index_text(p.pending_our_index().expect("pending index")),
-        "{line}"
+    assert!(
+        e.node
+            .get_peer(&e.peer)
+            .expect("peer present")
+            .pending_new_session()
+            .is_none(),
+        "the refused msg1 armed no pending"
     );
     stop_transport(&mut e.node, TransportId::new(1)).await;
     stop_transport(&mut e.node, tid2).await;

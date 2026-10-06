@@ -403,6 +403,15 @@ impl<I: BleIo> BleTransport<I> {
         Ok(())
     }
 
+    /// Whether the pool holds a connection to `addr`, the lookup
+    /// [`send_async`](Self::send_async) makes first.
+    ///
+    /// Reads only: no background connect is started, and the pool lock is
+    /// awaited rather than tried.
+    pub async fn has_connection(&self, addr: &TransportAddr) -> bool {
+        self.pool.lock().await.contains(addr)
+    }
+
     /// Send data to a remote BLE address.
     ///
     /// If no connection exists, triggers a background connect and fails
@@ -2091,6 +2100,53 @@ mod tests {
         let config = BleConfig::default();
         let transport = BleTransport::new(TransportId::new(1), None, config, io, tx);
         (transport, rx)
+    }
+
+    /// `has_connection` reports whether the pool holds a connection to the
+    /// address, the lookup `send_async` makes first, and unlike a send to an
+    /// unpooled address it starts no connect.
+    #[tokio::test]
+    async fn has_connection_reports_the_pool_and_starts_no_connect() {
+        let io = MockBleIo::new("hci0", test_addr(1));
+        let (transport, _rx) = make_transport(io);
+        let ta = test_addr(2).to_transport_addr();
+
+        assert!(
+            !transport.has_connection(&ta).await,
+            "no connection before one is pooled"
+        );
+        assert!(
+            transport.connecting.lock().await.is_empty(),
+            "the query started a connect"
+        );
+
+        let (near, _far) = MockBleStream::pair(test_addr(1), test_addr(2), 2048);
+        let (send_tx, _send_rx) = tokio::sync::mpsc::channel(pool::SEND_QUEUE_DEPTH);
+        transport
+            .pool
+            .lock()
+            .await
+            .insert(
+                ta.clone(),
+                BleConnection {
+                    stream: Arc::new(near),
+                    send_tx,
+                    send_task: None,
+                    recv_task: None,
+                    send_mtu: 2048,
+                    recv_mtu: 2048,
+                    established_at: tokio::time::Instant::now(),
+                    is_static: false,
+                    outbound: false,
+                    addr: test_addr(2),
+                    node_addr: None,
+                },
+            )
+            .unwrap();
+        assert!(
+            transport.has_connection(&ta).await,
+            "the pooled connection is reported"
+        );
     }
 
     /// **The property the writer task exists to guarantee, on the transport

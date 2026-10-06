@@ -125,10 +125,12 @@ fn sealed_by_node0_pending(
 }
 
 /// A frame on node 1's pending index that carries the K-bit both ends hold
-/// skips the pending trial, and the failure line says which session the
-/// index belongs to and that the trial did not run.
+/// is tried against the pending session because it names that index, and
+/// the failure line says which session the index belongs to and that the
+/// trial ran on the index alone.
 #[tokio::test]
-async fn a_frame_on_the_pending_index_carrying_our_kbit_logs_that_the_pending_trial_did_not_run() {
+async fn a_frame_on_the_pending_index_carrying_our_kbit_logs_that_the_pending_trial_ran_on_the_index()
+ {
     let HeldMsg2Pair {
         mut nodes,
         node0_addr,
@@ -158,7 +160,7 @@ async fn a_frame_on_the_pending_index_carrying_our_kbit_logs_that_the_pending_tr
     let logs = frame_logged(&mut nodes[1].node, p).await;
     let line = expect_line(&logs, "Decryption failed");
     assert_eq!(field(&line, "slot"), "pending-responder", "{line}");
-    assert_eq!(field(&line, "trial"), "not-run-kbit-equal", "{line}");
+    assert_eq!(field(&line, "trial"), "run-index", "{line}");
     assert_eq!(field(&line, "kbit_frame"), "false", "{line}");
     assert_eq!(field(&line, "kbit_ours"), "false", "{line}");
     assert_eq!(field(&line, "receiver_idx"), index_text(idx), "{line}");
@@ -239,7 +241,7 @@ async fn a_frame_naming_the_pending_session_we_initiated_logs_its_slot() {
     let logs = frame_logged(&mut nodes[0].node, p).await;
     let line = expect_line(&logs, "Decryption failed");
     assert_eq!(field(&line, "slot"), "pending-initiator", "{line}");
-    assert_eq!(field(&line, "trial"), "not-run-kbit-equal", "{line}");
+    assert_eq!(field(&line, "trial"), "run-index", "{line}");
     assert_eq!(field(&line, "receiver_idx"), index_text(idx), "{line}");
 
     cleanup_nodes(&mut nodes).await;
@@ -320,8 +322,8 @@ async fn the_excessive_failures_warning_after_twenty_failures_on_the_pending_ind
         pending_tag = tag;
         let p = arriving(&nodes[1], &nodes[0], corrupt(frame));
         if i == 19 {
-            // The 20th failure removes the peer, so its age cannot be read
-            // afterwards: bound it by the age before and the time taken.
+            // Bound the age the 20th failure logs by the age before it and
+            // the time it took.
             let before = nodes[1]
                 .node
                 .get_peer(&node0_addr)
@@ -337,8 +339,12 @@ async fn the_excessive_failures_warning_after_twenty_failures_on_the_pending_ind
     }
     drop(guard);
 
-    let line = expect_line(&logs, "Excessive decryption failures, removing peer");
+    let line = expect_line(&logs, "Excessive decryption failures, peer kept");
     assert!(line.starts_with("WARN"), "{line}");
+    assert!(
+        nodes[1].node.get_peer(&node0_addr).is_some(),
+        "the peer is kept after the 20th failure"
+    );
     assert_eq!(field(&line, "slot"), "pending-responder", "{line}");
     assert_eq!(field(&line, "kbit_ours"), "false", "{line}");
     assert_eq!(field(&line, "pending_epoch"), pending_tag, "{line}");
@@ -348,6 +354,83 @@ async fn the_excessive_failures_warning_after_twenty_failures_on_the_pending_ind
         (age_window.0..=age_window.1).contains(&age),
         "pending_age_s {age} outside {age_window:?}: {line}"
     );
+
+    cleanup_nodes(&mut nodes).await;
+}
+
+/// A heartbeat from node 1 on its current session for node 0's index
+/// `idx`, arriving at node 0, corrupted unless `authentic`.
+fn current_frame(
+    nodes: &mut [TestNode],
+    node0_addr: &NodeAddr,
+    idx: SessionIndex,
+    authentic: bool,
+) -> ReceivedPacket {
+    let p1 = nodes[1].node.get_peer_mut(node0_addr).unwrap();
+    let frame = seal(p1.noise_session_mut().unwrap(), idx, false);
+    let frame = if authentic { frame } else { corrupt(frame) };
+    arriving(&nodes[0], &nodes[1], frame)
+}
+
+/// Once a run of failures has reached the warning's threshold, the peer is
+/// kept and a further failing frame logs no failure line; a frame that
+/// authenticates ends the run, and the next failure is logged again.
+#[tokio::test]
+async fn failure_lines_stop_at_the_threshold_and_resume_after_an_authentic_frame() {
+    let HeldMsg2Pair {
+        mut nodes,
+        node0_addr,
+        node1_addr,
+        ..
+    } = rekey_pair_with_held_msg2().await;
+    let idx = nodes[0]
+        .node
+        .get_peer(&node1_addr)
+        .unwrap()
+        .our_index()
+        .unwrap();
+    let failures = |nodes: &[TestNode]| {
+        nodes[0]
+            .node
+            .get_peer(&node1_addr)
+            .expect("the peer is kept")
+            .consecutive_decrypt_failures()
+    };
+
+    let (logs, guard) = capture_logs_scoped();
+    for _ in 0..20 {
+        let p = current_frame(&mut nodes, &node0_addr, idx, false);
+        nodes[0].node.handle_encrypted_frame(p).await;
+    }
+    drop(guard);
+    assert_eq!(failures(&nodes), 20, "precondition: a run of twenty");
+    assert_eq!(
+        lines_with(&logs, "Decryption failed").len(),
+        20,
+        "each of the first twenty failures logs a line"
+    );
+    assert_eq!(
+        lines_with(&logs, "Excessive decryption failures, peer kept").len(),
+        1,
+        "the warning fires once, at the twentieth"
+    );
+
+    let p = current_frame(&mut nodes, &node0_addr, idx, false);
+    let logs = frame_logged(&mut nodes[0].node, p).await;
+    assert!(
+        lines_with(&logs, "Decryption failed").is_empty(),
+        "the 21st failure of a run logs no line: {:#?}",
+        logs.lines()
+    );
+    assert_eq!(failures(&nodes), 21, "the 21st failure is still counted");
+
+    let p = current_frame(&mut nodes, &node0_addr, idx, true);
+    nodes[0].node.handle_encrypted_frame(p).await;
+    assert_eq!(failures(&nodes), 0, "an authentic frame ends the run");
+
+    let p = current_frame(&mut nodes, &node0_addr, idx, false);
+    let logs = frame_logged(&mut nodes[0].node, p).await;
+    expect_line(&logs, "Decryption failed");
 
     cleanup_nodes(&mut nodes).await;
 }
@@ -406,8 +489,28 @@ async fn a_worker_decrypt_failure_logs_the_frames_index_and_path() {
     assert_eq!(field(&line, "slot"), "current", "{line}");
     assert_eq!(field(&line, "kbit_frame"), "false", "{line}");
     assert_eq!(field(&line, "kbit_ours"), "false", "{line}");
-    let warn = expect_line(&logs, "Excessive decryption failures, removing peer");
+    let warn = expect_line(&logs, "Excessive decryption failures, peer kept");
     assert_eq!(field(&warn, "slot"), "current", "{warn}");
+    assert!(
+        nodes[0].node.get_peer(&node1_addr).is_some(),
+        "the peer is kept after the 20th failure"
+    );
+
+    // A 21st failure in the same run logs no worker failure line.
+    let p = arriving(&nodes[0], &nodes[1], junk_frame(idx, 1_000_020));
+    let (logs, guard) = capture_logs_scoped();
+    nodes[0].node.handle_encrypted_frame(p).await;
+    let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
+        .await
+        .expect("the worker reports within 5 s")
+        .expect("the worker channel is open");
+    nodes[0].node.process_decrypt_worker_event(event).await;
+    drop(guard);
+    assert!(
+        lines_with(&logs, "Worker FMP AEAD decryption failed").is_empty(),
+        "the 21st failure of a run logs no line: {:#?}",
+        logs.lines()
+    );
 
     cleanup_nodes(&mut nodes).await;
 }

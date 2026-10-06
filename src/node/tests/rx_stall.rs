@@ -623,12 +623,18 @@ async fn rekey_reply(dead: bool) -> (Reply, bool) {
         .unwrap()
         .test_backdate_session_established(Duration::from_secs(31));
 
-    // The peer has come back on a new connection and sends a rekey msg1 at
-    // the same epoch. The rekey msg2 goes to the established link's address.
+    // With the link gone, the peer has come back on a new connection and
+    // sends a rekey msg1 at the same epoch; with it alive, the msg1 comes on
+    // the link. The rekey msg2 goes to the established link's address.
+    let from = if dead {
+        elsewhere()
+    } else {
+        bh.transport_addr()
+    };
     let data = craft_msg1(&node, &sender, 0x02);
     let r = timed_process(
         &mut node,
-        ReceivedPacket::new(TransportId::new(TCP_ID), elsewhere(), data),
+        ReceivedPacket::new(TransportId::new(TCP_ID), from, data),
     )
     .await;
     let pending = node
@@ -927,8 +933,8 @@ enum ReplySite {
     /// A second msg1 from the address of a pending inbound handshake: the
     /// stored msg2 is resent before any crypto.
     DuplicateMsg1,
-    /// A same-epoch msg1 from an established peer whose session is too young
-    /// to rekey: the stored msg2 is resent on the established link.
+    /// A resend of the setup msg1 from an established peer whose session is
+    /// too young to rekey: the stored msg2 is resent on the established link.
     ResendMsg2,
     /// A resend of the rekey msg1 we already answered: the held answer is
     /// resent on the established link.
@@ -990,8 +996,11 @@ async fn arm_site(row: ReplySite, bh: &Blackhole) -> (Node, std::net::TcpStream,
             (node, far_end, Trigger::Packet(packet))
         }
         ReplySite::ResendMsg2 => {
-            let (node, sender, _, far_end) = peer_on_tcp(bh).await;
+            let (mut node, sender, sender_addr, far_end) = peer_on_tcp(bh).await;
             let data = craft_msg1(&node, &sender, 0x22);
+            node.get_peer_mut(&sender_addr)
+                .unwrap()
+                .note_setup(crate::proto::fmp::Msg1Digest::of(&data));
             let packet = ReceivedPacket::new(tcp_id, elsewhere(), data);
             (node, far_end, Trigger::Packet(packet))
         }
@@ -1001,7 +1010,7 @@ async fn arm_site(row: ReplySite, bh: &Blackhole) -> (Node, std::net::TcpStream,
                 .unwrap()
                 .test_backdate_session_established(Duration::from_secs(31));
             let data = craft_msg1(&node, &sender, 0x23);
-            node.process_packet(ReceivedPacket::new(tcp_id, elsewhere(), data.clone()))
+            node.process_packet(ReceivedPacket::new(tcp_id, link.clone(), data.clone()))
                 .await;
             assert!(
                 node.get_peer(&sender_addr)
@@ -1012,7 +1021,7 @@ async fn arm_site(row: ReplySite, bh: &Blackhole) -> (Node, std::net::TcpStream,
                 read_frame(&mut far_end).await.is_some(),
                 "the rekey msg2 went out on the connection"
             );
-            let packet = ReceivedPacket::new(tcp_id, elsewhere(), data);
+            let packet = ReceivedPacket::new(tcp_id, link, data);
             (node, far_end, Trigger::Packet(packet))
         }
         ReplySite::RekeyMsg1Resend => {
@@ -1112,11 +1121,12 @@ async fn every_rx_loop_handshake_send_to_dead_tcp_link_is_bounded() {
 }
 
 /// A rekey msg1 copy that arrives over UDP from an address unrelated to the
-/// peer is answered on the peer's established TCP link, never at its source.
-/// With that link's connection gone it is not answered at all: a
-/// connectionless source address is whatever the sender wrote.
+/// peer is never answered at its source. While the peer's established TCP
+/// connection is up the copy is off that link and refused outright; with the
+/// connection gone it is not answered either, since a connectionless source
+/// address is whatever the sender wrote.
 #[tokio::test]
-async fn a_rekey_msg1_copy_over_udp_is_answered_on_the_established_link_not_its_source() {
+async fn a_rekey_msg1_copy_over_udp_is_never_answered_at_its_source() {
     for dead in [false, true] {
         let mut bh = Blackhole::open(false);
         let (mut node, sender, sender_addr, far_end) = peer_on_tcp(&bh).await;
@@ -1155,12 +1165,11 @@ async fn a_rekey_msg1_copy_over_udp_is_answered_on_the_established_link_not_its_
 
         assert_no_dial("rekey msg1 copy over UDP", &r);
         assert!(!at_source, "a msg2 was sent to the copy's UDP source");
-        if dead {
-            assert!(!pending, "an unanswered rekey msg1 stores no session");
-        } else {
-            assert!(on_link, "the msg2 did not go out on the established link");
-            assert!(pending, "the answered rekey stores its session");
-        }
+        assert!(
+            !on_link,
+            "a msg2 went out on the established link for a copy off it"
+        );
+        assert!(!pending, "an unanswered rekey msg1 stores no session");
     }
 }
 

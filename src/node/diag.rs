@@ -258,23 +258,31 @@ impl KeyView {
 pub(crate) enum Trial {
     /// The peer held no pending session.
     NotRunNoPending,
-    /// A pending session was held, but the frame's K-bit matched ours, so
-    /// the gate did not try it.
+    /// A pending session was held, but the frame's K-bit matched ours and
+    /// it did not name the pending index, so the gate did not try it.
     NotRunKbitEqual,
-    /// The gate tried the pending session and it did not authenticate the
-    /// frame.
+    /// The gate tried the pending session on a flipped K-bit and it did not
+    /// authenticate the frame.
     Failed,
+    /// The gate tried the pending session only because the frame named the
+    /// pending index, its K-bit equal to ours, and it did not authenticate
+    /// the frame.
+    RunIndex,
 }
 
 impl Trial {
     /// The trial outcome for a frame that went on to fail: `pending` is
     /// whether a pending session was held, `tried` is the gate's own
-    /// decision. A trial that succeeded never reaches a failure line.
-    pub(crate) fn of(pending: bool, tried: bool) -> Self {
-        match (pending, tried) {
-            (false, _) => Self::NotRunNoPending,
-            (true, false) => Self::NotRunKbitEqual,
-            (true, true) => Self::Failed,
+    /// decision, and `kbit_differs` is whether the frame's K-bit differed
+    /// from ours. A differing K-bit takes precedence, so `failed` keeps the
+    /// meaning it had before an index match could select the trial. A trial
+    /// that succeeded never reaches a failure line.
+    pub(crate) fn of(pending: bool, tried: bool, kbit_differs: bool) -> Self {
+        match (pending, tried, kbit_differs) {
+            (false, _, _) => Self::NotRunNoPending,
+            (true, false, _) => Self::NotRunKbitEqual,
+            (true, true, true) => Self::Failed,
+            (true, true, false) => Self::RunIndex,
         }
     }
 }
@@ -285,6 +293,7 @@ impl fmt::Display for Trial {
             Self::NotRunNoPending => "not-run-no-pending",
             Self::NotRunKbitEqual => "not-run-kbit-equal",
             Self::Failed => "failed",
+            Self::RunIndex => "run-index",
         })
     }
 }
@@ -371,11 +380,23 @@ mod tests {
     }
 
     #[test]
-    fn the_trial_reads_whether_a_pending_was_held_and_whether_the_gate_tried_it() {
-        assert_eq!(Trial::of(false, false).to_string(), "not-run-no-pending");
-        assert_eq!(Trial::of(false, true).to_string(), "not-run-no-pending");
-        assert_eq!(Trial::of(true, false).to_string(), "not-run-kbit-equal");
-        assert_eq!(Trial::of(true, true).to_string(), "failed");
+    fn the_trial_reads_whether_a_pending_was_held_whether_the_gate_tried_it_and_on_which_signal() {
+        for kbit_differs in [false, true] {
+            assert_eq!(
+                Trial::of(false, false, kbit_differs).to_string(),
+                "not-run-no-pending"
+            );
+            assert_eq!(
+                Trial::of(false, true, kbit_differs).to_string(),
+                "not-run-no-pending"
+            );
+            assert_eq!(
+                Trial::of(true, false, kbit_differs).to_string(),
+                "not-run-kbit-equal"
+            );
+        }
+        assert_eq!(Trial::of(true, true, true).to_string(), "failed");
+        assert_eq!(Trial::of(true, true, false).to_string(), "run-index");
     }
 
     #[test]

@@ -176,6 +176,13 @@ pub(crate) async fn existing_sender<M>(
     }
 }
 
+/// Whether `pool` holds a connection to `addr`: the lookup
+/// [`existing_sender`] makes before it would promote a finished background
+/// connect. Reads only; the pool lock is awaited rather than tried.
+pub(crate) async fn is_pooled<M>(pool: &ProxiedPool<M>, addr: &TransportAddr) -> bool {
+    pool.lock().await.contains_key(addr)
+}
+
 /// Minimal stats surface the shared receive loop needs.
 ///
 /// The per-transport stats structs implement this by delegating to their

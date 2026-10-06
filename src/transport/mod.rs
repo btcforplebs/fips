@@ -953,6 +953,32 @@ impl TransportHandle {
         }
     }
 
+    /// Whether a connection to `addr` is already pooled: true exactly when
+    /// [`send_existing`](Self::send_existing) would find one there.
+    ///
+    /// Changes nothing. Unlike
+    /// [`connection_state`](Self::connection_state), it does not move a
+    /// finished background connect into the pool, start a connect, or report
+    /// a connection absent because the pool lock was busy. A finished connect
+    /// that has not been pooled yet is reported false, although
+    /// `send_existing` would promote it and send. Connectionless transports
+    /// have no connection to look up and report true, as `connection_state`
+    /// does.
+    pub async fn has_connection(&self, addr: &TransportAddr) -> bool {
+        match self {
+            TransportHandle::Udp(_) => true,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            TransportHandle::Ethernet(_) => true,
+            TransportHandle::Tcp(t) => t.has_connection(addr).await,
+            TransportHandle::Tor(t) => t.has_connection(addr).await,
+            TransportHandle::Nym(t) => t.has_connection(addr).await,
+            #[cfg(ble_available)]
+            TransportHandle::Ble(t) => t.has_connection(addr).await,
+            #[cfg(test)]
+            TransportHandle::Loopback(_) => true,
+        }
+    }
+
     /// Get the transport ID.
     pub fn transport_id(&self) -> TransportId {
         match self {

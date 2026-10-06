@@ -1261,8 +1261,9 @@ impl PeerMachine {
     /// `establish_inbound` evaluation happens here; the driver routes on the
     /// returned [`InboundDecision`] and owns the effect-bearing arm bodies
     /// (the rekey-respond abandon/alloc/send/store, the duplicate resend, the
-    /// reject bookkeeping). Only the `Promote`/`RestartThenPromote` phase-1
-    /// actions (and the fresh-context reject state flip) are machine-side.
+    /// reject bookkeeping). Only the `Promote`, `RestartThenPromote` and
+    /// `ReplaceThenPromote` phase-1 actions (and the fresh-context reject
+    /// state flip) are machine-side.
     pub(crate) fn inbound_msg1(
         &mut self,
         link: LinkId,
@@ -1292,7 +1293,8 @@ impl PeerMachine {
             // index allocation, the framed msg2 send, the pending-session
             // store, and the dampening stamp. The machine mutates nothing.
             InboundDecision::RekeyRespond { .. } => Vec::new(),
-            InboundDecision::RestartThenPromote { peer } => {
+            InboundDecision::RestartThenPromote { peer }
+            | InboundDecision::ReplaceThenPromote { peer } => {
                 let peer = *peer;
                 let mut actions = vec![PeerAction::InvalidateSendState];
                 if let Some(idx) = self.conn.our_index() {
@@ -1937,6 +1939,9 @@ mod tests {
             rekey_in_progress: false,
             held_answer: None,
             msg1_answered_before: false,
+            msg1_on_link: false,
+            link_reachable: false,
+            setup_match: false,
             existing_msg2: None,
             at_max_peers: false,
             has_pending_outbound_to_peer: false,
@@ -2258,6 +2263,7 @@ mod tests {
         est.has_session = true;
         est.existing_session_age_secs = 5; // young session -> duplicate, not rekey
         est.existing_msg2 = Some(vec![0xC4; 16]);
+        est.setup_match = true;
         let wire = wire_outcome(peer, Some([1u8; 8]), 0x77);
 
         let (decision, actions) = m.inbound_msg1(LinkId::new(1), &wire, est, 1_000);
@@ -2354,6 +2360,46 @@ mod tests {
                 .any(|a| matches!(a, PeerAction::RegisterDecryptSession { .. }))
         );
         assert_eq!(m.state(), PeerState::Established { addr: peer_addr });
+    }
+
+    /// A same-epoch msg1 that asks to replace the session drives the same
+    /// teardown of the existing peer as an epoch restart.
+    #[test]
+    fn a_replace_decision_emits_the_same_teardown_actions_as_a_restart() {
+        let peer = peer_identity();
+        let peer_addr = *peer.node_addr();
+        let our = *peer_identity().node_addr();
+        let run = |existing_epoch: [u8; 8]| {
+            let mut m = PeerMachine::new_inbound(LinkId::new(1), 0);
+            m.conn.set_our_index(SessionIndex::new(0xDEAD));
+            let mut est = est_new_peer(our);
+            est.has_existing_peer = true;
+            est.existing_peer_epoch = Some(existing_epoch);
+            est.has_session = true;
+            est.existing_session_age_secs = 5;
+            let wire = wire_outcome(peer, Some([2u8; 8]), 0x77);
+            m.inbound_msg1(LinkId::new(1), &wire, est, 1_000)
+        };
+
+        let (restart, restart_actions) = run([1u8; 8]);
+        let (replace, replace_actions) = run([2u8; 8]);
+        assert!(
+            matches!(restart, InboundDecision::RestartThenPromote { peer } if peer == peer_addr),
+            "an epoch change restarts: got {restart:?}"
+        );
+        assert!(
+            matches!(replace, InboundDecision::ReplaceThenPromote { peer } if peer == peer_addr),
+            "a fresh same-epoch msg1 on a young session replaces: got {replace:?}"
+        );
+        assert_eq!(replace_actions, restart_actions);
+        assert_eq!(
+            replace_actions.first(),
+            Some(&PeerAction::InvalidateSendState)
+        );
+        assert!(replace_actions.contains(&PeerAction::ReportLost {
+            peer: peer_addr,
+            kind: LostKind::LinkDead,
+        }));
     }
 
     // ---- Test 5: N:1 crystallization --------------------------------------
