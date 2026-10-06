@@ -42,10 +42,11 @@ services:
         # `docker buildx imagetools inspect ghcr.io/hoytech/strfry:latest`.
         STRFRY_IMAGE: ghcr.io/hoytech/strfry@sha256:36f1886d185a88ca57c66ebe52e6e9e8428dac2486eea0a5d50ff934f18b60c3
     container_name: fips-nat-relay${FIPS_CI_NAME_SUFFIX:-}
-    # A third-party relay abort should not fail a whole run, so the relay comes
-    # back on its own; relay_verdict still reports the restart and the fault
-    # lines. Bounded so a relay that aborts repeatedly ends up exited, and the
-    # verdict says so, rather than a crash loop hiding it.
+    # The relay comes back on its own after an abort so the scenario runs on
+    # and its assertions still report; assert_relay then fails the suite on
+    # the restart and prints the relay's full log. Bounded so a relay that
+    # aborts repeatedly ends up exited, and the verdict says so, rather than
+    # a crash loop hiding it.
     #
     # `init` is here so the restart can be tested, not for the restart itself.
     # It makes docker's init PID 1, with strfry as its child, where strfry was
