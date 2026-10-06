@@ -17,6 +17,9 @@ services:
       context: ../..
       dockerfile: examples/sidecar-nostr-mixnet-relay/Dockerfile
     hostname: fips-mixnet
+    # Docker's init runs as PID 1 and forwards the stop to fips, which the
+    # entrypoint execs.
+    init: true
     cap_add:
       - NET_ADMIN
     devices:
