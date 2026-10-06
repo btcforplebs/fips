@@ -441,6 +441,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   binaries behave as before. The peer wire and the control-socket response
   shape are unchanged.
 
+- **Source-breaking for consumers of the library crate**: the `fips::upper`
+  module path is gone. The TUN, DNS and ICMPv6 items it named are under
+  `fips::ipv6tun` (for example `fips::ipv6tun::tun::TunState`), the hosts file
+  is `fips::hosts`, and `FIPS_OVERHEAD`, `MIN_ACTIONABLE_PATH_MTU` and
+  `MIN_REACTIVE_PATH_MTU` are re-exported at the crate root. `PathMtuEntry`
+  and `PathMtuLookup` are no longer public. `fipsctl` and the daemon behave as
+  before.
+
 ### Fixed
 
 #### Node lifecycle

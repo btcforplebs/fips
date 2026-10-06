@@ -77,10 +77,9 @@ pub const SESSION_COLD_START_INTERVAL_MS: u64 = 1_000;
 /// It lives here rather than beside the arithmetic that consumes it because it
 /// is a protocol policy decision — how little a remote party may claim before
 /// this node stops believing it — and the path-MTU state machine that owns
-/// that rule is in this module. The upper layer re-exports it, so
-/// `crate::upper::icmp::MIN_ACTIONABLE_PATH_MTU` continues to resolve.
+/// that rule is in this module.
 ///
-/// [`mss_ceiling`]: crate::upper::icmp::mss_ceiling
+/// [`mss_ceiling`]: crate::ipv6tun::icmp::mss_ceiling
 pub const MIN_ACTIONABLE_PATH_MTU: u16 = 256;
 
 /// Smallest path MTU this node will act on when the claim arrives on the

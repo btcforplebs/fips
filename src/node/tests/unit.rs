@@ -1911,7 +1911,7 @@ async fn the_tun_mss_ceiling_follows_a_transport_arriving_and_leaving() {
     let wide_ceiling = node.tun_mss_ceiling();
     assert_eq!(
         wide_ceiling,
-        crate::upper::icmp::mss_ceiling(1452),
+        crate::ipv6tun::icmp::mss_ceiling(1452),
         "the seeded ceiling must match the only bound transport"
     );
 
@@ -1921,14 +1921,14 @@ async fn the_tun_mss_ceiling_follows_a_transport_arriving_and_leaving() {
     node.transports.insert(TransportId::new(2), narrow);
     node.refresh_tun_mss_ceiling();
     let narrow_ceiling = node.tun_mss_ceiling();
-    assert_eq!(narrow_ceiling, crate::upper::icmp::mss_ceiling(1280));
+    assert_eq!(narrow_ceiling, crate::ipv6tun::icmp::mss_ceiling(1280));
     assert!(
         narrow_ceiling < wide_ceiling,
         "a narrower transport must tighten the clamp, not be ignored"
     );
     assert_eq!(
         narrow_ceiling,
-        crate::upper::icmp::mss_ceiling(node.transport_mtu()),
+        crate::ipv6tun::icmp::mss_ceiling(node.transport_mtu()),
         "the clamp and the reported MTU must not disagree"
     );
 
@@ -1966,7 +1966,7 @@ async fn a_presence_edge_refreshes_the_tun_mss_ceiling_without_being_asked() {
     // Nothing bound: the conservative seed.
     node.refresh_tun_mss_ceiling();
     let seeded = node.tun_mss_ceiling();
-    assert_eq!(seeded, crate::upper::icmp::mss_ceiling(1280));
+    assert_eq!(seeded, crate::ipv6tun::icmp::mss_ceiling(1280));
 
     // A wide transport appears, and an edge announces it. No explicit
     // refresh call here — draining the edge is the whole trigger.
@@ -1984,7 +1984,7 @@ async fn a_presence_edge_refreshes_the_tun_mss_ceiling_without_being_asked() {
 
     assert_eq!(
         node.tun_mss_ceiling(),
-        crate::upper::icmp::mss_ceiling(1452),
+        crate::ipv6tun::icmp::mss_ceiling(1452),
         "draining a presence edge must refresh the ceiling on its own"
     );
     assert_ne!(
@@ -2101,7 +2101,7 @@ async fn test_seeded_narrow_link_mtu_reaches_the_clamp_as_a_tight_ceiling() {
     // every full-size segment would be refused by the transport with no
     // feedback to the TCP stack.
     assert_eq!(
-        crate::upper::tun::per_flow_max_mss(&node.path_mtu_lookup, fips_addr.as_bytes(), 1360),
+        crate::ipv6tun::tun::per_flow_max_mss(&node.path_mtu_lookup, fips_addr.as_bytes(), 1360),
         103,
         "the clamp must honour the seeded link MTU, not fall back to 1143"
     );
@@ -2130,7 +2130,7 @@ async fn test_seed_path_mtu_keeps_tighter_existing_value() {
     node.path_mtu_lookup
         .write()
         .unwrap()
-        .insert(fips_addr, crate::upper::tun::PathMtuEntry::held(1280));
+        .insert(fips_addr, crate::node::path_mtu::PathMtuEntry::held(1280));
 
     node.seed_path_mtu_for_link_peer(&peer_addr, TransportId::new(1), &transport_addr);
 
@@ -2169,7 +2169,7 @@ async fn test_seed_path_mtu_tightens_looser_existing_value() {
     node.path_mtu_lookup
         .write()
         .unwrap()
-        .insert(fips_addr, crate::upper::tun::PathMtuEntry::held(1452));
+        .insert(fips_addr, crate::node::path_mtu::PathMtuEntry::held(1452));
 
     node.seed_path_mtu_for_link_peer(&peer_addr, TransportId::new(1), &transport_addr);
 
@@ -2284,7 +2284,7 @@ async fn test_seed_path_mtu_discards_learned_value_from_abandoned_link() {
     node.path_mtu_lookup
         .write()
         .unwrap()
-        .insert(fips_addr, crate::upper::tun::PathMtuEntry::held(900));
+        .insert(fips_addr, crate::node::path_mtu::PathMtuEntry::held(900));
 
     node.seed_path_mtu_for_link_peer(&peer_addr, TransportId::new(2), &wide_addr);
     assert_eq!(
@@ -2324,7 +2324,7 @@ async fn test_seed_path_mtu_keeps_tighter_value_when_reseeding_same_transport() 
     node.path_mtu_lookup
         .write()
         .unwrap()
-        .insert(fips_addr, crate::upper::tun::PathMtuEntry::held(1200));
+        .insert(fips_addr, crate::node::path_mtu::PathMtuEntry::held(1200));
 
     // Re-promotion on the same transport.
     node.seed_path_mtu_for_link_peer(&peer_addr, TransportId::new(1), &transport_addr);
@@ -3416,7 +3416,7 @@ fn app_owned_tun_seam_wires_channels() {
 
     // TUN is active and the inbound (mesh→app) sender is installed, so `start()`
     // will skip `TunDevice::create` (it gates on `tun_tx.is_none()`).
-    assert_eq!(node.tun_state(), crate::upper::tun::TunState::Active);
+    assert_eq!(node.tun_state(), crate::ipv6tun::tun::TunState::Active);
     assert!(node.tun_tx().is_some(), "inbound sender installed");
 
     // mesh → app: a packet the node delivers to its `tun_tx` reaches the app's rx.
@@ -3461,7 +3461,7 @@ async fn start_skips_system_tun_when_app_owned() {
         node.tun_name().is_none(),
         "app-owned TUN must not create a named system device",
     );
-    assert_eq!(node.tun_state(), crate::upper::tun::TunState::Active);
+    assert_eq!(node.tun_state(), crate::ipv6tun::tun::TunState::Active);
 
     node.stop().await.unwrap();
 }

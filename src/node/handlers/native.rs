@@ -12,8 +12,8 @@ use crate::identity::NodeAddr;
 use crate::native::link::{self, NativeMessage, Outcome, Served};
 use crate::native::registry::FlowKey;
 use crate::node::Node;
+use crate::proto::framing::FIPS_OVERHEAD;
 use crate::proto::fsp::wire::FSP_PORT_HEADER_SIZE;
-use crate::upper::icmp::FIPS_OVERHEAD;
 use secp256k1::XOnlyPublicKey;
 use tracing::debug;
 

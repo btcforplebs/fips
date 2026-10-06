@@ -88,7 +88,7 @@ they match — meaning the query came from another mesh node, not from a
 local socket — the responder discards the query without replying.
 
 The check is implemented in
-[`is_mesh_interface_query`](../../src/upper/dns.rs) and prevents two
+[`is_mesh_interface_query`](../../src/ipv6tun/dns.rs) and prevents two
 classes of misbehaviour: a peer asking the daemon to resolve `.fips`
 names on its behalf (which would let one node use another as an
 identity-cache priming proxy), and accidental query loops where a

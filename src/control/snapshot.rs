@@ -23,10 +23,10 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use crate::identity::NodeAddr;
+use crate::ipv6tun::tun::TunState;
 use crate::node::NodeState;
 use crate::node::acl::PeerAclStatus;
 use crate::node::stats_history::StatsHistory;
-use crate::upper::tun::TunState;
 use secp256k1::XOnlyPublicKey;
 
 /// Read-only snapshot of the stats-history rings plus the scalar gauges and

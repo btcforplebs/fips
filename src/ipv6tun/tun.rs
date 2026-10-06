@@ -34,9 +34,7 @@ use tracing::{error, warn};
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 use tun::Layer;
 
-// The path MTU map is node state; re-exported so `crate::upper::tun` paths
-// keep resolving.
-pub use crate::node::path_mtu::{PathMtuEntry, PathMtuLookup};
+use crate::node::path_mtu::PathMtuLookup;
 
 /// The node-global TCP MSS ceiling, shared live with the TUN reader and
 /// writer threads.
@@ -1120,7 +1118,7 @@ mod windows_tun {
         /// to the wintun session. Returns when the channel is closed.
         pub fn run(self) {
             use super::per_flow_max_mss;
-            use crate::upper::tcp_mss::clamp_tcp_mss;
+            use crate::ipv6tun::tcp_mss::clamp_tcp_mss;
 
             debug!(
                 name = %self.name,
@@ -1611,6 +1609,7 @@ mod platform {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::node::path_mtu::PathMtuEntry;
     use std::collections::HashMap;
     use std::sync::RwLock;
 
@@ -1780,7 +1779,7 @@ mod tests {
         let addr = fips_addr_with_node_byte(0x42);
         lookup.write().unwrap().insert(
             addr,
-            PathMtuEntry::held(super::super::icmp::MIN_ACTIONABLE_PATH_MTU),
+            PathMtuEntry::held(crate::proto::mmp::MIN_ACTIONABLE_PATH_MTU),
         );
         assert_eq!(per_flow_max_mss(&lookup, addr.as_bytes(), 1360), 119);
     }

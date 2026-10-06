@@ -47,6 +47,9 @@ use self::reloadable::Reloadable;
 /// `node.rekey.after_secs` remains the nominal interval (mean preserved).
 pub(crate) const REKEY_JITTER_SECS: i64 = 15;
 use crate::cache::CoordCache;
+use crate::hosts::HostMap;
+use crate::ipv6tun::icmp_rate_limit::IcmpRateLimiter;
+use crate::ipv6tun::tun::{TunError, TunOutboundTx, TunState, TunTx};
 use crate::node::session::SessionEntry;
 use crate::peer::machine::{PeerMachine, TimerKind};
 use crate::peer::{ActivePeer, ConnectivityState};
@@ -72,9 +75,6 @@ use crate::transport::{
     Link, LinkDirection, LinkId, PacketRx, PacketTx, TransportAddr, TransportError,
     TransportHandle, TransportId,
 };
-use crate::upper::hosts::HostMap;
-use crate::upper::icmp_rate_limit::IcmpRateLimiter;
-use crate::upper::tun::{TunError, TunOutboundTx, TunState, TunTx};
 use crate::utils::index::IndexAllocator;
 use crate::{Config, ConfigError, Identity, IdentityError, NodeAddr, PeerIdentity, TreeCoordinate};
 use rand::Rng;
@@ -416,7 +416,7 @@ pub struct Node {
     /// the TUN reader/writer threads at TCP MSS clamp time so the
     /// SYN/SYN-ACK clamp can use the smaller of the local-egress floor
     /// and the learned per-destination path MTU.
-    path_mtu_lookup: crate::upper::tun::PathMtuLookup,
+    path_mtu_lookup: crate::node::path_mtu::PathMtuLookup,
     /// Node-global TCP MSS ceiling, shared live with the TUN reader and writer
     /// threads and recomputed whenever the set of *bound* transports changes.
     ///
@@ -426,7 +426,7 @@ pub struct Node {
     /// smaller. Both have to be read live — a transport that binds after start
     /// can be the narrow one, and one that unbinds can be the reason the node
     /// was clamped at all.
-    tun_mss_ceiling: crate::upper::tun::MssCeiling,
+    tun_mss_ceiling: crate::ipv6tun::tun::MssCeiling,
     /// Which transport last supplied a *link seed* into `path_mtu_lookup`,
     /// per destination.
     ///
@@ -849,7 +849,7 @@ impl Node {
         let forward_min_interval_secs = config.node.lookup.forward_min_interval_secs;
 
         let base_host_map = HostMap::from_peer_configs(config.peers());
-        let hosts_path = std::path::PathBuf::from(crate::upper::hosts::DEFAULT_HOSTS_PATH);
+        let hosts_path = std::path::PathBuf::from(crate::hosts::DEFAULT_HOSTS_PATH);
         let host_map =
             reloadable::HostMapReloadable::new(base_host_map.clone(), hosts_path.clone());
         let peer_acl = acl::PeerAclReloader::with_default_paths(base_host_map, hosts_path);
@@ -956,7 +956,7 @@ impl Node {
             // itself falls back to when nothing is bound. Refreshed before
             // the TUN threads start and on every change to the bound set.
             tun_mss_ceiling: Arc::new(std::sync::atomic::AtomicU16::new(
-                crate::upper::icmp::mss_ceiling(crate::upper::tun::IPV6_MIN_MTU),
+                crate::ipv6tun::icmp::mss_ceiling(crate::ipv6tun::tun::IPV6_MIN_MTU),
             )),
             path_mtu_seeded_by: Arc::new(std::sync::RwLock::new(HashMap::new())),
             netmon_trigger: netmon::NetmonTrigger::new(),
@@ -1018,7 +1018,7 @@ impl Node {
         let coords_response_interval_ms = config.node.session.coords_response_interval_ms;
 
         let base_host_map = HostMap::from_peer_configs(config.peers());
-        let hosts_path = std::path::PathBuf::from(crate::upper::hosts::DEFAULT_HOSTS_PATH);
+        let hosts_path = std::path::PathBuf::from(crate::hosts::DEFAULT_HOSTS_PATH);
         let host_map =
             reloadable::HostMapReloadable::new(base_host_map.clone(), hosts_path.clone());
         let peer_acl = acl::PeerAclReloader::with_default_paths(base_host_map, hosts_path);
@@ -1122,7 +1122,7 @@ impl Node {
             // itself falls back to when nothing is bound. Refreshed before
             // the TUN threads start and on every change to the bound set.
             tun_mss_ceiling: Arc::new(std::sync::atomic::AtomicU16::new(
-                crate::upper::icmp::mss_ceiling(crate::upper::tun::IPV6_MIN_MTU),
+                crate::ipv6tun::icmp::mss_ceiling(crate::ipv6tun::tun::IPV6_MIN_MTU),
             )),
             path_mtu_seeded_by: Arc::new(std::sync::RwLock::new(HashMap::new())),
             netmon_trigger: netmon::NetmonTrigger::new(),
@@ -1551,11 +1551,11 @@ impl Node {
 
     /// Calculate the effective IPv6 MTU that can be sent over FIPS.
     ///
-    /// Delegates to `upper::icmp::effective_ipv6_mtu()` with this node's
+    /// Delegates to `ipv6tun::icmp::effective_ipv6_mtu()` with this node's
     /// transport MTU. Returns the maximum IPv6 packet size (including
     /// IPv6 header) that can be transmitted through the FIPS mesh.
     pub fn effective_ipv6_mtu(&self) -> u16 {
-        crate::upper::icmp::effective_ipv6_mtu(self.transport_mtu())
+        crate::ipv6tun::icmp::effective_ipv6_mtu(self.transport_mtu())
     }
 
     /// The TCP MSS ceiling the TUN threads are currently clamping to.
@@ -1586,7 +1586,7 @@ impl Node {
     pub(crate) fn refresh_tun_mss_ceiling(&self) {
         use std::sync::atomic::Ordering;
 
-        let ceiling = crate::upper::icmp::mss_ceiling(self.transport_mtu());
+        let ceiling = crate::ipv6tun::icmp::mss_ceiling(self.transport_mtu());
         let previous = self.tun_mss_ceiling.swap(ceiling, Ordering::Relaxed);
         if previous != ceiling {
             tracing::info!(
@@ -3170,7 +3170,7 @@ impl Node {
     pub(crate) fn path_mtu_lookup_entry(
         &self,
         fips_addr: &crate::FipsAddress,
-    ) -> Option<crate::upper::tun::PathMtuEntry> {
+    ) -> Option<crate::node::path_mtu::PathMtuEntry> {
         self.path_mtu_lookup
             .read()
             .ok()
@@ -3186,7 +3186,7 @@ impl Node {
     #[cfg(test)]
     pub(crate) fn path_mtu_lookup_insert(&self, fips_addr: crate::FipsAddress, mtu: u16) {
         if let Ok(mut map) = self.path_mtu_lookup.write() {
-            map.insert(fips_addr, crate::upper::tun::PathMtuEntry::held(mtu));
+            map.insert(fips_addr, crate::node::path_mtu::PathMtuEntry::held(mtu));
         }
     }
 
@@ -3202,7 +3202,7 @@ impl Node {
         if let Ok(mut map) = self.path_mtu_lookup.write() {
             map.insert(
                 fips_addr,
-                crate::upper::tun::PathMtuEntry::learned(mtu, at_ms),
+                crate::node::path_mtu::PathMtuEntry::learned(mtu, at_ms),
             );
         }
     }

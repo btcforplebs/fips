@@ -9,10 +9,10 @@
 //! evaluated first, an allowlist match overrides a denylist match for the
 //! same peer.
 
+use crate::hosts::{DEFAULT_HOSTS_PATH, HostMap, HostMapReloader, file_mtime};
 use crate::node::reloadable::Reloadable;
 use crate::node::{Node, NodeError};
 use crate::transport::{TransportAddr, TransportId};
-use crate::upper::hosts::{DEFAULT_HOSTS_PATH, HostMap, HostMapReloader, file_mtime};
 use crate::{NodeAddr, PeerIdentity};
 use serde::Serialize;
 use std::collections::{BTreeSet, HashSet};
@@ -59,7 +59,7 @@ pub const DEFAULT_PEERS_DENY_PATH: &str = r"C:\ProgramData\fips\peers.deny";
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 pub fn warn_on_legacy_config_paths() {
     for (current, name) in [
-        (crate::upper::hosts::DEFAULT_HOSTS_PATH, "hosts"),
+        (crate::hosts::DEFAULT_HOSTS_PATH, "hosts"),
         (DEFAULT_PEERS_ALLOW_PATH, "peers.allow"),
         (DEFAULT_PEERS_DENY_PATH, "peers.deny"),
     ] {

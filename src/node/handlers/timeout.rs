@@ -630,7 +630,7 @@ impl Node {
     /// shortens this with it. A TTL of zero disables the pass, matching
     /// `purge_idle_sessions`.
     pub(in crate::node) fn purge_expired_path_mtu(&mut self, now_ms: u64) {
-        use crate::upper::tun::PathMtuEntry;
+        use crate::node::path_mtu::PathMtuEntry;
 
         let ttl_ms = self.config().node.cache.coord_ttl_secs * 1000;
         if ttl_ms == 0 {

@@ -4,9 +4,9 @@
 
 use super::*;
 use crate::config::{ConnectPolicy, PeerAddress, PeerConfig};
+use crate::hosts::HostMap;
 use crate::node::acl::{PeerAclDecision, PeerAclReloader};
 use crate::node::reloadable::HostMapReloadable;
-use crate::upper::hosts::HostMap;
 use std::net::Ipv6Addr;
 
 /// A suffix taken from a fresh npub's data part, so alias names cannot

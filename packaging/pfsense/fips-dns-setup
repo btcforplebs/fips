@@ -75,7 +75,7 @@ yaml_dns_field() {
 BIND_ADDR="$(yaml_dns_field bind_addr)"
 DNS_PORT="$(yaml_dns_field port)"
 
-# Defaults match src/upper/config.rs (DEFAULT_DNS_BIND_ADDR, DEFAULT_DNS_PORT).
+# Defaults match src/ipv6tun/config.rs (DEFAULT_DNS_BIND_ADDR, DEFAULT_DNS_PORT).
 [ -n "$BIND_ADDR" ] || BIND_ADDR="::1"
 [ -n "$DNS_PORT" ] || DNS_PORT="5354"
 

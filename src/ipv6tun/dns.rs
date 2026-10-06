@@ -10,7 +10,7 @@
 //! As a side effect, resolved identities are sent to the Node for identity
 //! cache population, enabling subsequent TUN packet routing.
 
-use crate::upper::hosts::{HostMap, HostMapReloader};
+use crate::hosts::{HostMap, HostMapReloader};
 use crate::{NodeAddr, PeerIdentity};
 use simple_dns::rdata::{AAAA, RData};
 use simple_dns::{CLASS, Name, Packet, PacketFlag, QTYPE, RCODE, ResourceRecord, TYPE};

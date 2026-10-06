@@ -13,6 +13,7 @@ use super::peering::retry::MAX_RETRY_CONNECTIONS_PER_TICK;
 
 use crate::config::{ConnectPolicy, PeerAddress, PeerConfig};
 use crate::ipv6tun::lifecycle::{TunThreads, open_tun};
+use crate::ipv6tun::tun::TunState;
 use crate::node::acl::PeerAclContext;
 use crate::node::dataplane::PeerActionCtx;
 use crate::nostr::{BootstrapEvent, NostrRendezvous};
@@ -21,7 +22,6 @@ use crate::peer::machine::{HandshakeCrypto, PeerEvent, PeerMachine};
 use crate::proto::fmp::wire::build_msg1;
 use crate::proto::fmp::{Disconnect, DisconnectReason};
 use crate::transport::{Link, LinkDirection, LinkId, TransportAddr, TransportId, packet_channel};
-use crate::upper::tun::TunState;
 use crate::{NodeAddr, PeerIdentity};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -1718,7 +1718,7 @@ impl Node {
                             // right now. Both TUN threads read it live from here
                             // on, so a transport binding or unbinding later moves
                             // the clamp instead of leaving it at this instant's
-                            // value — see `crate::upper::tun::MssCeiling`.
+                            // value — see `crate::ipv6tun::tun::MssCeiling`.
                             self.refresh_tun_mss_ceiling();
                             let threads = TunThreads {
                                 ceiling: self.tun_mss_ceiling.clone(),

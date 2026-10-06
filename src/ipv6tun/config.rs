@@ -21,7 +21,7 @@ const DEFAULT_TUN_MTU: u16 = 1280;
 /// causing the mesh-interface filter to silently drop every query.
 ///
 /// To expose the responder to mesh peers, set `bind_addr: "::"` in
-/// fips.yaml. The `is_mesh_interface_query` filter in `src/upper/dns.rs`
+/// fips.yaml. The `is_mesh_interface_query` filter in `src/ipv6tun/dns.rs`
 /// is still in place to prevent hosts-file alias enumeration in that
 /// mode. See `packaging/common/fips-dns-setup` for backend selection.
 const DEFAULT_DNS_BIND_ADDR: &str = "::1";

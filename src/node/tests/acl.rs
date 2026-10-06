@@ -1,9 +1,9 @@
 use super::*;
 use crate::ReceivedPacket;
+use crate::hosts::HostMap;
 use crate::node::acl::PeerAclReloader;
 use crate::node::reloadable::HostMapReloadable;
 use crate::proto::fmp::wire::{build_msg1, build_msg2};
-use crate::upper::hosts::HostMap;
 use crate::utils::index::SessionIndex;
 use std::path::PathBuf;
 use std::time::Duration;

@@ -8,7 +8,7 @@
 
 use clap::{Parser, Subcommand};
 use fips::config::{read_key_file, write_key_file, write_pub_file};
-use fips::upper::hosts::HostMap;
+use fips::hosts::HostMap;
 use fips::version;
 use fips::{ConfigError, Identity, PeerIdentity, encode_nsec};
 use std::io::{BufRead, BufReader, IsTerminal, Write};
@@ -409,14 +409,14 @@ fn resolve_peer(peer: &str) -> String {
         return peer.to_string();
     }
 
-    let hosts = HostMap::load_hosts_file(Path::new(fips::upper::hosts::DEFAULT_HOSTS_PATH));
+    let hosts = HostMap::load_hosts_file(Path::new(fips::hosts::DEFAULT_HOSTS_PATH));
     match hosts.lookup_npub(peer) {
         Some(npub) => npub.to_string(),
         None => {
             eprintln!("error: unknown host '{peer}'");
             eprintln!(
                 "Not found in {} and not an npub.",
-                fips::upper::hosts::DEFAULT_HOSTS_PATH
+                fips::hosts::DEFAULT_HOSTS_PATH
             );
             std::process::exit(1);
         }
