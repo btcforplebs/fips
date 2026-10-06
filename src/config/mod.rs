@@ -29,7 +29,13 @@ use crate::node::REKEY_JITTER_SECS;
 use crate::nostr::FRESHNESS_SKEW_TOLERANCE_MS;
 use crate::upper::config::{DnsConfig, TunConfig};
 use crate::{Identity, IdentityError};
+use serde::de::{
+    Deserializer, EnumAccess, IgnoredAny, MapAccess, SeqAccess, VariantAccess, Visitor,
+};
 use serde::{Deserialize, Serialize};
+use serde_yaml::Mapping;
+use std::collections::BTreeMap;
+use std::fmt;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
@@ -1044,6 +1050,348 @@ impl Drop for IdentityConfig {
     }
 }
 
+/// Which keys one config file set under a section, with no values held.
+///
+/// `Config::load_from_paths` layers `node` per key, so it has to know which
+/// keys each file named: once deserialised, a field the file omitted and one
+/// it set to its default look the same. A `serde_yaml::Value` cannot stand in
+/// for this, because its mapping rejects a repeated key that the typed parse
+/// accepts when the key is unknown.
+#[derive(Debug)]
+enum Keys {
+    /// An explicit null, including a section header with nothing under it.
+    Null,
+    /// A scalar or sequence, or a marker for a key whose value is taken
+    /// whole.
+    Leaf,
+    /// A mapping, by string key.
+    Map(BTreeMap<String, Keys>),
+}
+
+/// Builds a [`Keys`] tree from any YAML value.
+struct KeysVisitor;
+
+impl<'de> Visitor<'de> for KeysVisitor {
+    type Value = Keys;
+
+    /// Describe what this visitor accepts.
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("any YAML value")
+    }
+
+    /// A boolean is a leaf.
+    fn visit_bool<E>(self, _: bool) -> Result<Keys, E> {
+        Ok(Keys::Leaf)
+    }
+
+    /// An integer is a leaf.
+    fn visit_i64<E>(self, _: i64) -> Result<Keys, E> {
+        Ok(Keys::Leaf)
+    }
+
+    /// An integer beyond 64 bits is a leaf; an unknown key may hold one.
+    fn visit_i128<E>(self, _: i128) -> Result<Keys, E> {
+        Ok(Keys::Leaf)
+    }
+
+    /// An integer is a leaf.
+    fn visit_u64<E>(self, _: u64) -> Result<Keys, E> {
+        Ok(Keys::Leaf)
+    }
+
+    /// An integer beyond 64 bits is a leaf; an unknown key may hold one.
+    fn visit_u128<E>(self, _: u128) -> Result<Keys, E> {
+        Ok(Keys::Leaf)
+    }
+
+    /// A float is a leaf.
+    fn visit_f64<E>(self, _: f64) -> Result<Keys, E> {
+        Ok(Keys::Leaf)
+    }
+
+    /// A string is a leaf, and is not copied: it may be the private key.
+    fn visit_str<E>(self, _: &str) -> Result<Keys, E> {
+        Ok(Keys::Leaf)
+    }
+
+    /// An explicit null.
+    fn visit_unit<E>(self) -> Result<Keys, E> {
+        Ok(Keys::Null)
+    }
+
+    /// An explicit null.
+    fn visit_none<E>(self) -> Result<Keys, E> {
+        Ok(Keys::Null)
+    }
+
+    /// A present optional value is read as the value itself.
+    fn visit_some<D: Deserializer<'de>>(self, d: D) -> Result<Keys, D::Error> {
+        d.deserialize_any(KeysVisitor)
+    }
+
+    /// A sequence replaces whole, so its contents are skipped.
+    fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Keys, A::Error> {
+        IgnoredAny.visit_seq(seq).map(|_| Keys::Leaf)
+    }
+
+    /// A value under a custom tag is read as the value itself: the typed
+    /// parse takes a tagged mapping as the plain struct, so its keys layer
+    /// the same as an untagged one's.
+    fn visit_enum<A: EnumAccess<'de>>(self, data: A) -> Result<Keys, A::Error> {
+        data.variant::<IgnoredAny>()?.1.newtype_variant()
+    }
+
+    /// Record each string key with its own tree. A repeated key replaces the
+    /// earlier entry: only an unknown key can repeat in a file the typed
+    /// parse accepted, and unknown keys are ignored when layering.
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Keys, A::Error> {
+        let mut out = BTreeMap::new();
+        while let Some(name) = map.next_key::<KeyName>()? {
+            match name.0 {
+                Some(name) => {
+                    let keys: Keys = map.next_value()?;
+                    out.insert(name, keys);
+                }
+                None => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+        Ok(Keys::Map(out))
+    }
+}
+
+impl<'de> Deserialize<'de> for Keys {
+    /// Read the key tree of whatever value is next.
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        d.deserialize_any(KeysVisitor)
+    }
+}
+
+/// A mapping key: its text when it is a string, `None` otherwise. A field
+/// name is always a string, and the typed parse ignores any other key.
+struct KeyName(Option<String>);
+
+/// Reads a [`KeyName`] from any YAML value.
+struct KeyNameVisitor;
+
+impl<'de> Visitor<'de> for KeyNameVisitor {
+    type Value = KeyName;
+
+    /// Describe what this visitor accepts.
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("a mapping key")
+    }
+
+    /// A string key names a field.
+    fn visit_str<E>(self, v: &str) -> Result<KeyName, E> {
+        Ok(KeyName(Some(v.to_owned())))
+    }
+
+    /// A boolean key names no field.
+    fn visit_bool<E>(self, _: bool) -> Result<KeyName, E> {
+        Ok(KeyName(None))
+    }
+
+    /// An integer key names no field.
+    fn visit_i64<E>(self, _: i64) -> Result<KeyName, E> {
+        Ok(KeyName(None))
+    }
+
+    /// An integer key names no field.
+    fn visit_i128<E>(self, _: i128) -> Result<KeyName, E> {
+        Ok(KeyName(None))
+    }
+
+    /// An integer key names no field.
+    fn visit_u64<E>(self, _: u64) -> Result<KeyName, E> {
+        Ok(KeyName(None))
+    }
+
+    /// An integer key names no field.
+    fn visit_u128<E>(self, _: u128) -> Result<KeyName, E> {
+        Ok(KeyName(None))
+    }
+
+    /// A float key names no field.
+    fn visit_f64<E>(self, _: f64) -> Result<KeyName, E> {
+        Ok(KeyName(None))
+    }
+
+    /// A null key names no field.
+    fn visit_unit<E>(self) -> Result<KeyName, E> {
+        Ok(KeyName(None))
+    }
+
+    /// A null key names no field.
+    fn visit_none<E>(self) -> Result<KeyName, E> {
+        Ok(KeyName(None))
+    }
+
+    /// A sequence key names no field.
+    fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<KeyName, A::Error> {
+        IgnoredAny.visit_seq(seq).map(|_| KeyName(None))
+    }
+
+    /// A mapping key names no field.
+    fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<KeyName, A::Error> {
+        IgnoredAny.visit_map(map).map(|_| KeyName(None))
+    }
+
+    /// A tagged key names no field.
+    fn visit_enum<A: EnumAccess<'de>>(self, data: A) -> Result<KeyName, A::Error> {
+        IgnoredAny.visit_enum(data).map(|_| KeyName(None))
+    }
+}
+
+impl<'de> Deserialize<'de> for KeyName {
+    /// Read a mapping key of any type.
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        d.deserialize_any(KeyNameVisitor)
+    }
+}
+
+/// The `node` key tree of a config file; every other section is skipped.
+#[derive(Deserialize)]
+struct NodeKeys {
+    /// The key tree of `node`, if the file has one.
+    #[serde(default)]
+    node: Option<Keys>,
+}
+
+/// The six scalar names of the deprecated `node.discovery` block, which fold
+/// into `node.lookup` (see `normalize_deprecated_keys`).
+const LEGACY_LOOKUP: [&str; 6] = [
+    "ttl",
+    "attempt_timeouts_secs",
+    "recent_expiry_secs",
+    "backoff_base_secs",
+    "backoff_max_secs",
+    "forward_min_interval_secs",
+];
+
+/// The two block names of the deprecated `node.discovery` block, which fold
+/// into `node.rendezvous` whole (see `normalize_deprecated_keys`).
+const LEGACY_RENDEZVOUS: [&str; 2] = ["nostr", "lan"];
+
+/// The submapping at `name` in `map`, made an empty one if absent or not a
+/// mapping.
+fn submap<'a>(map: &'a mut BTreeMap<String, Keys>, name: &str) -> &'a mut BTreeMap<String, Keys> {
+    let entry = map
+        .entry(name.to_owned())
+        .or_insert_with(|| Keys::Map(BTreeMap::new()));
+    if !matches!(entry, Keys::Map(_)) {
+        *entry = Keys::Map(BTreeMap::new());
+    }
+    match entry {
+        Keys::Map(sub) => sub,
+        _ => unreachable!("made a mapping above"),
+    }
+}
+
+/// The `node` keys a config file set, other than `identity`.
+///
+/// A deprecated `discovery` block is replaced by markers on the keys it folds
+/// into, so the file's own folded values for those keys are taken whole at
+/// its priority. A marker is placed only for a legacy key that is present and
+/// not null, because the fold acts only on those.
+///
+/// This parses the file text a second time. serde_yaml copies each scalar it
+/// reads, `node.identity.nsec` included, into a buffer it frees without
+/// clearing, so the scan leaves one more such copy than the typed parse does.
+/// The visitor itself copies no value.
+fn node_keys(text: &str) -> Result<BTreeMap<String, Keys>, serde_yaml::Error> {
+    let raw: NodeKeys = serde_yaml::from_str(text)?;
+    let mut keys = match raw.node {
+        Some(Keys::Map(keys)) => keys,
+        _ => BTreeMap::new(),
+    };
+    keys.remove("identity");
+    if let Some(Keys::Map(legacy)) = keys.remove("discovery") {
+        let set = |name: &str| matches!(legacy.get(name), Some(Keys::Leaf | Keys::Map(_)));
+        for name in LEGACY_LOOKUP.into_iter().filter(|n| set(n)) {
+            submap(&mut keys, "lookup").insert(name.to_owned(), Keys::Leaf);
+        }
+        for name in LEGACY_RENDEZVOUS.into_iter().filter(|n| set(n)) {
+            submap(&mut keys, "rendezvous").insert(name.to_owned(), Keys::Leaf);
+        }
+    }
+    Ok(keys)
+}
+
+/// Clear every string under `value` before it is dropped.
+fn scrub(value: &mut serde_yaml::Value) {
+    match value {
+        serde_yaml::Value::String(s) => s.zeroize(),
+        serde_yaml::Value::Sequence(items) => items.iter_mut().for_each(scrub),
+        serde_yaml::Value::Mapping(map) => map.iter_mut().for_each(|(_, v)| scrub(v)),
+        serde_yaml::Value::Tagged(tagged) => scrub(&mut tagged.value),
+        _ => {}
+    }
+}
+
+/// A file's typed `node` section as a YAML mapping, without `identity`.
+///
+/// Values come from the typed config rather than the file's raw YAML because
+/// the raw YAML resolves plain scalars to numbers and booleans: an unquoted
+/// `scope: 2026` that the typed parse reads as the string "2026" would not
+/// deserialise back into a `String` field.
+fn node_value(node: &NodeConfig) -> Result<Mapping, serde_yaml::Error> {
+    let mut map = match serde_yaml::to_value(node)? {
+        serde_yaml::Value::Mapping(map) => map,
+        _ => Mapping::new(),
+    };
+    // `identity` is merged by `Config::merge`, which zeroizes the nsec; the
+    // serialised copy must not outlive this function uncleared.
+    if let Some(mut identity) = map.remove("identity") {
+        scrub(&mut identity);
+    }
+    Ok(map)
+}
+
+/// Layer one file's `node` keys onto `acc`, later file wins per key.
+///
+/// `raw` says which keys the file set and `typed` gives their values. A key
+/// the file set that `typed` omits is a field at its default under
+/// `skip_serializing_if`, so it is removed from `acc` and the final
+/// deserialise fills its default, which is what the file said.
+///
+/// A null on a section (a header with every child commented out, as the
+/// packaged template has) sets nothing, the same as an empty mapping there:
+/// it must not reset keys an earlier file set in that section. A section is
+/// recognised by its typed value being a mapping, or, for a section skipped
+/// at its default, by the value accumulated so far being one. A null on any
+/// other key still resets it.
+fn overlay(acc: &mut Mapping, raw: &BTreeMap<String, Keys>, typed: Option<&Mapping>) {
+    for (name, keys) in raw {
+        let key = serde_yaml::Value::from(name.as_str());
+        let value = typed.and_then(|t| t.get(&key));
+        match (keys, value) {
+            (Keys::Null, Some(serde_yaml::Value::Mapping(_))) => {}
+            (Keys::Null, None) if matches!(acc.get(&key), Some(serde_yaml::Value::Mapping(_))) => {}
+            (Keys::Map(sub), Some(serde_yaml::Value::Mapping(tsub))) => {
+                if !matches!(acc.get(&key), Some(serde_yaml::Value::Mapping(_))) {
+                    acc.insert(key.clone(), serde_yaml::Value::Mapping(Mapping::new()));
+                }
+                if let Some(serde_yaml::Value::Mapping(asub)) = acc.get_mut(&key) {
+                    overlay(asub, sub, Some(tsub));
+                }
+            }
+            (_, Some(value)) => {
+                acc.insert(key, value.clone());
+            }
+            (Keys::Map(sub), None) => {
+                if let Some(serde_yaml::Value::Mapping(asub)) = acc.get_mut(&key) {
+                    overlay(asub, sub, None);
+                }
+            }
+            (_, None) => {
+                acc.remove(&key);
+            }
+        }
+    }
+}
+
 /// Root configuration structure.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
@@ -1097,16 +1445,44 @@ impl Config {
     /// Load configuration from specific paths.
     ///
     /// Paths are processed in order, with later paths overriding earlier ones.
+    /// The `node` section is layered per key: a key a later file sets wins,
+    /// and a key set only in an earlier file survives. The other sections, and
+    /// `node.identity`, follow [`Config::merge`].
     pub fn load_from_paths(paths: &[PathBuf]) -> Result<(Self, Vec<PathBuf>), ConfigError> {
         let mut config = Config::default();
         let mut loaded_paths = Vec::new();
+        let mut node = Mapping::new();
+        // Set when any file names a `node` key other than `identity`. The
+        // layered mapping can end up empty even then (`leaf_only: true` and
+        // then `false`), and the result must still come from it.
+        let mut layered = false;
 
         for path in paths {
             if path.exists() {
-                let file_config = Self::load_file(path)?;
+                let contents = Self::read_text(path)?;
+                let file_config = Self::parse_text(path, &contents)?;
+                let parse_error = |e| ConfigError::ParseYaml {
+                    path: path.to_path_buf(),
+                    source: e,
+                };
+                let keys = node_keys(&contents).map_err(parse_error)?;
+                let typed = node_value(&file_config.node).map_err(parse_error)?;
+                layered |= !keys.is_empty();
+                overlay(&mut node, &keys, Some(&typed));
                 config.merge(file_config);
                 loaded_paths.push(path.clone());
             }
+        }
+
+        if layered {
+            let last = loaded_paths.last().cloned().unwrap_or_default();
+            let mut merged: NodeConfig = serde_yaml::from_value(serde_yaml::Value::Mapping(node))
+                .map_err(|e| ConfigError::ParseYaml {
+                path: last,
+                source: e,
+            })?;
+            merged.identity = std::mem::take(&mut config.node.identity);
+            config.node = merged;
         }
 
         Ok((config, loaded_paths))
@@ -1114,19 +1490,27 @@ impl Config {
 
     /// Load configuration from a single file.
     pub fn load_file(path: &Path) -> Result<Self, ConfigError> {
+        let contents = Self::read_text(path)?;
+        Self::parse_text(path, &contents)
+    }
+
+    /// Read a config file's text.
+    fn read_text(path: &Path) -> Result<Zeroizing<String>, ConfigError> {
         // The config file is the highest-priority home of a plaintext key:
         // `node.identity.nsec` is read straight out of it, so the whole file
         // text is treated as secret for as long as it is held.
-        let contents =
-            Zeroizing::new(
-                std::fs::read_to_string(path).map_err(|e| ConfigError::ReadFile {
-                    path: path.to_path_buf(),
-                    source: e,
-                })?,
-            );
+        Ok(Zeroizing::new(std::fs::read_to_string(path).map_err(
+            |e| ConfigError::ReadFile {
+                path: path.to_path_buf(),
+                source: e,
+            },
+        )?))
+    }
 
+    /// Parse a config file's text, folding deprecated keys.
+    fn parse_text(path: &Path, contents: &str) -> Result<Self, ConfigError> {
         let mut config: Config =
-            serde_yaml::from_str(&contents).map_err(|e| ConfigError::ParseYaml {
+            serde_yaml::from_str(contents).map_err(|e| ConfigError::ParseYaml {
                 path: path.to_path_buf(),
                 source: e,
             })?;
@@ -1142,7 +1526,10 @@ impl Config {
     /// field fills the corresponding new-table field, so a config that predates
     /// the split keeps behaving identically. When a legacy block is seen, a
     /// one-time deprecation warning names the old→new key moves. Exposed to the
-    /// crate so config tests that deserialize directly can invoke it.
+    /// crate so config tests that deserialize directly can invoke it. The node
+    /// that `load_from_paths` assembles from several files is built from
+    /// values each file already folded, and carries no `discovery` key, so it
+    /// is not folded again.
     pub(crate) fn normalize_deprecated_keys(&mut self) {
         let Some(compat) = self.node.discovery.take() else {
             return;
@@ -1215,7 +1602,11 @@ impl Config {
 
     /// Merge another configuration into this one.
     ///
-    /// Values from `other` override values in `self` when present.
+    /// Values from `other` override values in `self` when present. From
+    /// `node` only `identity` and `leaf_only` are merged here;
+    /// `load_from_paths` layers the rest of `node` from the files themselves,
+    /// since a deserialised config cannot tell an omitted key from one set to
+    /// its default.
     pub fn merge(&mut self, mut other: Config) {
         // Merge node.identity section. The nsec is taken rather than moved
         // out of `other.node.identity`, which clears its private key on drop
@@ -1840,6 +2231,261 @@ node:
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0], existing);
         assert_eq!(config.node.identity.nsec, Some("existing_nsec".to_string()));
+    }
+
+    /// Write each text to its own file, in order, and load them all through
+    /// `load_from_paths`, as `Config::load()` does with the search paths.
+    fn load_layers(texts: &[&str]) -> Config {
+        let temp_dir = TempDir::new().unwrap();
+        let paths: Vec<PathBuf> = texts
+            .iter()
+            .enumerate()
+            .map(|(i, text)| {
+                let path = temp_dir.path().join(format!("layer{i}.yaml"));
+                fs::write(&path, text).unwrap();
+                path
+            })
+            .collect();
+        let (config, loaded) = Config::load_from_paths(&paths).unwrap();
+        assert_eq!(loaded.len(), texts.len());
+        config
+    }
+
+    /// Flip every bool and add one to every number under `value`, so each
+    /// serialised leaf differs from its default.
+    fn bump(value: &mut serde_yaml::Value) {
+        use serde_yaml::{Number, Value};
+        match value {
+            Value::Bool(b) => *b = !*b,
+            Value::Number(n) => {
+                *n = if let Some(u) = n.as_u64() {
+                    Number::from(u + 1)
+                } else if let Some(i) = n.as_i64() {
+                    Number::from(i + 1)
+                } else {
+                    Number::from(n.as_f64().unwrap() + 1.0)
+                };
+            }
+            Value::Sequence(items) => items.iter_mut().for_each(bump),
+            Value::Mapping(map) => map.iter_mut().for_each(|(_, v)| bump(v)),
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn test_load_from_paths_applies_node_settings_other_than_identity_from_a_single_file() {
+        let config = load_layers(&["node:\n  log_level: debug\n  rekey:\n    after_secs: 300\n"]);
+        assert_eq!(config.node.log_level, Some("debug".to_string()));
+        assert_eq!(config.node.rekey.after_secs, 300);
+    }
+
+    #[test]
+    fn test_load_from_paths_later_file_wins_per_node_key_and_keys_set_only_earlier_survive() {
+        let low = r#"
+node:
+  identity:
+    nsec: "low_priority_nsec"
+  log_level: debug
+  rekey:
+    after_secs: 300
+  session:
+    idle_timeout_secs: 45
+  rendezvous:
+    nostr:
+      policy: open
+  leaf_only: true
+"#;
+        let high = r#"
+node:
+  log_level: warn
+  rekey:
+    after_messages: 7
+  rendezvous:
+    nostr:
+      enabled: true
+  leaf_only: false
+"#;
+        let tun_only = "tun:\n  enabled: true\n";
+        let config = load_layers(&[low, high, tun_only]);
+        assert_eq!(config.node.log_level, Some("warn".to_string()));
+        assert_eq!(config.node.rekey.after_secs, 300);
+        assert_eq!(config.node.rekey.after_messages, 7);
+        assert_eq!(config.node.session.idle_timeout_secs, 45);
+        assert_eq!(
+            config.node.rendezvous.nostr.policy,
+            NostrRendezvousPolicy::Open
+        );
+        assert!(config.node.rendezvous.nostr.enabled);
+        assert_eq!(
+            config.node.identity.nsec,
+            Some("low_priority_nsec".to_string())
+        );
+        assert!(!config.node.leaf_only);
+    }
+
+    #[test]
+    fn test_load_from_paths_reaches_every_node_key_the_same_as_load_file() {
+        let mut node = serde_yaml::to_value(NodeConfig::default()).unwrap();
+        bump(&mut node);
+        let serde_yaml::Value::Mapping(map) = &mut node else {
+            panic!("NodeConfig serialises to a mapping");
+        };
+        map.insert("log_level".into(), "debug".into());
+        let mut doc = serde_yaml::Mapping::new();
+        doc.insert("node".into(), node);
+        let text = serde_yaml::to_string(&doc).unwrap();
+
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("fips.yaml");
+        fs::write(&path, &text).unwrap();
+        let direct = Config::load_file(&path).unwrap();
+        let (layered, _) = Config::load_from_paths(std::slice::from_ref(&path)).unwrap();
+
+        assert_eq!(
+            serde_yaml::to_value(&layered.node).unwrap(),
+            serde_yaml::to_value(&direct.node).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_load_from_paths_keeps_unquoted_numeric_and_hex_text_in_string_fields_exactly_as_load_file_reads_it()
+     {
+        let text = "node:\n  rendezvous:\n    lan:\n      scope: 2026\n      service_type: 0x10\n";
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("fips.yaml");
+        fs::write(&path, text).unwrap();
+        let direct = Config::load_file(&path).unwrap();
+        let (layered, _) = Config::load_from_paths(std::slice::from_ref(&path)).unwrap();
+
+        let lan = &layered.node.rendezvous.lan;
+        assert_eq!(lan.scope, Some("2026".to_string()));
+        assert_eq!(lan.service_type, "0x10");
+        assert_eq!(lan.scope, direct.node.rendezvous.lan.scope);
+        assert_eq!(lan.service_type, direct.node.rendezvous.lan.service_type);
+    }
+
+    #[test]
+    fn test_load_from_paths_deprecated_discovery_block_follows_later_file_wins_like_any_other_key()
+    {
+        // A legacy block replaces `rendezvous.nostr` whole within its own
+        // file, so it counts as that file setting every key there; a later
+        // file then overrides only the keys it names.
+        let config = load_layers(&[
+            "node:\n  discovery:\n    nostr:\n      enabled: true\n    ttl: 9\n",
+            "node:\n  rendezvous:\n    nostr:\n      policy: open\n  lookup:\n    ttl: 3\n",
+        ]);
+        assert_eq!(
+            config.node.rendezvous.nostr.policy,
+            NostrRendezvousPolicy::Open
+        );
+        assert!(config.node.rendezvous.nostr.enabled);
+        assert_eq!(config.node.lookup.ttl, 3);
+
+        let config = load_layers(&[
+            "node:\n  lookup:\n    ttl: 3\n",
+            "node:\n  discovery:\n    ttl: 9\n",
+        ]);
+        assert_eq!(config.node.lookup.ttl, 9);
+
+        // A null legacy block sets nothing, so it must not reset the earlier
+        // file's block.
+        let config = load_layers(&[
+            "node:\n  rendezvous:\n    nostr:\n      enabled: true\n",
+            "node:\n  discovery:\n    nostr: ~\n  rendezvous:\n    nostr:\n      policy: open\n",
+        ]);
+        assert!(config.node.rendezvous.nostr.enabled);
+        assert_eq!(
+            config.node.rendezvous.nostr.policy,
+            NostrRendezvousPolicy::Open
+        );
+    }
+
+    #[test]
+    fn test_load_from_paths_later_file_turns_leaf_only_off_when_it_is_the_only_node_key() {
+        let config = load_layers(&["node:\n  leaf_only: true\n", "node:\n  leaf_only: false\n"]);
+        assert!(!config.node.leaf_only);
+    }
+
+    #[test]
+    fn test_load_from_paths_empty_section_header_in_a_later_file_keeps_the_earlier_files_keys() {
+        let low = r#"
+node:
+  rendezvous:
+    nostr:
+      enabled: true
+      policy: open
+  native_api:
+    enabled: true
+  lookup:
+    recent_expiry_secs: 77
+"#;
+        // The packaged template's shape: a section header whose children are
+        // all commented out. `native_api` is skipped when serialised at its
+        // default, so its empty header reaches the layering with no value.
+        let template_shape = r#"
+node:
+  rendezvous:
+    # nostr:
+    #   enabled: false
+  native_api:
+  lookup:
+  log_level: warn
+"#;
+        let config = load_layers(&[low, template_shape]);
+        assert!(config.node.rendezvous.nostr.enabled);
+        assert_eq!(
+            config.node.rendezvous.nostr.policy,
+            NostrRendezvousPolicy::Open
+        );
+        assert!(config.node.native_api.enabled);
+        assert_eq!(config.node.lookup.recent_expiry_secs, 77);
+        assert_eq!(config.node.log_level, Some("warn".to_string()));
+
+        // An empty header one level down sets nothing either.
+        let config = load_layers(&[low, "node:\n  rendezvous:\n    nostr:\n"]);
+        assert!(config.node.rendezvous.nostr.enabled);
+        assert_eq!(
+            config.node.rendezvous.nostr.policy,
+            NostrRendezvousPolicy::Open
+        );
+
+        // An empty header beside a legacy block that folds into it behaves
+        // the same as one without.
+        let config = load_layers(&[low, "node:\n  lookup:\n  discovery:\n    ttl: 9\n"]);
+        assert_eq!(config.node.lookup.recent_expiry_secs, 77);
+        assert_eq!(config.node.lookup.ttl, 9);
+
+        // A null scalar still resets the key, as it does in a single file.
+        let config = load_layers(&["node:\n  log_level: debug\n", "node:\n  log_level: ~\n"]);
+        assert_eq!(config.node.log_level, None);
+    }
+
+    #[test]
+    fn test_load_from_paths_layers_a_section_carrying_a_custom_yaml_tag_per_key_like_an_untagged_one()
+     {
+        let low = "node:\n  rekey:\n    after_secs: 300\n    after_messages: 9\n";
+        let high = "node:\n  rekey: !Foo\n    after_secs: 5\n";
+
+        // The typed parse takes the tagged mapping as the plain struct.
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("fips.yaml");
+        fs::write(&path, high).unwrap();
+        assert_eq!(Config::load_file(&path).unwrap().node.rekey.after_secs, 5);
+
+        let config = load_layers(&[low, high]);
+        assert_eq!(config.node.rekey.after_secs, 5);
+        assert_eq!(config.node.rekey.after_messages, 9);
+    }
+
+    #[test]
+    fn test_load_from_paths_loads_a_file_with_a_duplicated_unknown_node_key_as_load_file_does() {
+        let text = "node:\n  log_level: debug\n  zz_unknown: 1\n  zz_unknown: 2\n  zz_big: 99999999999999999999\n";
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("fips.yaml");
+        fs::write(&path, text).unwrap();
+        Config::load_file(&path).unwrap();
+        let (config, _) = Config::load_from_paths(std::slice::from_ref(&path)).unwrap();
+        assert_eq!(config.node.log_level, Some("debug".to_string()));
     }
 
     #[test]
