@@ -60,6 +60,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+#### FreeBSD
+
+- With pkg dnsmasq, the DNS setup and teardown scripts now restart dnsmasq
+  instead of reloading it. The rc script's reload sends dnsmasq a SIGHUP,
+  which does not make it re-read its configuration, so `.fips` names did not
+  resolve, and after teardown were not dropped, until dnsmasq was restarted
+  by hand.
+
 #### Gateway
 
 - The gateway retries failed firewall rebuilds every ten seconds without
@@ -71,6 +79,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mapping's source rewrite used to take it first, so the target saw the
   peer's pool address instead, which changed as mappings came and went and
   could be answered only by a host that routes the pool to the gateway.
+
+#### Identity and config
+
+- Run without `--config`, `fips` and `fips-gateway` now apply every `node.*`
+  setting from the config files found on the search path. Only
+  `node.identity` and `node.leaf_only` were applied, so settings such as
+  `node.log_level`, `node.limits` and `node.rekey` were silently ignored.
+  Where several files set the same key the later file wins, and this now
+  includes `node.leaf_only`, which a later file can turn off.
+  `node.identity.persistent` is the exception: it stays on once any file
+  turns it on. A node started this way now uses those settings after the
+  upgrade, so check the files on the search path for values you did not mean
+  to apply. Services started with `--config`, or on Windows with
+  `FIPS_CONFIG` set, were not affected.
 
 #### Linux packages
 
@@ -89,6 +111,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   systemd-resolved (`systemctl enable --now`) and then restart
   `fips-dns.service`, since setup uses systemd-resolved only when it is
   running.
+
+- On a host that uses standalone dnsmasq, `fips-dns-setup` now restarts
+  dnsmasq instead of reloading it, so `.fips` names resolve without a manual
+  restart. A reload does not make dnsmasq re-read its configuration, so the
+  `.fips` forwarding line was never loaded. Stopping `fips-dns`, removing the
+  `.deb`, and the tarball's `uninstall.sh` now restart a running dnsmasq too,
+  so the forwarding is actually dropped.
 
 #### Links and transports
 
@@ -131,6 +160,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unreachable host or network, a reset or any other connect error lands there
   too, with the error in the debug log.
 
+- A UDP peer configured by hostname no longer holds up the node for as long
+  as the system resolver takes when it is slow or down. The node waits at
+  most 250 ms for a lookup, then carries on. A name that resolved within the
+  last hour keeps its last address until the lookup answers, and keeps it if
+  the lookup fails, including when the resolver answers that the name does
+  not exist; a handshake sent to that address meanwhile is sent again to the
+  new address if the answer has changed it. For a name with no address yet,
+  the handshake is sent as soon as the lookup completes.
+
 #### macOS
 
 - If an encrypt worker thread exits, the daemon no longer stops once that
@@ -152,6 +190,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   but its answer was discarded, and the datagram was held without being
   sent. The node now records the flow's key before starting discovery, and
   retries the session for held native datagrams once discovery answers.
+
+- A native API datagram held for a destination whose session never comes up
+  (its lookup or handshake timed out, its peer went away, or no lookup could
+  be started) is now discarded instead of held for the life of the daemon.
+  After the pending-destination limit
+  (`node.session.pending_max_destinations`, 256 by default) was reached, the
+  first datagrams to every new destination were dropped.
 
 #### OpenWrt
 
