@@ -810,9 +810,13 @@ round trip that drops asymmetrically across chipsets.
 
 ### Connection Establishment
 
-A scan/probe loop dials discovered addresses, keeping the learned PSM
-per address beside a probe-cooldown book and falling back to the
-configured `DEFAULT_PSM` for a peer that advertises none.
+A scan/probe loop dials discovered addresses, pacing them with a
+probe-cooldown book. The PSM each peer advertises is kept on the
+transport, and every dial reads it: the loop's probes, a dial to a
+configured peer, and every redial. A peer that advertises none is
+dialled at the configured PSM, `DEFAULT_PSM` unless set. A learned PSM
+is forgotten only when a dial to that same PSM is refused; a timeout
+keeps it.
 
 Peers are identified by node address, not by link address. A device
 using resolvable private addresses rotates continually, and modern

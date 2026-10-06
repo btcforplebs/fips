@@ -787,6 +787,13 @@ with v0.5.x or earlier peers.
   not exist; a handshake sent to that address meanwhile is sent again to the
   new address if the answer has changed it. For a name with no address yet,
   the handshake is sent as soon as the lookup completes.
+- Every BLE dial now goes to the PSM the peer advertised. Only the scan
+  loop's probe used it; a node-initiated dial (a configured peer, or a
+  redial after a link drops) went to the configured PSM, which a platform
+  that assigns listener PSMs never listens on. A learned PSM is forgotten
+  only when a dial to that same PSM is refused, not when a dial times out
+  or went out at another value, so an unreachable peer keeps the PSM it
+  advertised.
 
 #### Gateway
 

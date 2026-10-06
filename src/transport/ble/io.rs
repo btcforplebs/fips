@@ -302,6 +302,10 @@ pub struct MockBleIo {
     stop_scans: std::sync::atomic::AtomicUsize,
     /// When set, `connect` never completes, so the caller's timeout fires.
     connect_stalls: std::sync::atomic::AtomicBool,
+    /// When set, `connect` waits while the gate reads `false`, before it
+    /// reaches the handler. A test closes the gate to hold dials in flight
+    /// (or let them time out) and opens it to let them through.
+    connect_gate: std::sync::Mutex<Option<tokio::sync::watch::Receiver<bool>>>,
 }
 
 impl MockBleIo {
@@ -321,6 +325,7 @@ impl MockBleIo {
             advertised_psm: std::sync::Mutex::new(None),
             stop_scans: std::sync::atomic::AtomicUsize::new(0),
             connect_stalls: std::sync::atomic::AtomicBool::new(false),
+            connect_gate: std::sync::Mutex::new(None),
         }
     }
 
@@ -366,6 +371,14 @@ impl MockBleIo {
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Hold every `connect` at a gate until `gate` reads `true`.
+    ///
+    /// A dial held here that the caller times out never reaches the
+    /// handler, so a handler that logs dials sees only the ones let through.
+    pub fn set_connect_gate(&self, gate: tokio::sync::watch::Receiver<bool>) {
+        *self.connect_gate.lock().unwrap_or_else(|e| e.into_inner()) = Some(gate);
+    }
+
     /// Set a handler for outbound connect calls.
     pub fn set_connect_handler<F>(&self, handler: F)
     where
@@ -404,6 +417,16 @@ impl BleIo for MockBleIo {
             .load(std::sync::atomic::Ordering::Relaxed)
         {
             std::future::pending::<()>().await;
+        }
+        let gate = self
+            .connect_gate
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(mut gate) = gate
+            && gate.wait_for(|open| *open).await.is_err()
+        {
+            return Err(TransportError::ConnectionRefused);
         }
         let handler = self
             .connect_handler

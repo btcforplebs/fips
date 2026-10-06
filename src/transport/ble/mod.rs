@@ -149,6 +149,46 @@ pub struct BleTransport<I: BleIo> {
     neighbor_buffer: Arc<NeighborBuffer>,
     /// Transport statistics.
     stats: Arc<BleStats>,
+    /// L2CAP listener PSMs read out of peers' advertisements, by link
+    /// address. A peer whose platform assigns its listener PSM cannot be
+    /// dialled at a configured constant, so it publishes the number it
+    /// actually bound and every dial to it, the scan loop's probe and the
+    /// node's [`connect_async`](Self::connect_async) alike, goes there. A
+    /// peer that advertises nothing is dialled at the configured PSM.
+    learned_psm: LearnedPsm,
+}
+
+/// Advertised listener PSM by link address, shared between the scan loop
+/// that learns it and the dials that need it. A plain mutex: never held
+/// across an await.
+type LearnedPsm = Arc<std::sync::Mutex<HashMap<BleAddr, u16>>>;
+
+/// The PSM to dial `addr` at: what it advertised, else `configured`.
+fn psm_for(learned: &LearnedPsm, addr: &BleAddr, configured: u16) -> u16 {
+    learned
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(addr)
+        .copied()
+        .unwrap_or(configured)
+}
+
+/// A learned PSM that refused a dial is stale: forget it, so the next
+/// advert re-learns it and the fallback applies in the meantime.
+///
+/// Only the PSM that was actually dialled is forgotten. A dial that went out
+/// at the configured fallback, or at a value the scan loop has since
+/// replaced, says nothing about the entry the map holds now.
+///
+/// Callers forget on a refusal only, never on a timeout: a timeout says the
+/// peer was out of reach, not that it listens elsewhere, and on BlueZ
+/// nothing would re-learn the entry, because `DeviceAdded` fires once per
+/// discovery session.
+fn forget_psm(learned: &LearnedPsm, addr: &BleAddr, dialled: u16) {
+    let mut learned = learned.lock().unwrap_or_else(|e| e.into_inner());
+    if learned.get(addr) == Some(&dialled) {
+        learned.remove(addr);
+    }
 }
 
 /// A pending background connection attempt.
@@ -179,6 +219,7 @@ impl<I: BleIo> BleTransport<I> {
             scan_probe_task: None,
             neighbor_buffer: Arc::new(NeighborBuffer::new(transport_id)),
             stats: Arc::new(BleStats::new()),
+            learned_psm: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -271,6 +312,7 @@ impl<I: BleIo> BleTransport<I> {
                         Arc::clone(&self.pool),
                         Arc::clone(&self.neighbor_buffer),
                         Arc::clone(&self.stats),
+                        Arc::clone(&self.learned_psm),
                         self.config.psm(),
                         self.config.connect_timeout_ms(),
                         self.config.probe_cooldown_secs(),
@@ -407,7 +449,7 @@ impl<I: BleIo> BleTransport<I> {
                 .ok_or_else(|| TransportError::InvalidAddress("not valid UTF-8".into()))?,
         )?;
 
-        let psm = self.config.psm();
+        let psm = psm_for(&self.learned_psm, &ble_addr, self.config.psm());
         let timeout_ms = self.config.connect_timeout_ms();
 
         let stream = match tokio::time::timeout(
@@ -419,9 +461,10 @@ impl<I: BleIo> BleTransport<I> {
             Ok(Ok(stream)) => stream,
             Ok(Err(e)) => {
                 self.stats.record_connect_error();
+                forget_psm(&self.learned_psm, &ble_addr, psm);
                 debug!(
-                    addr = %addr, role = "central", outcome = "connect-error", error = %e,
-                    "BLE connect-on-send failed"
+                    addr = %addr, role = "central", outcome = "connect-error", psm,
+                    error = %e, "BLE connect-on-send failed"
                 );
                 return Err(TransportError::ConnectionRefused);
             }
@@ -542,7 +585,8 @@ impl<I: BleIo> BleTransport<I> {
         let packet_tx = self.packet_tx.clone();
         let transport_id = self.transport_id;
         let stats = Arc::clone(&self.stats);
-        let psm = self.config.psm();
+        let learned_psm = Arc::clone(&self.learned_psm);
+        let psm = psm_for(&learned_psm, &ble_addr, self.config.psm());
         let timeout_ms = self.config.connect_timeout_ms();
         let addr_clone = addr.clone();
         let neighbor_buffer = Arc::clone(&self.neighbor_buffer);
@@ -617,16 +661,17 @@ impl<I: BleIo> BleTransport<I> {
                 }
                 Ok(Err(e)) => {
                     stats.record_connect_error();
+                    forget_psm(&learned_psm, &ble_addr, psm);
                     debug!(
                         addr = %addr_clone, role = "central", outcome = "connect-error",
-                        error = %e, "BLE connect failed"
+                        psm, error = %e, "BLE connect failed"
                     );
                 }
                 Err(_) => {
                     stats.record_connect_timeout();
                     debug!(
                         addr = %addr_clone, role = "central", outcome = "connect-timeout",
-                        "BLE connect timeout"
+                        psm, "BLE connect timeout"
                     );
                 }
             }
@@ -1080,6 +1125,7 @@ async fn scan_probe_loop<I: io::BleIo>(
     pool: Arc<Mutex<ConnectionPool<Arc<I::Stream>>>>,
     buffer: Arc<NeighborBuffer>,
     stats: Arc<BleStats>,
+    learned_psm: LearnedPsm,
     configured_psm: u16,
     connect_timeout_ms: u64,
     cooldown_secs: u64,
@@ -1092,13 +1138,6 @@ async fn scan_probe_loop<I: io::BleIo>(
     // an address leaves the book the moment it reaches a conclusive outcome,
     // after which the pool guard below covers it.
     let mut pending = PendingProbes::new(std::time::Duration::from_secs(cooldown_secs));
-    // L2CAP listener PSMs read out of peers' advertisements. A peer whose
-    // platform assigns its listener PSM cannot be dialled at a configured
-    // constant, so it publishes the number it actually bound and we dial
-    // that. A peer that advertises nothing is dialled at `configured_psm`,
-    // which is every peer that predates this and every backend that does not
-    // advertise service data.
-    let mut learned_psm: HashMap<BleAddr, u16> = HashMap::new();
     let retry_interval = tokio::time::interval(std::time::Duration::from_secs(cooldown_secs));
     tokio::pin!(retry_interval);
     retry_interval.tick().await; // consume initial tick
@@ -1111,7 +1150,10 @@ async fn scan_probe_loop<I: io::BleIo>(
                     Some(advert) => {
                         if let Some(psm) = advert.psm {
                             trace!(addr = %advert.addr, psm, "BLE scan: learned peer PSM");
-                            learned_psm.insert(advert.addr.clone(), psm);
+                            learned_psm
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .insert(advert.addr.clone(), psm);
                         }
                         advert.addr
                     }
@@ -1160,7 +1202,7 @@ async fn scan_probe_loop<I: io::BleIo>(
         pending.mark_attempt(&addr, now);
 
         // L2CAP connect, at whatever PSM this peer advertised.
-        let dial_psm = learned_psm.get(&addr).copied().unwrap_or(configured_psm);
+        let dial_psm = psm_for(&learned_psm, &addr, configured_psm);
         // Stamped here so every outcome below can report how long the peer
         // took to go from advertisement to conclusion.
         let probe_started = tokio::time::Instant::now();
@@ -1179,10 +1221,7 @@ async fn scan_probe_loop<I: io::BleIo>(
                     psm = dial_psm, discovery_ms = probe_started.elapsed().as_millis() as u64,
                     failures, error = %e, "BLE probe connect failed"
                 );
-                // A learned PSM that does not answer is stale — forget it, so
-                // the next advert re-learns it and the fallback applies in the
-                // meantime. Costs one retry.
-                learned_psm.remove(&addr);
+                forget_psm(&learned_psm, &addr, dial_psm);
                 continue;
             }
             Err(_) => {
@@ -1193,7 +1232,6 @@ async fn scan_probe_loop<I: io::BleIo>(
                     psm = dial_psm, discovery_ms = probe_started.elapsed().as_millis() as u64,
                     failures, "BLE probe connect timeout"
                 );
-                learned_psm.remove(&addr);
                 continue;
             }
         };
@@ -1820,6 +1858,30 @@ mod tests {
         }
     }
 
+    /// Wait until `cond` holds, or fail the test.
+    ///
+    /// A fixed number of `yield_now()` calls is not a wait, it is a race
+    /// against the clock, and it loses whenever a loop under test is parked
+    /// on a timer rather than on a channel. `scan_probe_loop` is: before it
+    /// reaches its `select!` it consumes the retry interval's first tick,
+    /// and tokio rounds a timer deadline up to the next whole millisecond of
+    /// its wheel. Polling the condition with a short sleep between attempts
+    /// lets that timer fire, and the condition is what ends the wait.
+    async fn wait_for(what: &str, mut cond: impl FnMut() -> bool) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            settle().await;
+            if cond() {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    }
+
     /// A probe the pool refuses is not a connection, and must not be recorded
     /// as one. The inbound path already continues on rejection; this pins the
     /// outbound probe path to the same shape.
@@ -1979,6 +2041,147 @@ mod tests {
         assert!(
             log[1..].iter().all(|(_, psm)| *psm == DEFAULT_PSM),
             "retries fall back to the configured PSM: {log:?}"
+        );
+        transport.stop_async().await.unwrap();
+    }
+
+    /// The node's own dial goes to the PSM the scan loop learned. Before,
+    /// only the probe read the learned value; `connect_async` dialled the
+    /// configured PSM, which a platform that assigns listener PSMs never
+    /// listens on, so a configured peer or a redial after a link loss failed
+    /// every time against such a peer.
+    #[tokio::test(start_paused = true)]
+    async fn a_node_dial_goes_to_the_psm_the_scan_loop_learned() {
+        let dials: DialLog = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (mut transport, _rx) = psm_probe_transport(Arc::clone(&dials));
+        transport.start_async().await.unwrap();
+
+        // A first sighting with no PSM: the probe dials the configured PSM,
+        // is refused, and backs the address off for one cooldown.
+        transport.io.inject_scan_result(test_addr(2)).await;
+        wait_for("the first probe", || dials.lock().unwrap().len() == 1).await;
+        assert_eq!(dials.lock().unwrap()[0], (test_addr(2), DEFAULT_PSM));
+
+        // The peer's advert is learned, and the probe skips it as not due.
+        transport
+            .io
+            .inject_scan_advert(io::ScanAdvert::with_psm(test_addr(2), 0x00C1))
+            .await;
+        {
+            let stats = Arc::clone(&transport.stats);
+            wait_for("the advert to be read", || {
+                stats.snapshot().scan_results == 2
+            })
+            .await;
+        }
+        let before = dials.lock().unwrap().len();
+
+        transport
+            .connect_async(&test_addr(2).to_transport_addr())
+            .await
+            .unwrap();
+        wait_for("the node's dial", || dials.lock().unwrap().len() > before).await;
+
+        // Assert on the node's dial itself, not on the last dial: a probe
+        // retry would dial the learned PSM too.
+        let log = dials.lock().unwrap().clone();
+        assert_eq!(
+            log[before],
+            (test_addr(2), 0x00C1),
+            "the node's dial must go to the advertised PSM: {log:?}"
+        );
+        assert!(
+            log[1..=before]
+                .iter()
+                .all(|entry| *entry != (test_addr(2), DEFAULT_PSM)),
+            "nothing dialled the configured PSM after the advert: {log:?}"
+        );
+        transport.stop_async().await.unwrap();
+    }
+
+    /// A probe that times out keeps the learned PSM, so the retry goes to
+    /// where the peer listens. A timeout says the peer was out of reach, not
+    /// that it listens elsewhere, and on BlueZ nothing re-learns a forgotten
+    /// entry: `DeviceAdded` fires once per address per discovery session.
+    #[tokio::test(start_paused = true)]
+    async fn a_timed_out_probe_redials_the_learned_psm() {
+        let dials: DialLog = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (mut transport, _rx) = psm_probe_transport(Arc::clone(&dials));
+        let (gate, gate_rx) = tokio::sync::watch::channel(false);
+        transport.io.set_connect_gate(gate_rx);
+        transport.start_async().await.unwrap();
+
+        transport
+            .io
+            .inject_scan_advert(io::ScanAdvert::with_psm(test_addr(2), 0x00C1))
+            .await;
+        settle().await;
+        tokio::time::advance(std::time::Duration::from_millis(
+            transport.config.connect_timeout_ms() + 1,
+        ))
+        .await;
+        {
+            let stats = Arc::clone(&transport.stats);
+            wait_for("the probe to time out", || {
+                stats.snapshot().connect_timeouts == 1
+            })
+            .await;
+        }
+        assert!(
+            dials.lock().unwrap().is_empty(),
+            "the gated dial never reached the handler"
+        );
+
+        // Let the retry through: the next tick re-probes after one cooldown.
+        gate.send(true).unwrap();
+        wait_for("the retry", || !dials.lock().unwrap().is_empty()).await;
+
+        let log = dials.lock().unwrap().clone();
+        assert_eq!(
+            log[0],
+            (test_addr(2), 0x00C1),
+            "the retry after a timeout must go to the advertised PSM: {log:?}"
+        );
+        transport.stop_async().await.unwrap();
+    }
+
+    /// A refusal forgets only the PSM that was dialled. Here the scan loop
+    /// learns a new value while the dial is in flight; the refusal of the old
+    /// one must not take the new one with it.
+    #[tokio::test]
+    async fn a_refusal_forgets_only_the_psm_it_dialled() {
+        let dials: DialLog = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (mut transport, _rx) = psm_probe_transport(Arc::clone(&dials));
+        transport.start_async().await.unwrap();
+
+        let learned = Arc::clone(&transport.learned_psm);
+        learned.lock().unwrap().insert(test_addr(2), 0x00C1);
+        {
+            let learned = Arc::clone(&learned);
+            transport.io.set_connect_handler(move |addr, psm| {
+                dials.lock().unwrap().push((addr.clone(), psm));
+                // The peer re-advertised on a new PSM meanwhile.
+                learned.lock().unwrap().insert(addr.clone(), 0x00C2);
+                Err(TransportError::ConnectionRefused)
+            });
+        }
+
+        transport
+            .connect_async(&test_addr(2).to_transport_addr())
+            .await
+            .unwrap();
+        {
+            let stats = Arc::clone(&transport.stats);
+            wait_for("the dial to be refused", || {
+                stats.snapshot().connect_errors == 1
+            })
+            .await;
+        }
+
+        assert_eq!(
+            learned.lock().unwrap().get(&test_addr(2)),
+            Some(&0x00C2),
+            "the refusal of 0x00C1 says nothing about 0x00C2"
         );
         transport.stop_async().await.unwrap();
     }
