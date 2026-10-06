@@ -264,3 +264,126 @@ async fn both_ends_log_the_same_msg1_and_session_tags_when_a_link_is_promoted() 
 
     cleanup_nodes(&mut nodes).await;
 }
+
+/// Both nodes dial each other, and node `r` reads the other node's msg3, which
+/// promotes the other node's handshake inbound, before the msg2 that answers
+/// its own msg1. The cross-connection then resolves at `r`'s msg2, whose lines
+/// are returned with `r`'s msg1 as it went on the wire. Each outbound leg
+/// keeps the msg1 it sent, as the dial path does.
+async fn crossed_at_msg2(r: usize) -> (Vec<TestNode>, LogCapture, Vec<u8>) {
+    let o = 1 - r;
+    let mut nodes = vec![make_test_node().await, make_test_node().await];
+    initiate_handshake(&mut nodes, 0, 1).await;
+    initiate_handshake(&mut nodes, 1, 0).await;
+    let mut msg1s = Vec::new();
+    for (from, to) in [(0, 1), (1, 0)] {
+        let msg1 = nodes[to]
+            .packet_rx
+            .try_recv()
+            .expect("each dial's msg1 is queued at the other node");
+        let leg = *nodes[from]
+            .node
+            .addr_to_link
+            .get(&(nodes[from].transport_id, nodes[to].addr.clone()))
+            .expect("the dialling node holds its outbound leg");
+        nodes[from]
+            .node
+            .peer_machines
+            .get_mut(&leg)
+            .expect("the leg's machine")
+            .set_conn_handshake_msg1(msg1.data.clone(), 0);
+        msg1s.push(msg1);
+    }
+    let r_msg1 = msg1s[r].clone();
+    let o_msg1 = msg1s[o].clone();
+
+    nodes[o].node.handle_msg1(r_msg1.clone()).await;
+    nodes[r].node.handle_msg1(o_msg1).await;
+    let held_msg2 = nodes[r]
+        .packet_rx
+        .try_recv()
+        .expect("the msg2 answering r's msg1");
+    let msg2 = nodes[o]
+        .packet_rx
+        .try_recv()
+        .expect("the msg2 answering o's msg1");
+    nodes[o].node.handle_msg2(msg2).await;
+    let msg3 = nodes[r]
+        .packet_rx
+        .try_recv()
+        .expect("o's msg3 for its own handshake");
+    nodes[r].node.handle_msg3(msg3).await;
+    assert!(
+        nodes[r].node.get_peer(nodes[o].node.node_addr()).is_some(),
+        "r promoted o's handshake before reading its own msg2"
+    );
+
+    let logs = msg2_logged(&mut nodes[r].node, held_msg2).await;
+    for _ in 0..10 {
+        if process_available_packets(&mut nodes).await == 0 {
+            break;
+        }
+    }
+    (nodes, logs, r_msg1.data)
+}
+
+/// A crossed pair, as `crossed_at_msg2(0)` builds it, in which node 0 has the
+/// smaller address when `smaller` is set and the larger otherwise. Identities
+/// are random, so the address order is only known once a pair exists; pairs
+/// with the other order are discarded.
+async fn crossed_at_node0(smaller: bool) -> (Vec<TestNode>, LogCapture, Vec<u8>) {
+    for _ in 0..64 {
+        let (mut nodes, logs, wire) = crossed_at_msg2(0).await;
+        if (nodes[0].node.node_addr() < nodes[1].node.node_addr()) == smaller {
+            return (nodes, logs, wire);
+        }
+        cleanup_nodes(&mut nodes).await;
+    }
+    panic!("64 random pairs all had the same address order");
+}
+
+/// A smaller node that resolves a cross-connection at msg2 swaps to its
+/// outbound session. The swap line names its own msg1 and the session both
+/// ends keep.
+#[tokio::test]
+async fn a_cross_connection_swapped_at_msg2_tags_its_msg1_and_the_surviving_session() {
+    let (mut nodes, logs, wire) = crossed_at_node0(true).await;
+    let line = expect_line(
+        &logs,
+        "Cross-connection: swapped to outbound session (our outbound wins)",
+    );
+    let index = Msg1Header::parse(&wire).expect("a msg1 header").sender_idx;
+
+    assert_eq!(field(&line, "msg1_sidx"), index_text(index), "{line}");
+    assert_eq!(field(&line, "msg1_dg"), msg1_tag(&wire), "{line}");
+    assert_eq!(field(&line, "epoch"), held_tag(&nodes, 0, 1), "{line}");
+    assert_eq!(held_tag(&nodes, 0, 1), held_tag(&nodes, 1, 0));
+    assert_eq!(
+        field(&line, "transport_id"),
+        nodes[0].transport_id.to_string()
+    );
+    assert_eq!(field(&line, "remote_addr"), nodes[1].addr.to_string());
+
+    cleanup_nodes(&mut nodes).await;
+}
+
+/// A larger node that resolves a cross-connection at msg2 keeps its inbound
+/// session. The keep line tags the session both ends keep.
+#[tokio::test]
+async fn a_cross_connection_kept_at_msg2_tags_the_surviving_session() {
+    let (mut nodes, logs, _) = crossed_at_node0(false).await;
+    let line = expect_line(
+        &logs,
+        "Cross-connection: keeping inbound session and original their_index (peer outbound wins)",
+    );
+
+    assert_eq!(field(&line, "epoch"), held_tag(&nodes, 0, 1), "{line}");
+    assert_eq!(held_tag(&nodes, 0, 1), held_tag(&nodes, 1, 0));
+    assert_eq!(
+        field(&line, "transport_id"),
+        nodes[0].transport_id.to_string()
+    );
+    assert_eq!(field(&line, "remote_addr"), nodes[1].addr.to_string());
+
+    cleanup_nodes(&mut nodes).await;
+}
