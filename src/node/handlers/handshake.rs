@@ -1126,9 +1126,12 @@ impl Node {
                     self.peer_machines.get(&link_id).map(|m| m.state()),
                     Some(PeerState::Established { .. })
                 ) {
-                    // Store msg2 on peer for resend on duplicate msg1
+                    // Store msg2 on peer for resend on duplicate msg1, and
+                    // record the msg1 itself: a copy of it after the session
+                    // can rekey is not a rekey, and must not arm a pending.
                     if let Some(peer) = self.peers.get_mut(&peer_node_addr) {
                         peer.set_handshake_msg2(wire_msg2.clone());
+                        peer.note_setup(wire.msg1_digest);
                     }
                     // Send initial tree announce to new peer
                     if let Err(e) = self.send_tree_announce_to_peer(&peer_node_addr).await {
@@ -1256,9 +1259,12 @@ impl Node {
                     self.peer_machines.get(&link_id).map(|m| m.state()),
                     Some(PeerState::Established { .. })
                 ) {
-                    // Store msg2 on peer for resend on duplicate msg1
+                    // Store msg2 on peer for resend on duplicate msg1, and
+                    // record the msg1 itself: a copy of it after the session
+                    // can rekey is not a rekey, and must not arm a pending.
                     if let Some(peer) = self.peers.get_mut(&peer_node_addr) {
                         peer.set_handshake_msg2(wire_msg2.clone());
+                        peer.note_setup(wire.msg1_digest);
                     }
                     // Send initial tree announce to new peer
                     if let Err(e) = self.send_tree_announce_to_peer(&peer_node_addr).await {

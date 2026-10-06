@@ -1169,9 +1169,16 @@ impl ActivePeer {
         self.answered.held()
     }
 
-    /// Whether `msg1` armed a responder cycle with this peer that has ended.
+    /// Whether `msg1` armed a responder cycle with this peer that has ended,
+    /// or is the link-setup msg1 the peering was promoted from.
     pub(crate) fn answered_before(&self, msg1: &Msg1Digest) -> bool {
         self.answered.ended(msg1)
+    }
+
+    /// Record `msg1`, the link-setup msg1 this peering was promoted from, so
+    /// a copy of it is refused once the session is old enough to rekey.
+    pub(crate) fn note_setup(&mut self, msg1: Msg1Digest) {
+        self.answered.end_setup(msg1);
     }
 
     /// Check whether the pending session has been held for at least `hold`

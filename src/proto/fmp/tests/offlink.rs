@@ -1,9 +1,13 @@
 //! Classification of a same-epoch msg1 by where it arrived: on the existing
-//! peer's established link or off it, and whether that link still works.
+//! peer's established link or off it, and whether that link still works; and
+//! the record of the link-setup msg1 a peering was promoted from.
 
 use super::util::{establish_snapshot, wire_outcome};
 use crate::NodeAddr;
-use crate::proto::fmp::{EstablishSnapshot, Fmp, InboundDecision, InboundReject, RekeyAnswer};
+use crate::proto::fmp::core::ENDED_MSG1_RECORD;
+use crate::proto::fmp::{
+    AnsweredMsg1s, EstablishSnapshot, Fmp, InboundDecision, InboundReject, Msg1Digest, RekeyAnswer,
+};
 
 /// The epoch the existing peer and the msg1 share.
 const EPOCH: [u8; 8] = [7u8; 8];
@@ -154,4 +158,26 @@ fn an_off_link_msg1_under_30_s_still_gets_the_stored_msg2() {
         InboundDecision::ResendMsg2 { msg2 } => assert_eq!(msg2, Some(vec![0x02; 4])),
         other => panic!("expected ResendMsg2, got {other:?}"),
     }
+}
+
+#[test]
+fn a_link_setup_msg1_recorded_at_promotion_is_answered_before() {
+    let mut record = AnsweredMsg1s::default();
+    let setup = Msg1Digest::of(b"link setup");
+    record.end_setup(setup);
+    assert!(record.ended(&setup), "the link-setup msg1 is recorded");
+    assert!(record.held().is_none(), "recording it holds no answer");
+    assert!(!record.ended(&Msg1Digest::of(b"never seen")));
+
+    // It shares the ended list's bound with the rekey cycles.
+    let digest = |i: usize| Msg1Digest::of(&i.to_le_bytes());
+    for i in 0..ENDED_MSG1_RECORD {
+        record.end_setup(digest(i));
+    }
+    assert!(
+        !record.ended(&setup),
+        "the oldest beyond the bound is forgotten"
+    );
+    assert!(record.ended(&digest(0)));
+    assert!(record.ended(&digest(ENDED_MSG1_RECORD - 1)));
 }

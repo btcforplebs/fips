@@ -194,6 +194,11 @@ pub(crate) const ENDED_MSG1_RECORD: usize = 256;
 /// ended list, and a msg1 matching an ended cycle is refused instead of arming
 /// a new pending.
 ///
+/// The ended list also holds the link-setup msg1 the peering was promoted
+/// from. A copy of it is no more a rekey than a copy of an ended cycle's
+/// msg1, and once the session is old enough to rekey it would otherwise arm
+/// a pending.
+///
 /// Retention is bounded: the ended list keeps the last
 /// [`ENDED_MSG1_RECORD`] digests, so a msg1 from an older cycle of the same
 /// epoch is not recognized. The record lives with the peer, so it starts empty
@@ -215,11 +220,21 @@ impl AnsweredMsg1s {
     /// The pending the held answer armed has left: keep only its digest.
     pub(crate) fn end(&mut self) {
         if let Some(answer) = self.held.take() {
-            if self.ended.len() == ENDED_MSG1_RECORD {
-                self.ended.pop_front();
-            }
-            self.ended.push_back(answer.msg1);
+            self.push_ended(answer.msg1);
         }
+    }
+
+    /// Record the link-setup msg1 the peering was promoted from as ended.
+    pub(crate) fn end_setup(&mut self, msg1: Msg1Digest) {
+        self.push_ended(msg1);
+    }
+
+    /// Append `msg1` to the ended list, dropping the oldest at the bound.
+    fn push_ended(&mut self, msg1: Msg1Digest) {
+        if self.ended.len() == ENDED_MSG1_RECORD {
+            self.ended.pop_front();
+        }
+        self.ended.push_back(msg1);
     }
 
     /// The answer that armed the pending this node holds, if it holds one it
@@ -349,8 +364,9 @@ pub(crate) struct EstablishSnapshot {
     /// responder, the answer that armed it. `None` with no pending, or with a
     /// pending this node initiated.
     pub held_answer: Option<RekeyAnswer>,
-    /// This msg1 armed a responder cycle of this peer's that has since ended
-    /// (pre-evaluated shell-side against the peer's [`AnsweredMsg1s`]).
+    /// This msg1 armed a responder cycle of this peer's that has since ended,
+    /// or is the link-setup msg1 the peering was promoted from (pre-evaluated
+    /// shell-side against the peer's [`AnsweredMsg1s`]).
     pub msg1_answered_before: bool,
     /// The msg1 arrived on the existing peer's established link: its
     /// transport and current address, or an address mapped to its link.
