@@ -818,10 +818,22 @@ dialled at the configured PSM, `DEFAULT_PSM` unless set. A learned PSM
 is forgotten only when a dial to that same PSM is refused; a timeout
 keeps it.
 
-Peers are identified by node address, not by link address. A device
-using resolvable private addresses rotates continually, and modern
-phones do so by default, so an address-keyed pool sees every rotation as
-a new device and every already-connected guard fails to fire.
+The pool is keyed by link address. Before the XX handshake a channel
+carries no peer identity, so two nodes that dial each other at once each
+end up with two channels at one address and nothing they share to choose
+between them: direction is mirrored, and BLE addresses rotate and are
+not always known to their owner. The pool therefore holds the second
+channel open beside the first. Both deliver, sends use the older, and
+the handshake completes whichever channel each side sends on. When the
+handshake promotes the peer, the node settles the address: each end
+keeps the channel the node with the smaller node address dialled, the
+rule that also settles crossed handshakes, so both keep the same one.
+The other is retired: it takes no new frames, writes what it has
+queued, and keeps delivering until the peer closes it or the connect
+timeout passes. A node that dials one address twice retires its second
+dial itself, and the node that accepted both follows when it reads
+end-of-stream. A channel at a rotated address is a separate link to the
+node layer and is not settled here.
 
 Failing addresses back off by powers of two up to
 `MAX_PROBE_BACKOFF_SHIFT`, and the retry book is capped at

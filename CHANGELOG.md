@@ -96,8 +96,10 @@ with v0.5.x or earlier peers.
 - Ethernet frame header unified to 4 bytes `[type][flags][length:2
   LE]` for all frame types. Beacons reduced from 34 to 5 bytes
   (pubkey stripped — identity learned from XX handshake).
-- BLE pre-handshake pubkey exchange removed. Cross-probe tie-breaker
-  eliminated (unnecessary with XX).
+- BLE pre-handshake pubkey exchange removed, and with it the
+  cross-probe tie-breaker that chose between two raced channels by the
+  exchanged keys. Raced channels are now settled once the XX handshake
+  names the peer (see Fixed).
 
 #### Bloom Filter Wire Format
 
@@ -794,6 +796,15 @@ with v0.5.x or earlier peers.
   only when a dial to that same PSM is refused, not when a dial times out
   or went out at another value, so an unreachable peer keeps the PSM it
   advertised.
+- Two BLE nodes that dial each other at the same moment no longer lose
+  both links. Each kept the channel it had dialled and closed the one the
+  other dialled, so both were left holding a closed channel and had to
+  dial again, often into the same race. A second channel to a linked
+  address is now held open until the handshake identifies the peer, and
+  both ends then keep the channel the node with the smaller address
+  dialled. The other channel finishes sending what it holds before it
+  closes. The `duplicates_held` and `duplicates_closed` counters report
+  these races.
 
 #### Gateway
 

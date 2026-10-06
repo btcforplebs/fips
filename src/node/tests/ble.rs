@@ -11,7 +11,8 @@ use crate::transport::ble::addr::BleAddr;
 use crate::transport::ble::io::{MockBleIo, MockBleStream};
 use crate::transport::{Transport, TransportHandle, TransportId, packet_channel};
 use spanning_tree::{
-    TestNode, cleanup_nodes, drain_all_packets, initiate_handshake, verify_tree_convergence,
+    TestNode, cleanup_nodes, drain_all_packets, initiate_handshake, process_available_packets,
+    verify_tree_convergence,
 };
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -36,11 +37,12 @@ type StreamBank = Arc<StdMutex<HashMap<String, MockBleStream>>>;
 /// Returns the TestNode and its MockBleIo (via Arc inside the transport)
 /// for test injection of connections and scan results.
 async fn make_test_node_ble(node_num: u8) -> TestNode {
-    let mut node = make_node();
-    let transport_id = TransportId::new(1);
-    let addr = ble_addr(node_num);
+    make_test_node_ble_with(node_num, test_ble_config()).await
+}
 
-    let config = BleConfig {
+/// The BLE configuration test nodes run with.
+fn test_ble_config() -> BleConfig {
+    BleConfig {
         adapter: Some("hci0".to_string()),
         mtu: Some(2048),
         accept_connections: Some(true),
@@ -48,7 +50,14 @@ async fn make_test_node_ble(node_num: u8) -> TestNode {
         advertise: Some(false), // no advertising in tests
         auto_connect: Some(false),
         ..Default::default()
-    };
+    }
+}
+
+/// Create a test node with a BLE transport built from `config`.
+async fn make_test_node_ble_with(node_num: u8, config: BleConfig) -> TestNode {
+    let mut node = make_node();
+    let transport_id = TransportId::new(1);
+    let addr = ble_addr(node_num);
 
     let io = MockBleIo::new("hci0", addr.clone());
     let (packet_tx, packet_rx) = packet_channel(256);
@@ -312,5 +321,223 @@ async fn test_ble_discovery() {
         packet_rx: spanning_tree::bridge_to_unbounded(packet_rx),
         addr: ta,
     }];
+    cleanup_nodes(&mut nodes).await;
+}
+
+// ============================================================================
+// Two BLE nodes that dial each other at once
+// ============================================================================
+
+/// How long a retired channel lingers in the race tests, as the transport's
+/// connect timeout. Short, because these tests run on real time.
+const RACE_LINGER_MS: u64 = 300;
+
+/// How long the race tests wait for a condition they expect to reach. Long,
+/// so a slow machine passes; a passing run returns as soon as it holds.
+const RACE_DEADLINE: Duration = Duration::from_secs(10);
+
+/// The BLE transport of a test node.
+fn ble_transport(node: &TestNode) -> &BleTransport<MockBleIo> {
+    match node.node.transports.get(&node.transport_id).unwrap() {
+        TransportHandle::Ble(t) => t,
+        _ => panic!("expected BLE transport"),
+    }
+}
+
+/// Two BLE test nodes whose transports each hold two channels at the
+/// other's address: L1, which node 0 dialled, and L2, which node 1 dialled.
+/// That is what both nodes dialling each other at once leaves behind.
+async fn two_racing_ble_nodes() -> Vec<TestNode> {
+    let config = BleConfig {
+        connect_timeout_ms: Some(RACE_LINGER_MS),
+        ..test_ble_config()
+    };
+    let nodes = vec![
+        make_test_node_ble_with(1, config.clone()).await,
+        make_test_node_ble_with(2, config).await,
+    ];
+    let (addr0, addr1) = (ble_addr(1), ble_addr(2));
+    // `pair(a, b)` gives the end at `a` (whose remote is `b`) first.
+    let (l1_at_0, l1_at_1) = MockBleStream::pair(addr0.clone(), addr1.clone(), 2048);
+    let (l2_at_1, l2_at_0) = MockBleStream::pair(addr1, addr0, 2048);
+    for (i, dial) in [(0, l1_at_0), (1, l2_at_1)] {
+        let dial = StdMutex::new(Some(dial));
+        ble_transport(&nodes[i])
+            .io()
+            .set_connect_handler(move |_addr, _psm| {
+                dial.lock()
+                    .unwrap()
+                    .take()
+                    .ok_or(crate::transport::TransportError::ConnectionRefused)
+            });
+    }
+    ble_transport(&nodes[0])
+        .connect_async(&nodes[1].addr)
+        .await
+        .unwrap();
+    ble_transport(&nodes[1])
+        .connect_async(&nodes[0].addr)
+        .await
+        .unwrap();
+    ble_transport(&nodes[0]).io().inject_inbound(l2_at_0).await;
+    ble_transport(&nodes[1]).io().inject_inbound(l1_at_1).await;
+
+    let end = tokio::time::Instant::now() + RACE_DEADLINE;
+    while tokio::time::Instant::now() < end {
+        let (held0, _) = ble_transport(&nodes[0]).channels_at(&nodes[1].addr).await;
+        let (held1, _) = ble_transport(&nodes[1]).channels_at(&nodes[0].addr).await;
+        if held0.len() == 2 && held1.len() == 2 {
+            return nodes;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("each node should hold both channels before the handshake");
+}
+
+/// Process packets until each node holds one channel to the other and
+/// retires nothing, or until the deadline passes. The caller asserts what
+/// was reached, so a deadline that passes reports the state it stopped in.
+async fn wait_for_one_channel_each(nodes: &mut [TestNode]) {
+    let end = tokio::time::Instant::now() + RACE_DEADLINE;
+    while tokio::time::Instant::now() < end {
+        process_available_packets(nodes).await;
+        let mut settled = true;
+        for i in 0..2 {
+            let peer_addr = nodes[1 - i].addr.clone();
+            let (held, retiring) = ble_transport(&nodes[i]).channels_at(&peer_addr).await;
+            settled &= held.len() == 1 && retiring.is_empty();
+        }
+        if settled {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Assert that the two nodes are peers on one session, that each holds one
+/// channel to the other and nothing retiring, that it is the channel the
+/// smaller node dialled, and that an encrypted frame crosses each way.
+async fn assert_one_working_link(nodes: &mut [TestNode], when: &str) {
+    let addr = [*nodes[0].node.node_addr(), *nodes[1].node.node_addr()];
+    let (on0, on1) = (
+        nodes[0]
+            .node
+            .get_peer(&addr[1])
+            .map(|p| (p.our_index(), p.their_index())),
+        nodes[1]
+            .node
+            .get_peer(&addr[0])
+            .map(|p| (p.our_index(), p.their_index())),
+    );
+    let (Some((our0, their0)), Some((our1, their1))) = (on0, on1) else {
+        panic!("{when}: both nodes must hold the other as a peer: {on0:?} {on1:?}");
+    };
+    assert!(our0.is_some() && their0.is_some(), "{when}: indices set");
+    assert_eq!(
+        their0, our1,
+        "{when}: node 0 sends on an index node 1 receives on"
+    );
+    assert_eq!(
+        their1, our0,
+        "{when}: node 1 sends on an index node 0 receives on"
+    );
+
+    for i in 0..2 {
+        let peer_addr = nodes[1 - i].addr.clone();
+        let (held, retiring) = ble_transport(&nodes[i]).channels_at(&peer_addr).await;
+        let smaller = addr[i] < addr[1 - i];
+        assert_eq!(
+            held.len(),
+            1,
+            "{when}: node {i} holds one channel to its peer: {held:?}"
+        );
+        assert!(
+            retiring.is_empty(),
+            "{when}: node {i} retires nothing: {retiring:?}"
+        );
+        assert_eq!(
+            held[0].1, smaller,
+            "{when}: node {i} keeps the channel the smaller node dialled"
+        );
+    }
+
+    for i in 0..2 {
+        let peer = addr[1 - i];
+        let before = nodes[1 - i]
+            .node
+            .get_peer(&addr[i])
+            .unwrap()
+            .link_stats()
+            .packets_recv;
+        nodes[i]
+            .node
+            .send_encrypted_link_message(&peer, &[0x51])
+            .await
+            .unwrap_or_else(|e| panic!("{when}: node {i} sends to its peer: {e}"));
+        let mut arrived = false;
+        let end = tokio::time::Instant::now() + RACE_DEADLINE;
+        while tokio::time::Instant::now() < end {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            process_available_packets(nodes).await;
+            let after = nodes[1 - i]
+                .node
+                .get_peer(&addr[i])
+                .unwrap()
+                .link_stats()
+                .packets_recv;
+            if after > before {
+                arrived = true;
+                break;
+            }
+        }
+        assert!(arrived, "{when}: node {i}'s frame is decrypted by its peer");
+    }
+}
+
+/// Let retired channels linger out, then run both handshake reapers at a
+/// time past the handshake timeout, as a long-running node would: the
+/// inbound-leg reaper (`check_timeouts`) and the outbound one (the machine's
+/// handshake timer). Then give any close they made time to reach the other
+/// end before the caller asserts the link survived.
+///
+/// In the races these tests build, no handshake leg is left once the peer
+/// is promoted, so both reapers find nothing to reap. The phase is there so
+/// that a change which leaves a leg behind at the peer's address, where a
+/// reap would close the peer's own link, would fail the assertion that
+/// follows.
+async fn age_past_linger_and_handshake_timeout(nodes: &mut [TestNode]) {
+    wait_for_one_channel_each(nodes).await;
+    drain_all_packets(nodes, false).await;
+    let later = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+        + 120_000;
+    for tn in nodes.iter_mut() {
+        let timeout_ms = tn.node.config().node.rate_limit.handshake_timeout_secs * 1000;
+        assert!(timeout_ms < 120_000, "the reapers run past the timeout");
+        tn.node.check_timeouts_at(later).await;
+        tn.node.drive_peer_timers(later).await;
+    }
+    tokio::time::sleep(Duration::from_millis(RACE_LINGER_MS * 2)).await;
+    drain_all_packets(nodes, false).await;
+}
+
+/// Two BLE nodes whose channels raced at one address, and whose handshakes
+/// both start before either answers, end on one link that carries traffic,
+/// and keep it past the handshake timeout.
+#[tokio::test]
+async fn two_ble_nodes_that_dial_each_other_keep_one_link() {
+    let mut nodes = two_racing_ble_nodes().await;
+
+    initiate_handshake(&mut nodes, 0, 1).await;
+    initiate_handshake(&mut nodes, 1, 0).await;
+    drain_all_packets(&mut nodes, false).await;
+    wait_for_one_channel_each(&mut nodes).await;
+    assert_one_working_link(&mut nodes, "after the handshakes").await;
+
+    age_past_linger_and_handshake_timeout(&mut nodes).await;
+    assert_one_working_link(&mut nodes, "past the handshake timeout").await;
+
     cleanup_nodes(&mut nodes).await;
 }

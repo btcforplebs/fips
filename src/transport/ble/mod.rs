@@ -323,6 +323,16 @@ impl<S: BleStream + 'static> Channels<S> {
         Ok(admitted)
     }
 
+    /// Record which direction to keep at `addr`, and retire the held
+    /// channels of the other direction.
+    async fn settle(&self, addr: &TransportAddr, keep_outbound: bool) {
+        let retired = self.pool.lock().await.settle(addr, keep_outbound);
+        if !retired.is_empty() {
+            debug!(addr = %addr, keep_outbound, "BLE link settled");
+        }
+        self.linger(addr, &retired);
+    }
+
     /// Drop each retired channel once the linger passes, unless its reader
     /// has already seen the peer close it.
     fn linger(&self, addr: &TransportAddr, ids: &[u64]) {
@@ -715,6 +725,19 @@ impl<I: BleIo> BleTransport<I> {
         Ok(())
     }
 
+    /// Settle the channels at `addr` once the handshake has named the peer:
+    /// keep the one this side dialled if `keep_outbound`, else the one the
+    /// peer dialled, and retire the rest.
+    ///
+    /// Both ends compute `keep_outbound` from node order, so both keep the
+    /// same channel. Before the handshake there is nothing the two ends
+    /// share to choose by, which is why a second channel is held until
+    /// then. A verdict for a direction not yet held waits for that channel,
+    /// so this never retires the only channel at an address.
+    pub async fn settle_link(&self, addr: &TransportAddr, keep_outbound: bool) {
+        self.channels().settle(addr, keep_outbound).await;
+    }
+
     /// Query the state of a connection attempt.
     pub fn connection_state_sync(&self, addr: &TransportAddr) -> ConnectionState {
         // Check established pool (try_lock to avoid blocking)
@@ -743,6 +766,14 @@ impl<I: BleIo> BleTransport<I> {
         if closed > 0 {
             debug!(addr = %addr, channels = closed, "BLE connection closed");
         }
+    }
+
+    /// `(id, outbound)` of each channel held at `addr`, oldest first, and
+    /// the ids of the channels retiring there.
+    #[cfg(test)]
+    pub(crate) async fn channels_at(&self, addr: &TransportAddr) -> (Vec<(u64, bool)>, Vec<u64>) {
+        let pool = self.pool.lock().await;
+        (pool.held(addr), pool.retiring(addr))
     }
 
     /// Get the link MTU for a specific address.
@@ -2583,6 +2614,283 @@ mod tests {
             "and reported"
         );
         side.transport.stop_async().await.unwrap();
+    }
+
+    // ------------------------------------------------------------------
+    // Settling two channels once the handshake names the peer
+    // ------------------------------------------------------------------
+
+    /// The MTU L1, the channel A dials, is built with. Each channel gets its
+    /// own MTU, so a test can tell which one an end holds.
+    const L1_MTU: u16 = 2048;
+    /// The MTU L2, the channel B dials, is built with.
+    const L2_MTU: u16 = 1024;
+
+    /// One step of a race between A and B.
+    #[derive(Clone, Copy, Debug)]
+    enum Step {
+        /// A's own dial (L1) completes.
+        ADial,
+        /// B's dial (L2) arrives at A.
+        AAccept,
+        /// B's own dial (L2) completes.
+        BDial,
+        /// L1 arrives at B.
+        BAccept,
+        /// A settles, keeping its outbound channel if `true`.
+        ASettle(bool),
+        /// B settles, keeping its outbound channel if `true`.
+        BSettle(bool),
+    }
+
+    /// How many channels `side` has at `addr`, held and retiring together.
+    fn channels_seen(side: &Side, addr: &BleAddr) -> usize {
+        side.transport
+            .pool
+            .try_lock()
+            .map(|pool| {
+                let ta = addr.to_transport_addr();
+                pool.held(&ta).len() + pool.retiring(&ta).len()
+            })
+            .unwrap_or(0)
+    }
+
+    impl Side {
+        /// Let this side's one held dial through and wait until the pool
+        /// has taken it, held or retired.
+        async fn dial_through(&self, peer: &BleAddr) {
+            let before = channels_seen(self, peer);
+            self.gate.send(true).unwrap();
+            wait_for("the dial to land in the pool", || {
+                channels_seen(self, peer) == before + 1
+            })
+            .await;
+        }
+    }
+
+    /// Run a race between A (`test_addr(1)`) and B (`test_addr(2)`): each
+    /// starts one dial to the other, held at its gate, and `steps` then
+    /// decides the order in which each end sees its own dial complete, the
+    /// peer's dial arrive, and its settlement.
+    async fn race(steps: &[Step]) -> (Side, Side) {
+        let (a, b) = (test_addr(1), test_addr(2));
+        let (l1_a, l1_b) = MockBleStream::pair(a.clone(), b.clone(), L1_MTU);
+        let (l2_b, l2_a) = MockBleStream::pair(b.clone(), a.clone(), L2_MTU);
+        let side_a = Side::start(a.clone(), vec![l1_a], race_config()).await;
+        let side_b = Side::start(b.clone(), vec![l2_b], race_config()).await;
+        side_a
+            .transport
+            .connect_async(&b.to_transport_addr())
+            .await
+            .unwrap();
+        side_b
+            .transport
+            .connect_async(&a.to_transport_addr())
+            .await
+            .unwrap();
+        settle().await;
+        let (mut l2_a, mut l1_b) = (Some(l2_a), Some(l1_b));
+        for step in steps {
+            match *step {
+                Step::ADial => side_a.dial_through(&b).await,
+                Step::AAccept => side_a.accept(l2_a.take().unwrap()).await,
+                Step::BDial => side_b.dial_through(&a).await,
+                Step::BAccept => side_b.accept(l1_b.take().unwrap()).await,
+                Step::ASettle(keep) => {
+                    side_a
+                        .transport
+                        .settle_link(&b.to_transport_addr(), keep)
+                        .await
+                }
+                Step::BSettle(keep) => {
+                    side_b
+                        .transport
+                        .settle_link(&a.to_transport_addr(), keep)
+                        .await
+                }
+            }
+        }
+        (side_a, side_b)
+    }
+
+    /// Advance past the linger, then report `(held, retiring)` on each end
+    /// and the MTU each end sends on.
+    async fn after_linger(side_a: &Side, side_b: &Side) -> [((usize, usize), Option<u16>); 2] {
+        // Let each linger timer start its sleep before the clock moves.
+        settle().await;
+        tokio::time::advance(Duration::from_millis(
+            side_a.transport.config.connect_timeout_ms() + 1,
+        ))
+        .await;
+        settle().await;
+        let (a, b) = (test_addr(1), test_addr(2));
+        [
+            (
+                channel_counts(side_a, &b).await,
+                sending_mtu(side_a, &b).await,
+            ),
+            (
+                channel_counts(side_b, &a).await,
+                sending_mtu(side_b, &a).await,
+            ),
+        ]
+    }
+
+    /// Whether a frame crosses each way between A and B.
+    async fn frames_cross(side_a: &mut Side, side_b: &mut Side) -> bool {
+        let (a, b) = (test_addr(1), test_addr(2));
+        let to_b = build_established_frame(16);
+        let to_a = build_established_frame(24);
+        let sent = side_a
+            .transport
+            .send_async(&b.to_transport_addr(), &to_b)
+            .await
+            .is_ok()
+            && side_b
+                .transport
+                .send_async(&a.to_transport_addr(), &to_a)
+                .await
+                .is_ok();
+        sent && side_b.receives(&to_b).await && side_a.receives(&to_a).await
+    }
+
+    /// Both ends keep the channel the smaller node dialled, whichever order
+    /// the channels arrived in and whenever each end settles: after both
+    /// channels are in, between its two channels, or before the peer has
+    /// settled at all. Either node may be the smaller.
+    #[tokio::test(start_paused = true)]
+    async fn both_ends_settle_on_the_link_the_smaller_node_dialled() {
+        use Step::*;
+        let orders = [
+            [ADial, BDial, AAccept, BAccept],
+            [ADial, BAccept, AAccept, BDial],
+            [AAccept, BDial, ADial, BAccept],
+            [AAccept, BAccept, ADial, BDial],
+        ];
+        let mut failures = Vec::new();
+        for a_smaller in [true, false] {
+            let (keep_a, keep_b) = (a_smaller, !a_smaller);
+            let kept = if a_smaller { L1_MTU } else { L2_MTU };
+            for order in orders {
+                // Settle after both channels, A between its two, or both
+                // between their two.
+                let timings: [Vec<Step>; 3] = [
+                    vec![
+                        order[0],
+                        order[1],
+                        order[2],
+                        order[3],
+                        ASettle(keep_a),
+                        BSettle(keep_b),
+                    ],
+                    vec![
+                        order[0],
+                        order[1],
+                        ASettle(keep_a),
+                        order[2],
+                        order[3],
+                        BSettle(keep_b),
+                    ],
+                    vec![
+                        order[0],
+                        order[1],
+                        ASettle(keep_a),
+                        BSettle(keep_b),
+                        order[2],
+                        order[3],
+                    ],
+                ];
+                for steps in timings {
+                    let (mut side_a, mut side_b) = race(&steps).await;
+                    let ends = after_linger(&side_a, &side_b).await;
+                    let crossed = frames_cross(&mut side_a, &mut side_b).await;
+                    let want = ((1, 0), Some(kept));
+                    if ends != [want, want] || !crossed {
+                        failures.push(format!(
+                            "{steps:?}: A {:?}, B {:?}, frames crossed: {crossed}",
+                            ends[0], ends[1]
+                        ));
+                    }
+                    side_a.transport.stop_async().await.unwrap();
+                    side_b.transport.stop_async().await.unwrap();
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "ends that did not keep the smaller node's channel:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    /// A frame queued on a channel that settlement then retires is still
+    /// written. Dropping the channel at settlement would abort its writer
+    /// with the frame still queued; on the node that is the handshake's
+    /// msg3, queued on the oldest channel just before the promotion that
+    /// settles the link.
+    #[tokio::test(start_paused = true)]
+    async fn a_frame_queued_on_a_losing_channel_still_arrives() {
+        use Step::*;
+        let (a, b) = (test_addr(1), test_addr(2));
+        let (side_a, mut side_b) = race(&[ADial, BDial, AAccept, BAccept]).await;
+        // A sends on its oldest channel, L1 (outbound); settle against it in
+        // the same task, with nothing in between that yields.
+        let frame = build_established_frame(16);
+        side_a
+            .transport
+            .send_async(&b.to_transport_addr(), &frame)
+            .await
+            .unwrap();
+        side_a
+            .transport
+            .settle_link(&b.to_transport_addr(), false)
+            .await;
+        assert_eq!(sending_mtu(&side_a, &b).await, Some(L2_MTU), "L1 retired");
+        assert!(side_b.receives(&frame).await, "the queued frame arrives");
+        let _ = a;
+    }
+
+    /// A frame the peer sends on a channel this end has already retired is
+    /// still delivered: the peer may not have settled yet, and its sends go
+    /// on its oldest channel until it does.
+    #[tokio::test(start_paused = true)]
+    async fn a_frame_the_peer_sends_on_a_losing_channel_still_arrives() {
+        use Step::*;
+        let a = test_addr(1);
+        // B's oldest channel is L2, which B dialled; A retires it by keeping
+        // its own outbound, L1, before B settles.
+        let (mut side_a, side_b) = race(&[BDial, ADial, AAccept, BAccept, ASettle(true)]).await;
+        assert_eq!(sending_mtu(&side_b, &a).await, Some(L2_MTU));
+        let frame = build_established_frame(16);
+        side_b
+            .transport
+            .send_async(&a.to_transport_addr(), &frame)
+            .await
+            .unwrap();
+        assert!(side_a.receives(&frame).await, "the peer's frame arrives");
+    }
+
+    /// A retired channel closes once the linger passes, on both ends, and
+    /// the survivor still carries traffic.
+    #[tokio::test(start_paused = true)]
+    async fn a_retired_channel_closes_after_the_linger() {
+        use Step::*;
+        let (mut side_a, mut side_b) = race(&[
+            ADial,
+            BDial,
+            AAccept,
+            BAccept,
+            ASettle(true),
+            BSettle(false),
+        ])
+        .await;
+        let (a, b) = (test_addr(1), test_addr(2));
+        assert_eq!(channel_counts(&side_a, &b).await, (1, 1));
+        assert_eq!(channel_counts(&side_b, &a).await, (1, 1));
+
+        let ends = after_linger(&side_a, &side_b).await;
+        assert_eq!(ends, [((1, 0), Some(L1_MTU)), ((1, 0), Some(L1_MTU))]);
+        assert!(frames_cross(&mut side_a, &mut side_b).await);
     }
 
     /// An oversized packet is a caller bug, not a property of the peer's

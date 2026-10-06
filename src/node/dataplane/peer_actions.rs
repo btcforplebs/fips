@@ -43,8 +43,8 @@ use crate::PeerIdentity;
 use crate::node::reject::{HandshakeReject, RejectReason};
 use crate::node::{Node, NodeError};
 use crate::peer::machine::{LostKind, PeerAction, PeerEvent};
-use crate::proto::fmp::PromotionResult;
 use crate::proto::fmp::wire::build_msg2;
+use crate::proto::fmp::{PromotionResult, cross_connection_winner};
 use crate::transport::{LinkId, TransportAddr, TransportId};
 use crate::utils::index::SessionIndex;
 use std::collections::VecDeque;
@@ -283,6 +283,21 @@ impl Node {
                     match &promote_result {
                         Ok(PromotionResult::Promoted(node_addr)) => {
                             let node_addr = *node_addr;
+                            // Two nodes that dialled each other may share two
+                            // transport connections at this address. Now that
+                            // the handshake has named the peer, tell the
+                            // transport which to keep: the one the smaller
+                            // node dialled, the same rule that settles
+                            // crossed handshakes, so both ends keep the same
+                            // one. First, so the tree announce below goes on
+                            // the connection that stays.
+                            let keep_outbound =
+                                cross_connection_winner(self.node_addr(), &node_addr, true);
+                            if let Some(transport) = self.transports.get(&ambient.transport_id) {
+                                transport
+                                    .settle_link(&ambient.remote_addr, keep_outbound)
+                                    .await;
+                            }
                             if ambient.is_outbound {
                                 // The outbound promote logs a second line here in
                                 // addition to `promote_connection`'s "Connection

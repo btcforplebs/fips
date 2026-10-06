@@ -1283,6 +1283,23 @@ impl TransportHandle {
         }
     }
 
+    /// Settle the link at `addr` once the handshake has named the peer.
+    ///
+    /// `keep_outbound` says whether to keep the connection this node dialled
+    /// or the one the peer dialled, where both exist at one address. Only
+    /// BLE can hold two connections at one address, because two nodes that
+    /// dial each other there cannot tell the channels apart before the
+    /// handshake; every other transport ignores this.
+    pub async fn settle_link(&self, addr: &TransportAddr, keep_outbound: bool) {
+        match self {
+            #[cfg(ble_available)]
+            TransportHandle::Ble(t) => t.settle_link(addr, keep_outbound).await,
+            _ => {
+                let _ = (addr, keep_outbound);
+            }
+        }
+    }
+
     /// Check if transport is operational.
     pub fn is_operational(&self) -> bool {
         self.state().is_operational()

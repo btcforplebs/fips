@@ -59,11 +59,16 @@ impl Node {
     /// the retry-then-teardown choreography is the pure
     /// [`Fmp::poll_timeouts`](crate::proto::fmp::Fmp::poll_timeouts) decision.
     pub(in crate::node) async fn check_timeouts(&mut self) {
+        self.check_timeouts_at(Self::now_ms()).await;
+    }
+
+    /// [`check_timeouts`](Self::check_timeouts) at the time `now_ms`, so a
+    /// test can run the reaper past the handshake timeout without waiting.
+    pub(in crate::node) async fn check_timeouts_at(&mut self, now_ms: u64) {
         if self.connection_count() == 0 {
             return;
         }
 
-        let now_ms = Self::now_ms();
         let timeout_ms = self.config().node.rate_limit.handshake_timeout_secs * 1000;
 
         let stale = self.stale_connections(now_ms, timeout_ms);

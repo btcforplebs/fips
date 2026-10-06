@@ -986,11 +986,12 @@ scanners as an unnamed device with the FIPS UUID. When `scan` is enabled,
 the transport continuously scans for other FIPS nodes' advertisements and
 learns each peer's advertised PSM; a peer that advertises none is dialled
 at the configured `psm`. Discovered
-peers are probed immediately (L2CAP connect + pubkey exchange) with a
-cooldown (`probe_cooldown_secs`) to prevent rapid re-probing of the same
-address. If two nodes probe each other at the same time (cross-probe),
-a deterministic tie-breaker based on NodeAddr comparison ensures only
-one connection is established.
+peers are probed immediately (L2CAP connect) with a cooldown
+(`probe_cooldown_secs`) to prevent rapid re-probing of the same address.
+If two nodes dial each other at the same time, both channels are kept
+until the handshake identifies the peer, and both ends then keep the one
+the node with the smaller node address dialled; the other finishes
+sending what it holds and closes within `connect_timeout_ms`.
 
 **Connection pool.** The `max_connections` parameter limits the number of
 concurrent BLE connections. When the pool is full, the least-recently-used
