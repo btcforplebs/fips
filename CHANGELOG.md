@@ -773,6 +773,12 @@ with v0.5.x or earlier peers.
 - The gateway retries failed firewall rebuilds every ten seconds without
   waiting for another mapping change. Retries apply the latest desired
   mappings and port forwards, preserving changes across transient failures.
+- An inbound port-forwarded connection from a mesh peer that also has a live
+  `.fips` mapping on the gateway now reaches the LAN target from the
+  gateway's LAN address, as connections from every other peer do. The
+  mapping's source rewrite used to take it first, so the target saw the
+  peer's pool address instead, which changed as mappings came and went and
+  could be answered only by a host that routes the pool to the gateway.
 
 #### Packaging
 
@@ -780,6 +786,17 @@ with v0.5.x or earlier peers.
   an upgrade when they were running. It stopped fips first, which stopped both
   through `Requires=fips.service`, then restarted only fips, so `.fips`
   resolution stayed down and the gateway stayed stopped until started by hand.
+- Removing the `.deb` without purging it now removes the `.fips` DNS routing
+  when `fips-dns` was not running at the time, as purging already did. The
+  routing stayed behind, so the host kept sending `.fips` queries to
+  `[::1]:5354`, where nothing listens once the package is removed, and
+  `.fips` lookups timed out until the file was deleted by hand.
+- When no supported DNS resolver is found, `fips-dns-setup` no longer tells
+  the host to run `apt install systemd-resolved`. The script is not
+  Debian-only, so the hint now names no package manager. It says to start
+  systemd-resolved (`systemctl enable --now`) and then restart
+  `fips-dns.service`, since setup uses systemd-resolved only when it is
+  running.
 
 - A node no longer relays away the answer to its own lookup. A request is
   flooded to every tree peer whose bloom filter claims the target, so a false
@@ -962,6 +979,11 @@ with v0.5.x or earlier peers.
   closed, losing the peer's first datagram, when the kernel's descriptor
   garbage collector ran before the client read the arrival message. The same
   exposure on connect and listen replies is closed too.
+- A native API flow can now reach a node that is not a peer, has no session,
+  was not resolved through DNS and has no known route. Discovery ran for it,
+  but its answer was discarded, and the datagram was held without being
+  sent. The node now records the flow's key before starting discovery, and
+  retries the session for held native datagrams once discovery answers.
 
 #### OpenWrt
 
@@ -982,6 +1004,14 @@ with v0.5.x or earlier peers.
   member port (for example `lan1` or `eth1`), change it back to `br-lan`. Your
   edited config is kept across upgrades, along with its old "physical port
   names, NOT bridge names" comment, so an upgrade alone will not correct it.
+
+#### Routing and discovery
+
+- A backward step of the system clock, from an NTP correction, a manual set
+  or a VM resume, no longer holds a node's bloom filter announces for the
+  size of the step. The spacing between announces to a peer
+  (`node.bloom.update_debounce_ms`, 500 ms by default) is now measured on a
+  monotonic clock.
 
 #### Sessions and rekey
 

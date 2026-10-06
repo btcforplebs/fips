@@ -60,7 +60,8 @@ pub(crate) enum LookupAction {
     },
     /// Reset the coords-warmup counter if an established session exists.
     ResetWarmupIfEstablished { target: NodeAddr },
-    /// Retry queued TUN packets for the target if any are pending.
+    /// Retry queued TUN packets or native datagrams for the target if any are
+    /// pending.
     RetryQueuedPackets { target: NodeAddr },
 }
 

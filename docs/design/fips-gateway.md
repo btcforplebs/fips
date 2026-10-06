@@ -419,6 +419,13 @@ masquerade in the outbound pipeline; the two have disjoint match
 clauses (different `iifname`/`oifname` combinations) and coexist
 without interaction when both directions are active.
 
+The per-mapping SNAT rules match on source address alone, so an
+inbound forwarded connection from a mesh peer that also holds a live
+mapping matches both its SNAT and the LAN-side masquerade. NAT
+statements are terminal, and the rebuild places the LAN-side
+masquerade ahead of every per-mapping SNAT, so that peer's connection
+reaches the LAN target from the gateway's LAN address like any other.
+
 ### Independence From Outbound
 
 The inbound half does not require:
@@ -449,9 +456,9 @@ sequence is:
 1. Add the table (which succeeds whether or not it exists), delete
    it, and add it again, so the delete always has a target.
 2. Add the `prerouting` and `postrouting` chains; the always-on
-   `oifname fips0` masquerade; per-mapping DNAT/SNAT rules for
-   every live pool entry; per-port-forward DNAT rules; the LAN-side
-   masquerade if any port-forwards exist.
+   `oifname fips0` masquerade; the LAN-side masquerade if any
+   port-forwards exist; per-mapping DNAT/SNAT rules for every live
+   pool entry; per-port-forward DNAT rules.
 3. Send all of it as one batch, which the kernel applies as a single
    transaction. Only the last message before the batch end requests
    an acknowledgement, the socket's send buffer is sized to the
