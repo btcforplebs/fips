@@ -1325,6 +1325,7 @@ impl Node {
                             }
 
                             if remote_epoch_changed {
+                                peer.note_restart();
                                 if self.sessions.remove(&peer_node_addr).is_some() {
                                     debug!(
                                         peer = %display_name,

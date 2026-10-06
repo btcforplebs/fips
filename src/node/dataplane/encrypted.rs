@@ -38,10 +38,11 @@ impl Node {
     /// This is the hot path for established sessions. We use O(1)
     /// index-based lookup to find the session, then decrypt.
     ///
-    /// K-bit handling: when the peer flips the K-bit after a rekey,
-    /// we promote the pending new session to current and demote the old
-    /// session to previous for a drain window. During drain, we try the
-    /// current session first, then fall back to the previous session.
+    /// Rekey cutover: when a frame that names the pending new session's
+    /// index, or carries a flipped K-bit, authenticates against that
+    /// session, we promote it to current, take the frame's K-bit, and demote
+    /// the old session to previous for a drain window. During drain, we try
+    /// the current session first, then fall back to the previous session.
     pub(in crate::node) async fn handle_encrypted_frame(&mut self, packet: ReceivedPacket) {
         // Parse header (fail fast)
         let header = match EncryptedHeader::parse(&packet.data) {
@@ -71,9 +72,18 @@ impl Node {
         // Extract K-bit from flags
         let received_k_bit = header.flags & FLAG_KEY_EPOCH != 0;
 
-        // K-bit flip detection: peer has cut over to the new session.
+        // Pending-session trial: the peer may have cut over to the new
+        // session.
         //
-        // The header K-bit is NOT a sufficient gating event on its own.
+        // A frame naming the pending session's receiver index was sealed for
+        // that session, so it is always tried there. The K-bit alone is not
+        // enough to select the trial: the two ends' bits can fall out of
+        // step (a peer restart revealed by our rekey, or a second-path dial
+        // the peer completes as a cross-connection swap), and then the
+        // peer's frames on the new session carry a K-bit equal to ours. A
+        // frame with a flipped K-bit is still tried too, as before.
+        //
+        // Neither signal is a reason to promote; only the trial is.
         // Under jitter the FMP rekey interval shrinks and the two
         // directions' rekeys interleave, so a node can hold a `pending`
         // session from rekey N while the peer's observed K-bit flip
@@ -93,10 +103,16 @@ impl Node {
             let Some(peer) = self.peers.get(&node_addr) else {
                 return;
             };
-            let k_bit_flipped =
-                received_k_bit != peer.current_k_bit() && peer.pending_new_session().is_some();
+            let try_pending = peer.pending_new_session().is_some()
+                && (received_k_bit != peer.current_k_bit()
+                    || peer.pending_our_index() == Some(header.receiver_idx));
+            // Test-only: model a peer that tries the pending session only on
+            // a flipped K-bit.
+            #[cfg(test)]
+            let try_pending =
+                try_pending && (!peer.old_gate() || received_k_bit != peer.current_k_bit());
 
-            if k_bit_flipped {
+            if try_pending {
                 let ciphertext = &packet.data[header.ciphertext_offset()..];
                 let display_name = self.peer_display_name(&node_addr);
                 let Some(peer) = self.peers.get_mut(&node_addr) else {
@@ -121,10 +137,10 @@ impl Node {
                         "Peer new-epoch frame authenticated, K-bit flip promoting new session"
                     );
                     // The trial-decrypt already advanced the pending
-                    // session's replay window; `handle_peer_kbit_flip`
-                    // moves that same session object to `current`, so no
-                    // re-decrypt.
-                    let did_flip = peer.handle_peer_kbit_flip().is_some();
+                    // session's replay window; `adopt_pending` moves that
+                    // same session object to `current`, so no re-decrypt,
+                    // and takes the K-bit from this authenticated frame.
+                    let did_flip = peer.adopt_pending(received_k_bit).is_some();
                     if did_flip {
                         // New index was pre-registered in peers_by_index
                         // during msg1 handling (handshake.rs). Verify,

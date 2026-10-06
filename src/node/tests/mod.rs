@@ -23,6 +23,7 @@ mod handshake;
 mod heartbeat;
 mod mmp_chartests;
 mod probe;
+mod rekey_parity;
 mod routing;
 mod rx_stall;
 mod session;
