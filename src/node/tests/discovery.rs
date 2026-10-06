@@ -2283,3 +2283,296 @@ async fn a_native_first_send_to_an_uncached_unrouted_key_is_delivered_after_disc
 
     cleanup_nodes(&mut nodes).await;
 }
+
+// ============================================================================
+// Native API — releasing datagrams held for destinations that never establish
+// ============================================================================
+
+/// Send one native datagram to a freshly generated identity, and return its
+/// address.
+///
+/// The identity is in no peer's filter and has no cached coordinates, so the
+/// send cannot start a session and is held, which is the state every test in
+/// this section starts from.
+async fn send_unknown(node: &mut Node) -> NodeAddr {
+    let dest = crate::Identity::generate();
+    let dest_addr = *dest.node_addr();
+    let flow = FlowKey {
+        peer: dest_addr,
+        remote: NATIVE_PORT,
+        local: 7001,
+    };
+    node.handle_native_outbound(flow, dest.pubkey(), b"held".to_vec())
+        .await;
+    dest_addr
+}
+
+#[tokio::test]
+async fn native_datagrams_held_for_destinations_with_no_session_and_no_lookup_are_released_so_a_new_destination_can_still_be_queued()
+ {
+    // No peers, so every lookup is a bloom miss and no destination gets a
+    // session entry or a pending lookup.
+    let mut node = make_node();
+    let cap = node.config().node.session.pending_max_destinations;
+
+    for _ in 0..cap {
+        send_unknown(&mut node).await;
+    }
+    assert_eq!(
+        node.pending_native.len(),
+        cap,
+        "precondition: the native queue must hold the destination limit"
+    );
+    assert!(
+        node.sessions.is_empty() && node.lookup.pending_lookups.is_empty(),
+        "precondition: no held destination may have a session or a pending lookup"
+    );
+
+    node.native_expire();
+    assert!(
+        node.pending_native.is_empty(),
+        "the tick must release datagrams that no session or lookup can ever send, \
+         but {} destinations are still held",
+        node.pending_native.len()
+    );
+
+    let next = send_unknown(&mut node).await;
+    assert!(
+        node.pending_native.contains_key(&next),
+        "a new destination must be queued once the stranded ones are released"
+    );
+}
+
+#[tokio::test]
+async fn native_datagrams_held_while_a_lookup_is_pending_are_kept_and_released_after_the_lookup_times_out()
+ {
+    let mut node = make_node();
+    let dest = crate::Identity::generate();
+    let dest_addr = *dest.node_addr();
+
+    // A lookup in flight, as a successful `maybe_initiate_lookup` at t=0
+    // leaves it; the send below is then deduplicated against it.
+    node.lookup
+        .pending_lookups
+        .insert(dest_addr, crate::proto::lookup::PendingLookup::new(0));
+    let flow = FlowKey {
+        peer: dest_addr,
+        remote: NATIVE_PORT,
+        local: 7001,
+    };
+    node.handle_native_outbound(flow, dest.pubkey(), b"held".to_vec())
+        .await;
+    assert!(
+        node.pending_native.contains_key(&dest_addr),
+        "precondition: the send must be held"
+    );
+
+    node.native_expire();
+    assert!(
+        node.pending_native.contains_key(&dest_addr),
+        "a datagram must stay held while its destination's lookup is pending"
+    );
+
+    // Step the whole retry ladder: one poll just past each attempt's deadline.
+    // A single late poll is only the first retry, since an entry is removed
+    // only once it is on its last attempt.
+    let ladder = node.config().node.lookup.attempt_timeouts_secs.clone();
+    let mut now_ms = 100;
+    for secs in ladder {
+        now_ms += secs * 1000;
+        node.check_pending_lookups(now_ms).await;
+    }
+    assert!(
+        !node.lookup.pending_lookups.contains_key(&dest_addr),
+        "precondition: the lookup must have timed out after its last attempt"
+    );
+
+    node.native_expire();
+    assert!(
+        !node.pending_native.contains_key(&dest_addr),
+        "the tick must release a datagram whose destination's lookup timed out"
+    );
+}
+
+#[tokio::test]
+async fn native_datagrams_held_for_an_initiating_session_are_kept_and_released_after_the_handshake_times_out()
+ {
+    let edges = vec![(0, 1)];
+    let mut nodes = run_tree_test(2, &edges, false).await;
+    let node1_addr = *nodes[1].node.node_addr();
+    let node1_xonly = nodes[1].node.identity().pubkey();
+
+    // No packets are processed after this send, so the handshake never
+    // completes.
+    let flow = FlowKey {
+        peer: node1_addr,
+        remote: NATIVE_PORT,
+        local: 7001,
+    };
+    nodes[0]
+        .node
+        .handle_native_outbound(flow, node1_xonly, b"held".to_vec())
+        .await;
+    let last_activity = {
+        let entry = nodes[0]
+            .node
+            .get_session(&node1_addr)
+            .expect("precondition: the send must create a session entry");
+        assert!(
+            entry.is_initiating(),
+            "precondition: the session must be initiating"
+        );
+        entry.last_activity()
+    };
+    assert!(
+        nodes[0].node.pending_native.contains_key(&node1_addr),
+        "precondition: the send must be held"
+    );
+
+    nodes[0].node.native_expire();
+    assert!(
+        nodes[0].node.pending_native.contains_key(&node1_addr),
+        "a datagram must stay held while its destination's session is initiating"
+    );
+
+    let rate_limit = &nodes[0].node.config().node.rate_limit;
+    let timeout_ms = rate_limit.handshake_timeout_secs * 1000;
+    nodes[0]
+        .node
+        .resend_pending_session_handshakes(last_activity + timeout_ms + 1_000)
+        .await;
+    assert!(
+        nodes[0].node.get_session(&node1_addr).is_none(),
+        "precondition: the handshake timeout must remove the session entry"
+    );
+
+    nodes[0].node.native_expire();
+    assert!(
+        !nodes[0].node.pending_native.contains_key(&node1_addr),
+        "the tick must release a datagram whose destination's handshake timed out"
+    );
+
+    cleanup_nodes(&mut nodes).await;
+}
+
+/// Bind a native listener on the node's `NATIVE_PORT` and return its arrivals.
+fn listen_native(node: &mut Node) -> mpsc::Receiver<crate::native::registry::Arrival> {
+    let (arrivals_tx, arrivals) = mpsc::channel(8);
+    let (reply_tx, mut reply_rx) = oneshot::channel();
+    node.handle_native(NativeMessage::Listen {
+        port: Some(NATIVE_PORT),
+        arrivals: arrivals_tx,
+        reply: reply_tx,
+    });
+    assert_eq!(
+        reply_rx
+            .try_recv()
+            .expect("Listen must answer synchronously"),
+        Ok(NATIVE_PORT),
+        "the node must hold the listener port"
+    );
+    arrivals
+}
+
+#[tokio::test]
+async fn native_datagrams_held_for_the_limit_of_unreachable_destinations_no_longer_block_delivery_to_a_reachable_one()
+ {
+    // Topology: node0 — node1 — node2.
+    let edges = vec![(0, 1), (1, 2)];
+    let mut nodes = run_tree_test(3, &edges, false).await;
+    let node2_addr = *nodes[2].node.node_addr();
+    let node2_xonly = nodes[2].node.identity().pubkey();
+    let mut arrivals = listen_native(&mut nodes[2].node);
+
+    let cap = nodes[0].node.config().node.session.pending_max_destinations;
+    for _ in 0..cap {
+        send_unknown(&mut nodes[0].node).await;
+    }
+    assert_eq!(
+        nodes[0].node.pending_native.len(),
+        cap,
+        "precondition: node 0's native queue must hold the destination limit"
+    );
+
+    // Not asserted: a bloom false positive can leave a generated destination
+    // with a pending lookup, which rightly keeps it held.
+    nodes[0].node.native_expire();
+    let remaining = nodes[0].node.pending_native.len();
+
+    let flow = FlowKey {
+        peer: node2_addr,
+        remote: NATIVE_PORT,
+        local: 7001,
+    };
+    nodes[0]
+        .node
+        .handle_native_outbound(flow, node2_xonly, b"reachable".to_vec())
+        .await;
+
+    // Bounded drive: never await `recv()`, which would hang rather than fail.
+    let mut arrival = None;
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        process_available_packets(&mut nodes).await;
+        if let Ok(seen) = arrivals.try_recv() {
+            arrival = Some(seen);
+            break;
+        }
+    }
+
+    assert!(
+        arrival.is_some(),
+        "the first datagram to a reachable destination must be delivered after \
+         {cap} unreachable destinations were held; {remaining} were still \
+         held after the tick"
+    );
+
+    cleanup_nodes(&mut nodes).await;
+}
+
+#[tokio::test]
+async fn a_native_first_send_through_discovery_is_still_delivered_when_the_tick_purge_runs_between_packets()
+ {
+    // Topology: node0 — node1 — node2. Node 0 must discover node 2, so the
+    // datagram is held first under a pending lookup and then under an
+    // initiating session, and the tick runs through both.
+    let edges = vec![(0, 1), (1, 2)];
+    let mut nodes = run_tree_test(3, &edges, false).await;
+    let node2_addr = *nodes[2].node.node_addr();
+    let node2_xonly = nodes[2].node.identity().pubkey();
+    let mut arrivals = listen_native(&mut nodes[2].node);
+
+    let flow = FlowKey {
+        peer: node2_addr,
+        remote: NATIVE_PORT,
+        local: 7001,
+    };
+    nodes[0]
+        .node
+        .handle_native_outbound(flow, node2_xonly, b"first".to_vec())
+        .await;
+
+    let mut arrival = None;
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        nodes[0].node.native_expire();
+        process_available_packets(&mut nodes).await;
+        if let Ok(seen) = arrivals.try_recv() {
+            arrival = Some(seen);
+            break;
+        }
+    }
+
+    assert!(
+        arrival.is_some(),
+        "the held datagram must survive the tick while its lookup and handshake \
+         are in progress, and be delivered"
+    );
+    assert_eq!(
+        nodes[0].node.metrics().native.sent_datagrams.get(),
+        1,
+        "node 0 must send the held native datagram exactly once"
+    );
+
+    cleanup_nodes(&mut nodes).await;
+}

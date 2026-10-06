@@ -429,7 +429,7 @@ fn dns_cleanup_in_postrm_remove_and_purge_and_uninstall_removes_every_file_fips_
     .collect();
     let commands = [
         "restart systemd-resolved",
-        "reload dnsmasq",
+        "try-restart dnsmasq",
         "nmcli general reload",
     ];
 

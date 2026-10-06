@@ -345,6 +345,47 @@ check_gateway_default_listener() {
     fi
 }
 
+# Print systemd-resolved's unit status and the tail of its journal, for a
+# failure report. The status is printed without its own journal lines so that
+# its Active line, which carries the unit's Result, is not cut off.
+show_resolved() {
+    local name="$1"
+    echo "  --- systemd-resolved status ---"
+    cexec "$name" systemctl status --no-pager --lines=0 systemd-resolved 2>&1
+    echo "  --- systemd-resolved journal ---"
+    cexec "$name" journalctl -u systemd-resolved --no-pager -n 20 2>&1
+    return 0
+}
+
+# Restart systemd-resolved and wait for it to be active. Returns 1, having
+# recorded a failure with <label> in front, if it does not come back.
+#
+# The restart lands seconds after several others: fips-dns-teardown and
+# fips-dns-setup each restart resolved when the gateway block restarts the
+# daemon, the teardown does again when the remove check stops fips-dns, and
+# postrm does on the remove. By default systemd refuses a sixth start within one
+# 10 s start-limit window (StartLimitBurst=5). The window is fixed, not sliding:
+# it opens at the first start after the previous window has expired, so whether
+# this restart is refused depends on where the window opened, not only on how
+# fast the run is. A refusal left resolved failed and the `resolvectl status`
+# after it waiting 25 s on D-Bus activation. Clearing the unit's failed state
+# and start counter first makes this restart independent of the ones before it.
+restart_resolved() {
+    local name="$1" label="$2" out
+    cexec "$name" systemctl reset-failed systemd-resolved >/dev/null 2>&1
+    if ! out=$(cexec "$name" systemctl restart systemd-resolved 2>&1); then
+        fail "$label: restarting systemd-resolved failed before the $label: $out"
+        show_resolved "$name"
+        return 1
+    fi
+    if ! wait_for_service_active "$name" systemd-resolved; then
+        fail "$label: systemd-resolved not active ${SERVICE_TIMEOUT}s after its restart before the $label"
+        show_resolved "$name"
+        return 1
+    fi
+    return 0
+}
+
 # Put the saved DNS routing file back at <file> and restart systemd-resolved,
 # then check the state in which removal leaves the file behind: the file in
 # place, fips-dns.service not active, and the resolver routing .fips to
@@ -355,7 +396,6 @@ plant_routing() {
     local name="$1" file="$2" label="$3"
     cexec "$name" mkdir -p "$(dirname "$file")"
     cexec "$name" cp /root/fips-dns.saved "$file"
-    cexec "$name" systemctl restart systemd-resolved >/dev/null 2>&1
 
     local ok=1 status
     if ! cexec "$name" sh -c "test -s '$file' && cmp -s '$file' /root/fips-dns.saved"; then
@@ -366,6 +406,9 @@ plant_routing() {
         fail "$label: fips-dns.service still active before the $label"
         ok=0
     fi
+    # A resolver that did not come back would only time out the resolvectl
+    # check, so that check is not run on top of the failure already recorded.
+    restart_resolved "$name" "$label" || return 1
     # Captured rather than piped into grep -q: under pipefail, grep closing the
     # pipe early can fail the pipeline on a match.
     if ! status=$(cexec "$name" resolvectl status 2>&1); then

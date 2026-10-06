@@ -193,9 +193,12 @@ EOF
         log "NOTE:     conf-dir=${DNSMASQ_DROPIN_DIR}/,*.conf"
     fi
 
-    service dnsmasq reload >/dev/null 2>&1 \
-        || service dnsmasq onerestart >/dev/null 2>&1 \
-        || log "WARNING: dnsmasq reload failed (config written, may need manual restart)"
+    # The rc script's reload is a SIGHUP, which does not make dnsmasq
+    # re-read its configuration, so only a restart loads the drop-in.
+    # onerestart, because a dnsmasq running without dnsmasq_enable is
+    # accepted above and plain restart refuses it.
+    service dnsmasq onerestart >/dev/null 2>&1 \
+        || log "WARNING: dnsmasq restart failed (config written, may need manual restart)"
     save_backend "dnsmasq"
     warn_if_not_system_resolver
     return 0

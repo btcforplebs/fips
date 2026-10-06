@@ -189,27 +189,17 @@ fi
 # directory of its own, created fresh for this run, so a name left by an
 # earlier run cannot be read.
 #
-# The directory lives inside the output directory, not under /tmp, and that
-# placement is the whole point rather than a detail. A bind-mount source is
-# resolved by the Docker daemon in the host's mount namespace. Where this
-# script runs with a private /tmp -- systemd's PrivateTmp=, which the CI
-# worker on the builder sets -- a path from a bare `mktemp -d` exists only in
-# this process's namespace: the daemon finds nothing at it, creates its own
-# directory at the same path in the host's /tmp, and the container writes the
-# name there while this script reads an empty directory and reports that the
-# build named nothing. The output directory is already bind-mounted as /out
-# and so already resolves the same way in both namespaces, which makes it the
-# one place the name can travel through unconditionally. testing/native-api's
-# shared_tmpdir() exists for the same reason and says the same thing.
+# The directory lives inside the output directory, not under /tmp, because a
+# bind-mount source must resolve the same way for the Docker daemon as for this
+# script, and under a private /tmp a bare `mktemp -d` path does not (see
+# shared_tmpdir in testing/lib/image-build.sh). The output directory is already
+# bind-mounted as /out, so it already resolves the same way in both namespaces,
+# which makes it the one place the name can travel through unconditionally.
 # The trap below clears the directory on any ordinary exit, but not on a
 # SIGKILL, and the builder's watch loop group-kills a run that overruns its
 # ceiling or is superseded by a newer tip. Nothing else sweeps the output
-# directory, so clear siblings old enough that no live run can own them. Two
-# hours is far above any build and far below the interval at which a killed
-# run's leftovers would accumulate.
-find "$DEST_ABS" -maxdepth 1 -type d -name '.name.*' -mmin +120 -exec rm -rf {} + 2>/dev/null || :
-
-NAME_DIR=$(mktemp -d "$DEST_ABS/.name.XXXXXX") || {
+# directory, so --sweep clears siblings old enough that no live run owns them.
+NAME_DIR=$(shared_tmpdir --sweep "$DEST_ABS" .name) || {
     echo "build-deb-container: could not create a name directory in $DEST_ABS" >&2
     exit 1
 }

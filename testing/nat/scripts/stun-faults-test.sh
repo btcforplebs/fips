@@ -380,11 +380,7 @@ run_test() {
         return 1
     }
 
-    # A relay that faulted while the phases still passed is a finding about
-    # the relay, not about this run, so it is reported and not made a failure.
-    if relay_verdict "$RELAY_CONTAINER"; then
-        echo "NOTE: the assertions above passed despite that." >&2
-    fi
+    assert_relay "$RELAY_CONTAINER" || return 1
 
     cleanup
     if [ ${#SKIPPED_PHASES[@]} -eq 0 ]; then
