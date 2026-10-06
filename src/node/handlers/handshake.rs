@@ -9,6 +9,7 @@ use crate::NodeAddr;
 use crate::PeerIdentity;
 use crate::node::acl::PeerAclContext;
 use crate::node::dataplane::PeerActionCtx;
+use crate::node::diag::{self, OrNone};
 use crate::node::rate_limit::Msg1Class;
 use crate::node::reject::{HandshakeReject, RejectReason};
 use crate::node::{Node, NodeError};
@@ -19,7 +20,7 @@ use crate::peer::{ActivePeer, RekeyMsg2Step};
 use crate::proto::fmp::wire::{Msg1Header, Msg2Header, Msg3Header, build_msg2, build_msg3};
 use crate::proto::fmp::{
     DialMsg2Decision, DialMsg2Reject, DialMsg2Snapshot, Disconnect, DisconnectReason,
-    EPOCH_RESTART_MIN_INTERVAL_SECS, EstablishSnapshot, InboundDecision, InboundReject,
+    EPOCH_RESTART_MIN_INTERVAL_SECS, EstablishSnapshot, InboundDecision, InboundReject, Msg1Digest,
     NegotiationPayload, OutboundSnapshot, PromotionResult, RekeyClaim, RekeyMsg2Reject,
     RekeyMsg2Snapshot, WireOutcome, cross_connection_winner, decide_fmp_negotiation,
 };
@@ -342,11 +343,15 @@ impl Node {
                             match transport.send_existing(&packet.remote_addr, &msg2).await {
                                 Ok(_) => debug!(
                                     remote_addr = %packet.remote_addr,
+                                    transport_id = %packet.transport_id,
+                                    link_id = %existing_link_id,
                                     "Resent msg2 for duplicate msg1"
                                 ),
                                 Err(e) => debug!(
                                     remote_addr = %packet.remote_addr,
                                     error = %e,
+                                    transport_id = %packet.transport_id,
+                                    link_id = %existing_link_id,
                                     "Failed to resend msg2"
                                 ),
                             }
@@ -408,6 +413,8 @@ impl Node {
             Err(e) => {
                 debug!(
                     error = %e,
+                    transport_id = %packet.transport_id,
+                    remote_addr = %packet.remote_addr,
                     "Failed to process msg1"
                 );
                 self.stats_mut()
@@ -621,6 +628,8 @@ impl Node {
             None => {
                 debug!(
                     receiver_idx = %header.receiver_idx,
+                    transport_id = %packet.transport_id,
+                    remote_addr = %packet.remote_addr,
                     "No pending outbound handshake for index"
                 );
                 self.stats_mut()
@@ -776,6 +785,7 @@ impl Node {
                                         // completed); on a send failure the rekey is
                                         // abandoned above and no teardown is warranted.
                                         if remote_epoch_changed {
+                                            peer.note_restart();
                                             if self.sessions.remove(&peer_node_addr).is_some() {
                                                 debug!(
                                                     peer = %display_name,
@@ -788,11 +798,16 @@ impl Node {
                                             );
                                         }
 
+                                        let epoch =
+                                            OrNone(peer.pending_new_session().map(diag::epoch_tag));
+                                        let kbit_ours = peer.current_k_bit();
                                         debug!(
                                             peer = %display_name,
                                             our_addr = %self.identity().node_addr(),
                                             new_our_index = %our_index,
                                             new_their_index = %header.sender_idx,
+                                            epoch = %epoch,
+                                            kbit_ours,
                                             "rekey-msg2 initiator: pending session set, awaiting K-bit cutover"
                                         );
 
@@ -1275,10 +1290,15 @@ impl Node {
             // right after the take — unconditionally, whether or not a
             // connection was carried — so none of this block's exits leave a
             // dangling machine.
-            let (taken_conn, carrier_our_index) = match self.peer_machines.get_mut(&link_id) {
-                Some(machine) => (machine.take_leg(), machine.our_index()),
-                None => (None, None),
-            };
+            let (taken_conn, carrier_our_index, sent_msg1_digest) =
+                match self.peer_machines.get_mut(&link_id) {
+                    Some(machine) => (
+                        machine.take_leg(),
+                        machine.our_index(),
+                        machine.conn_handshake_msg1().map(Msg1Digest::of),
+                    ),
+                    None => (None, None, None),
+                };
             self.remove_peer_machine(link_id);
 
             let mut conn = match taken_conn {
@@ -1314,6 +1334,7 @@ impl Node {
 
                 if let Some(peer) = self.peers.get_mut(&peer_node_addr) {
                     let suppressed = peer.replay_suppressed_count();
+                    let epoch = diag::epoch_tag(&outbound_session);
                     let old_our_index = peer.replace_session(
                         outbound_session,
                         outbound_our_index,
@@ -1346,6 +1367,11 @@ impl Node {
                         peer = %self.peer_display_name(&peer_node_addr),
                         new_our_index = %outbound_our_index,
                         new_their_index = %header.sender_idx,
+                        transport_id = %packet.transport_id,
+                        remote_addr = %packet.remote_addr,
+                        msg1_sidx = %outbound_our_index,
+                        msg1_dg = %OrNone(sent_msg1_digest.as_ref().map(diag::msg1_tag)),
+                        epoch = %epoch,
                         "Cross-connection: swapped to outbound session (our outbound wins)"
                     );
 
@@ -1370,6 +1396,9 @@ impl Node {
                     debug!(
                         peer = %self.peer_display_name(&peer_node_addr),
                         kept_their_index = ?peer.their_index(),
+                        transport_id = %packet.transport_id,
+                        remote_addr = %packet.remote_addr,
+                        epoch = %OrNone(peer.noise_session().map(diag::epoch_tag)),
                         "Cross-connection: keeping inbound session and original their_index (peer outbound wins)"
                     );
                 }
@@ -1413,7 +1442,7 @@ impl Node {
             if let Err(e) = self.send_tree_announce_to_peer(&peer_node_addr).await {
                 debug!(peer = %self.peer_display_name(&peer_node_addr), error = %e, "Failed to send TreeAnnounce after cross-connection resolution");
             }
-            // Schedule filter announce (sent on next tick via debounce)
+            // Schedule filter announce (sent on a tick once the peer has sent a frame)
             self.bloom_state.mark_update_needed(peer_node_addr);
             self.reset_lookup_backoff();
             return;
@@ -2055,6 +2084,10 @@ impl Node {
         let peer_profile = machine
             .conn_peer_profile()
             .unwrap_or(crate::proto::fmp::NodeProfile::Full);
+        let direction = machine.conn_direction();
+        // The msg1 this link was set up by: the one this node sent, or the
+        // one it answered. Both are kept on the carrier.
+        let msg1_digest = machine.conn_handshake_msg1().map(Msg1Digest::of);
 
         // Verify handshake is complete and extract session
         if connection.noise_session.is_none() {
@@ -2279,6 +2312,11 @@ impl Node {
 
             self.seed_path_mtu_for_link_peer(&peer_node_addr, transport_id, &current_addr);
 
+            let remote_addr = current_addr.clone();
+            let epoch = diag::epoch_tag(&noise_session);
+            // The msg1's sender index is the initiator's, so both ends log
+            // the same one.
+            let msg1_sidx = if is_outbound { our_index } else { their_index };
             let mut new_peer = ActivePeer::with_session(
                 verified_identity,
                 link_id,
@@ -2325,6 +2363,12 @@ impl Node {
                 link_id = %link_id,
                 our_index = %our_index,
                 their_index = %their_index,
+                transport_id = %transport_id,
+                remote_addr = %remote_addr,
+                direction = %direction,
+                msg1_sidx = %msg1_sidx,
+                msg1_dg = %OrNone(msg1_digest.as_ref().map(diag::msg1_tag)),
+                epoch = %epoch,
                 "Connection promoted to active peer"
             );
 

@@ -39,10 +39,6 @@ pub mod transport;
 pub mod utils;
 pub mod version;
 
-// `upper` is the former name of `ipv6tun`; the alias keeps `crate::upper::`
-// and `fips::upper::` paths resolving.
-pub use ipv6tun as upper;
-
 // Re-export identity types
 pub use identity::{
     AuthChallenge, AuthResponse, FipsAddress, Identity, IdentityError, NodeAddr, PeerIdentity,
@@ -51,7 +47,7 @@ pub use identity::{
 
 // Re-export config types
 pub use config::{Config, ConfigError, IdentityConfig, NymConfig, TorConfig, UdpConfig};
-pub use upper::config::{DnsConfig, TunConfig};
+pub use ipv6tun::config::{DnsConfig, TunConfig};
 
 // Re-export nostr rendezvous handoff types
 pub use nostr::{BootstrapHandoffResult, EstablishedTraversal, is_punch_packet};
@@ -89,6 +85,11 @@ pub use proto::bloom::FilterAnnounce;
 
 // Re-export discovery wire types (relocated from protocol:: to proto::lookup)
 pub use proto::lookup::{LookupRequest, LookupResponse};
+
+// Re-export the encapsulation overhead and path-MTU floors, which `proto` keeps
+// crate-private
+pub use proto::framing::FIPS_OVERHEAD;
+pub use proto::mmp::{MIN_ACTIONABLE_PATH_MTU, MIN_REACTIVE_PATH_MTU};
 
 // Re-export routing wire types (relocated from protocol:: to proto::routing)
 pub use proto::routing::{

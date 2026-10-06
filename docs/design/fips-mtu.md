@@ -198,7 +198,7 @@ consumers:
 - **TCP-clamp mirror** (`path_mtu_lookup`, a
   `HashMap<FipsAddress, u16>` on the Node). Read by the
   TUN-side TCP MSS clamp (`per_flow_max_mss` in
-  `src/upper/tun.rs`) at first-SYN time so outbound TCP flows
+  `src/ipv6tun/tun.rs`) at first-SYN time so outbound TCP flows
   are clamped to the per-destination MTU rather than a generic
   ceiling. Written from four sites, all using tighter-only
   semantics — the clamp is never loosened:

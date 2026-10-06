@@ -62,12 +62,6 @@ const ICMPV6_HEADER_LEN: usize = 8;
 /// Maximum original packet bytes to include in ICMPv6 error.
 const MAX_ORIGINAL_PACKET: usize = MIN_IPV6_MTU - IPV6_HEADER_LEN - ICMPV6_HEADER_LEN;
 
-/// FIPS base encapsulation overhead for DataPacket (excluding port payload).
-///
-/// Re-exported: the value is FMP plus FSP framing and is defined with the
-/// protocol layers, in [`crate::proto::framing::FIPS_OVERHEAD`].
-pub use crate::proto::framing::FIPS_OVERHEAD;
-
 /// FIPS encapsulation overhead for compressed IPv6 shim traffic (port 256).
 ///
 /// With port multiplexing (4 bytes) and IPv6 header compression (format byte +
@@ -80,23 +74,6 @@ pub use crate::proto::framing::FIPS_OVERHEAD;
 ///           = ipv6_len + 77
 /// ```
 pub const FIPS_IPV6_OVERHEAD: u16 = 77;
-
-/// Smallest remote-supplied transport path MTU this node will act on.
-///
-/// Re-exported: the value is a protocol policy decision and is defined beside
-/// the path-MTU state machine that owns it, in
-/// [`crate::proto::mmp::MIN_ACTIONABLE_PATH_MTU`]. It is named from here
-/// because every site that applies it — the MSS clamp, the lookup response and
-/// the `MtuExceeded` signal — reaches it through this module.
-pub use crate::proto::mmp::MIN_ACTIONABLE_PATH_MTU;
-
-/// Smallest path MTU this node will act on when the claim arrives on the
-/// unauthenticated reactive carrier, `MtuExceeded`.
-///
-/// Re-exported: a protocol policy decision defined beside
-/// [`crate::proto::mmp::MIN_ACTIONABLE_PATH_MTU`], in
-/// [`crate::proto::mmp::MIN_REACTIVE_PATH_MTU`].
-pub use crate::proto::mmp::MIN_REACTIVE_PATH_MTU;
 
 /// Calculate the effective IPv6 MTU for FIPS-encapsulated traffic.
 ///

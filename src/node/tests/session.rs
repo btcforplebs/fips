@@ -1447,20 +1447,20 @@ async fn pump_until_quiet(nodes: &mut [TestNode]) {
 /// A two-node pair with an FSP session over an FMP link whose link sessions
 /// have been aged, with a TUN receiver on each node. Built by
 /// [`aged_link_pair`].
-struct AgedLinkPair {
-    nodes: Vec<TestNode>,
-    node0_addr: NodeAddr,
-    node1_addr: NodeAddr,
-    fips0: crate::FipsAddress,
-    fips1: crate::FipsAddress,
-    tun0_rx: std::sync::mpsc::Receiver<Vec<u8>>,
-    tun1_rx: std::sync::mpsc::Receiver<Vec<u8>>,
+pub(super) struct AgedLinkPair {
+    pub(super) nodes: Vec<TestNode>,
+    pub(super) node0_addr: NodeAddr,
+    pub(super) node1_addr: NodeAddr,
+    pub(super) fips0: crate::FipsAddress,
+    pub(super) fips1: crate::FipsAddress,
+    pub(super) tun0_rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    pub(super) tun1_rx: std::sync::mpsc::Receiver<Vec<u8>>,
 }
 
 /// Build a two-node pair from `cfg0` and `cfg1`, peer node 0 to node 1 over
 /// FMP, open an FSP session from node 0, show that both directions decode,
 /// then backdate both link sessions by `age`.
-async fn aged_link_pair(
+pub(super) async fn aged_link_pair(
     cfg0: crate::config::Config,
     cfg1: crate::config::Config,
     age: Duration,
@@ -2845,7 +2845,7 @@ async fn test_tun_outbound_path_mtu_generates_ptb() {
     nodes[0].node.install_tun(tun_tx);
 
     // Build an IPv6 packet that fits local MTU but exceeds path MTU
-    let reduced_ipv6_mtu = crate::upper::icmp::effective_ipv6_mtu(reduced_mtu) as usize;
+    let reduced_ipv6_mtu = crate::ipv6tun::icmp::effective_ipv6_mtu(reduced_mtu) as usize;
     let local_ipv6_mtu = nodes[0].node.effective_ipv6_mtu() as usize;
     let oversized_payload = vec![0u8; reduced_ipv6_mtu - 39]; // 40-byte hdr + payload > reduced MTU
     let ipv6_packet = build_ipv6_packet(&src_fips, &dst_fips, &oversized_payload);
@@ -2991,7 +2991,7 @@ async fn test_multihop_pmtud_heterogeneous_mtu() {
     let oversized_payload = vec![0xABu8; 750 - 40]; // 710 bytes payload → 750-byte IPv6 packet
     let ipv6_packet = build_ipv6_packet(&src_fips, &dst_fips, &oversized_payload);
     assert_eq!(ipv6_packet.len(), 750);
-    let local_effective_mtu = crate::upper::icmp::effective_ipv6_mtu(1400) as usize;
+    let local_effective_mtu = crate::ipv6tun::icmp::effective_ipv6_mtu(1400) as usize;
     assert!(
         ipv6_packet.len() <= local_effective_mtu,
         "packet ({}) must fit A's local MTU ({})",
@@ -3073,7 +3073,7 @@ async fn test_multihop_pmtud_heterogeneous_mtu() {
 
     // Verify reported MTU is the path MTU (not local MTU)
     let reported_mtu = u32::from_be_bytes([ptb[44], ptb[45], ptb[46], ptb[47]]);
-    let expected_ipv6_mtu = crate::upper::icmp::effective_ipv6_mtu(path_mtu) as u32;
+    let expected_ipv6_mtu = crate::ipv6tun::icmp::effective_ipv6_mtu(path_mtu) as u32;
     assert_eq!(
         reported_mtu, expected_ipv6_mtu,
         "ICMPv6 PTB MTU should match path IPv6 MTU (transport MTU {} - overhead)",
@@ -3312,7 +3312,7 @@ async fn test_sub_floor_mtu_exceeded_is_counted_separately_from_all_mtu_exceeded
     let inner = build_mtu_exceeded_inner(
         &dest,
         &reporter,
-        crate::upper::icmp::MIN_ACTIONABLE_PATH_MTU - 1,
+        crate::proto::mmp::MIN_ACTIONABLE_PATH_MTU - 1,
     );
     tn.node.handle_mtu_exceeded(&reporter, &inner).await;
 
@@ -3352,7 +3352,7 @@ async fn test_handle_mtu_exceeded_at_the_floor_still_writes_path_mtu_lookup() {
     let dest = *remote.node_addr();
     let reporter = NodeAddr::from_bytes([0xBB; 16]);
     let dest_fips = crate::FipsAddress::from_node_addr(&dest);
-    let floor = crate::upper::icmp::MIN_REACTIVE_PATH_MTU;
+    let floor = crate::proto::mmp::MIN_REACTIVE_PATH_MTU;
 
     note_sent_wire_len(&mut tn.node, &dest, 1400);
     let inner = build_mtu_exceeded_inner(&dest, &reporter, floor);
@@ -4270,7 +4270,7 @@ fn test_sub_floor_path_mtu_notification_is_ignored_and_counted() {
         "counter starts at zero on a fresh node"
     );
 
-    let body = build_path_mtu_notification_body(crate::upper::icmp::MIN_ACTIONABLE_PATH_MTU - 1);
+    let body = build_path_mtu_notification_body(crate::proto::mmp::MIN_ACTIONABLE_PATH_MTU - 1);
     node.handle_session_path_mtu_notification(&remote_addr, &body);
 
     assert_eq!(
@@ -8877,7 +8877,7 @@ async fn a_reactive_mtu_exceeded_at_the_floor_no_longer_pins_a_session_this_node
         .map(|m| m.path_mtu.current_mtu());
 
     let inner =
-        build_mtu_exceeded_inner(&dest, &reporter, crate::upper::icmp::MIN_REACTIVE_PATH_MTU);
+        build_mtu_exceeded_inner(&dest, &reporter, crate::proto::mmp::MIN_REACTIVE_PATH_MTU);
     node.handle_mtu_exceeded(&reporter, &inner).await;
 
     assert_eq!(
@@ -9003,7 +9003,7 @@ async fn a_corroborated_report_below_the_reactive_floor_is_still_refused() {
     let inner = build_mtu_exceeded_inner(
         &dest,
         &reporter,
-        crate::upper::icmp::MIN_REACTIVE_PATH_MTU - 1,
+        crate::proto::mmp::MIN_REACTIVE_PATH_MTU - 1,
     );
     node.handle_mtu_exceeded(&reporter, &inner).await;
 
@@ -9023,7 +9023,7 @@ async fn the_authenticated_path_mtu_notification_still_applies_at_the_actionable
     install_established_session_with_mmp(&mut node, &remote);
     let dest = *remote.node_addr();
 
-    let floor = crate::upper::icmp::MIN_ACTIONABLE_PATH_MTU;
+    let floor = crate::proto::mmp::MIN_ACTIONABLE_PATH_MTU;
     let body = build_path_mtu_notification_body(floor);
     node.handle_session_path_mtu_notification(&dest, &body);
 

@@ -64,7 +64,7 @@
 
 use std::sync::Arc;
 
-use crate::upper::hosts::{HostMap, file_mtime};
+use crate::hosts::{HostMap, file_mtime};
 
 /// A resource backed by a lock-free [`arc_swap::ArcSwap`] snapshot that can be
 /// re-read from its source on demand.

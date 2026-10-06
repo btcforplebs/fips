@@ -25,9 +25,9 @@ mod node;
 mod peer;
 mod transport;
 
+use crate::ipv6tun::config::{DnsConfig, TunConfig};
 use crate::node::REKEY_JITTER_SECS;
 use crate::nostr::FRESHNESS_SKEW_TOLERANCE_MS;
-use crate::upper::config::{DnsConfig, TunConfig};
 use crate::{Identity, IdentityError};
 use serde::de::{
     Deserializer, EnumAccess, IgnoredAny, MapAccess, SeqAccess, VariantAccess, Visitor,

@@ -16,6 +16,14 @@ use tracing_subscriber::fmt::writer::BoxMakeWriter;
 use tracing_subscriber::{EnvFilter, fmt};
 use zeroize::Zeroize;
 
+#[cfg(unix)]
+#[path = "fips/shutdown.rs"]
+mod shutdown;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "fips/signal_tests.rs"]
+mod signal_tests;
+
 /// FIPS mesh network daemon
 #[derive(Parser, Debug)]
 #[command(
@@ -328,7 +336,44 @@ async fn run_daemon(
     info!("     state: {}", node.state());
     info!(" leaf_only: {}", node.is_leaf_only());
 
-    // Start the node (initializes TUN, spawns I/O threads)
+    // Start the node (initializes TUN, spawns I/O threads). On unix a stop
+    // that arrives meanwhile lets start-up finish, within a grace, and is then
+    // acted on by the rx loop below.
+    #[cfg(unix)]
+    let shutdown_signal = {
+        let mut signal = Box::pin(shutdown_signal);
+        let start = std::pin::pin!(node.start());
+        let signalled = match shutdown::start_within_grace(
+            start,
+            signal.as_mut(),
+            shutdown::STARTUP_STOP_GRACE,
+        )
+        .await
+        {
+            shutdown::StartOutcome::Started { signalled } => signalled,
+            shutdown::StartOutcome::Failed(e) => {
+                error!("Failed to start node: {}", e);
+                std::process::exit(1);
+            }
+            shutdown::StartOutcome::GraceElapsed => {
+                // Exit with start-up still in progress: a half-run start
+                // cannot be torn down in an orderly way, and the kernel
+                // reclaims the TUN device and sockets.
+                tracing::warn!(
+                    grace_secs = shutdown::STARTUP_STOP_GRACE.as_secs(),
+                    "Start-up did not finish within the stop grace; exiting without a drain"
+                );
+                std::process::exit(0);
+            }
+        };
+        // A shutdown future that has completed must not be polled again.
+        async move {
+            if !signalled {
+                signal.await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
     if let Err(e) = node.start().await {
         error!("Failed to start node: {}", e);
         std::process::exit(1);
@@ -358,21 +403,18 @@ async fn run_daemon(
 }
 
 /// Build a shutdown future for foreground mode (Ctrl+C / SIGTERM).
+///
+/// On unix both signals are registered by this call rather than on first
+/// poll, so a stop sent before the future is polled is not lost.
+#[cfg(unix)]
+fn foreground_shutdown_signal() -> impl std::future::Future<Output = ()> {
+    shutdown::foreground_signal()
+}
+
+/// Build a shutdown future for foreground mode (Ctrl+C).
+#[cfg(not(unix))]
 async fn foreground_shutdown_signal() {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-        let mut sigterm =
-            signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {},
-            _ = sigterm.recv() => {},
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
-    }
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 // ============================================================================
@@ -382,8 +424,11 @@ async fn foreground_shutdown_signal() {
 #[cfg(not(windows))]
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    // First, so that a stop sent at any point during start-up is held for
+    // the daemon instead of taking the default action.
+    let shutdown = foreground_shutdown_signal();
     let args = Args::parse();
-    run_daemon(args.config, args.log_file, foreground_shutdown_signal()).await;
+    run_daemon(args.config, args.log_file, shutdown).await;
 }
 
 // ============================================================================

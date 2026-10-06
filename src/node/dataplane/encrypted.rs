@@ -1,13 +1,16 @@
 //! Encrypted frame handling (hot path).
 
 use crate::node::Node;
+use crate::node::diag::{self, KeyView, OrNone, Trial};
 use crate::noise::NoiseError;
 use crate::proto::fmp::wire::{EncryptedHeader, FLAG_CE, FLAG_KEY_EPOCH, strip_inner_header};
 use crate::proto::link::LinkMessageType;
-use crate::transport::ReceivedPacket;
+use crate::transport::{ReceivedPacket, TransportAddr, TransportId};
+use std::time::Instant;
 use tracing::{debug, trace, warn};
 
-/// Force-remove a peer after this many consecutive decryption failures.
+/// Consecutive decryption failures at which a peer's warning is logged. The
+/// peer is kept; a broken session ends at the link-dead timeout.
 const DECRYPT_FAILURE_THRESHOLD: u32 = 20;
 
 /// Which of a peer's link sessions authenticated an inbound frame.
@@ -36,10 +39,11 @@ impl Node {
     /// This is the hot path for established sessions. We use O(1)
     /// index-based lookup to find the session, then decrypt.
     ///
-    /// K-bit handling: when the peer flips the K-bit after a rekey,
-    /// we promote the pending new session to current and demote the old
-    /// session to previous for a drain window. During drain, we try the
-    /// current session first, then fall back to the previous session.
+    /// Rekey cutover: when a frame that names the pending new session's
+    /// index, or carries a flipped K-bit, authenticates against that
+    /// session, we promote it to current, take the frame's K-bit, and demote
+    /// the old session to previous for a drain window. During drain, we try
+    /// the current session first, then fall back to the previous session.
     pub(in crate::node) async fn handle_encrypted_frame(&mut self, packet: ReceivedPacket) {
         // Parse header (fail fast)
         let header = match EncryptedHeader::parse(&packet.data) {
@@ -52,11 +56,19 @@ impl Node {
         let node_addr = match self.peers_by_index.get(&key) {
             Some(id) => *id,
             None => {
-                trace!(
-                    receiver_idx = %header.receiver_idx,
-                    transport_id = %packet.transport_id,
-                    "Unknown session index, dropping"
-                );
+                // The sender's address is not authenticated, so the line is
+                // limited by one node-wide budget rather than per source.
+                if tracing::enabled!(tracing::Level::DEBUG)
+                    && let Some(suppressed) = self.index_budget.admit(Instant::now())
+                {
+                    debug!(
+                        receiver_idx = %header.receiver_idx,
+                        transport_id = %packet.transport_id,
+                        remote_addr = %packet.remote_addr,
+                        suppressed,
+                        "Unknown session index, dropping"
+                    );
+                }
                 return;
             }
         };
@@ -69,9 +81,18 @@ impl Node {
         // Extract K-bit from flags
         let received_k_bit = header.flags & FLAG_KEY_EPOCH != 0;
 
-        // K-bit flip detection: peer has cut over to the new session.
+        // Pending-session trial: the peer may have cut over to the new
+        // session.
         //
-        // The header K-bit is NOT a sufficient gating event on its own.
+        // A frame naming the pending session's receiver index was sealed for
+        // that session, so it is always tried there. The K-bit alone is not
+        // enough to select the trial: the two ends' bits can fall out of
+        // step (a peer restart revealed by our rekey, or a second-path dial
+        // the peer completes as a cross-connection swap), and then the
+        // peer's frames on the new session carry a K-bit equal to ours. A
+        // frame with a flipped K-bit is still tried too, as before.
+        //
+        // Neither signal is a reason to promote; only the trial is.
         // Under jitter the FMP rekey interval shrinks and the two
         // directions' rekeys interleave, so a node can hold a `pending`
         // session from rekey N while the peer's observed K-bit flip
@@ -83,14 +104,22 @@ impl Node {
         // mirrors the FSP fix (node/session.rs): the authenticated decrypt,
         // not the header bit, is the cutover signal. Trial-decrypt the
         // frame against `pending` first; only promote if it authenticates.
-        {
+        let trial = {
             let Some(peer) = self.peers.get(&node_addr) else {
                 return;
             };
-            let k_bit_flipped =
-                received_k_bit != peer.current_k_bit() && peer.pending_new_session().is_some();
+            let pending = peer.pending_new_session().is_some();
+            let kbit_differs = received_k_bit != peer.current_k_bit();
+            let try_pending =
+                pending && (kbit_differs || peer.pending_our_index() == Some(header.receiver_idx));
+            // Test-only: model a peer that tries the pending session only on
+            // a flipped K-bit.
+            #[cfg(test)]
+            let try_pending = try_pending && (!peer.old_gate() || kbit_differs);
+            // Carried to a failure line: the gate's own decision.
+            let trial = Trial::of(pending, try_pending, kbit_differs);
 
-            if k_bit_flipped {
+            if try_pending {
                 let ciphertext = &packet.data[header.ciphertext_offset()..];
                 let display_name = self.peer_display_name(&node_addr);
                 let our_addr = *self.identity().node_addr();
@@ -111,14 +140,6 @@ impl Node {
                 if let Some(plaintext) = pending_plaintext {
                     let pending_our = peer.pending_our_index();
                     let pending_their = peer.pending_their_index();
-                    debug!(
-                        peer = %display_name,
-                        our_addr = %our_addr,
-                        their_addr = %node_addr,
-                        pending_our_index = ?pending_our,
-                        pending_their_index = ?pending_their,
-                        "Peer new-epoch frame authenticated, K-bit flip promoting new session"
-                    );
                     // The peer authenticated a frame on the new epoch, so it
                     // derived the new session (it received our rekey msg3).
                     // If we are the rekey initiator still retransmitting msg3,
@@ -126,9 +147,21 @@ impl Node {
                     // responder side, which never retained a msg3 payload.)
                     peer.clear_rekey_msg3_payload();
                     // The trial-decrypt already advanced the pending
-                    // session's replay window; handle_peer_kbit_flip moves
-                    // that same session object to current, so no re-decrypt.
-                    let did_flip = peer.handle_peer_kbit_flip().is_some();
+                    // session's replay window; `adopt_pending` moves that
+                    // same session object to `current`, so no re-decrypt,
+                    // and takes the K-bit from this authenticated frame.
+                    let did_flip = peer.adopt_pending(received_k_bit).is_some();
+                    debug!(
+                        peer = %display_name,
+                        our_addr = %our_addr,
+                        their_addr = %node_addr,
+                        pending_our_index = ?pending_our,
+                        pending_their_index = ?pending_their,
+                        epoch = %OrNone(peer.noise_session().map(diag::epoch_tag)),
+                        kbit_frame = received_k_bit,
+                        kbit_ours = peer.current_k_bit(),
+                        "Peer new-epoch frame authenticated, K-bit flip promoting new session"
+                    );
                     if did_flip {
                         debug_assert!(
                             peer.transport_id().is_some()
@@ -171,7 +204,8 @@ impl Node {
                 // decrypt; the genuine cutover is recognized when a frame
                 // that authenticates against `pending` arrives.
             }
-        }
+            trial
+        };
 
         // ── Decrypt-worker fast path (unix) ─────────────────────────
         // Once the session has been registered with a decrypt shard
@@ -248,13 +282,27 @@ impl Node {
                                 (p, LinkSlot::Previous)
                             }
                             Err(_) => {
-                                self.log_decrypt_failure(&node_addr, &header, &e);
+                                self.log_decrypt_failure(
+                                    &node_addr,
+                                    &header,
+                                    &e,
+                                    packet.transport_id,
+                                    &packet.remote_addr,
+                                    trial,
+                                );
                                 self.handle_decrypt_failure(&node_addr);
                                 return;
                             }
                         }
                     } else {
-                        self.log_decrypt_failure(&node_addr, &header, &e);
+                        self.log_decrypt_failure(
+                            &node_addr,
+                            &header,
+                            &e,
+                            packet.transport_id,
+                            &packet.remote_addr,
+                            trial,
+                        );
                         self.handle_decrypt_failure(&node_addr);
                         return;
                     }
@@ -311,6 +359,9 @@ impl Node {
             peer.link_stats_mut()
                 .record_recv(packet.data.len(), packet.timestamp_ms);
             peer.touch(packet.timestamp_ms);
+            if slot == LinkSlot::Previous {
+                peer.count_previous();
+            }
         }
 
         // Address rotation invalidates the per-peer connect()-ed UDP socket,
@@ -358,45 +409,60 @@ impl Node {
             .await;
     }
 
-    /// Log a decryption failure with replay suppression.
+    /// Log a decryption failure with replay suppression, with the frame's
+    /// index, where it arrived, and the peer's key state for that index.
+    /// Records the failing index on the peer for the excessive-failures
+    /// warning. A run of failures that has reached the warning's threshold
+    /// logs nothing more until a frame authenticates (`past_threshold`).
     fn log_decrypt_failure(
         &mut self,
         node_addr: &crate::NodeAddr,
         header: &EncryptedHeader,
         error: &NoiseError,
+        transport_id: TransportId,
+        remote_addr: &TransportAddr,
+        trial: Trial,
     ) {
-        if matches!(error, NoiseError::ReplayDetected(_)) {
-            if let Some(peer) = self.peers.get_mut(node_addr) {
-                let count = peer.increment_replay_suppressed();
-                if count <= 3 {
-                    debug!(
-                        peer = %self.peer_display_name(node_addr),
-                        counter = header.counter,
-                        error = %error,
-                        "Decryption failed"
-                    );
-                } else if count == 4 {
-                    debug!(
-                        peer = %self.peer_display_name(node_addr),
-                        "Suppressing further replay detection messages"
-                    );
-                }
+        let replay = matches!(error, NoiseError::ReplayDetected(_));
+        let replays = self.peers.get_mut(node_addr).map(|peer| {
+            peer.record_failed(header.receiver_idx);
+            if replay {
+                peer.increment_replay_suppressed()
             } else {
+                0
+            }
+        });
+        if !replay && self.past_threshold(node_addr) {
+            return;
+        }
+        if replay && let Some(count) = replays {
+            if count == 4 {
                 debug!(
                     peer = %self.peer_display_name(node_addr),
-                    counter = header.counter,
-                    error = %error,
-                    "Decryption failed"
+                    "Suppressing further replay detection messages"
                 );
             }
-        } else {
-            debug!(
-                peer = %self.peer_display_name(node_addr),
-                counter = header.counter,
-                error = %error,
-                "Decryption failed"
-            );
+            if count > 3 {
+                return;
+            }
         }
+        let keys = KeyView::of(self.peers.get(node_addr), Some(header.receiver_idx));
+        debug!(
+            peer = %self.peer_display_name(node_addr),
+            counter = header.counter,
+            error = %error,
+            receiver_idx = %header.receiver_idx,
+            transport_id = %transport_id,
+            remote_addr = %remote_addr,
+            kbit_frame = header.flags & FLAG_KEY_EPOCH != 0,
+            trial = %trial,
+            slot = %keys.slot,
+            kbit_ours = %keys.kbit_ours,
+            epoch = %keys.epoch,
+            prev_epoch = %keys.prev_epoch,
+            pending_epoch = %keys.pending_epoch,
+            "Decryption failed"
+        );
     }
 
     /// Canonical post-FMP-decrypt side-effect site. Used by both the
@@ -452,6 +518,9 @@ impl Node {
             peer.link_stats_mut()
                 .record_recv(packet_len, packet_timestamp_ms);
             peer.touch(packet_timestamp_ms);
+            if slot == LinkSlot::Previous {
+                peer.count_previous();
+            }
             if slot == LinkSlot::Current
                 && let Some(mmp) = peer.mmp_mut()
             {
@@ -519,10 +588,28 @@ impl Node {
         &mut self,
         report: crate::node::decrypt_worker::DecryptFailureReport,
     ) {
+        let idx = crate::utils::index::SessionIndex::new(report.receiver_idx);
+        if let Some(peer) = self.peers.get_mut(&report.source_node_addr) {
+            peer.record_failed(idx);
+        }
+        if self.past_threshold(&report.source_node_addr) {
+            self.handle_decrypt_failure(&report.source_node_addr);
+            return;
+        }
+        let keys = KeyView::of(self.peers.get(&report.source_node_addr), Some(idx));
         debug!(
             peer = %self.peer_display_name(&report.source_node_addr),
             counter = report.fmp_counter,
             replay_highest = report.fmp_replay_highest,
+            receiver_idx = %idx,
+            transport_id = %report.transport_id,
+            remote_addr = %report.remote_addr,
+            kbit_frame = report.fmp_flags & FLAG_KEY_EPOCH != 0,
+            slot = %keys.slot,
+            kbit_ours = %keys.kbit_ours,
+            epoch = %keys.epoch,
+            prev_epoch = %keys.prev_epoch,
+            pending_epoch = %keys.pending_epoch,
             "Worker FMP AEAD decryption failed"
         );
         self.handle_decrypt_failure(&report.source_node_addr);
@@ -620,23 +707,41 @@ impl Node {
         })
     }
 
-    /// Increment decrypt failure counter and force-remove peer if threshold exceeded.
+    /// Whether `node_addr`'s current run of decryption failures has already
+    /// reached the warning's threshold. A peer is kept through such a run, so
+    /// without this bound every failing frame would log a line: the per-frame
+    /// failure lines stop at the threshold, as they did when the peer was
+    /// removed there, and resume after a frame authenticates.
+    fn past_threshold(&self, node_addr: &crate::NodeAddr) -> bool {
+        self.peers
+            .get(node_addr)
+            .is_some_and(|p| p.consecutive_decrypt_failures() >= DECRYPT_FAILURE_THRESHOLD)
+    }
+
+    /// Count a decryption failure and warn once when the count reaches the
+    /// threshold. The peer is kept: a frame that does not authenticate names
+    /// its peer only by a receiver index sent in clear, so anyone who has
+    /// seen the index can cause the failures. A genuinely broken session ends
+    /// at the link-dead timeout, which only authenticated frames hold off.
     pub(in crate::node) fn handle_decrypt_failure(&mut self, node_addr: &crate::NodeAddr) {
         if let Some(peer) = self.peers.get_mut(node_addr) {
             let count = peer.increment_decrypt_failures();
-            if count >= DECRYPT_FAILURE_THRESHOLD {
+            // Only an authenticated frame resets the count, so this fires
+            // once per run of failures.
+            if count == DECRYPT_FAILURE_THRESHOLD {
+                let keys = KeyView::of(Some(peer), peer.last_failed());
+                let since_cutover_ms = OrNone(peer.since_cutover().map(|d| d.as_millis()));
                 warn!(
                     peer = %self.peer_display_name(node_addr),
                     consecutive_failures = count,
-                    "Excessive decryption failures, removing peer"
+                    slot = %keys.slot,
+                    kbit_ours = %keys.kbit_ours,
+                    epoch = %keys.epoch,
+                    prev_epoch = %keys.prev_epoch,
+                    pending_epoch = %keys.pending_epoch,
+                    since_cutover_ms = %since_cutover_ms,
+                    "Excessive decryption failures, peer kept"
                 );
-                let addr = *node_addr;
-                self.remove_active_peer(node_addr);
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0);
-                self.note_link_dead(addr, now_ms);
             }
         }
     }

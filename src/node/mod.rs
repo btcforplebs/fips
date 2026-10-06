@@ -12,6 +12,7 @@ pub(crate) mod context;
 mod dataplane;
 #[cfg(unix)]
 pub(crate) mod decrypt_worker;
+pub(crate) mod diag;
 #[cfg(unix)]
 pub(crate) mod encrypt_worker;
 mod handlers;
@@ -62,6 +63,9 @@ use self::reloadable::Reloadable;
 /// session-age clock can perturb. See CHANGELOG.
 pub(crate) const REKEY_JITTER_SECS: i64 = 15;
 use crate::cache::CoordCache;
+use crate::hosts::HostMap;
+use crate::ipv6tun::icmp_rate_limit::IcmpRateLimiter;
+use crate::ipv6tun::tun::{TunError, TunOutboundTx, TunState, TunTx};
 use crate::node::session::SessionEntry;
 use crate::peer::machine::{PeerMachine, TimerKind};
 use crate::peer::{ActivePeer, ConnectivityState};
@@ -88,9 +92,6 @@ use crate::transport::{
     Link, LinkDirection, LinkId, PacketRx, PacketTx, TransportAddr, TransportError,
     TransportHandle, TransportId,
 };
-use crate::upper::hosts::HostMap;
-use crate::upper::icmp_rate_limit::IcmpRateLimiter;
-use crate::upper::tun::{TunError, TunOutboundTx, TunState, TunTx};
 use crate::utils::index::IndexAllocator;
 use crate::{Config, ConfigError, Identity, IdentityError, NodeAddr, PeerIdentity, TreeCoordinate};
 use rand::Rng;
@@ -437,7 +438,7 @@ pub struct Node {
     /// the TUN reader/writer threads at TCP MSS clamp time so the
     /// SYN/SYN-ACK clamp can use the smaller of the local-egress floor
     /// and the learned per-destination path MTU.
-    path_mtu_lookup: crate::upper::tun::PathMtuLookup,
+    path_mtu_lookup: crate::node::path_mtu::PathMtuLookup,
     /// Node-global TCP MSS ceiling, shared live with the TUN reader and writer
     /// threads and recomputed whenever the set of *bound* transports changes.
     ///
@@ -447,7 +448,7 @@ pub struct Node {
     /// smaller. Both have to be read live — a transport that binds after start
     /// can be the narrow one, and one that unbinds can be the reason the node
     /// was clamped at all.
-    tun_mss_ceiling: crate::upper::tun::MssCeiling,
+    tun_mss_ceiling: crate::ipv6tun::tun::MssCeiling,
     /// Which transport last supplied a *link seed* into `path_mtu_lookup`,
     /// per destination.
     ///
@@ -652,6 +653,15 @@ pub struct Node {
     /// O(1) lookup: (transport_id, our_index) → NodeAddr.
     /// This maps our session index to the peer that uses it.
     peers_by_index: HashMap<(TransportId, u32), NodeAddr>,
+    /// Budget for the line logged for a frame naming an index that is not in
+    /// `peers_by_index`; its sender is not authenticated.
+    index_budget: diag::LogBudget,
+    /// Budget for the line logged for a frame with an unknown FMP version;
+    /// its sender is not authenticated.
+    version_budget: diag::LogBudget,
+    /// Budget for the line logged for an unknown link message type. One
+    /// node-wide budget rather than one per peer, so it adds no per-peer state.
+    msgtype_budget: diag::LogBudget,
     /// Pending outbound handshakes by our sender_idx.
     /// Tracks which LinkId corresponds to which session index.
     pending_outbound: HashMap<(TransportId, u32), LinkId>,
@@ -880,7 +890,7 @@ impl Node {
         let forward_min_interval_secs = config.node.lookup.forward_min_interval_secs;
 
         let base_host_map = HostMap::from_peer_configs(config.peers());
-        let hosts_path = std::path::PathBuf::from(crate::upper::hosts::DEFAULT_HOSTS_PATH);
+        let hosts_path = std::path::PathBuf::from(crate::hosts::DEFAULT_HOSTS_PATH);
         let host_map =
             reloadable::HostMapReloadable::new(base_host_map.clone(), hosts_path.clone());
         let peer_acl = acl::PeerAclReloader::with_default_paths(base_host_map, hosts_path);
@@ -952,6 +962,9 @@ impl Node {
             ble_radio: None,
             index_allocator: IndexAllocator::new(),
             peers_by_index: HashMap::new(),
+            index_budget: diag::LogBudget::new(std::time::Instant::now()),
+            version_budget: diag::LogBudget::new(std::time::Instant::now()),
+            msgtype_budget: diag::LogBudget::new(std::time::Instant::now()),
             pending_outbound: HashMap::new(),
             pending_inbound: HashMap::new(),
             restart_dampener: HashMap::new(),
@@ -990,7 +1003,7 @@ impl Node {
             // itself falls back to when nothing is bound. Refreshed before
             // the TUN threads start and on every change to the bound set.
             tun_mss_ceiling: Arc::new(std::sync::atomic::AtomicU16::new(
-                crate::upper::icmp::mss_ceiling(crate::upper::tun::IPV6_MIN_MTU),
+                crate::ipv6tun::icmp::mss_ceiling(crate::ipv6tun::tun::IPV6_MIN_MTU),
             )),
             path_mtu_seeded_by: Arc::new(std::sync::RwLock::new(HashMap::new())),
             netmon_trigger: netmon::NetmonTrigger::new(),
@@ -1057,7 +1070,7 @@ impl Node {
         let coords_response_interval_ms = config.node.session.coords_response_interval_ms;
 
         let base_host_map = HostMap::from_peer_configs(config.peers());
-        let hosts_path = std::path::PathBuf::from(crate::upper::hosts::DEFAULT_HOSTS_PATH);
+        let hosts_path = std::path::PathBuf::from(crate::hosts::DEFAULT_HOSTS_PATH);
         let host_map =
             reloadable::HostMapReloadable::new(base_host_map.clone(), hosts_path.clone());
         let peer_acl = acl::PeerAclReloader::with_default_paths(base_host_map, hosts_path);
@@ -1129,6 +1142,9 @@ impl Node {
             ble_radio: None,
             index_allocator: IndexAllocator::new(),
             peers_by_index: HashMap::new(),
+            index_budget: diag::LogBudget::new(std::time::Instant::now()),
+            version_budget: diag::LogBudget::new(std::time::Instant::now()),
+            msgtype_budget: diag::LogBudget::new(std::time::Instant::now()),
             pending_outbound: HashMap::new(),
             pending_inbound: HashMap::new(),
             restart_dampener: HashMap::new(),
@@ -1164,7 +1180,7 @@ impl Node {
             // itself falls back to when nothing is bound. Refreshed before
             // the TUN threads start and on every change to the bound set.
             tun_mss_ceiling: Arc::new(std::sync::atomic::AtomicU16::new(
-                crate::upper::icmp::mss_ceiling(crate::upper::tun::IPV6_MIN_MTU),
+                crate::ipv6tun::icmp::mss_ceiling(crate::ipv6tun::tun::IPV6_MIN_MTU),
             )),
             path_mtu_seeded_by: Arc::new(std::sync::RwLock::new(HashMap::new())),
             netmon_trigger: netmon::NetmonTrigger::new(),
@@ -1594,11 +1610,11 @@ impl Node {
 
     /// Calculate the effective IPv6 MTU that can be sent over FIPS.
     ///
-    /// Delegates to `upper::icmp::effective_ipv6_mtu()` with this node's
+    /// Delegates to `ipv6tun::icmp::effective_ipv6_mtu()` with this node's
     /// transport MTU. Returns the maximum IPv6 packet size (including
     /// IPv6 header) that can be transmitted through the FIPS mesh.
     pub fn effective_ipv6_mtu(&self) -> u16 {
-        crate::upper::icmp::effective_ipv6_mtu(self.transport_mtu())
+        crate::ipv6tun::icmp::effective_ipv6_mtu(self.transport_mtu())
     }
 
     /// The TCP MSS ceiling the TUN threads are currently clamping to.
@@ -1629,7 +1645,7 @@ impl Node {
     pub(crate) fn refresh_tun_mss_ceiling(&self) {
         use std::sync::atomic::Ordering;
 
-        let ceiling = crate::upper::icmp::mss_ceiling(self.transport_mtu());
+        let ceiling = crate::ipv6tun::icmp::mss_ceiling(self.transport_mtu());
         let previous = self.tun_mss_ceiling.swap(ceiling, Ordering::Relaxed);
         if previous != ceiling {
             tracing::info!(
@@ -2208,6 +2224,7 @@ impl Node {
                     display_name: self.peer_display_name(&addr),
                     has_filter: peer.filter_sequence() > 0,
                     filter_sequence: peer.filter_sequence(),
+                    tree_role: self.tree_role(&addr),
                     filter,
                 }
             })
@@ -3308,7 +3325,7 @@ impl Node {
     pub(crate) fn path_mtu_lookup_entry(
         &self,
         fips_addr: &crate::FipsAddress,
-    ) -> Option<crate::upper::tun::PathMtuEntry> {
+    ) -> Option<crate::node::path_mtu::PathMtuEntry> {
         self.path_mtu_lookup
             .read()
             .ok()
@@ -3324,7 +3341,7 @@ impl Node {
     #[cfg(test)]
     pub(crate) fn path_mtu_lookup_insert(&self, fips_addr: crate::FipsAddress, mtu: u16) {
         if let Ok(mut map) = self.path_mtu_lookup.write() {
-            map.insert(fips_addr, crate::upper::tun::PathMtuEntry::held(mtu));
+            map.insert(fips_addr, crate::node::path_mtu::PathMtuEntry::held(mtu));
         }
     }
 
@@ -3340,7 +3357,7 @@ impl Node {
         if let Ok(mut map) = self.path_mtu_lookup.write() {
             map.insert(
                 fips_addr,
-                crate::upper::tun::PathMtuEntry::learned(mtu, at_ms),
+                crate::node::path_mtu::PathMtuEntry::learned(mtu, at_ms),
             );
         }
     }
@@ -3557,17 +3574,21 @@ impl Node {
     /// Returns true if the peer is our current tree parent, or if the peer
     /// has declared us as their parent (making them our child).
     pub(crate) fn is_tree_peer(&self, peer_addr: &NodeAddr) -> bool {
-        // Peer is our parent
+        self.tree_role(peer_addr) != diag::TreeRole::None
+    }
+
+    /// The peer's place in the spanning tree: our parent, our child (its
+    /// declaration names us as parent), or neither.
+    pub(crate) fn tree_role(&self, peer_addr: &NodeAddr) -> diag::TreeRole {
         if !self.tree_state.is_root() && self.tree_state.my_declaration().parent_id() == peer_addr {
-            return true;
+            return diag::TreeRole::Parent;
         }
-        // Peer is our child (their declaration names us as parent)
         if let Some(decl) = self.tree_state.peer_declaration(peer_addr)
             && decl.parent_id() == self.node_addr()
         {
-            return true;
+            return diag::TreeRole::Child;
         }
-        false
+        diag::TreeRole::None
     }
 
     /// Find next hop for a destination node address.

@@ -4,6 +4,9 @@ services:
     image: wireguard-sidecar:latest
     container_name: wireguard-sidecar
     hostname: wireguard-sidecar
+    # Docker's init runs as PID 1 and forwards the stop to fips, which the
+    # entrypoint execs.
+    init: true
     privileged: true
     devices:
       - /dev/net/tun:/dev/net/tun

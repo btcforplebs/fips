@@ -109,6 +109,14 @@ impl PendingLookup {
 /// cache; lowering it clips a genuine transit burst.
 pub(crate) const MIN_RECENT_PER_PEER: usize = 64;
 
+/// How many evicted request ids [`Lookup::was_evicted`] remembers.
+///
+/// A fixed ring, 8 KiB, so its memory does not grow with the eviction rate,
+/// which a flooding peer chooses. A response arriving after more evictions
+/// than this since its own is not recognised as one lost to eviction, so the
+/// diagnostic undercounts under heavy eviction.
+pub(crate) const EVICTED_KEPT: usize = 1024;
+
 /// Mesh lookup subsystem state.
 pub(crate) struct Lookup {
     /// Recent lookup requests (dedup + reverse-path forwarding).
@@ -134,6 +142,9 @@ pub(crate) struct Lookup {
     pub(crate) backoff: LookupBackoff,
     /// Rate limiter for forwarded lookup requests (transit-side).
     pub(crate) forward_limiter: LookupForwardRateLimiter,
+    /// The most recently evicted request ids, oldest first, at most
+    /// [`EVICTED_KEPT`]. Read only by diagnostics.
+    evicted: VecDeque<u64>,
 }
 
 impl Lookup {
@@ -149,6 +160,7 @@ impl Lookup {
             pending_lookups: BTreeMap::new(),
             backoff,
             forward_limiter,
+            evicted: VecDeque::new(),
         }
     }
 
@@ -194,18 +206,33 @@ impl Lookup {
             .push_back(request_id);
     }
 
-    /// Drop `peer`'s oldest cached entry, returning the evicted `request_id`.
+    /// Drop `peer`'s oldest cached entry, returning the evicted `request_id`
+    /// and the entry, and remember the id for [`Self::was_evicted`]. The
+    /// entry is `None` only if the index has drifted from the cache.
     ///
     /// Returns `None` when the peer holds nothing, which the eviction policy
     /// treats as "no room could be made" rather than as an error.
-    pub(crate) fn evict_oldest_from(&mut self, peer: &NodeAddr) -> Option<u64> {
+    pub(crate) fn evict_oldest_from(
+        &mut self,
+        peer: &NodeAddr,
+    ) -> Option<(u64, Option<RecentRequest>)> {
         let ids = self.recent_by_peer.get_mut(peer)?;
         let evicted = ids.pop_front()?;
         if ids.is_empty() {
             self.recent_by_peer.remove(peer);
         }
-        self.recent_requests.remove(&evicted);
-        Some(evicted)
+        let entry = self.recent_requests.remove(&evicted);
+        if self.evicted.len() == EVICTED_KEPT {
+            self.evicted.pop_front();
+        }
+        self.evicted.push_back(evicted);
+        Some((evicted, entry))
+    }
+
+    /// Whether `request_id` is among the last [`EVICTED_KEPT`] ids evicted
+    /// to make room. Expiry purges are not evictions and are not counted.
+    pub(crate) fn was_evicted(&self, request_id: u64) -> bool {
+        self.evicted.contains(&request_id)
     }
 
     /// Purge expired dedup entries, from the cache and the index together.

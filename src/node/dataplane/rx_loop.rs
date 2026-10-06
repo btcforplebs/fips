@@ -1,13 +1,14 @@
 //! RX event loop and packet dispatch.
 
 use crate::control::{ControlSocket, commands};
+use crate::node::diag;
 use crate::node::{Node, NodeError};
 use crate::proto::fmp::wire::{
     COMMON_PREFIX_SIZE, CommonPrefix, FMP_VERSION, PHASE_ESTABLISHED, PHASE_MSG1, PHASE_MSG2,
     PHASE_MSG3,
 };
 use crate::transport::ReceivedPacket;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 /// Inside the packet_rx burst drain, run a fallback drain every
@@ -635,11 +636,20 @@ impl Node {
         };
 
         if prefix.version != FMP_VERSION {
-            debug!(
-                version = prefix.version,
-                transport_id = %packet.transport_id,
-                "Unknown FMP version, dropping"
-            );
+            // The sender is not authenticated, so the line is limited by one
+            // node-wide budget rather than per source.
+            if tracing::enabled!(tracing::Level::DEBUG)
+                && let Some(suppressed) = self.version_budget.admit(Instant::now())
+            {
+                debug!(
+                    version = prefix.version,
+                    transport_id = %packet.transport_id,
+                    remote_addr = %packet.remote_addr,
+                    head = %diag::head(&packet.data),
+                    suppressed,
+                    "Unknown FMP version, dropping"
+                );
+            }
 
             // If the packet arrived on an adopted Nostr-NAT bootstrap
             // transport, the originating peer is necessarily on a

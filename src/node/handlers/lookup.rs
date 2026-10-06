@@ -5,8 +5,8 @@
 //! bloom filter contains the target. TTL and request_id dedup provide
 //! safety bounds.
 
-use crate::node::Node;
 use crate::node::reject::DiscoveryReject;
+use crate::node::{Node, diag};
 use crate::proto::fsp::should_apply_path_mtu;
 use crate::proto::lookup::{
     LookupAction, LookupRequest, LookupResponse, MAX_RECENT_LOOKUP_REQUESTS,
@@ -92,6 +92,13 @@ impl crate::proto::lookup::RoutingView for NodeRoutingView<'_> {
     }
 }
 
+/// Whether any of `actions` sends to `peer`.
+fn sends_to(actions: &[LookupAction], peer: &NodeAddr) -> bool {
+    actions
+        .iter()
+        .any(|a| matches!(a, LookupAction::SendLink { peer: p, .. } if p == peer))
+}
+
 impl Node {
     /// Handle an incoming LookupRequest from a peer.
     ///
@@ -141,6 +148,8 @@ impl Node {
                 evicted_from = %self.peer_display_name(&evicted.peer),
                 admitting = %self.peer_display_name(from),
                 share = evicted.share,
+                evicted_age_ms = %diag::OrNone(evicted.age_ms),
+                evicted_forwarded = %diag::OrNone(evicted.answered),
                 "Lookup dedup cache full, evicting the oldest entry to make room"
             );
         }
@@ -201,7 +210,7 @@ impl Node {
             }
             RequestOutcome::Forward => {
                 self.metrics().lookup.req_forwarded.inc();
-                self.forward_lookup_request(request).await;
+                self.forward_lookup_request(from, request).await;
             }
             RequestOutcome::ForwardRateLimited => {
                 self.metrics().lookup.req_forward_rate_limited.inc();
@@ -306,6 +315,7 @@ impl Node {
                 debug!(
                     request_id = response.request_id,
                     target = %self.peer_display_name(&response.target),
+                    evicted_recently = self.lookup.was_evicted(response.request_id),
                     "LookupResponse does not match an outstanding request, dropping"
                 );
             }
@@ -400,12 +410,12 @@ impl Node {
                     // so treat it as absent: cache the coordinates, which are
                     // what the proof covers, and store no path MTU from this
                     // response at all.
-                    if path_mtu < crate::upper::icmp::MIN_ACTIONABLE_PATH_MTU {
+                    if path_mtu < crate::proto::mmp::MIN_ACTIONABLE_PATH_MTU {
                         warn!(
                             request_id = request_id,
                             target = %self.peer_display_name(&target),
                             path_mtu = path_mtu,
-                            floor = crate::upper::icmp::MIN_ACTIONABLE_PATH_MTU,
+                            floor = crate::proto::mmp::MIN_ACTIONABLE_PATH_MTU,
                             "LookupResponse carries a path MTU below the actionable floor; \
                              caching coordinates without it"
                         );
@@ -424,7 +434,7 @@ impl Node {
                     // Refused as absent on the CacheCoords arm the core always
                     // pairs with this one, so there is nothing to mirror; the
                     // warning and the counter are emitted there, once.
-                    if path_mtu < crate::upper::icmp::MIN_ACTIONABLE_PATH_MTU {
+                    if path_mtu < crate::proto::mmp::MIN_ACTIONABLE_PATH_MTU {
                         continue;
                     }
                     // Mirror path_mtu into the FipsAddress-keyed read-only lookup
@@ -466,7 +476,7 @@ impl Node {
                                 // is the one write that carries a deadline.
                                 map.insert(
                                     fips_addr,
-                                    crate::upper::tun::PathMtuEntry::learned(path_mtu, now_ms),
+                                    crate::node::path_mtu::PathMtuEntry::learned(path_mtu, now_ms),
                                 );
                                 debug!(
                                     target = %self.peer_display_name(&target),
@@ -605,14 +615,16 @@ impl Node {
     /// Fallback: if no tree peer's bloom matches, try non-tree peers whose
     /// bloom contains the target. This recovers from dead ends caused by
     /// stale bloom filters, tree restructuring, or transit node failures.
-    async fn forward_lookup_request(&mut self, mut request: LookupRequest) {
+    ///
+    /// Neither path sends the request back to `from`, the peer it came from.
+    async fn forward_lookup_request(&mut self, from: &NodeAddr, mut request: LookupRequest) {
         // Plan the forward with the sans-IO decision core. The core owns the
         // TTL decrement, Leaf suppression, Full+MTU eligibility, tree/fallback
         // peer selection, and single-encode fan-out; the shell keeps all
         // metrics/logging and drives the sends.
         let outcome = {
             let rv = NodeRoutingView { node: self };
-            crate::proto::lookup::plan_forward(&mut request, &rv)
+            crate::proto::lookup::plan_forward(&mut request, from, &rv)
         };
         match outcome {
             crate::proto::lookup::ForwardOutcome::TtlExhausted => {}
@@ -636,6 +648,10 @@ impl Node {
                         target = %self.peer_display_name(&request.target),
                         ttl = request.ttl,
                         peer_count,
+                        from = %self.peer_display_name(from),
+                        origin = %self.peer_display_name(&request.origin),
+                        to = %self.recipient_names(&actions),
+                        to_sender = sends_to(&actions, from),
                         "Forwarding LookupRequest via non-tree fallback"
                     );
                 } else {
@@ -644,6 +660,10 @@ impl Node {
                         target = %self.peer_display_name(&request.target),
                         ttl = request.ttl,
                         peer_count,
+                        from = %self.peer_display_name(from),
+                        origin = %self.peer_display_name(&request.origin),
+                        to = %self.recipient_names(&actions),
+                        to_sender = sends_to(&actions, from),
                         "Forwarding LookupRequest"
                     );
                 }
@@ -660,6 +680,19 @@ impl Node {
                 }
             }
         }
+    }
+
+    /// The display names of the peers `actions` sends to, in order.
+    fn recipient_names(&self, actions: &[LookupAction]) -> diag::Names {
+        diag::Names(
+            actions
+                .iter()
+                .filter_map(|a| match a {
+                    LookupAction::SendLink { peer, .. } => Some(self.peer_display_name(peer)),
+                    _ => None,
+                })
+                .collect(),
+        )
     }
 
     /// Initiate a discovery lookup for a target node.
@@ -951,7 +984,7 @@ impl Node {
         // admits no TCP payload byte at all, since there the SYN-time clamp
         // has nothing usable to derive and drops the peer onto the
         // conservative fallback ceiling for as long as the link stands.
-        if crate::upper::icmp::mss_ceiling(link_mtu) == 0 {
+        if crate::ipv6tun::icmp::mss_ceiling(link_mtu) == 0 {
             warn!(
                 peer = %self.peer_display_name(peer_addr),
                 link_mtu = link_mtu,
@@ -1005,7 +1038,10 @@ impl Node {
             other => {
                 // Held, not expiring: this describes a link this node can see
                 // for itself, and it is released when the link goes.
-                map.insert(fips_addr, crate::upper::tun::PathMtuEntry::held(link_mtu));
+                map.insert(
+                    fips_addr,
+                    crate::node::path_mtu::PathMtuEntry::held(link_mtu),
+                );
                 debug!(
                     peer = %self.peer_display_name(peer_addr),
                     fips_addr = %fips_addr,

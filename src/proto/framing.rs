@@ -33,5 +33,5 @@
 /// byte (shared, not double-counted). The "35 bytes" is the SessionDatagram
 /// body after msg_type is consumed by the dispatch layer.
 ///
-/// [`FIPS_IPV6_OVERHEAD`]: crate::upper::icmp::FIPS_IPV6_OVERHEAD
+/// [`FIPS_IPV6_OVERHEAD`]: crate::ipv6tun::icmp::FIPS_IPV6_OVERHEAD
 pub const FIPS_OVERHEAD: u16 = 16 + 16 + 5 + 35 + 12 + 6 + 16; // 106 bytes

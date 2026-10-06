@@ -16,7 +16,7 @@ use crate::{FipsAddress, NodeAddr, PeerIdentity};
 use rand::RngExt;
 use secp256k1::XOnlyPublicKey;
 use std::fmt;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Result of completing a rekey msg2 on the initiator (XX pattern):
 /// the XX msg3 bytes to send, the completed Noise session, the remote
@@ -119,6 +119,9 @@ struct PeerSendState {
     previous_our_index: Option<SessionIndex>,
     /// When the drain window started (None = no drain in progress).
     drain_started: Option<Instant>,
+    /// When the last cutover happened, in either role. Kept after the drain
+    /// completes, so a later removal can say how long ago it was.
+    last_cutover: Option<Instant>,
 
     // === Pending epoch slot ===
     /// Pending new session from completed rekey (before K-bit cutover).
@@ -165,10 +168,17 @@ struct PeerSendState {
     link_stats: LinkStats,
     /// When this peer was last seen (any activity, Unix milliseconds).
     last_seen: u64,
+    /// Whether an authenticated frame from this peer has arrived since it was
+    /// promoted. Kept beside `last_seen` because `touch` writes both.
+    heard: bool,
     /// Number of replay detections suppressed since last session reset.
     replay_suppressed_count: u32,
     /// Consecutive decryption failures (reset on any successful decrypt).
     consecutive_decrypt_failures: u32,
+    /// Frames authenticated on the previous session since the last cutover.
+    prev_frames: u64,
+    /// The receiver index of the last frame that failed to decrypt.
+    failed_idx: Option<SessionIndex>,
     /// Per-peer MMP state (None for legacy peers without Noise sessions).
     mmp: Option<MmpPeerState>,
 }
@@ -184,6 +194,7 @@ impl PeerSendState {
             previous_session: None,
             previous_our_index: None,
             drain_started: None,
+            last_cutover: None,
             pending_new_session: None,
             pending_our_index: None,
             pending_their_index: None,
@@ -198,8 +209,11 @@ impl PeerSendState {
             peer_recv_drain: None,
             link_stats: LinkStats::new(),
             last_seen,
+            heard: false,
             replay_suppressed_count: 0,
             consecutive_decrypt_failures: 0,
+            prev_frames: 0,
+            failed_idx: None,
             mmp: None,
         }
     }
@@ -322,6 +336,14 @@ pub struct ActivePeer {
     rekey_msg3_next_resend_ms: u64,
     /// Number of msg3 retransmissions performed this rekey cycle.
     rekey_msg3_resend_count: u32,
+    /// The pending session completed a rekey msg2 that revealed a peer
+    /// restart: the restarted peer promoted our rekey as a fresh link at
+    /// K-bit 0. Set with the pending slot and cleared with it.
+    pending_restart: bool,
+    /// Test-only: hold this peer entry on the K-bit-only pending trial, as a
+    /// peer running the earlier gate would.
+    #[cfg(test)]
+    old_gate: bool,
 
     // === Published active-send-state (two-tier boundary) ===
     /// The send-critical subset read (and, on roam/responder-cutover, written)
@@ -369,6 +391,9 @@ impl ActivePeer {
             rekey_msg3_payload: None,
             rekey_msg3_next_resend_ms: 0,
             rekey_msg3_resend_count: 0,
+            pending_restart: false,
+            #[cfg(test)]
+            old_gate: false,
             send: PeerSendState::new(link_id, now, authenticated_at),
         }
     }
@@ -461,6 +486,9 @@ impl ActivePeer {
             rekey_msg3_payload: None,
             rekey_msg3_next_resend_ms: 0,
             rekey_msg3_resend_count: 0,
+            pending_restart: false,
+            #[cfg(test)]
+            old_gate: false,
             send,
         }
     }
@@ -681,8 +709,10 @@ impl ActivePeer {
     // === Decryption Failure Tracking ===
 
     /// Increment consecutive decryption failure counter, returning new count.
+    /// Saturates at `u32::MAX`, since only an authenticated frame resets it.
     pub fn increment_decrypt_failures(&mut self) -> u32 {
-        self.send.consecutive_decrypt_failures += 1;
+        self.send.consecutive_decrypt_failures =
+            self.send.consecutive_decrypt_failures.saturating_add(1);
         self.send.consecutive_decrypt_failures
     }
 
@@ -694,6 +724,31 @@ impl ActivePeer {
     /// Current consecutive decryption failure count.
     pub fn consecutive_decrypt_failures(&self) -> u32 {
         self.send.consecutive_decrypt_failures
+    }
+
+    /// Record the receiver index of a frame that failed to decrypt.
+    pub(crate) fn record_failed(&mut self, idx: SessionIndex) {
+        self.send.failed_idx = Some(idx);
+    }
+
+    /// The receiver index of the last frame that failed to decrypt.
+    pub(crate) fn last_failed(&self) -> Option<SessionIndex> {
+        self.send.failed_idx
+    }
+
+    /// Count one frame authenticated on the previous session.
+    pub(crate) fn count_previous(&mut self) {
+        self.send.prev_frames = self.send.prev_frames.saturating_add(1);
+    }
+
+    /// Frames authenticated on the previous session since the last cutover.
+    pub(crate) fn prev_frames(&self) -> u64 {
+        self.send.prev_frames
+    }
+
+    /// How long ago the last cutover happened; `None` if there has been none.
+    pub(crate) fn since_cutover(&self) -> Option<Duration> {
+        self.send.last_cutover.map(|t| t.elapsed())
     }
 
     // === Epoch Accessors ===
@@ -837,6 +892,12 @@ impl ActivePeer {
         self.send.last_seen
     }
 
+    /// Whether an authenticated frame from this peer has arrived since it was
+    /// promoted.
+    pub(crate) fn heard(&self) -> bool {
+        self.send.heard
+    }
+
     /// Time since last activity.
     pub fn idle_time(&self, current_time_ms: u64) -> u64 {
         current_time_ms.saturating_sub(self.send.last_seen)
@@ -893,9 +954,11 @@ impl ActivePeer {
 
     // === State Updates ===
 
-    /// Update last seen timestamp.
+    /// Record an authenticated frame from this peer: refresh the last-seen
+    /// time and mark the peer as heard.
     pub fn touch(&mut self, current_time_ms: u64) {
         self.send.last_seen = current_time_ms;
+        self.send.heard = true;
     }
 
     /// Update the link ID (e.g., on reconnect).
@@ -1071,6 +1134,28 @@ impl ActivePeer {
         }
     }
 
+    /// Test-only seam: set the K-bit this node sends with, to stand up the
+    /// out-of-step K-bits that a peer restart or a cross-connection swap
+    /// leaves behind. Compiled out of release builds.
+    #[cfg(test)]
+    pub(crate) fn force_kbit(&mut self, kbit: bool) {
+        self.send.current_k_bit = kbit;
+    }
+
+    /// Test-only seam: try the pending session only on a K-bit that differs
+    /// from ours, as a peer running the earlier gate does. Compiled out of
+    /// release builds.
+    #[cfg(test)]
+    pub(crate) fn set_oldgate(&mut self) {
+        self.old_gate = true;
+    }
+
+    /// Test-only: whether [`set_oldgate`](Self::set_oldgate) was called.
+    #[cfg(test)]
+    pub(crate) fn old_gate(&self) -> bool {
+        self.old_gate
+    }
+
     /// Per-session symmetric rekey-timer jitter offset (seconds).
     ///
     /// Drawn at session construction and at each rekey cutover; uniform
@@ -1158,6 +1243,7 @@ impl ActivePeer {
         self.send.pending_new_session = Some(session);
         self.send.pending_our_index = Some(our_index);
         self.send.pending_their_index = Some(their_index);
+        self.pending_restart = false;
         self.rekey_in_progress = false;
         // Clear initiator handshake state (index now lives in pending_our_index)
         self.rekey_our_index = None;
@@ -1167,28 +1253,49 @@ impl ActivePeer {
         self.rekey_msg1_resend_count = 0;
     }
 
+    /// Record that the rekey msg2 which completed the pending session
+    /// revealed a peer restart. The restarted peer promoted our rekey as a
+    /// fresh link and sends at K-bit 0, so the cutover to this pending takes
+    /// K-bit 0 instead of toggling ours.
+    pub(crate) fn note_restart(&mut self) {
+        debug_assert!(
+            self.send.pending_new_session.is_some(),
+            "note_restart: no pending session is held"
+        );
+        self.pending_restart = true;
+    }
+
     /// Cut over to the pending new session (initiator side).
     ///
     /// Moves current session to previous (for drain), promotes pending to current,
-    /// flips the K-bit. Returns the old our_index that should remain in peers_by_index
-    /// during the drain window.
+    /// flips the K-bit, or sets it to 0 when the pending's msg2 revealed a peer
+    /// restart ([`note_restart`](Self::note_restart)). Returns the old our_index
+    /// that should remain in peers_by_index during the drain window.
     pub fn cutover_to_new_session(&mut self) -> Option<SessionIndex> {
         let new_session = self.send.pending_new_session.take()?;
         let new_our_index = self.send.pending_our_index.take();
         let new_their_index = self.send.pending_their_index.take();
+        let restarted = std::mem::take(&mut self.pending_restart);
 
         // Demote current to previous
         self.send.previous_session = self.send.noise_session.take();
         self.send.previous_our_index = self.send.our_index;
         self.send.drain_started = Some(Instant::now());
+        self.send.last_cutover = self.send.drain_started;
+        self.send.prev_frames = 0;
 
         // Promote pending to current
         self.send.noise_session = Some(new_session);
         self.send.our_index = new_our_index;
         self.send.their_index = new_their_index;
 
-        // Flip K-bit and reset timing
-        self.send.current_k_bit = !self.send.current_k_bit;
+        // Flip the K-bit and reset timing. A peer that restarted promoted our
+        // msg1 as a fresh link at K-bit 0 and did not flip, so match it.
+        self.send.current_k_bit = if restarted {
+            false
+        } else {
+            !self.send.current_k_bit
+        };
         self.session_established_at = Instant::now();
         self.send.session_start = Instant::now();
         self.rekey_in_progress = false;
@@ -1213,11 +1320,14 @@ impl ActivePeer {
         let new_session = self.send.pending_new_session.take()?;
         let new_our_index = self.send.pending_our_index.take();
         let new_their_index = self.send.pending_their_index.take();
+        self.pending_restart = false;
 
         // Demote current to previous
         self.send.previous_session = self.send.noise_session.take();
         self.send.previous_our_index = self.send.our_index;
         self.send.drain_started = Some(Instant::now());
+        self.send.last_cutover = self.send.drain_started;
+        self.send.prev_frames = 0;
 
         // Promote pending to current
         self.send.noise_session = Some(new_session);
@@ -1240,6 +1350,19 @@ impl ActivePeer {
         }
 
         self.send.previous_our_index
+    }
+
+    /// Promote the pending session on a peer frame that authenticated
+    /// against it, and take the K-bit from that frame rather than toggling
+    /// ours: the two ends' bits may have been out of step, and the frame's
+    /// bit is the one the peer sends with.
+    pub(crate) fn adopt_pending(&mut self, frame_kbit: bool) -> Option<SessionIndex> {
+        let held = self.send.pending_new_session.is_some();
+        let old = self.handle_peer_kbit_flip();
+        if held {
+            self.send.current_k_bit = frame_kbit;
+        }
+        old
     }
 
     /// Check if the drain window has expired.
@@ -1281,6 +1404,7 @@ impl ActivePeer {
         self.rekey_our_index.take().or_else(|| {
             self.send.pending_new_session = None;
             self.send.pending_their_index = None;
+            self.pending_restart = false;
             self.send.pending_our_index.take()
         })
     }
@@ -1777,6 +1901,19 @@ mod tests {
     }
 
     #[test]
+    fn the_consecutive_decrypt_failure_counter_saturates_instead_of_overflowing() {
+        let identity = make_peer_identity();
+        let mut peer = ActivePeer::new(identity, LinkId::new(1), 1000);
+
+        // Nothing resets the counter between authenticated frames, so a long
+        // run of failures must not overflow it.
+        peer.send.consecutive_decrypt_failures = u32::MAX - 1;
+        assert_eq!(peer.increment_decrypt_failures(), u32::MAX);
+        assert_eq!(peer.increment_decrypt_failures(), u32::MAX);
+        assert_eq!(peer.consecutive_decrypt_failures(), u32::MAX);
+    }
+
+    #[test]
     fn test_rekey_jitter_in_range() {
         // Every newly constructed peer's jitter must lie in the
         // symmetric range [-REKEY_JITTER_SECS, +REKEY_JITTER_SECS].
@@ -1861,5 +1998,180 @@ mod tests {
         assert!(!peer.rekey_in_progress());
         assert!(peer.rekey_msg1().is_none());
         assert_eq!(peer.rekey_msg1_resend_count(), 0);
+    }
+
+    /// A peer holding `current` as its session, indices 1 (ours) and 2.
+    fn peer_with_current(current: NoiseSession) -> ActivePeer {
+        ActivePeer::with_session(
+            make_peer_identity(),
+            LinkId::new(1),
+            1_000,
+            current,
+            SessionIndex::new(1),
+            SessionIndex::new(2),
+            TransportId::new(1),
+            TransportAddr::from_string("127.0.0.1:9000"),
+            LinkStats::new(),
+            true,
+            &MmpConfig::default(),
+            None,
+            NodeProfile::Full,
+            NodeProfile::Full,
+        )
+    }
+
+    /// Both cutover bodies restart the previous-session frame count and stamp
+    /// the cutover time, and completing the drain keeps both.
+    #[test]
+    fn each_cutover_restarts_the_previous_frame_count_and_stamps_the_cutover() {
+        type Cutover = fn(&mut ActivePeer) -> Option<SessionIndex>;
+        let cutovers: [(&str, Cutover); 2] = [
+            ("initiator", ActivePeer::cutover_to_new_session),
+            ("responder", ActivePeer::handle_peer_kbit_flip),
+        ];
+        for (name, cutover) in cutovers {
+            let (cur, _) = xx_session_pair();
+            let (pend, _) = xx_session_pair();
+            let mut peer = peer_with_current(cur);
+            assert!(peer.since_cutover().is_none(), "{name}: no cutover yet");
+            peer.count_previous();
+            peer.count_previous();
+            assert_eq!(peer.prev_frames(), 2);
+            peer.set_pending_session(pend, SessionIndex::new(3), SessionIndex::new(4));
+
+            assert!(cutover(&mut peer).is_some(), "{name}: the cutover runs");
+            assert_eq!(peer.prev_frames(), 0, "{name}: the count restarts");
+            assert!(
+                peer.since_cutover().is_some(),
+                "{name}: the cutover is stamped"
+            );
+
+            peer.count_previous();
+            assert!(peer.complete_drain().is_some());
+            assert_eq!(peer.prev_frames(), 1, "{name}: the drain keeps the count");
+            assert!(
+                peer.since_cutover().is_some(),
+                "{name}: the drain keeps the stamp"
+            );
+        }
+    }
+
+    /// The last failing index is the one most recently recorded.
+    #[test]
+    fn the_last_failed_index_is_the_most_recent_one_recorded() {
+        let (cur, _) = xx_session_pair();
+        let mut peer = peer_with_current(cur);
+        assert_eq!(peer.last_failed(), None);
+        peer.record_failed(SessionIndex::new(5));
+        peer.record_failed(SessionIndex::new(6));
+        assert_eq!(peer.last_failed(), Some(SessionIndex::new(6)));
+    }
+
+    /// An index names the current, previous or pending slot it belongs to,
+    /// and any other index names none.
+    #[test]
+    fn an_index_names_the_slot_of_the_session_it_belongs_to() {
+        use crate::node::diag::Slot;
+
+        let (cur, _) = xx_session_pair();
+        let (pend, _) = xx_session_pair();
+        let mut peer = peer_with_current(cur);
+        assert_eq!(Slot::of(&peer, SessionIndex::new(1)), Slot::Current);
+        assert_eq!(Slot::of(&peer, SessionIndex::new(9)), Slot::Unknown);
+
+        peer.set_pending_session(pend, SessionIndex::new(3), SessionIndex::new(4));
+        assert_eq!(Slot::of(&peer, SessionIndex::new(3)), Slot::Pending);
+        assert!(peer.handle_peer_kbit_flip().is_some());
+        assert_eq!(Slot::of(&peer, SessionIndex::new(3)), Slot::Current);
+        assert_eq!(Slot::of(&peer, SessionIndex::new(1)), Slot::Previous);
+        assert_eq!(Slot::Unknown.to_string(), "none");
+        assert_eq!(Slot::Pending.to_string(), "pending");
+    }
+
+    /// A peer starts unheard, is heard after its first authenticated frame, and
+    /// stays heard across either cutover and the drain that follows it.
+    #[test]
+    fn a_peer_is_unheard_until_its_first_frame_and_stays_heard_across_both_cutovers() {
+        let mut fresh = ActivePeer::new(make_peer_identity(), LinkId::new(1), 1000);
+        assert!(!fresh.heard(), "a new peer starts unheard");
+        fresh.touch(2000);
+        assert!(fresh.heard(), "a frame marks the peer heard");
+
+        type Cutover = fn(&mut ActivePeer) -> Option<SessionIndex>;
+        let cutovers: [(&str, Cutover); 2] = [
+            ("initiator", ActivePeer::cutover_to_new_session),
+            ("responder", ActivePeer::handle_peer_kbit_flip),
+        ];
+        for (name, cutover) in cutovers {
+            let (cur, _) = xx_session_pair();
+            let (pend, _) = xx_session_pair();
+            let mut peer = peer_with_current(cur);
+            assert!(!peer.heard(), "{name}: a promoted peer starts unheard");
+            peer.touch(2000);
+            assert!(peer.heard(), "{name}: a frame marks the peer heard");
+            peer.set_pending_session(pend, SessionIndex::new(3), SessionIndex::new(4));
+
+            assert!(cutover(&mut peer).is_some(), "{name}: the cutover runs");
+            assert!(peer.heard(), "{name}: the cutover keeps the peer heard");
+            assert!(peer.complete_drain().is_some(), "{name}: the drain runs");
+            assert!(peer.heard(), "{name}: the drain keeps the peer heard");
+        }
+    }
+
+    /// A cutover after a restart-revealing msg2 takes K-bit 0, whatever K-bit
+    /// this node held, and the next cutover toggles as usual. Taking a new
+    /// pending forgets the restart.
+    #[test]
+    fn a_cutover_after_note_restart_takes_kbit_zero_and_the_next_one_toggles() {
+        for start in [false, true] {
+            let (cur, _) = xx_session_pair();
+            let (pend, _) = xx_session_pair();
+            let mut peer = peer_with_current(cur);
+            peer.force_kbit(start);
+            peer.set_pending_session(pend, SessionIndex::new(3), SessionIndex::new(4));
+            peer.note_restart();
+            assert!(peer.cutover_to_new_session().is_some());
+            assert!(!peer.current_k_bit(), "start {start}: the cutover takes 0");
+
+            let (next, _) = xx_session_pair();
+            peer.set_pending_session(next, SessionIndex::new(5), SessionIndex::new(6));
+            assert!(peer.cutover_to_new_session().is_some());
+            assert!(peer.current_k_bit(), "start {start}: the next one toggles");
+        }
+
+        let (cur, _) = xx_session_pair();
+        let mut peer = peer_with_current(cur);
+        let (pend, _) = xx_session_pair();
+        peer.set_pending_session(pend, SessionIndex::new(3), SessionIndex::new(4));
+        peer.note_restart();
+        let (pend, _) = xx_session_pair();
+        peer.set_pending_session(pend, SessionIndex::new(7), SessionIndex::new(8));
+        let before = peer.current_k_bit();
+        assert!(peer.cutover_to_new_session().is_some());
+        assert_eq!(
+            peer.current_k_bit(),
+            !before,
+            "a new pending forgets the restart and the cutover toggles"
+        );
+    }
+
+    /// Adopting the pending session takes the frame's K-bit, whichever this
+    /// node held; with no pending held it changes nothing.
+    #[test]
+    fn adopting_the_pending_takes_the_frames_kbit() {
+        for (ours, frame) in [(false, false), (false, true), (true, false), (true, true)] {
+            let (cur, _) = xx_session_pair();
+            let (pend, _) = xx_session_pair();
+            let mut peer = peer_with_current(cur);
+            peer.force_kbit(ours);
+            peer.set_pending_session(pend, SessionIndex::new(3), SessionIndex::new(4));
+            assert!(peer.adopt_pending(frame).is_some());
+            assert_eq!(peer.current_k_bit(), frame, "ours {ours}, frame {frame}");
+            assert_eq!(peer.our_index(), Some(SessionIndex::new(3)));
+        }
+        let (cur, _) = xx_session_pair();
+        let mut peer = peer_with_current(cur);
+        assert!(peer.adopt_pending(true).is_none());
+        assert!(!peer.current_k_bit(), "no pending: the K-bit is unchanged");
     }
 }

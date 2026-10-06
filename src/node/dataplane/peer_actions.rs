@@ -40,6 +40,7 @@
 //! shell drivers — so populating them stays behavior-neutral.
 
 use crate::PeerIdentity;
+use crate::node::diag::{self, OrNone};
 use crate::node::reject::{HandshakeReject, RejectReason};
 use crate::node::{Node, NodeError};
 use crate::peer::machine::{LostKind, PeerAction, PeerEvent};
@@ -323,7 +324,7 @@ impl Node {
                             if let Err(e) = self.send_tree_announce_to_peer(&node_addr).await {
                                 debug!(peer = %self.peer_display_name(&node_addr), error = %e, "Failed to send initial TreeAnnounce");
                             }
-                            // Schedule filter announce (sent on next tick via debounce)
+                            // Schedule filter announce (sent on a tick once the peer has sent a frame)
                             self.bloom_state.mark_update_needed(node_addr);
                             self.reset_lookup_backoff();
                             // Clear the pending outbound entry on promote success
@@ -506,6 +507,8 @@ impl Node {
                     let node_addr = *ambient.verified_identity.node_addr();
                     let did_cutover = if let Some(peer) = self.peers.get_mut(&node_addr) {
                         if let Some(_old_our_index) = peer.cutover_to_new_session() {
+                            let epoch = OrNone(peer.noise_session().map(diag::epoch_tag));
+                            let kbit_ours = peer.current_k_bit();
                             // New index was pre-registered in peers_by_index
                             // during msg2 handling (handshake.rs).
                             debug_assert!(
@@ -532,6 +535,8 @@ impl Node {
                                 their_addr = %node_addr,
                                 our_index = ?our_index,
                                 their_index = ?their_index,
+                                epoch = %epoch,
+                                kbit_ours,
                                 "Rekey cutover complete (initiator), K-bit flipped"
                             );
                             true
@@ -765,11 +770,19 @@ impl Node {
                     self.remove_link(&link);
                     self.remove_peer_machine(link);
 
+                    let held = self.peers.get(&peer);
+                    let epoch = OrNone(
+                        held.and_then(|p| p.pending_new_session())
+                            .map(diag::epoch_tag),
+                    );
+                    let kbit_ours = OrNone(held.map(|p| p.current_k_bit()));
                     debug!(
                         peer = %self.peer_display_name(&peer),
                         our_addr = %self.identity().node_addr(),
                         new_our_index = %our_new_index,
                         new_their_index = %their_index,
+                        epoch = %epoch,
+                        kbit_ours = %kbit_ours,
                         "rekey-msg3 responder: pending session set, awaiting K-bit cutover"
                     );
                     return;

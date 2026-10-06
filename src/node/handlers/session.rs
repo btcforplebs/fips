@@ -17,6 +17,7 @@ use crate::noise::{HANDSHAKE_MSG1_SIZE, HANDSHAKE_MSG2_SIZE, HANDSHAKE_MSG3_SIZE
 use crate::proto::fmp::NegotiationPayload;
 #[cfg(unix)]
 use crate::proto::fmp::wire::{ESTABLISHED_HEADER_SIZE, FLAG_KEY_EPOCH, build_established_header};
+use crate::proto::framing::FIPS_OVERHEAD;
 use crate::proto::fsp::quorum::QuorumVerdict;
 use crate::proto::fsp::wire::{
     FSP_COMMON_PREFIX_SIZE, FSP_FLAG_CP, FSP_FLAG_K, FSP_HEADER_SIZE, FSP_PHASE_ESTABLISHED,
@@ -42,7 +43,6 @@ use crate::proto::routing::{CoordsRequired, MtuExceeded, PathBroken, RoutingSign
 use crate::proto::stp::{coords_wire_size, encode_coords};
 #[cfg(unix)]
 use crate::transport::TransportHandle;
-use crate::upper::icmp::FIPS_OVERHEAD;
 use secp256k1::PublicKey;
 use tracing::{debug, info, trace, warn};
 
@@ -445,7 +445,7 @@ impl Node {
                             .to_ipv6()
                             .octets();
 
-                        match crate::upper::ipv6_shim::decompress_ipv6(
+                        match crate::ipv6tun::ipv6_shim::decompress_ipv6(
                             service_payload,
                             src_ipv6,
                             dst_ipv6,
@@ -1913,11 +1913,11 @@ impl Node {
         // arrives on the decrypted service-payload path, so a value this low
         // means an authenticated peer we hold a session with is sending
         // something unusable.
-        if notif.path_mtu < crate::upper::icmp::MIN_ACTIONABLE_PATH_MTU {
+        if notif.path_mtu < crate::proto::mmp::MIN_ACTIONABLE_PATH_MTU {
             warn!(
                 src = %peer_name,
                 reported_mtu = notif.path_mtu,
-                floor = crate::upper::icmp::MIN_ACTIONABLE_PATH_MTU,
+                floor = crate::proto::mmp::MIN_ACTIONABLE_PATH_MTU,
                 "PathMtuNotification reports a path MTU below the actionable floor; ignoring"
             );
             self.metrics.errors.path_mtu_notif_below_floor.inc();
@@ -1975,7 +1975,7 @@ impl Node {
                         // path takes the unchanged early-return above and never
                         // rewrites the entry, so an expiring one would vanish
                         // and stay gone.
-                        map.insert(fips_addr, crate::upper::tun::PathMtuEntry::held(mtu));
+                        map.insert(fips_addr, crate::node::path_mtu::PathMtuEntry::held(mtu));
                         debug!(
                             dest = %peer_name,
                             fips_addr = %fips_addr,
@@ -2414,12 +2414,12 @@ impl Node {
         // value that low drives the SYN-time MSS clamp into single digits or
         // zero. The reactive carrier is unauthenticated, so it has its own
         // floor constant, currently equal to the actionable one.
-        if msg.mtu < crate::upper::icmp::MIN_REACTIVE_PATH_MTU {
+        if msg.mtu < crate::proto::mmp::MIN_REACTIVE_PATH_MTU {
             warn!(
                 dest = %peer_name,
                 reporter = %msg.reporter,
                 bottleneck_mtu = msg.mtu,
-                floor = crate::upper::icmp::MIN_REACTIVE_PATH_MTU,
+                floor = crate::proto::mmp::MIN_REACTIVE_PATH_MTU,
                 "MtuExceeded reports a path MTU below the actionable floor; ignoring"
             );
             self.metrics().errors.mtu_exceeded_below_floor.inc();
@@ -2516,7 +2516,7 @@ impl Node {
                         // re-sends the signal once traffic is sized to fit, so a
                         // deadline would drop a genuine persistent bottleneck
                         // and start the next flow at the conservative ceiling.
-                        map.insert(fips_addr, crate::upper::tun::PathMtuEntry::held(mtu));
+                        map.insert(fips_addr, crate::node::path_mtu::PathMtuEntry::held(mtu));
                         debug!(
                             dest = %peer_name,
                             fips_addr = %fips_addr,
@@ -3156,12 +3156,13 @@ impl Node {
         dest_addr: &NodeAddr,
         ipv6_packet: &[u8],
     ) -> Result<(), NodeError> {
-        let compressed = crate::upper::ipv6_shim::compress_ipv6(ipv6_packet).ok_or_else(|| {
-            NodeError::SendFailed {
-                node_addr: *dest_addr,
-                reason: "IPv6 header compression failed".into(),
-            }
-        })?;
+        let compressed =
+            crate::ipv6tun::ipv6_shim::compress_ipv6(ipv6_packet).ok_or_else(|| {
+                NodeError::SendFailed {
+                    node_addr: *dest_addr,
+                    reason: "IPv6 header compression failed".into(),
+                }
+            })?;
         self.send_session_data(
             dest_addr,
             FSP_PORT_IPV6_SHIM,

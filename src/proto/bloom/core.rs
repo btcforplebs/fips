@@ -137,6 +137,28 @@ impl BloomFilter {
         self.bits.iter().map(|b| b.count_ones() as usize).sum()
     }
 
+    /// The share of `sent`'s set bits that are also set in this filter.
+    ///
+    /// Near 1 when this filter contains what was sent, as a filter returned
+    /// to its sender does; near this filter's fill ratio when the two are
+    /// unrelated. `None` when the sizes differ or `sent` has no bit set.
+    pub fn overlap(&self, sent: &BloomFilter) -> Option<f64> {
+        if self.num_bits != sent.num_bits {
+            return None;
+        }
+        let sent_ones = sent.count_ones();
+        if sent_ones == 0 {
+            return None;
+        }
+        let both: usize = self
+            .bits
+            .iter()
+            .zip(sent.bits.iter())
+            .map(|(a, b)| (a & b).count_ones() as usize)
+            .sum();
+        Some(both as f64 / sent_ones as f64)
+    }
+
     /// Estimate the fill ratio (set bits / total bits).
     pub fn fill_ratio(&self) -> f64 {
         self.count_ones() as f64 / self.num_bits as f64

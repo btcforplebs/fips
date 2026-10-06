@@ -26,7 +26,7 @@ fn arm_rekey(node: &mut crate::node::Node, peer_addr: &NodeAddr) {
 /// Set `link_dead_timeout_secs` on an already-constructed node via the
 /// sole-store copy-on-write context swap (immutable state is no longer a
 /// directly-pokeable field; `config()` is a read-only accessor).
-fn set_link_dead_timeout(node: &mut crate::node::Node, secs: u64) {
+pub(super) fn set_link_dead_timeout(node: &mut crate::node::Node, secs: u64) {
     node.replace_context(|ctx| {
         let mut cfg = (*ctx.config).clone();
         cfg.node.link_dead_timeout_secs = secs;

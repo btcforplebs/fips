@@ -9,7 +9,7 @@ use crate::proto::bloom::FilterAnnounce;
 use crate::proto::mmp::delivery::{LinkEvidence, RrCounters};
 
 use super::reject::BloomReject;
-use super::{Node, NodeError};
+use super::{Node, NodeError, diag};
 use std::collections::BTreeMap;
 use tracing::{debug, warn};
 
@@ -123,6 +123,7 @@ impl Node {
             set_bits = sent_filter.count_ones(),
             fill = format_args!("{:.1}%", sent_filter.fill_ratio() * 100.0),
             tree_peer = self.is_tree_peer(peer_addr),
+            digest = %diag::filter_tag(&sent_filter),
             "Sent FilterAnnounce"
         );
         self.bloom_state.record_update_sent(*peer_addr, now_ms);
@@ -135,6 +136,13 @@ impl Node {
     }
 
     /// Send pending rate-limited filter announces whose debounce has expired.
+    ///
+    /// A peer that has not sent an authenticated frame since it was promoted
+    /// is skipped, and its update stays pending for the first tick after that
+    /// frame. A peer that completes a handshake and then sends nothing would
+    /// otherwise draw an announce, and its resends, on every promotion. A
+    /// working peer sends its TreeAnnounce as soon as it promotes, so its
+    /// filter waits about one round trip.
     pub(super) async fn send_pending_filter_announces(&mut self) {
         // Monotonic: the debounce compares two reads, and a wall-clock step
         // back would hold announces for the size of the step.
@@ -142,9 +150,11 @@ impl Node {
 
         let ready: Vec<NodeAddr> = self
             .peers
-            .keys()
-            .filter(|addr| self.bloom_state.should_send_update(addr, now_ms))
-            .copied()
+            .iter()
+            .filter(|(addr, peer)| {
+                peer.heard() && self.bloom_state.should_send_update(addr, now_ms)
+            })
+            .map(|(addr, _)| *addr)
             .collect();
 
         if ready.is_empty() {
@@ -267,6 +277,9 @@ impl Node {
             set_bits = announce.filter.count_ones(),
             fill = format_args!("{:.1}%", announce.filter.fill_ratio() * 100.0),
             tree_peer = self.is_tree_peer(from),
+            digest = %diag::filter_tag(&announce.filter),
+            tree_role = %self.tree_role(from),
+            overlap = %self.overlap_with_sent(from, &announce.filter),
             "Received FilterAnnounce"
         );
 
@@ -282,6 +295,17 @@ impl Node {
         let peer_filters = self.peer_inbound_filters();
         self.bloom_state
             .mark_changed_peers(from, &peer_addrs, &peer_filters);
+    }
+
+    /// How much of the filter last sent to `from` the filter it announced
+    /// contains, for a tree peer; `none` for a non-tree peer, or before
+    /// anything was sent to it.
+    fn overlap_with_sent(&self, from: &NodeAddr, got: &BloomFilter) -> diag::OrNone<diag::Ratio> {
+        if self.tree_role(from) == diag::TreeRole::None {
+            return diag::OrNone(None);
+        }
+        let sent = self.bloom_state.last_sent_filter(from);
+        diag::OrNone(sent.and_then(|s| got.overlap(s)).map(diag::Ratio))
     }
 
     /// Read what `peer_addr`'s link shows about delivery of our frames: the

@@ -1034,7 +1034,7 @@ async fn mmp_round(nodes: &mut [TestNode]) {
 }
 
 /// Process packets on every node until a pass handles none, at most 50 passes.
-async fn drain_quiet(nodes: &mut [TestNode]) {
+pub(super) async fn drain_quiet(nodes: &mut [TestNode]) {
     for _ in 0..50 {
         if process_available_packets(nodes).await == 0 {
             return;
@@ -1045,7 +1045,7 @@ async fn drain_quiet(nodes: &mut [TestNode]) {
 
 /// Wait at most 1 s for `tn` to hold a queued frame, then take every queued
 /// frame without processing it. Returns how many were taken.
-async fn drop_queued(tn: &mut TestNode) -> usize {
+pub(super) async fn drop_queued(tn: &mut TestNode) -> usize {
     let deadline = std::time::Instant::now() + Duration::from_secs(1);
     while tn.packet_rx.is_empty() && std::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(5)).await;

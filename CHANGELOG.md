@@ -334,6 +334,71 @@ with v0.5.x or earlier peers.
 
 ### Changed
 
+- The debug lines for handshake msg1 and msg2 handling, link promotion and
+  cross-connection resolution at msg2 now say where a message came from and
+  which handshake it belongs to. They carry the transport and address the
+  message arrived on (`transport_id`, `remote_addr`); the duplicate-msg1
+  resend lines also name the pending link (`link_id`). "Connection promoted to
+  active peer" and "Cross-connection: swapped to outbound session" carry the
+  msg1's sender index (`msg1_sidx`) and the first four bytes of its SHA-256
+  digest (`msg1_dg`); those two and the other "Cross-connection:" line carry
+  the first four bytes of the resulting session's handshake hash (`epoch`),
+  and the promotion line logs `direction`. Both ends of a link derive the
+  same digest and hash, so their logs can be joined on these fields. Message
+  texts and levels are unchanged.
+
+- Decryption-failure lines now say which of the peer's sessions a failing frame
+  named and what key state each end held. "Decryption failed" and "Worker FMP
+  AEAD decryption failed" carry the frame's receiver index (`receiver_idx`), the
+  transport and address it arrived on (`transport_id`, `remote_addr`), its K-bit
+  and ours (`kbit_frame`, `kbit_ours`), the session slot its index names
+  (`slot`: `current`, `previous`, `pending` or `none`), and the tags of the
+  current, previous and pending sessions (`epoch`, `prev_epoch`,
+  `pending_epoch`); the first also says whether the pending session was tried
+  (`trial`); a run of failures on one peer logs at most twenty of either, until
+  a frame from it authenticates. "Excessive decryption failures, peer kept"
+  carries the same key state for the last failing index, with the time since the
+  last cutover (`since_cutover_ms`). The lines each end logs when it sets its
+  pending session, both cutover lines and the promotion on the peer's first
+  new-epoch frame log the new session's tag (`epoch`) and this node's K-bit
+  after the change (`kbit_ours`). "Removing peer: link dead timeout" says
+  whether the silence was measured from the last received frame or from the
+  session start (`basis`, `basis_age_ms`), the time since the last cutover, the
+  K-bit, how many frames arrived on the previous session since then
+  (`prev_slot_frames`), and the peer's link (`link_tid`, `link_addr`). "Unknown
+  session index, dropping" is now logged at debug rather than trace, with the
+  sender's address, under one node-wide budget of 10 lines and then one a
+  second; each line reports how many were withheld before it (`suppressed`).
+  Message texts are unchanged except the excessive-failures warning, which said
+  "removing peer" before the peer was kept.
+
+- "Unknown FMP version, dropping" now names the sender's address and the frame's
+  first 8 bytes (`remote_addr`, `head`), and "Unknown link message type" names
+  the peer (`peer`). Each of the two is limited by its own node-wide budget of
+  10 lines and then one a second, and reports how many lines were withheld
+  before it (`suppressed`). "Accepted inbound TCP connection" says how many
+  inbound connections its source holds, counting an IPv6 source by its /64
+  (`open_from_source`), and how many the pool holds (`open_total`). A new debug
+  line, "Closed TCP connection", gives each connection's lifetime, the frames
+  received on it, whether this node wrote a msg2 on it, and why it ended
+  (`lifetime_s`, `frames`, `msg2_sent`, `reason`). "Sent FilterAnnounce" and
+  "Received FilterAnnounce" carry an 8-byte digest of the filter bits
+  (`digest`); a received one also gives the peer's tree role (`tree_role`) and,
+  from a tree peer, the share of the filter last sent to that peer that the new
+  one contains (`overlap`). "Forwarding LookupRequest" names the sender, origin
+  and recipients and says whether the request went back to its sender (`from`,
+  `origin`, `to`, `to_sender`). A dedup eviction logs the evicted entry's age
+  and whether a response had already gone back on it (`evicted_age_ms`,
+  `evicted_forwarded`), and an unsolicited LookupResponse says whether its
+  request was among the recently evicted ones (`evicted_recently`). `show_bloom`
+  peer rows carry `tree_role` (`parent`, `child` or `none`). Message texts are
+  unchanged.
+
+- A FilterAnnounce to a newly connected peer is held until that peer sends its
+  first authenticated frame. A peer that completes a handshake and then sends
+  nothing no longer draws a filter, or its resends, on every connection; other
+  peers get theirs about one round trip later than before.
+
 - The Windows service log is rolled at `node.log_max_size_mb` and keeps
   `node.log_max_files` old files. The defaults are the 10 MiB and four files it
   used before.
@@ -600,6 +665,14 @@ with v0.5.x or earlier peers.
   binaries behave as before. The peer wire and the control-socket response
   shape are unchanged.
 
+- **Source-breaking for consumers of the library crate**: the `fips::upper`
+  module path is gone. The TUN, DNS and ICMPv6 items it named are under
+  `fips::ipv6tun` (for example `fips::ipv6tun::tun::TunState`), the hosts file
+  is `fips::hosts`, and `FIPS_OVERHEAD`, `MIN_ACTIONABLE_PATH_MTU` and
+  `MIN_REACTIVE_PATH_MTU` are re-exported at the crate root. `PathMtuEntry`
+  and `PathMtuLookup` are no longer public. `fipsctl` and the daemon behave as
+  before.
+
 ### Fixed
 
 #### Node lifecycle
@@ -683,6 +756,14 @@ with v0.5.x or earlier peers.
   where the fix listed under macOS below dropped these packets; only packets
   already queued to the exited worker are lost. With the macOS ordered sender,
   a packet sent this way can arrive out of order with the rest of its flow.
+
+- A stop sent while the daemon is starting is no longer lost. The shutdown
+  handler was installed only once start-up finished, so a stop during start-up
+  killed the daemon at once, or, with `fips` as a container's PID 1, was
+  discarded until the container's stop timeout killed it with no drain. The
+  handlers are now registered first; a stop during start-up lets start-up
+  finish for up to five seconds and then drains as usual. The example compose
+  files now run their containers under an init, so a stop reaches `fips`.
 
 #### Data plane and transports
 
@@ -810,6 +891,14 @@ with v0.5.x or earlier peers.
   every channel at the address, the peer's link and the handshake's last
   message with it.
 
+- A peer is no longer removed when frames carrying its index fail to
+  decrypt. Twenty such frames removed the peer and marked its link dead, and
+  the index travels in clear, so anyone who had seen one frame of a link could
+  tear it down from any address, again after every reconnect. Such frames are
+  now dropped; the node logs one "Excessive decryption failures" warning when
+  the old threshold is reached and keeps the peer. A real key mismatch still
+  ends at the link-dead timeout.
+
 #### Gateway
 
 - The gateway retries failed firewall rebuilds every ten seconds without
@@ -821,6 +910,13 @@ with v0.5.x or earlier peers.
   mapping's source rewrite used to take it first, so the target saw the
   peer's pool address instead, which changed as mappings came and went and
   could be answered only by a host that routes the pool to the gateway.
+
+- `fips-gateway` now acts on a stop sent while it is still setting up. Its
+  shutdown handler was installed only after set-up, which can spend seconds
+  probing the daemon's DNS responder, so a stop in that window was lost when
+  the gateway ran as a container's PID 1 and killed it part-way through set-up
+  otherwise. A stop during the probe now ends it and exits before any NAT
+  table or route exists.
 
 #### Identity and config
 
@@ -1096,6 +1192,11 @@ with v0.5.x or earlier peers.
   (`node.bloom.update_debounce_ms`, 500 ms by default) is now measured on a
   monotonic clock.
 
+- A transit lookup request is no longer forwarded back to the peer it came
+  from. That copy was always a duplicate, and a tree child announcing a filter
+  that covers most of the mesh turned every lookup between it and the parent
+  into a two-way echo, multiplying duplicate traffic and dedup-cache evictions.
+
 #### Sessions and rekey
 
 - Link quality estimates no longer freeze after a link rekey. Frames the peer
@@ -1119,6 +1220,13 @@ with v0.5.x or earlier peers.
 - An unreadable SessionMsg3 no longer discards the half-open session of an
   initial handshake, which left the initiator's genuine msg3 to an unknown
   session.
+
+- A link whose ends had fallen out of step on the K-bit, for example after a
+  peer restart, no longer loses every rekey the peer starts. Frames on the
+  peer's new session were tried against it only when their K-bit differed from
+  ours, so they failed decryption until the peer was removed. Frames on the
+  pending session's index now always get that trial, and the K-bits are put
+  back in step at the cutover after a restart.
 
 #### Windows
 

@@ -556,7 +556,7 @@ assert_zero_count "PANIC\|panicked" "Panics"
 assert_zero_count "ERROR" "Errors"
 assert_zero_count "MMP link teardown" "Spurious link teardowns"
 assert_zero_count "Excessive decryption failures" \
-    "Excessive decrypt failure removals"
+    "Decryption failure threshold crossings"
 assert_zero_count "Rekey msg2 processing failed" "Rekey msg2 failures"
 assert_zero_count "Session AEAD decryption failed" \
     "FSP decryption failures during rekey"

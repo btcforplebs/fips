@@ -43,9 +43,9 @@ mod tests;
 pub(crate) use core::{
     ConnAction, ConnSnapshot, DialMsg2Decision, DialMsg2Reject, DialMsg2Snapshot,
     EPOCH_RESTART_MIN_INTERVAL_SECS, EstablishSnapshot, InboundDecision, InboundReject,
-    LifecycleView, OutboundDecision, OutboundSnapshot, PeerSnapshot, RekeyCfg, RekeyClaim,
-    RekeyMsg2Decision, RekeyMsg2Reject, RekeyMsg2Snapshot, RekeyResendSnapshot, WireOutcome,
-    decide_fmp_negotiation,
+    LifecycleView, Msg1Digest, OutboundDecision, OutboundSnapshot, PeerSnapshot, RekeyCfg,
+    RekeyClaim, RekeyMsg2Decision, RekeyMsg2Reject, RekeyMsg2Snapshot, RekeyResendSnapshot,
+    WireOutcome, decide_fmp_negotiation,
 };
 pub use core::{PromotionResult, cross_connection_winner};
 pub(crate) use limits::backoff_ms;

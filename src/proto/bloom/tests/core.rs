@@ -436,3 +436,58 @@ fn test_compute_outgoing_filters_empty_inputs() {
     let batch = state.compute_outgoing_filters(&[target], &peer_filters);
     assert_eq!(batch[&target], state.base_filter());
 }
+
+/// A filter holding `count` distinct addresses whose second byte is `tag`.
+fn filled(tag: u8, count: u8) -> BloomFilter {
+    let mut f = BloomFilter::new();
+    for i in 0..count {
+        let mut bytes = [0u8; 16];
+        bytes[0] = i;
+        bytes[1] = tag;
+        f.insert(&NodeAddr::from_bytes(bytes));
+    }
+    f
+}
+
+#[test]
+fn overlap_is_one_against_itself_and_against_any_subset_of_it() {
+    let a = filled(1, 10);
+    let mut b = a.clone();
+    b.merge(&filled(2, 30)).unwrap();
+    assert_eq!(a.overlap(&a), Some(1.0));
+    assert_eq!(b.overlap(&a), Some(1.0), "b contains every bit of a");
+    let want = a.count_ones() as f64 / b.count_ones() as f64;
+    assert_eq!(a.overlap(&b), Some(want), "a holds only a's share of b");
+    assert!(want < 1.0);
+}
+
+#[test]
+fn overlap_is_zero_for_filters_with_no_bit_in_common() {
+    let mut a = BloomFilter::new();
+    a.insert_bytes(b"x");
+    let mut b = BloomFilter::new();
+    for i in 0u16..512 {
+        b.insert_bytes(&i.to_le_bytes());
+    }
+    // Keep only the bits of b that a does not have.
+    let disjoint_bits: Vec<u8> = b
+        .as_bytes()
+        .iter()
+        .zip(a.as_bytes())
+        .map(|(x, y)| x & !y)
+        .collect();
+    let disjoint = BloomFilter::from_bytes(disjoint_bits, b.hash_count()).expect("a valid filter");
+    assert!(disjoint.count_ones() > 0);
+    assert_eq!(disjoint.overlap(&a), Some(0.0));
+}
+
+#[test]
+fn overlap_is_undefined_against_an_empty_filter_or_across_sizes() {
+    let a = filled(1, 10);
+    assert_eq!(a.overlap(&BloomFilter::new()), None);
+    // Non-empty, so only the size difference can make it undefined.
+    let mut small = BloomFilter::with_params(1024, DEFAULT_HASH_COUNT).unwrap();
+    small.insert_bytes(b"x");
+    assert_eq!(a.overlap(&small), None);
+    assert_eq!(small.overlap(&a), None);
+}

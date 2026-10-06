@@ -7,8 +7,10 @@
 use crate::NodeAddr;
 use crate::node::Node;
 use crate::node::dataplane::PeerActionCtx;
+use crate::node::diag::OrNone;
 use crate::node::reject::{MmpReject, RejectReason, TreeReject};
 use crate::node::tree::sign_declaration;
+use crate::peer::ActivePeer;
 use crate::peer::machine::PeerEvent;
 use crate::proto::link::LinkMessageType;
 use crate::proto::mmp::{
@@ -516,14 +518,8 @@ impl Node {
                 // ms. Fall back to session_start (an `ActivePeer` Instant) for
                 // peers that never sent data, keeping that branch in Instant
                 // space so no monotonic-ms epoch conversion is needed.
-                let time_dead = if let Some(mmp) = peer.mmp() {
-                    match mmp.receiver.last_recv_ms() {
-                        Some(last_ms) => now_ms.saturating_sub(last_ms) >= dead_timeout_ms,
-                        None => now.duration_since(peer.session_start()) >= dead_timeout,
-                    }
-                } else {
-                    false
-                };
+                let time_dead = silence(peer, now, now_ms)
+                    .is_some_and(|s| s.is_dead(dead_timeout, dead_timeout_ms));
 
                 // Suppress teardown while an FMP rekey is genuinely in flight
                 // with budget left: a rekey-handshake link is not silent —
@@ -563,7 +559,7 @@ impl Node {
         let actions = self.mmp.plan_heartbeats(&snapshots);
 
         // Wall-clock basis for reconnect scheduling, sourced once (as before).
-        let now_ms = std::time::SystemTime::now()
+        let wall_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
@@ -577,12 +573,31 @@ impl Node {
                     // Log SHELL-SIDE before routing so the reap keeps the
                     // `fips::node::handlers::mmp` tracing target (no relocation into
                     // the executor, no target pin needed).
+                    // The same silence the decision read, with what the
+                    // peer's sessions did since the last cutover.
+                    let p = self.peers.get(&peer);
+                    let quiet = p.and_then(|p| silence(p, now, now_ms));
+                    let basis = OrNone(quiet.as_ref().map(Silence::basis));
+                    let basis_age_ms = OrNone(quiet.as_ref().map(Silence::age_ms));
+                    let since_cutover_ms =
+                        OrNone(p.and_then(|p| p.since_cutover()).map(|d| d.as_millis()));
+                    let kbit_ours = OrNone(p.map(|p| p.current_k_bit()));
+                    let prev_slot_frames = OrNone(p.map(|p| p.prev_frames()));
+                    let link_tid = OrNone(p.and_then(|p| p.transport_id()));
+                    let link_addr = OrNone(p.and_then(|p| p.current_addr()).cloned());
                     debug!(
                         peer = %self.peer_display_name(&peer),
                         timeout_secs = self.config().node.link_dead_timeout_secs,
+                        basis = %basis,
+                        basis_age_ms = %basis_age_ms,
+                        since_cutover_ms = %since_cutover_ms,
+                        kbit_ours = %kbit_ours,
+                        prev_slot_frames = %prev_slot_frames,
+                        link_tid = %link_tid,
+                        link_addr = %link_addr,
                         "Removing peer: link dead timeout"
                     );
-                    self.route_link_dead(peer, now_ms).await;
+                    self.route_link_dead(peer, wall_ms).await;
                 }
                 MmpAction::Heartbeat { peer } => {
                     // Attempt first, success after: the attempt is recorded
@@ -735,10 +750,94 @@ impl Node {
     }
 }
 
+/// How long a peer has been silent, and what the silence is measured from.
+#[derive(Debug, PartialEq, Eq)]
+enum Silence {
+    /// Monotonic ms since the MMP receiver last recorded a frame.
+    LastRecv(u64),
+    /// Time since the session started, for a peer the MMP receiver has
+    /// recorded no frame from since then.
+    SessionStart(Duration),
+}
+
+impl Silence {
+    /// Whether the silence has reached the link-dead timeout. Each basis
+    /// keeps its own comparison: milliseconds for the receiver's clock,
+    /// `Duration` for the session start, so no conversion is added to the
+    /// latter.
+    fn is_dead(&self, dead_timeout: Duration, dead_timeout_ms: u64) -> bool {
+        match self {
+            Self::LastRecv(ms) => *ms >= dead_timeout_ms,
+            Self::SessionStart(d) => *d >= dead_timeout,
+        }
+    }
+
+    /// The basis, as the link-dead line logs it.
+    fn basis(&self) -> &'static str {
+        match self {
+            Self::LastRecv(_) => "last_recv",
+            Self::SessionStart(_) => "session_start",
+        }
+    }
+
+    /// The silence in milliseconds, for display.
+    fn age_ms(&self) -> u128 {
+        match self {
+            Self::LastRecv(ms) => u128::from(*ms),
+            Self::SessionStart(d) => d.as_millis(),
+        }
+    }
+}
+
+/// The silence of `peer` as of `now` and the monotonic `now_ms`; `None` for a
+/// peer without MMP state, which is never declared dead on time.
+fn silence(peer: &ActivePeer, now: Instant, now_ms: u64) -> Option<Silence> {
+    let mmp = peer.mmp()?;
+    Some(match mmp.receiver.last_recv_ms() {
+        Some(last_ms) => Silence::LastRecv(now_ms.saturating_sub(last_ms)),
+        None => Silence::SessionStart(now.duration_since(peer.session_start())),
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{HEARTBEAT_RETRY_INTERVAL, heartbeat_due};
+    use super::{HEARTBEAT_RETRY_INTERVAL, Silence, heartbeat_due};
     use std::time::{Duration, Instant};
+
+    /// The link-dead timeout the boundary tests use, as `check_link_heartbeats`
+    /// derives both forms of it.
+    fn timeout(secs: u64) -> (Duration, u64) {
+        let d = Duration::from_secs(secs);
+        (d, d.as_millis() as u64)
+    }
+
+    #[test]
+    fn silence_reaches_the_timeout_at_exactly_the_timeout_on_either_basis() {
+        let (d, ms) = timeout(30);
+        assert!(!Silence::LastRecv(29_999).is_dead(d, ms));
+        assert!(Silence::LastRecv(30_000).is_dead(d, ms));
+        assert!(!Silence::SessionStart(Duration::from_millis(29_999)).is_dead(d, ms));
+        assert!(Silence::SessionStart(Duration::from_millis(30_000)).is_dead(d, ms));
+    }
+
+    /// A timeout whose millisecond count wraps in `u64` to 384 ms. The
+    /// session-start basis compares `Duration`s, so 31 s is still well short
+    /// of it; a comparison in wrapped milliseconds would call it dead.
+    #[test]
+    fn the_session_start_basis_compares_durations_for_a_timeout_too_large_for_u64_ms() {
+        let (d, ms) = timeout(18_446_744_073_709_552);
+        assert_eq!(ms, 384, "the millisecond form wraps");
+        assert!(!Silence::SessionStart(Duration::from_secs(31)).is_dead(d, ms));
+    }
+
+    #[test]
+    fn silence_names_its_basis_and_age() {
+        assert_eq!(Silence::LastRecv(1_500).basis(), "last_recv");
+        assert_eq!(Silence::LastRecv(1_500).age_ms(), 1_500);
+        let s = Silence::SessionStart(Duration::from_millis(31_250));
+        assert_eq!(s.basis(), "session_start");
+        assert_eq!(s.age_ms(), 31_250);
+    }
 
     const INTERVAL: Duration = Duration::from_secs(10);
 

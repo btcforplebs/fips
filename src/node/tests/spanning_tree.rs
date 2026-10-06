@@ -76,6 +76,34 @@ pub(super) fn add_loopback_alias(existing: &TransportAddr) -> TransportAddr {
     alias
 }
 
+/// Build a node that stands for `old` after a restart: the same identity
+/// and loopback address, a fresh startup epoch and no peers.
+///
+/// The old node's address is pointed at the new node's receive channel, so
+/// packets its peers still send to that address reach the restarted node.
+/// The caller drops `old`.
+pub(super) fn restarted_node(old: &TestNode, config: crate::config::Config) -> TestNode {
+    let mut node = Node::with_identity(old.node.identity().clone(), config).unwrap();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<ReceivedPacket>();
+    LOOPBACK_REGISTRY
+        .lock()
+        .unwrap()
+        .insert(old.addr.clone(), tx);
+    let loopback = LoopbackTransport::new(
+        old.transport_id,
+        old.addr.clone(),
+        LOOPBACK_REGISTRY.clone(),
+    );
+    node.transports
+        .insert(old.transport_id, TransportHandle::Loopback(loopback));
+    TestNode {
+        node,
+        transport_id: old.transport_id,
+        packet_rx: rx,
+        addr: old.addr.clone(),
+    }
+}
+
 /// A test node bundling a Node with its transport and packet channel.
 pub(super) struct TestNode {
     pub(super) node: Node,

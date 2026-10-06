@@ -1823,6 +1823,15 @@ print(f'  shutdown duration: {ts[1] - ts[0]:.3f}s')
 
 limits_phase
 
+# Stops sent while fips and fips-gateway are still starting. These run their
+# own containers and keep their own tally; a failure there, or a script that
+# cannot run, counts as one failure here.
+echo ""
+echo "Start-up stop cases"
+startup_rc=0
+bash "$SCRIPT_DIR/startup-stop-test.sh" || startup_rc=$?
+check "Start-up stop: daemon and gateway cases" "$startup_rc"
+
 echo ""
 echo "=== Results: $PASSED passed, $FAILED failed ==="
 [ "$FAILED" -eq 0 ] && exit 0 || exit 1

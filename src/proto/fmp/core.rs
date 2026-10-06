@@ -134,6 +134,27 @@ pub(crate) struct ConnSnapshot {
     pub msg1: Vec<u8>,
 }
 
+/// A digest of one link handshake msg1 exactly as it arrived, header included.
+///
+/// Both ends of a link hold the same msg1 bytes, the initiator the msg1 it
+/// sent and the responder the msg1 it answered, so the digest joins their
+/// log lines for one handshake.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Msg1Digest([u8; 32]);
+
+impl Msg1Digest {
+    /// Digest the wire bytes of one msg1.
+    pub(crate) fn of(wire_msg1: &[u8]) -> Self {
+        use sha2::{Digest, Sha256};
+        Self(Sha256::digest(wire_msg1).into())
+    }
+
+    /// The first four bytes of the digest, the part the log lines carry.
+    pub(crate) fn prefix(&self) -> [u8; 4] {
+        [self.0[0], self.0[1], self.0[2], self.0[3]]
+    }
+}
+
 /// A snapshot of one active peer's rekey-relevant state, taken by the shell.
 ///
 /// Every clock read is resolved shell-side into a plain `u64`/`bool` before the

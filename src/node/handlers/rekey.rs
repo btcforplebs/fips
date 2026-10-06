@@ -8,6 +8,7 @@
 use crate::NodeAddr;
 use crate::node::Node;
 use crate::node::dataplane::PeerActionCtx;
+use crate::node::diag::{self, OrNone};
 use crate::node::reject::{HandshakeReject, RejectReason};
 use crate::noise::HandshakeState;
 use crate::peer::machine::PeerEvent;
@@ -260,6 +261,8 @@ impl Node {
     fn cutover_peer_inline(&mut self, node_addr: &NodeAddr) {
         let did_cutover = if let Some(peer) = self.peers.get_mut(node_addr) {
             if let Some(_old_our_index) = peer.cutover_to_new_session() {
+                let epoch = OrNone(peer.noise_session().map(diag::epoch_tag));
+                let kbit_ours = peer.current_k_bit();
                 // New index was pre-registered in peers_by_index during msg2
                 // handling (handshake.rs).
                 debug_assert!(
@@ -279,6 +282,8 @@ impl Node {
                     their_addr = %node_addr,
                     our_index = ?our_index,
                     their_index = ?their_index,
+                    epoch = %epoch,
+                    kbit_ours,
                     "Rekey cutover complete (initiator), K-bit flipped"
                 );
                 true

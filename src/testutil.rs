@@ -53,6 +53,42 @@ impl LogCapture {
             .cloned()
             .collect()
     }
+
+    /// The first captured line whose message is exactly `message`.
+    ///
+    /// A substring match would let a message match a longer one it is a
+    /// prefix of, so the text must be followed by the end of the line or by
+    /// another `name=` field.
+    pub(crate) fn line(&self, message: &str) -> Option<String> {
+        let needle = format!(" message={message}");
+        self.lines().into_iter().find(|line| {
+            line.match_indices(&needle)
+                .any(|(at, _)| ends_value(&line[at + needle.len()..]))
+        })
+    }
+}
+
+/// Whether `rest`, the text after a field value, starts where that value
+/// ends: at the end of the line or at a following ` name=` field.
+fn ends_value(rest: &str) -> bool {
+    let Some(next) = rest.strip_prefix(' ') else {
+        return rest.is_empty();
+    };
+    let token = next.split(' ').next().unwrap_or("");
+    token.split_once('=').is_some_and(|(name, _)| {
+        !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    })
+}
+
+/// The value of field `name` in a captured `line`, up to the next space.
+///
+/// The leading space is part of the match, so `age_s` does not match inside
+/// `pending_age_s=`. Fields whose values contain spaces cannot be read this
+/// way.
+pub(crate) fn log_field<'a>(line: &'a str, name: &str) -> Option<&'a str> {
+    let needle = format!(" {name}=");
+    let start = line.find(&needle)? + needle.len();
+    line[start..].split(' ').next()
 }
 
 impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for LogCapture {
@@ -348,6 +384,34 @@ mod tests {
             other_thread_sees_quiet_default(),
             "capture_logs_scoped did not install QuietDefault"
         );
+    }
+
+    /// `line` matches the whole message, not a prefix of a longer one, and
+    /// `log_field` matches the whole field name, not the tail of a longer
+    /// one.
+    #[test]
+    fn line_and_log_field_match_whole_messages_and_whole_field_names() {
+        let ((), logs) = capture_logs(|| {
+            tracing::debug!(
+                pending_age_s = 40,
+                new_our_index = 7,
+                "Resent msg2 for duplicate msg1 (same epoch)"
+            );
+            tracing::debug!(age_s = 12, our_index = 3, "Resent msg2 for duplicate msg1");
+        });
+        let short = logs
+            .line("Resent msg2 for duplicate msg1")
+            .expect("the shorter message is found");
+        assert_eq!(log_field(&short, "age_s"), Some("12"), "{short}");
+        assert_eq!(log_field(&short, "our_index"), Some("3"), "{short}");
+
+        let long = logs
+            .line("Resent msg2 for duplicate msg1 (same epoch)")
+            .expect("the longer message is found");
+        assert_eq!(log_field(&long, "age_s"), None, "{long}");
+        assert_eq!(log_field(&long, "our_index"), None, "{long}");
+        assert_eq!(log_field(&long, "pending_age_s"), Some("40"), "{long}");
+        assert_eq!(logs.line("Resent msg2 for duplicate"), None);
     }
 
     /// Whether a fresh thread, with no subscriber of its own, falls back to
