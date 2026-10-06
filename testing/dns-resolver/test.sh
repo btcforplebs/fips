@@ -684,6 +684,22 @@ DOCKERFILE
         fail "missing manual instructions warning"
     fi
 
+    # The script ships beyond Debian, so the hint must not name one
+    # distribution's package manager.
+    if echo "$output" | grep -qE '(apt|apt-get|dnf|yum|zypper) install|pacman -S'; then
+        fail "manual instructions name a package manager"
+    else
+        pass "manual instructions name no package manager"
+    fi
+
+    # Setup uses systemd-resolved only when it is active, so the hint
+    # must say to start it, not only to install or enable it.
+    if echo "$output" | grep -qF 'enable --now systemd-resolved'; then
+        pass "manual instructions start systemd-resolved"
+    else
+        fail "manual instructions do not start systemd-resolved"
+    fi
+
     run_teardown "$name" >/dev/null 2>&1
     check_removed "$name" /run/fips/dns-backend \
         "teardown cleaned state file" \

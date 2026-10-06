@@ -391,17 +391,19 @@ fn freebsd_newsyslog_entry_signals_the_daemon8_supervisor_started_with_sighup_re
     );
 }
 
-/// Pins the DNS cleanup in `postrm purge` and `uninstall.sh` to the files
-/// `fips-dns-setup` writes, so a purge after a `fips-dns` that never ran its
-/// teardown does not leave the resolver sending `.fips` to a dead responder.
+/// Pins the DNS cleanup in `postrm remove` and `postrm purge` and in
+/// `uninstall.sh` to the files `fips-dns-setup` writes, so a remove or purge
+/// after a `fips-dns` that never ran its teardown does not leave the resolver
+/// sending `.fips` to a dead responder.
 ///
 /// This is a text test. Each path must appear on an `rm -f` line, but a
 /// resolver command passes wherever it appears on a code line, including in a
-/// message. What `postrm` actually does is covered by the deb-install purge
-/// check. No suite runs `uninstall.sh`: its two resolved paths were run once,
-/// by hand in a container, and its dnsmasq and NetworkManager paths by nothing.
+/// message. What `postrm` actually does is covered by the deb-install remove
+/// and purge checks. No suite runs `uninstall.sh`: its two resolved paths were
+/// run once, by hand in a container, and its dnsmasq and NetworkManager paths
+/// by nothing.
 #[test]
-fn dns_cleanup_in_postrm_purge_and_uninstall_removes_every_file_fips_dns_setup_writes_and_restarts_its_resolver()
+fn dns_cleanup_in_postrm_remove_and_purge_and_uninstall_removes_every_file_fips_dns_setup_writes_and_restarts_its_resolver()
  {
     let setup = rc_vars(&repo_file("packaging/common/fips-dns-setup"));
     let teardown = rc_vars(&repo_file("packaging/common/fips-dns-teardown"));
@@ -433,8 +435,8 @@ fn dns_cleanup_in_postrm_purge_and_uninstall_removes_every_file_fips_dns_setup_w
 
     let scripts = [
         (
-            "packaging/debian/postrm purge)",
-            case_branch(&repo_file("packaging/debian/postrm"), "purge"),
+            "packaging/debian/postrm remove|purge)",
+            case_branch(&repo_file("packaging/debian/postrm"), "remove|purge"),
         ),
         (
             "packaging/systemd/uninstall.sh",
@@ -1254,5 +1256,62 @@ fn openwrt_config_offers_no_ble_block_because_musl_builds_have_no_ble() {
         found.is_empty(),
         "{OPENWRT_CONFIG} offers a ble: block, but OpenWrt builds target musl, \
          where the BLE transport is not compiled: {found:?}"
+    );
+}
+
+/// `fips-dns-setup` is shared by the Debian package, the Arch packages, the
+/// systemd tarball and, where it is packaged, the RPM, so the hint it prints
+/// when it finds no DNS resolver must not tell the host to use one
+/// distribution's package manager.
+///
+/// Every systemd-resolved backend in the script gates on the unit being active
+/// (`is_active`), so the hint must say to start it (`enable --now`), not only to
+/// install or enable it, and then to restart `fips-dns.service` so detection
+/// runs again. `test_no_resolver` in `testing/dns-resolver/test.sh` asserts the
+/// same on the script's real output.
+#[test]
+fn fips_dns_setup_no_resolver_hint_starts_resolved_and_names_no_package_manager_because_the_script_is_not_debian_only()
+ {
+    const SETUP: &str = "packaging/common/fips-dns-setup";
+    const BANNED: [&str; 6] = [
+        "apt install",
+        "apt-get install",
+        "dnf install",
+        "yum install",
+        "zypper install",
+        "pacman -S",
+    ];
+    let lines = code_lines(&repo_file(SETUP));
+    let mut problems = Vec::new();
+
+    let hints: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.starts_with("log \"  systemd-resolved:"))
+        .collect();
+    match hints.as_slice() {
+        [hint] => {
+            for needed in ["enable --now", "restart fips-dns.service"] {
+                if !hint.contains(needed) {
+                    problems.push(format!("hint lacks '{needed}': {hint}"));
+                }
+            }
+        }
+        _ => problems.push(format!(
+            "expected one systemd-resolved hint line, found {}: {hints:?}",
+            hints.len()
+        )),
+    }
+    for line in &lines {
+        for banned in BANNED {
+            if line.contains(banned) {
+                problems.push(format!("names a package manager ('{banned}'): {line}"));
+            }
+        }
+    }
+
+    assert!(
+        problems.is_empty(),
+        "{SETUP}'s no-resolver hint is wrong:\n  {}",
+        problems.join("\n  ")
     );
 }

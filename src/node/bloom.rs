@@ -44,10 +44,9 @@ impl Node {
         peer_addr: &NodeAddr,
         filter: BloomFilter,
     ) -> Result<(), NodeError> {
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+        // Monotonic: the debounce compares two reads, and a wall-clock step
+        // back would hold announces for the size of the step.
+        let now_ms = crate::time::mono_ms();
 
         // Check debounce
         if !self.bloom_state.should_send_update(peer_addr, now_ms) {
@@ -137,10 +136,9 @@ impl Node {
 
     /// Send pending rate-limited filter announces whose debounce has expired.
     pub(super) async fn send_pending_filter_announces(&mut self) {
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+        // Monotonic: the debounce compares two reads, and a wall-clock step
+        // back would hold announces for the size of the step.
+        let now_ms = crate::time::mono_ms();
 
         let ready: Vec<NodeAddr> = self
             .peers

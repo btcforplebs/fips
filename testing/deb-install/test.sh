@@ -10,8 +10,10 @@
 # through the resolver backend that fips-dns-setup configured. Then
 # exercises fips-gateway against the same daemon to verify the
 # gateway/daemon default-pairing. Finally it
-# purges the package with the DNS routing file planted and fips-dns
-# stopped, and checks the file is removed and systemd-resolved restarted.
+# removes the package with the DNS routing file planted and fips-dns
+# stopped, and checks the file is removed and systemd-resolved restarted,
+# then plants the file again and purges the package from config-files
+# state, with the same checks.
 #
 # This is the most thorough test surface — it exercises:
 #   - cargo deb packaging (binary stripping, dependency declaration)
@@ -19,7 +21,8 @@
 #     of /etc/fips/fips.yaml
 #   - postinst maintainer scripts (systemd unit enablement,
 #     fips-dns.service running fips-dns-setup)
-#   - postrm purge (removing the DNS routing fips-dns-setup wrote)
+#   - postrm remove and postrm purge (removing the DNS routing
+#     fips-dns-setup wrote)
 #   - The fips, fips-dns, and (optionally) fips-gateway systemd units
 #   - End-to-end .fips resolution as a real user would experience it
 #
@@ -342,19 +345,155 @@ check_gateway_default_listener() {
     fi
 }
 
-# Purge the package with the DNS routing file planted and fips-dns stopped, and
+# Put the saved DNS routing file back at <file> and restart systemd-resolved,
+# then check the state in which removal leaves the file behind: the file in
+# place, fips-dns.service not active, and the resolver routing .fips to
+# [::1]:5354. Every failure is recorded with <label> in front.
+#
+# Args: <name> <file> <label>. Returns 1 if any precondition failed.
+plant_routing() {
+    local name="$1" file="$2" label="$3"
+    cexec "$name" mkdir -p "$(dirname "$file")"
+    cexec "$name" cp /root/fips-dns.saved "$file"
+    cexec "$name" systemctl restart systemd-resolved >/dev/null 2>&1
+
+    local ok=1 status
+    if ! cexec "$name" sh -c "test -s '$file' && cmp -s '$file' /root/fips-dns.saved"; then
+        fail "$label: $file not restored before the $label"
+        ok=0
+    fi
+    if cexec "$name" systemctl is-active --quiet fips-dns.service; then
+        fail "$label: fips-dns.service still active before the $label"
+        ok=0
+    fi
+    # Captured rather than piped into grep -q: under pipefail, grep closing the
+    # pipe early can fail the pipeline on a match.
+    if ! status=$(cexec "$name" resolvectl status 2>&1); then
+        fail "$label: resolvectl status failed before the $label"
+        echo "$status" | tail -10
+        ok=0
+    elif ! grep -q ':5354' <<<"$status"; then
+        fail "$label: resolvectl status does not show $file in effect before the $label"
+        echo "$status" | tail -25
+        ok=0
+    fi
+    [ "$ok" = 1 ]
+}
+
+# Check that the apt run just made removed <file> and restarted
+# systemd-resolved, and that the resolver no longer routes to [::1]:5354.
+#
+# Args: <name> <file> <label> <InvocationID of systemd-resolved before the run>
+expect_cleared() {
+    local name="$1" file="$2" label="$3" before="$4"
+    # test exits 1 for a missing file; any other failure is docker exec's.
+    local rc=0 after status
+    cexec "$name" test -e "$file" || rc=$?
+    case "$rc" in
+        1) pass "$label removed $file" ;;
+        0) fail "$label left $file behind" ;;
+        *) fail "$label: could not check for $file (exit $rc)" ;;
+    esac
+    after=$(cexec "$name" systemctl show -p InvocationID --value systemd-resolved)
+    if [ -n "$before" ] && [ -n "$after" ] && [ "$before" != "$after" ]; then
+        pass "$label restarted systemd-resolved"
+    else
+        fail "$label did not restart systemd-resolved (InvocationID '$before' -> '$after')"
+    fi
+    if ! status=$(cexec "$name" resolvectl status 2>&1); then
+        fail "$label: resolvectl status failed after the $label"
+        echo "$status" | tail -10
+    elif grep -q ':5354' <<<"$status"; then
+        fail "$label: resolvectl status still routes to port 5354"
+        echo "$status" | tail -25
+    else
+        pass "$label: resolvectl status no longer routes to port 5354"
+    fi
+    return
+}
+
+# Remove the package with the DNS routing file planted and fips-dns stopped, and
 # check that postrm removes the file and restarts systemd-resolved.
 #
 # Stopping fips-dns runs fips-dns-teardown, which removes the file; putting it
 # back gives the state in which removal leaves it behind: a live delegation and
-# an inactive fips-dns, so prerm's stop runs no teardown. Only postrm purge is
-# left to clean up, and a file it misses keeps the resolver sending .fips to
+# an inactive fips-dns, so prerm's stop runs no teardown. Only postrm is left
+# to clean up, and a file it misses keeps the resolver sending .fips to
 # [::1]:5354 after nothing listens there.
 #
 # Args: <name> <expected_backend>, the backend the scenario expects
-# fips-dns-setup to pick (dns-delegate or global-drop-in).
-check_purge_clears_dns() {
+# fips-dns-setup to pick (dns-delegate or global-drop-in). Returns 0 once
+# apt-get remove has succeeded, whatever the checks after it found, so the
+# purge check can follow; 1, having recorded why, if anything before that
+# failed.
+check_remove_clears_dns() {
     local name="$1" backend="$2" file
+    case "$backend" in
+        dns-delegate) file=/etc/systemd/dns-delegate.d/fips.dns-delegate ;;
+        global-drop-in) file=/etc/systemd/resolved.conf.d/fips.conf ;;
+        *)
+            fail "remove: no DNS routing file known for backend '$backend'"
+            return 1
+            ;;
+    esac
+
+    # The gateway-enable restart of fips.service is passed on to fips-dns
+    # (Requires=fips.service), whose setup waits for fips0 before it writes the
+    # file, and nothing since has waited for it. After=fips.service stops the
+    # old instance before the daemon, so active here means the new setup ran.
+    if ! wait_for_service_active "$name" fips-dns.service; then
+        fail "remove: fips-dns.service not active again after the gateway-enable restart"
+        echo "  --- fips-dns.service journal ---"
+        docker exec "$name" journalctl -u fips-dns.service --no-pager 2>&1 | tail -20
+        return 1
+    fi
+    if ! cexec "$name" test -f "$file"; then
+        fail "remove: $file not written by fips-dns-setup before the remove"
+        return 1
+    fi
+    # Saved inside the container: cexec runs docker exec without -i, so a
+    # copy piped back from the host would arrive empty.
+    if ! cexec "$name" cp "$file" /root/fips-dns.saved; then
+        fail "remove: could not save $file"
+        return 1
+    fi
+
+    cexec "$name" systemctl stop fips-dns.service >/dev/null 2>&1
+    plant_routing "$name" "$file" remove || return 1
+
+    # The runtime image's tag is shared by every run on the host, so show which
+    # postrm this run is testing.
+    local branches
+    branches=$(cexec "$name" grep -E '^[[:space:]]*[a-z|-]+\)[[:space:]]*$' \
+        /var/lib/dpkg/info/fips.postrm 2>&1 | tr -s ' \n' ' ')
+    echo "  installed postrm branches: $branches"
+
+    local before
+    before=$(cexec "$name" systemctl show -p InvocationID --value systemd-resolved)
+    run_apt "$name" "$UPGRADE_APT_TIMEOUT" remove -y fips
+    echo "  remove took ${APT_SECS}s"
+    if [ "$APT_RC" -ne 0 ]; then
+        fail "remove: apt-get remove exited $APT_RC"
+        echo "$APT_OUT" | tail -20
+        return 1
+    fi
+
+    expect_cleared "$name" "$file" remove "$before"
+    return 0
+}
+
+# Purge the removed package with the DNS routing file planted again, and check
+# that postrm removes the file and restarts systemd-resolved.
+#
+# The package is in config-files (rc) state after the remove, so dpkg runs only
+# postrm purge. Purging an installed package would run postrm remove first,
+# which clears the file and leaves this check unable to fail on the purge
+# branch.
+#
+# Args: <name> <expected_backend>, as for check_remove_clears_dns, which must
+# have run first: it saves the file this plants.
+check_purge_clears_dns() {
+    local name="$1" backend="$2" file state
     case "$backend" in
         dns-delegate) file=/etc/systemd/dns-delegate.d/fips.dns-delegate ;;
         global-drop-in) file=/etc/systemd/resolved.conf.d/fips.conf ;;
@@ -364,55 +503,18 @@ check_purge_clears_dns() {
             ;;
     esac
 
-    # The gateway-enable restart of fips.service is passed on to fips-dns
-    # (Requires=fips.service), whose setup waits for fips0 before it writes the
-    # file, and nothing since has waited for it. After=fips.service stops the
-    # old instance before the daemon, so active here means the new setup ran.
-    if ! wait_for_service_active "$name" fips-dns.service; then
-        fail "purge: fips-dns.service not active again after the gateway-enable restart"
-        echo "  --- fips-dns.service journal ---"
-        docker exec "$name" journalctl -u fips-dns.service --no-pager 2>&1 | tail -20
-        return
-    fi
-    if ! cexec "$name" test -f "$file"; then
-        fail "purge: $file not written by fips-dns-setup before the purge"
-        return
-    fi
-    # Saved inside the container: cexec runs docker exec without -i, so a
-    # copy piped back from the host would arrive empty.
-    if ! cexec "$name" cp "$file" /root/fips-dns.saved; then
-        fail "purge: could not save $file"
+    # shellcheck disable=SC2016  # a dpkg-query format field, not a shell expansion
+    state=$(cexec "$name" dpkg-query -W -f='${db:Status-Abbrev}' fips 2>&1)
+    state="${state%"${state##*[![:space:]]}"}"
+    if [ "$state" != "rc" ]; then
+        fail "purge: fips is in state '$state' after the remove, not config-files (rc)"
         return
     fi
 
-    cexec "$name" systemctl stop fips-dns.service >/dev/null 2>&1
-    cexec "$name" cp /root/fips-dns.saved "$file"
-    cexec "$name" systemctl restart systemd-resolved >/dev/null 2>&1
+    plant_routing "$name" "$file" purge || return
 
-    local ok=1 status
-    if ! cexec "$name" sh -c "test -s '$file' && cmp -s '$file' /root/fips-dns.saved"; then
-        fail "purge: $file not restored before the purge"
-        ok=0
-    fi
-    if cexec "$name" systemctl is-active --quiet fips-dns.service; then
-        fail "purge: fips-dns.service still active before the purge"
-        ok=0
-    fi
-    # Captured rather than piped into grep -q: under pipefail, grep closing the
-    # pipe early can fail the pipeline on a match.
-    if ! status=$(cexec "$name" resolvectl status 2>&1); then
-        fail "purge: resolvectl status failed before the purge"
-        echo "$status" | tail -10
-        ok=0
-    elif ! grep -q ':5354' <<<"$status"; then
-        fail "purge: resolvectl status does not show $file in effect before the purge"
-        echo "$status" | tail -25
-        ok=0
-    fi
-    [ "$ok" = 1 ] || return
-    local before after
+    local before
     before=$(cexec "$name" systemctl show -p InvocationID --value systemd-resolved)
-
     run_apt "$name" "$UPGRADE_APT_TIMEOUT" purge -y fips
     echo "  purge took ${APT_SECS}s"
     if [ "$APT_RC" -ne 0 ]; then
@@ -421,29 +523,7 @@ check_purge_clears_dns() {
         return
     fi
 
-    # test exits 1 for a missing file; any other failure is docker exec's.
-    local rc=0
-    cexec "$name" test -e "$file" || rc=$?
-    case "$rc" in
-        1) pass "purge removed $file" ;;
-        0) fail "purge left $file behind" ;;
-        *) fail "purge: could not check for $file (exit $rc)" ;;
-    esac
-    after=$(cexec "$name" systemctl show -p InvocationID --value systemd-resolved)
-    if [ -n "$before" ] && [ -n "$after" ] && [ "$before" != "$after" ]; then
-        pass "purge restarted systemd-resolved"
-    else
-        fail "purge did not restart systemd-resolved (InvocationID '$before' -> '$after')"
-    fi
-    if ! status=$(cexec "$name" resolvectl status 2>&1); then
-        fail "purge: resolvectl status failed after the purge"
-        echo "$status" | tail -10
-    elif grep -q ':5354' <<<"$status"; then
-        fail "purge: resolvectl status still routes to port 5354"
-        echo "$status" | tail -25
-    else
-        pass "purge: resolvectl status no longer routes to port 5354"
-    fi
+    expect_cleared "$name" "$file" purge "$before"
     return
 }
 
@@ -749,7 +829,9 @@ DOCKERFILE
 
     check_gateway_default_listener "$name" "$npub"
 
-    check_purge_clears_dns "$name" "$expected_backend"
+    if check_remove_clears_dns "$name" "$expected_backend"; then
+        check_purge_clears_dns "$name" "$expected_backend"
+    fi
 
     cleanup_container "$name"
 }

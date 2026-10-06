@@ -66,6 +66,31 @@ fn test_bloom_state_debounce() {
 }
 
 #[test]
+fn should_send_update_after_backward_clock_step_waits_at_most_the_debounce() {
+    let node = make_node_addr(0);
+    let peer = make_node_addr(1);
+    let mut state = BloomState::new(node);
+    state.set_update_debounce_ms(500);
+
+    state.mark_update_needed(peer);
+    state.record_update_sent(peer, 100_000);
+    state.mark_update_needed(peer);
+
+    // A clock reading 60 s before the last send must not hold the update
+    // until the clock regains the 60 s.
+    assert!(
+        state.should_send_update(&peer, 40_000),
+        "a time before the last send must permit the send"
+    );
+
+    // Once restamped at the earlier time, the ordinary window applies again.
+    state.record_update_sent(peer, 40_000);
+    state.mark_update_needed(peer);
+    assert!(!state.should_send_update(&peer, 40_200));
+    assert!(state.should_send_update(&peer, 40_500));
+}
+
+#[test]
 fn test_bloom_state_sequence() {
     let node = make_node_addr(0);
     let mut state = BloomState::new(node);
@@ -215,9 +240,10 @@ fn test_bloom_state_remove_peer_state() {
     // Pending updates cleared
     assert!(!state.needs_update(&peer));
 
-    // Debounce state cleared — should be able to send immediately
+    // Debounce state cleared — should be able to send inside the window a
+    // surviving stamp of 1000 would still impose
     state.mark_update_needed(peer);
-    assert!(state.should_send_update(&peer, 0));
+    assert!(state.should_send_update(&peer, 1200));
 
     // Sent filter cleared — mark_changed_peers should treat as "never sent"
     state.clear_pending_updates();

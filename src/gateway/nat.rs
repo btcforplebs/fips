@@ -341,6 +341,16 @@ impl NatManager {
             NatOp::FipsMasquerade,
         ];
 
+        // When any port forwards are configured, one LAN-side masquerade in
+        // postrouting gives the LAN target the gateway's LAN address as the
+        // source, so replies flow back through conntrack. It goes ahead of
+        // every per-mapping SNAT: those match on source address alone, NAT
+        // statements are terminal, and a SNAT listed first would take an
+        // inbound forwarded flow from a peer that holds a live mapping.
+        if !self.port_forwards.is_empty() {
+            ops.push(NatOp::LanMasquerade);
+        }
+
         for mapping in self.mappings.values() {
             ops.push(NatOp::Dnat(mapping.virtual_ip));
             ops.push(NatOp::Snat(mapping.virtual_ip));
@@ -348,14 +358,8 @@ impl NatManager {
 
         // Inbound port-forward rules. Each forward is one DNAT rule in
         // prerouting keyed on (iif fips0, nfproto ipv6, l4proto, th dport).
-        // When any forwards are configured, emit a single LAN-side masquerade
-        // in postrouting so the LAN target host sees the gateway's LAN address
-        // as source and replies flow back through conntrack.
         for index in 0..self.port_forwards.len() {
             ops.push(NatOp::PortForward(index));
-        }
-        if !self.port_forwards.is_empty() {
-            ops.push(NatOp::LanMasquerade);
         }
 
         vec![ops]
@@ -1244,6 +1248,39 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn rebuild_places_the_lan_masquerade_before_every_mapping_snat() {
+        let mut mgr = manager_with_mappings(3);
+        mgr.port_forwards = vec![PortForward {
+            proto: Proto::Tcp,
+            listen_port: 8080,
+            target: SocketAddrV6::new(Ipv6Addr::LOCALHOST, 80, 0, 0),
+        }];
+
+        let ops = mgr.rebuild_batches().remove(0);
+
+        let masquerade = ops
+            .iter()
+            .position(|op| matches!(op, NatOp::LanMasquerade))
+            .expect("a port forward emits the LAN masquerade");
+        let snats: Vec<usize> = ops
+            .iter()
+            .enumerate()
+            .filter(|(_, op)| matches!(op, NatOp::Snat(_)))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(snats.len(), 3, "one SNAT per mapping: {ops:?}");
+        for snat in snats {
+            assert!(
+                masquerade < snat,
+                "the LAN masquerade at index {masquerade} follows the SNAT at \
+                 index {snat}, so an inbound forwarded flow from a peer with a \
+                 live mapping takes the SNAT and bypasses the masquerade: \
+                 {ops:?}"
+            );
+        }
     }
 
     /// The encoded rebuild of a manager holding `count` mappings.
