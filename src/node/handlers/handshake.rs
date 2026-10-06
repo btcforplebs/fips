@@ -1772,14 +1772,10 @@ impl Node {
 
             // Clean up outbound connection state
             self.pending_outbound.remove(&key);
-            // Close the losing TCP connection (no-op for connectionless)
-            if let Some(link) = self.links.get(&link_id) {
-                let tid = link.transport_id();
-                let addr = link.remote_addr().clone();
-                if let Some(transport) = self.transports.get(&tid) {
-                    transport.close_connection(&addr).await;
-                }
-            }
+            // Close the losing leg's connection: a separate socket on TCP, a
+            // no-op when connectionless, and left open when it is the very
+            // connection the promoted peer runs on (BLE).
+            self.close_handshake_link_connection(link_id).await;
             self.remove_link(&link_id);
 
             // Send TreeAnnounce now that sessions are aligned
