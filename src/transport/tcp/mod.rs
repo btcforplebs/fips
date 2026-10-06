@@ -375,6 +375,18 @@ impl TcpTransport {
         self.write_packet(addr, writer, data).await
     }
 
+    /// Whether the pool holds a connection to `addr`, the lookup
+    /// [`send_existing`](Self::send_existing) makes first.
+    ///
+    /// Reads only: a finished background connect is not moved into the pool,
+    /// so for one that is waiting to be taken this reports false although
+    /// `send_existing` would promote it and send. Awaits the pool lock, so it
+    /// never reports a connection absent because the lock was busy.
+    pub async fn has_connection(&self, addr: &TransportAddr) -> bool {
+        let pool = self.pool.lock().await;
+        key_for_remote(&pool, addr).is_some()
+    }
+
     /// The writer for an established connection to `addr`, promoting a
     /// background connect that has finished since it was started.
     ///
@@ -2939,6 +2951,64 @@ mod tests {
             t2.stats().snapshot().connections_accepted,
             1,
             "the send used the background connection, not a new one"
+        );
+
+        t1.stop_async().await.unwrap();
+        t2.stop_async().await.unwrap();
+    }
+
+    /// `has_connection` reports only what the pool holds. A finished
+    /// background connect is not a pooled connection and is left where it
+    /// is; once `send_existing` has promoted it, the connection is reported,
+    /// and the accepting side reports the connection by its remote address.
+    #[tokio::test]
+    async fn has_connection_reports_the_pool_and_never_promotes_a_finished_connect() {
+        let (tx1, _rx1) = packet_channel(100);
+        let (tx2, mut rx2) = packet_channel(100);
+        let mut t1 = TcpTransport::new(TransportId::new(1), None, make_outbound_config(), tx1);
+        let mut t2 = TcpTransport::new(TransportId::new(2), None, make_config(), tx2);
+        t1.start_async().await.unwrap();
+        t2.start_async().await.unwrap();
+        let remote = TransportAddr::from_string(&t2.local_addr().unwrap().to_string());
+
+        assert!(
+            !t1.has_connection(&remote).await,
+            "no connection before any connect"
+        );
+
+        t1.connect_async(&remote).await.unwrap();
+        wait_connect_finished(&t1, &remote).await;
+        assert!(
+            !t1.has_connection(&remote).await,
+            "a finished connect that is not pooled is not a connection"
+        );
+        assert!(
+            t1.connecting.lock().await.contains_key(&remote),
+            "the query moved the finished connect out of the connecting map"
+        );
+        assert!(
+            t1.pool.lock().await.is_empty(),
+            "the query put a connection in the pool"
+        );
+        assert_eq!(
+            t1.stats().snapshot().connections_established,
+            0,
+            "the query promoted the finished connect"
+        );
+
+        t1.send_existing(&remote, &msg1_frame()).await.unwrap();
+        assert!(
+            t1.has_connection(&remote).await,
+            "the promoted connection is pooled"
+        );
+
+        let packet = timeout(Duration::from_secs(2), rx2.recv())
+            .await
+            .expect("timeout")
+            .expect("channel closed");
+        assert!(
+            t2.has_connection(&packet.remote_addr).await,
+            "the accepting side holds the inbound connection by its remote address"
         );
 
         t1.stop_async().await.unwrap();

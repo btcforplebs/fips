@@ -362,6 +362,15 @@ impl<I: BleIo> BleTransport<I> {
         Ok(())
     }
 
+    /// Whether the pool holds a connection to `addr`, the lookup
+    /// [`send_async`](Self::send_async) makes first.
+    ///
+    /// Reads only: no background connect is started, and the pool lock is
+    /// awaited rather than tried.
+    pub async fn has_connection(&self, addr: &TransportAddr) -> bool {
+        self.pool.lock().await.contains(addr)
+    }
+
     /// Send data to a remote BLE address.
     ///
     /// If no connection exists, triggers a background connect and fails

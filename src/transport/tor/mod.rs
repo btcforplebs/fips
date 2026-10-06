@@ -696,6 +696,15 @@ impl TorTransport {
         self.write_packet(addr, writer, data).await
     }
 
+    /// Whether the pool holds a connection to `addr`, the lookup
+    /// [`send_existing`](Self::send_existing) makes first.
+    ///
+    /// Reads only: a finished background connect is not moved into the pool,
+    /// and the pool lock is awaited rather than tried.
+    pub async fn has_connection(&self, addr: &TransportAddr) -> bool {
+        self.pool.lock().await.contains_key(addr)
+    }
+
     /// Reject a packet larger than the transport MTU before writing it.
     fn check_mtu(&self, data: &[u8]) -> Result<(), TransportError> {
         if data.len() > self.config.mtu() as usize {
