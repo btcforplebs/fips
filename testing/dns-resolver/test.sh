@@ -178,7 +178,8 @@ run_setup() {
     docker cp "$TEARDOWN_SCRIPT" "$name:/usr/local/bin/fips-dns-teardown"
     docker exec "$name" chmod +x /usr/local/bin/fips-dns-setup /usr/local/bin/fips-dns-teardown
     # Exit code may be non-zero due to service reload failures in containers.
-    # We test detection and config generation, not service operation.
+    # Most cases test detection and config generation, not service
+    # operation; the dnsmasq case also checks that dnsmasq took the config.
     docker exec "$name" /usr/local/bin/fips-dns-setup 2>&1 || true
 }
 
@@ -527,17 +528,27 @@ DOCKERFILE
 
 test_dnsmasq() {
     local name="fips-dns-test-dnsmasq${FIPS_CI_NAME_SUFFIX:-}"
-    local image="fips-dns-test:dnsmasq"
+    # build_inline writes this tag with no run suffix, so change the tag
+    # whenever this Dockerfile changes. Otherwise a concurrent run of the
+    # previous Dockerfile can overwrite the image between this run's build
+    # and its docker run.
+    local image="fips-dns-test:dnsmasq-fwd"
     log "Debian 12 + dnsmasq standalone"
 
+    # procps provides /bin/kill, which dnsmasq.service's ExecReload runs, so
+    # the container behaves as a real Debian host does. dnsutils provides
+    # dig. 00-test.conf leaves dnsmasq with no upstream, so a .fips query it
+    # has no server for is answered locally rather than sent to the host's
+    # resolver.
     build_image "$image" "$(cat <<'DOCKERFILE'
 FROM debian:12
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    systemd dnsmasq iproute2 dbus && \
+    systemd dnsmasq iproute2 dbus procps dnsutils && \
     apt-get clean && rm -rf /var/lib/apt/lists/* && \
     systemctl enable dnsmasq && \
-    mkdir -p /etc/dnsmasq.d
+    mkdir -p /etc/dnsmasq.d && \
+    echo no-resolv > /etc/dnsmasq.d/00-test.conf
 CMD ["/lib/systemd/systemd"]
 DOCKERFILE
     )" || { fail "build failed"; return; }
@@ -545,6 +556,21 @@ DOCKERFILE
     start_systemd_container "$name" "$image"
     wait_for_systemd "$name"
     create_fips0 "$name"
+
+    # A stand-in for the fips DNS responder on the daemon's bind, ::1#5354,
+    # answering every .fips AAAA query with a fixed address. If it does not
+    # answer directly, the forwarding checks below would pass or fail for
+    # the wrong reason, so the case stops here.
+    docker exec "$name" dnsmasq --port=5354 --listen-address=::1 \
+        --bind-interfaces --no-resolv --no-hosts --conf-file=/dev/null \
+        --address=/fips/fd00::5354 --pid-file=/run/fips-standin.pid 2>&1
+    if [ "$(dnsmasq_query "$name" ::1 5354)" = "fd00::5354" ]; then
+        pass "stand-in .fips responder answers on ::1#5354"
+    else
+        fail "stand-in .fips responder does not answer on ::1#5354"
+        cleanup_container "$name"
+        return
+    fi
 
     local output
     output=$(run_setup "$name" 2>&1)
@@ -575,6 +601,24 @@ DOCKERFILE
         fail "dnsmasq config target wrong — must be server=/fips/::1#5354"
     fi
 
+    if grep -q 'WARNING: dnsmasq' <<<"$output"; then
+        fail "setup warned about dnsmasq"
+    else
+        pass "setup did not warn about dnsmasq"
+    fi
+
+    # A written file proves nothing until dnsmasq has loaded it: the query
+    # must come back with the stand-in's address through dnsmasq itself.
+    local answer forwarded=0
+    answer=$(dnsmasq_query "$name" 127.0.0.1 53)
+    if [ "$answer" = "fd00::5354" ]; then
+        pass "dnsmasq forwards .fips to ::1#5354 after setup"
+        forwarded=1
+    else
+        fail "dnsmasq forwards .fips: expected fd00::5354 through 127.0.0.1, got: ${answer:-(empty)}"
+        dnsmasq_dump "$name"
+    fi
+
     # Teardown
     run_teardown "$name" >/dev/null 2>&1
     check_removed "$name" /etc/dnsmasq.d/fips.conf \
@@ -584,7 +628,86 @@ DOCKERFILE
         "teardown cleaned state file" \
         "state file still exists after teardown"
 
+    if docker exec "$name" systemctl is-active --quiet dnsmasq.service; then
+        pass "dnsmasq still active after teardown"
+    else
+        fail "dnsmasq not active after teardown"
+    fi
+
+    # A missing fd00::5354 shows the forward was unloaded only if the
+    # forward had been loaded and the stand-in would still answer it.
+    # Otherwise the check below would pass without testing anything.
+    local reply
+    if [ "$forwarded" -ne 1 ]; then
+        skip "dnsmasq stops forwarding .fips after teardown: setup never loaded the forward"
+        cleanup_container "$name"
+        return
+    fi
+    if [ "$(dnsmasq_query "$name" ::1 5354)" != "fd00::5354" ]; then
+        fail "dnsmasq stops forwarding .fips after teardown: stand-in no longer answers on ::1#5354"
+        cleanup_container "$name"
+        return
+    fi
+    # dnsmasq must answer (a status header, so a dead dnsmasq cannot pass)
+    # and must no longer return the stand-in's address.
+    reply=$(dnsmasq_reply "$name")
+    if ! grep -q 'status:' <<<"$reply"; then
+        fail "dnsmasq stops forwarding .fips after teardown: no response from 127.0.0.1"
+        dnsmasq_dump "$name"
+    elif grep -qF 'fd00::5354' <<<"$reply"; then
+        fail "dnsmasq stops forwarding .fips after teardown: still answers fd00::5354"
+        dnsmasq_dump "$name"
+    else
+        pass "dnsmasq stops forwarding .fips after teardown"
+    fi
+
     cleanup_container "$name"
+}
+
+# Print the AAAA answer for probe.fips from the server at ADDR#PORT inside
+# the container, or nothing. Up to three tries a second apart, because a
+# dnsmasq that systemd has just restarted or that has just forked may not
+# be answering on the first query. dig reports a timeout on stdout as a
+# line starting ";;", which is not an answer, so it does not end the tries.
+dnsmasq_query() {
+    local name="$1" addr="$2" port="$3" answer=""
+    for _i in 1 2 3; do
+        answer=$(docker exec "$name" dig +short +time=2 +tries=1 \
+            -p "$port" "@$addr" AAAA probe.fips 2>/dev/null)
+        [ -n "$answer" ] && [ "${answer#;;}" = "$answer" ] && break
+        sleep 1
+    done
+    echo "$answer"
+    return 0
+}
+
+# Print dig's full reply for probe.fips from the container's dnsmasq on
+# 127.0.0.1, retrying up to three times until one carries a status header.
+dnsmasq_reply() {
+    local name="$1" reply=""
+    for _i in 1 2 3; do
+        reply=$(docker exec "$name" dig +time=2 +tries=1 \
+            @127.0.0.1 AAAA probe.fips 2>&1)
+        grep -q 'status:' <<<"$reply" && break
+        sleep 1
+    done
+    echo "$reply"
+    return 0
+}
+
+# Dump dnsmasq's unit status and journal, so a forwarding failure shows
+# whether dnsmasq rejected the config, never re-read it, or was down.
+dnsmasq_dump() {
+    local name="$1" out
+    out=$(mktemp)
+    {
+        echo "== systemctl status dnsmasq"
+        docker exec "$name" systemctl status dnsmasq --no-pager 2>&1
+        echo "== journalctl -u dnsmasq"
+        docker exec "$name" journalctl -u dnsmasq --no-pager 2>&1
+    } >"$out" 2>&1
+    dump_output "dnsmasq forwarding in $name" "$out"
+    rm -f "$out"
 }
 
 test_nm_dnsmasq() {

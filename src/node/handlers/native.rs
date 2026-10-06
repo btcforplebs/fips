@@ -223,13 +223,19 @@ impl Node {
         }
     }
 
-    /// Discard pending flows a listener's task never wired.
+    /// The native API's maintenance tick work.
     ///
-    /// Called from the maintenance tick. The window it closes is the hop
-    /// between the rx_loop announcing an arrival and the listener's task taking
-    /// it, so a non-zero count is the daemon failing to complete an arrival
-    /// rather than a client failing to answer for one. It should be zero on a
-    /// healthy node.
+    /// Two jobs. First, discard pending flows a listener's task never wired.
+    /// The window that closes is the hop between the rx_loop announcing an
+    /// arrival and the listener's task taking it, so a non-zero count is the
+    /// daemon failing to complete an arrival rather than a client failing to
+    /// answer for one. It should be zero on a healthy node.
+    ///
+    /// Second, release held datagrams for destinations with no session and
+    /// no lookup (see [`Self::purge_native`]). The purge is called from here
+    /// rather than beside this call in the tick so that tests driving this
+    /// function also cover the tick's wiring, which no unit test can reach
+    /// inside the rx_loop.
     pub(in crate::node) fn native_expire(&mut self) {
         let expired = self.native.expire(Self::now_ms());
         self.metrics.native.flows_expired.add(expired.len() as u64);
@@ -237,6 +243,43 @@ impl Node {
             debug!(
                 count = expired.len(),
                 "Native API pending flows expired without an answer"
+            );
+        }
+        self.purge_native();
+    }
+
+    /// Release native datagrams held for a destination nothing of ours is
+    /// still trying to reach.
+    ///
+    /// A held datagram leaves only when its destination's session
+    /// establishes. Once the destination has neither a session entry, in any
+    /// state, nor a pending lookup, nothing of ours is still working to
+    /// establish one, so the datagram could be held for the daemon's life and
+    /// would count against `pending_max_destinations` until every new
+    /// destination was refused. The cost is that a session which comes up
+    /// later for another reason, such as the peer initiating or a later send
+    /// of ours, no longer finds the datagram. One predicate rather than a hook
+    /// per event, because some ways of reaching that state fire no event: a
+    /// lookup gated by a bloom miss or by backoff never creates a session
+    /// entry or a pending lookup.
+    fn purge_native(&mut self) {
+        let sessions = &self.sessions;
+        let lookups = &self.lookup.pending_lookups;
+        let before = self.pending_native.len();
+        let mut datagrams = 0usize;
+        self.pending_native.retain(|dest, held| {
+            let live = sessions.contains_key(dest) || lookups.contains_key(dest);
+            if !live {
+                datagrams += held.len();
+            }
+            live
+        });
+        let destinations = before - self.pending_native.len();
+        if destinations > 0 {
+            debug!(
+                destinations,
+                datagrams,
+                "Released native datagrams held for destinations with no session or lookup"
             );
         }
     }

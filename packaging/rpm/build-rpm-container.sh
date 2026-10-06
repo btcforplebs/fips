@@ -79,20 +79,16 @@ mkdir -p "$DEST_DIR"
 DEST_ABS="$(cd "$DEST_DIR" && pwd)"
 
 # Both scratch directories live inside the output directory rather than under
-# /tmp, which is the shape build-deb-container.sh takes and for the same
-# reason: a bind-mount source is resolved by the Docker daemon in the host's
-# mount namespace, so under a private /tmp -- systemd's PrivateTmp=, which the
-# CI worker sets -- a path from a bare `mktemp -d` exists only in this
-# process's namespace. The daemon would create its own directory at that path
-# in the host's /tmp, the container would write there, and this script would
-# read an empty one. The output directory is already bind-mounted as /out and
-# so resolves the same way in both namespaces.
+# /tmp, as in build-deb-container.sh, because a bind-mount source must resolve
+# the same way for the Docker daemon as for this script, and under a private
+# /tmp a bare `mktemp -d` path does not (see shared_tmpdir in
+# testing/lib/image-build.sh). The output directory is already bind-mounted as
+# /out, so it resolves the same way in both namespaces.
 #
 # The traps clear them on any ordinary exit but not on a SIGKILL, and the
 # builder's watch loop group-kills a run that overruns or is superseded, so
-# sweep siblings old enough that no live run can own them.
-find "$DEST_ABS" -maxdepth 1 -type d \( -name '.name.*' -o -name '.stage.*' \) \
-    -mmin +120 -exec rm -rf {} + 2>/dev/null || :
+# each is created with --sweep, which clears siblings old enough that no live
+# run can own them.
 
 STAGE=""
 # The body is last, not the test: written as `[ -n "$STAGE" ] && rm -rf ...`,
@@ -111,7 +107,7 @@ if [ "$NO_BUILD" -eq 0 ]; then
     # it. That is one build rather than two, and it is the build that
     # build-deb-container.sh has already run the glibc floor and Depends checks
     # on, so the RPM cannot carry objects those checks never saw.
-    STAGE=$(mktemp -d "$DEST_ABS/.stage.XXXXXX") || {
+    STAGE=$(shared_tmpdir --sweep "$DEST_ABS" .stage) || {
         echo "build-rpm-container: could not create a staging directory in $DEST_ABS" >&2
         exit 1
     }
@@ -139,7 +135,7 @@ if [ "$NO_BUILD" -eq 0 ]; then
         -e "HOST_UID=$(id -u)" -e "HOST_GID=$(id -g)" \
         "$BUILD_IMAGE" \
         bash -euo pipefail -c '
-            unpack=$(mktemp -d)
+            unpack=$(mktemp -d) # mount-tmpdir: runs inside the container, never mounted
             dpkg-deb -x /deb/*.deb "$unpack"
             for binary in fips fipsctl fipstop fips-gateway; do
                 install -m 0755 "$unpack/usr/bin/$binary" "/bin-out/$binary"
@@ -181,7 +177,7 @@ fi
 
 echo "=== Packaging fips $VERSION in $FIPS_RPM_BUILD_IMAGE ===" >&2
 
-NAME_DIR=$(mktemp -d "$DEST_ABS/.name.XXXXXX") || {
+NAME_DIR=$(shared_tmpdir --sweep "$DEST_ABS" .name) || {
     echo "build-rpm-container: could not create a name directory in $DEST_ABS" >&2
     exit 1
 }

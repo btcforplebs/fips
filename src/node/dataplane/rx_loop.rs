@@ -505,8 +505,11 @@ impl Node {
                         instr_step!(instr_on, crate::instr::Domain::Tick, crate::instr::Step::CheckTimeouts,
                         self.check_timeouts().await);
                         // Discard flows the rx_loop announced and a listener's
-                        // own task never took. Cheap: it walks only the pending
-                        // map, which the backlog bounds.
+                        // own task never took, and release native datagrams
+                        // held for destinations with no session or lookup.
+                        // Cheap: it walks only the pending flow map, which the
+                        // backlog bounds, and the held-datagram map, which
+                        // `pending_max_destinations` bounds.
                         self.native_expire();
                         let now_ms = Self::now_ms();
                         instr_step!(instr_on, crate::instr::Domain::Tick, crate::instr::Step::ReloadPeerAcl,

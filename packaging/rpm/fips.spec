@@ -261,8 +261,8 @@ if [ $1 -eq 0 ]; then
         rm -f %{_sysconfdir}/dnsmasq.d/fips.conf
         if [ -d /run/systemd/system ] \
             && systemctl is-active --quiet dnsmasq.service; then
-            systemctl reload dnsmasq \
-                || echo "fips: warning: could not reload dnsmasq; reload it to drop the .fips route"
+            systemctl try-restart dnsmasq \
+                || echo "fips: warning: could not restart dnsmasq; restart it to drop the .fips route"
         fi
     fi
     if [ -f %{_sysconfdir}/NetworkManager/dnsmasq.d/fips.conf ]; then

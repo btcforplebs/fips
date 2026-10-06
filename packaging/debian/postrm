@@ -34,8 +34,8 @@ case "$1" in
             rm -f /etc/dnsmasq.d/fips.conf
             if [ -d /run/systemd/system ] \
                 && systemctl is-active --quiet dnsmasq.service; then
-                systemctl reload dnsmasq \
-                    || echo "fips: warning: could not reload dnsmasq; reload it to drop the .fips route"
+                systemctl try-restart dnsmasq \
+                    || echo "fips: warning: could not restart dnsmasq; restart it to drop the .fips route"
             fi
         fi
         if [ -f /etc/NetworkManager/dnsmasq.d/fips.conf ]; then

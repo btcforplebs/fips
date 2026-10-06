@@ -490,15 +490,6 @@ print(len(events))
     return 0
 }
 
-# A relay that faulted while a scenario's assertions still passed is a finding
-# about the relay, not about the scenario, so it is reported and not made a
-# failure: the scenario proved what it set out to prove.
-note_relay_event() {
-    if relay_verdict "$RELAY_CONTAINER"; then
-        echo "NOTE: the assertions above passed despite that." >&2
-    fi
-}
-
 run_cone() {
     echo "=== NAT lab: cone ==="
     cleanup
@@ -546,7 +537,7 @@ run_cone() {
         dump_cone_diagnostics
         return 1
     }
-    note_relay_event
+    assert_relay "$RELAY_CONTAINER" || return 1
     cleanup
 }
 
@@ -599,7 +590,7 @@ run_symmetric() {
         dump_symmetric_diagnostics
         return 1
     }
-    note_relay_event
+    assert_relay "$RELAY_CONTAINER" || return 1
     cleanup
 }
 
@@ -649,7 +640,7 @@ run_lan() {
         dump_lan_diagnostics
         return 1
     }
-    note_relay_event
+    assert_relay "$RELAY_CONTAINER" || return 1
     # Skip the final teardown when the mesh-lab harness wraps this
     # script: it needs to docker-logs the containers before teardown,
     # and will run its own cleanup after capture. Failure paths above

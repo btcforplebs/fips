@@ -48,7 +48,10 @@ teardown_dnsmasq() {
     [ -f "$DNSMASQ_CONF" ] || return 0
     log "Removing dnsmasq config"
     rm -f "$DNSMASQ_CONF"
-    is_active dnsmasq.service && systemctl reload dnsmasq || true
+    # A reload (SIGHUP) does not make dnsmasq re-read its configuration,
+    # so only a restart drops the forward. try-restart leaves a dnsmasq
+    # that stopped meanwhile stopped.
+    is_active dnsmasq.service && systemctl try-restart dnsmasq || true
     return 0
 }
 
