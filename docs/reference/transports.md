@@ -97,12 +97,11 @@ Nym is outbound-only (no inbound listener), so there are no
 | `connect_timeouts` | Connection timeout count |
 | `connect_errors` | Outbound connects that failed with an error rather than timing out |
 | `pubkey_exchange_failures` | Connections dropped because the pre-handshake pubkey exchange failed |
-| `tiebreaker_yields` | Outbound connections stood down by the cross-probe tie-breaker |
-| `tiebreaker_drops` | Inbound connections stood down by the cross-probe tie-breaker |
 | `pool_evictions` | Connection-pool entries evicted |
 | `advertisements_sent` | BLE advertisements emitted |
 | `scan_results` | BLE scan results observed |
-| `duplicate_node_declines` | Connections declined because the peer was already linked on another link address |
+| `duplicate_node_declines` | Connections declined because the peer was already linked, on the same link address or another |
+| `duplicate_link_replacements` | Links replaced by a racing second link to the same peer: both ends keep the one the smaller node dialled |
 
 ## See also
 

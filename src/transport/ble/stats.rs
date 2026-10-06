@@ -36,9 +36,12 @@ pub struct BleStats {
     pub pool_evictions: AtomicU64,
     pub advertisements_sent: AtomicU64,
     pub scan_results: AtomicU64,
-    /// Connections declined because the peer was already linked on another
-    /// link address (see `ConnectionPool::find_by_node`).
+    /// Connections declined because the peer was already linked (see
+    /// `ConnectionPool::find_by_node`).
     pub duplicate_node_declines: AtomicU64,
+    /// Links dropped because a second link to the same peer raced them and
+    /// won the tie-break: the one the smaller node dialled is kept.
+    pub duplicate_link_replacements: AtomicU64,
 }
 
 impl BleStats {
@@ -63,6 +66,7 @@ impl BleStats {
             advertisements_sent: AtomicU64::new(0),
             scan_results: AtomicU64::new(0),
             duplicate_node_declines: AtomicU64::new(0),
+            duplicate_link_replacements: AtomicU64::new(0),
         }
     }
 
@@ -146,14 +150,23 @@ impl BleStats {
         self.scan_results.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Record a connection declined as a duplicate of a peer already linked
-    /// under a different link address.
+    /// Record a connection declined as a duplicate of a peer already linked,
+    /// under the same link address or a different one.
     ///
     /// A peer using resolvable private addresses rotates continually, so a
     /// climbing count against a busy mesh is that rotation being absorbed —
     /// not an error.
     pub fn record_duplicate_node_decline(&self) {
         self.duplicate_node_declines.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a link replaced by a racing link to the same peer.
+    ///
+    /// Counts the simultaneous-dial race being settled: both ends dialled,
+    /// and this one admitted the loser first. Expect at most one per race.
+    pub fn record_duplicate_link_replacement(&self) {
+        self.duplicate_link_replacements
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record an inbound handshake aborted to free an in-flight slot.
@@ -182,6 +195,7 @@ impl BleStats {
             advertisements_sent: self.advertisements_sent.load(Ordering::Relaxed),
             scan_results: self.scan_results.load(Ordering::Relaxed),
             duplicate_node_declines: self.duplicate_node_declines.load(Ordering::Relaxed),
+            duplicate_link_replacements: self.duplicate_link_replacements.load(Ordering::Relaxed),
         }
     }
 }
@@ -213,4 +227,5 @@ pub struct BleStatsSnapshot {
     pub advertisements_sent: u64,
     pub scan_results: u64,
     pub duplicate_node_declines: u64,
+    pub duplicate_link_replacements: u64,
 }

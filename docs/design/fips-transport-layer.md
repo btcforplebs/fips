@@ -821,6 +821,17 @@ using resolvable private addresses rotates continually, and modern
 phones do so by default, so an address-keyed pool sees every rotation as
 a new device and every already-connected guard fails to fire.
 
+A second link to an already-linked node is arbitrated, never simply
+added, at the same address or another. A lone link is always admitted,
+whichever side dialled it. When the second link completes within one
+connect timeout of the first, the two raced — typically both nodes
+dialled each other — and both ends keep the link the node with the
+smaller address dialled. Each end admits the two links in its own order,
+so "keep the first" can leave each side holding the channel the other
+just closed; the node order is the one input both ends share. Outside
+that window the incumbent is kept, so address rotation and late redials
+cannot churn a settled link.
+
 Failing addresses back off by powers of two up to
 `MAX_PROBE_BACKOFF_SHIFT`, and the retry book is capped at
 `MAX_PENDING_PROBES` so that rotating addresses cannot grow it without

@@ -980,9 +980,11 @@ learns each peer's advertised PSM; a peer that advertises none is dialled
 at the configured `psm`. Discovered
 peers are probed immediately (L2CAP connect + pubkey exchange) with a
 cooldown (`probe_cooldown_secs`) to prevent rapid re-probing of the same
-address. If two nodes probe each other at the same time (cross-probe),
-a deterministic tie-breaker based on NodeAddr comparison ensures only
-one connection is established.
+address. A node already linked keeps one link: if two nodes dial each
+other at the same time and both links complete within one
+`connect_timeout_ms` of each other, both keep the link the node with the
+smaller NodeAddr dialled; otherwise the established link is kept and the
+newcomer is declined.
 
 **Connection pool.** The `max_connections` parameter limits the number of
 concurrent BLE connections. When the pool is full, the least-recently-used
