@@ -572,3 +572,18 @@ async fn two_ble_nodes_keep_one_link_when_one_answers_before_dialling() {
 
     cleanup_nodes(&mut nodes).await;
 }
+
+/// A BLE peer address configured in lower case resolves to the canonical
+/// upper-case form, which is the key the transport files the node's own
+/// dial under. Resolving it unchanged left the dial's connection invisible
+/// to the node under the address it asked for, so the connect read as failed.
+#[tokio::test]
+async fn a_lower_case_ble_peer_address_resolves_to_the_canonical_form() {
+    let node = make_test_node_ble(1).await;
+    let (_, resolved) = node
+        .node
+        .resolve_ble_addr("hci0/aa:bb:cc:dd:ee:02")
+        .expect("a lower-case address with an operational adapter resolves");
+    assert_eq!(resolved, ble_addr(2).to_transport_addr());
+    cleanup_nodes(&mut [node]).await;
+}

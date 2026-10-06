@@ -1495,12 +1495,13 @@ impl Node {
                 ))
             })?;
 
-        // Validate the address format
-        crate::transport::ble::addr::BleAddr::parse(addr_str).map_err(|e| {
+        // The transport files a dial under the canonical form, so a peer
+        // configured in lower case must resolve to that form to be found.
+        let ble = crate::transport::ble::addr::BleAddr::parse(addr_str).map_err(|e| {
             NodeError::NoTransportForType(format!("invalid BLE address '{}': {}", addr_str, e))
         })?;
 
-        Ok((transport_id, TransportAddr::from_string(addr_str)))
+        Ok((transport_id, ble.to_transport_addr()))
     }
 
     // === Identity Accessors ===
