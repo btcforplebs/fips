@@ -63,9 +63,10 @@ use pool::{Admission, Admitted, BleConnection, ConnectionPool};
 use stats::BleStats;
 use stream_read::BleStreamRead;
 
+use portable_atomic::AtomicU64;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, trace, warn};
