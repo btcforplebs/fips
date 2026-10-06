@@ -98,6 +98,8 @@ async fn twenty_five_forged_frames_on_a_live_peers_index_from_another_address_le
     let addr1 = *nodes[1].node.node_addr();
     let index = index_at_1(&nodes);
     let key = (nodes[1].transport_id, index.as_u32());
+    // Windows has no decrypt worker pool, so it always decrypts inline.
+    #[cfg(unix)]
     assert!(
         nodes[1].node.supervisor.decrypt_workers.is_none(),
         "precondition: node 1 decrypts inline"
