@@ -5,5 +5,6 @@ mod core;
 mod limits;
 mod offlink;
 mod state;
+mod stored_msg2;
 mod util;
 mod wire;

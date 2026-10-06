@@ -264,6 +264,9 @@ pub struct ActivePeer {
     /// Wire-format msg2 for resend on duplicate msg1 (responder only).
     /// Cleared after the handshake timeout window.
     handshake_msg2: Option<Vec<u8>>,
+    /// Digest of the link-setup msg1 the peering was promoted from, which
+    /// `handshake_msg2` answers. Only a resend of that msg1 draws it.
+    setup_msg1: Option<Msg1Digest>,
 
     // === Rekey (Key Rotation) ===
     /// When the current Noise session was established (for rekey timer).
@@ -339,6 +342,7 @@ impl ActivePeer {
             last_heartbeat_sent: None,
             last_heartbeat_attempt: None,
             handshake_msg2: None,
+            setup_msg1: None,
             session_established_at: now,
             rekey_jitter_secs: draw_rekey_jitter(),
             rekey_in_progress: false,
@@ -425,6 +429,7 @@ impl ActivePeer {
             last_heartbeat_sent: None,
             last_heartbeat_attempt: None,
             handshake_msg2: None,
+            setup_msg1: None,
             session_established_at: now,
             rekey_jitter_secs: draw_rekey_jitter(),
             rekey_in_progress: false,
@@ -647,6 +652,7 @@ impl ActivePeer {
     /// Clear stored msg2 (no longer needed after handshake window).
     pub fn clear_handshake_msg2(&mut self) {
         self.handshake_msg2 = None;
+        self.setup_msg1 = None;
     }
 
     // === Replay Detection Suppression ===
@@ -1175,9 +1181,17 @@ impl ActivePeer {
         self.answered.ended(msg1)
     }
 
+    /// Whether `msg1` is the link-setup msg1 this peering was promoted from,
+    /// the one the stored msg2 answers.
+    pub(crate) fn is_setup(&self, msg1: &Msg1Digest) -> bool {
+        self.setup_msg1.as_ref() == Some(msg1)
+    }
+
     /// Record `msg1`, the link-setup msg1 this peering was promoted from, so
-    /// a copy of it is refused once the session is old enough to rekey.
+    /// a resend of it draws the stored msg2 while the session is too young
+    /// to rekey, and a copy of it is refused once the session is old enough.
     pub(crate) fn note_setup(&mut self, msg1: Msg1Digest) {
+        self.setup_msg1 = Some(msg1);
         self.answered.end_setup(msg1);
     }
 

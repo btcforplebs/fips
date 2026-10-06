@@ -11,7 +11,7 @@
 //! Coverage map (branch → test):
 //!   * epoch-restart              → `chartest_msg1_epoch_restart_replaces_active_peer`
 //!   * duplicate (pre-crypto)     → `chartest_msg1_duplicate_pending_resends_stored_msg2`
-//!   * duplicate (post-crypto)    → `chartest_msg1_duplicate_active_same_epoch_resends_stored_msg2`
+//!   * setup resend (post-crypto) → `chartest_msg1_duplicate_active_same_epoch_resends_stored_msg2`
 //!   * cross-connection precedence→ `chartest_msg1_inbound_promote_defers_pending_outbound_to_same_identity`
 //!   * max-peers cap (bypass)     → `chartest_msg1_at_cap_with_pending_outbound_bypasses_early_gate`
 //!   * tie-break (winner+loser)   → `chartest_cross_connection_tiebreak_winner_and_loser`
@@ -253,9 +253,10 @@ async fn chartest_msg1_duplicate_pending_resends_stored_msg2() {
     );
 }
 
-/// Duplicate msg1, post-crypto same-epoch path: an inbound msg1 from an active
-/// peer at the SAME epoch, on a session too young (< 30s) to be a rekey, is a
-/// duplicate. The peer's stored msg2 is resent.
+/// Resend of the setup msg1, post-crypto same-epoch path: an inbound msg1 from
+/// an active peer at the SAME epoch, on a session too young (< 30s) to be a
+/// rekey, that is the msg1 the peering was promoted from. The peer's stored
+/// msg2 is resent.
 ///
 /// Oracle: the active peer's stored msg2 is resent, no new peer or session
 /// index is allocated, and the existing peer is untouched.
@@ -272,16 +273,17 @@ async fn chartest_msg1_duplicate_active_same_epoch_resends_stored_msg2() {
     let epoch = [7u8; 8];
     let stored_msg2 = vec![0xD0, 0xD1, 0xD2, 0xD3];
     let link_id = LinkId::new(555);
+    let data = craft_msg1_wire(&node, &sender, epoch, SessionIndex::new(0x33), 2000);
     let mut peer = ActivePeer::new(sender_pid, link_id, 1000);
     peer.set_remote_epoch(Some(epoch));
     peer.set_current_addr(transport_id, peer_addr.clone());
     peer.set_handshake_msg2(stored_msg2.clone());
+    peer.note_setup(crate::proto::fmp::Msg1Digest::of(&data));
     node.peers.insert(sender_addr, peer);
     // Session age is ~0 (< 30s) → the rekey gate is false → a same-epoch msg1
     // classifies as a duplicate, not a rekey initiation.
     assert!(!node.get_peer(&sender_addr).unwrap().has_session());
 
-    let data = craft_msg1_wire(&node, &sender, epoch, SessionIndex::new(0x33), 2000);
     let packet = ReceivedPacket {
         transport_id,
         remote_addr: peer_addr.clone(),

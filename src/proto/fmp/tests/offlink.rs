@@ -15,7 +15,7 @@ const EPOCH: [u8; 8] = [7u8; 8];
 /// An existing peer at [`EPOCH`] with a session aged past the 30 s rekey
 /// floor and nothing pending: the state in which a same-epoch msg1 is
 /// classified as a rekey.
-fn aged_snapshot() -> EstablishSnapshot {
+pub(super) fn aged_snapshot() -> EstablishSnapshot {
     let mut snap = establish_snapshot();
     snap.has_existing_peer = true;
     snap.existing_peer_epoch = Some(EPOCH);
@@ -152,6 +152,7 @@ fn an_off_link_msg1_under_30_s_still_gets_the_stored_msg2() {
     let mut snap = aged_snapshot();
     snap.existing_session_age_secs = 29;
     snap.existing_msg2 = Some(vec![0x02; 4]);
+    snap.setup_match = true;
     snap.msg1_on_link = false;
     snap.link_reachable = true;
     match fmp.establish_inbound(&snap, &wire_outcome(Some(EPOCH))) {

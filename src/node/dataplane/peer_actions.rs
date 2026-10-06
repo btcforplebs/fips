@@ -290,7 +290,8 @@ impl Node {
                             // UNREACHABLE on every current driven path: the inbound
                             // and outbound net-new establish arms only route to the
                             // machine when no promoted peer exists for the node_addr
-                            // (and `RestartThenPromote` removes the old peer first),
+                            // (and `RestartThenPromote` and `ReplaceThenPromote`
+                            // remove the old peer first),
                             // so `promote_connection` always returns `Promoted`. The
                             // `debug_assert!(false, ..)` catches any future path that
                             // drives a cross-connection through the executor without

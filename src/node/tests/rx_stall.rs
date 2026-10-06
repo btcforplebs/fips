@@ -943,8 +943,8 @@ enum ReplySite {
     /// A second msg1 from the address of a pending inbound handshake: the
     /// stored msg2 is resent before any crypto.
     DuplicateMsg1,
-    /// A same-epoch msg1 from an established peer whose session is too young
-    /// to rekey: the stored msg2 is resent on the established link.
+    /// A resend of the setup msg1 from an established peer whose session is
+    /// too young to rekey: the stored msg2 is resent on the established link.
     ResendMsg2,
     /// A resend of the rekey msg1 we already answered: the held answer is
     /// resent on the established link.
@@ -1006,8 +1006,11 @@ async fn arm_site(row: ReplySite, bh: &Blackhole) -> (Node, std::net::TcpStream,
             (node, far_end, Trigger::Packet(packet))
         }
         ReplySite::ResendMsg2 => {
-            let (node, sender, _, far_end) = peer_on_tcp(bh).await;
+            let (mut node, sender, sender_addr, far_end) = peer_on_tcp(bh).await;
             let data = craft_msg1(&node, &sender, 0x22);
+            node.get_peer_mut(&sender_addr)
+                .unwrap()
+                .note_setup(crate::proto::fmp::Msg1Digest::of(&data));
             let packet = ReceivedPacket::new(tcp_id, elsewhere(), data);
             (node, far_end, Trigger::Packet(packet))
         }

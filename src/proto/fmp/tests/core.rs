@@ -380,6 +380,7 @@ fn establish_inbound_at_cap_existing_peer_not_capped() {
     snap.has_existing_peer = true;
     snap.existing_peer_epoch = Some([9u8; 8]);
     snap.existing_msg2 = Some(vec![0xAB, 0xCD]);
+    snap.setup_match = true;
     let wire = wire_outcome(Some([9u8; 8]));
     assert!(matches!(
         fmp.establish_inbound(&snap, &wire),
@@ -403,8 +404,8 @@ fn establish_inbound_epoch_mismatch_restarts() {
 
 #[test]
 fn establish_inbound_same_epoch_young_session_resends() {
-    // Same epoch but session younger than the rekey gate → duplicate resend,
-    // carrying the stored msg2 bytes verbatim.
+    // Same epoch but session younger than the rekey gate, and a resend of the
+    // setup msg1 → resend, carrying the stored msg2 bytes verbatim.
     let fmp = Fmp::new();
     let mut snap = establish_snapshot();
     snap.has_existing_peer = true;
@@ -413,6 +414,7 @@ fn establish_inbound_same_epoch_young_session_resends() {
     snap.is_healthy = true;
     snap.existing_session_age_secs = 5;
     snap.existing_msg2 = Some(vec![0x01, 0x02, 0x03]);
+    snap.setup_match = true;
     let wire = wire_outcome(Some([7u8; 8]));
     match fmp.establish_inbound(&snap, &wire) {
         InboundDecision::ResendMsg2 { msg2 } => {
@@ -451,6 +453,7 @@ fn establish_inbound_rekey_gate_requires_enabled() {
     snap.is_healthy = true;
     snap.existing_session_age_secs = 31;
     snap.rekey_enabled = false;
+    snap.setup_match = true;
     let wire = wire_outcome(Some([7u8; 8]));
     assert!(matches!(
         fmp.establish_inbound(&snap, &wire),
@@ -468,6 +471,7 @@ fn establish_inbound_rekey_gate_boundary_at_30s() {
     snap.has_session = true;
     snap.is_healthy = true;
     let wire = wire_outcome(Some([7u8; 8]));
+    snap.setup_match = true;
 
     snap.existing_session_age_secs = 30;
     assert!(matches!(

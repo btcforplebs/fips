@@ -29,6 +29,7 @@ mod rx_stall;
 mod second_path_msg1;
 mod session;
 mod spanning_tree;
+mod stored_msg2;
 mod tcp;
 mod udp_dns;
 mod unit;

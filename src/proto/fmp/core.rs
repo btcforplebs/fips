@@ -374,9 +374,13 @@ pub(crate) struct EstablishSnapshot {
     /// The existing peer's established link can still carry an answer: a
     /// connectionless transport, or its connection still pooled.
     pub link_reachable: bool,
+    /// This msg1 is the link-setup msg1 the peering was promoted from, the
+    /// one `existing_msg2` answers (pre-evaluated shell-side against the
+    /// digest stored beside that msg2).
+    pub setup_match: bool,
     /// The existing peer's stored msg2 wire bytes (an opaque blob), resent on a
-    /// same-epoch duplicate msg1. `None` when there is no existing peer or it
-    /// has no stored msg2.
+    /// resend of the link-setup msg1. `None` when there is no existing peer or
+    /// it has no stored msg2.
     pub existing_msg2: Option<Vec<u8>>,
     /// Admitting this peer as a net-new identity would exceed `max_peers`
     /// (pre-evaluated `max_peers > 0 && peers.len() >= max_peers`).
@@ -520,6 +524,13 @@ pub(crate) enum InboundDecision {
     /// index, opaque msg2 payload) is in the `WireOutcome` it still holds, so
     /// the variant carries nothing.
     Promote,
+    /// Same-epoch msg1 on a session that cannot rekey, that is not a resend of
+    /// the peering's link-setup msg1 and not a copy of an answered one: a
+    /// fresh attempt by a peer that has lost its side of the link. The shell
+    /// tears the existing peer down and promotes this msg1 exactly as for
+    /// [`RestartThenPromote`](InboundDecision::RestartThenPromote), under the
+    /// same liveness and interval conditions, and drops it otherwise.
+    ReplaceThenPromote { peer: NodeAddr },
     /// Existing peer at a *different* startup epoch — a peer restart. The shell
     /// tears down the stale peer and schedules its reconnect, then runs the same
     /// authorize → … → promote sequence as [`Promote`](InboundDecision::Promote).
@@ -538,9 +549,10 @@ pub(crate) enum InboundDecision {
     /// address, since a captured msg1 replayed from anywhere authenticates
     /// the same as a resend. Nothing else changes; the pending stays held.
     ResendRekeyMsg2 { peer: NodeAddr, msg2: Vec<u8> },
-    /// Same-epoch duplicate msg1 (not a rekey): resend the existing peer's stored
-    /// msg2. `msg2` is the opaque stored bytes (`None` → nothing to resend, the
-    /// silent no-op preserved from the pre-refactor path).
+    /// A resend of the msg1 the peering was promoted from, on a session that
+    /// cannot rekey: resend the stored msg2 that answered it. `msg2` is the
+    /// opaque stored bytes, always present when the setup digest matched,
+    /// since the two are stored and cleared together.
     ResendMsg2 { msg2: Option<Vec<u8>> },
     /// Drop this msg1 with a handshake reject (`HandshakeReject::BadState`) and
     /// no promotion. `reason` selects only the diagnostic log line — every reject
@@ -564,7 +576,9 @@ pub(crate) enum InboundReject {
     /// NodeAddr): drop the peer's msg1 and keep driving our own rekey.
     DualRekeyWon,
     /// The msg1 armed a rekey cycle with this peer that has already ended: a
-    /// copy, not a fresh request, and it must not arm a pending.
+    /// copy, not a fresh request, and it must not arm a pending. Also refused
+    /// on a session too young to rekey, where it would otherwise replace the
+    /// session.
     AnsweredBefore,
     /// A same-epoch msg1 on a session old enough to rekey arrived off the
     /// peer's established link while that link works: a second path, not a
@@ -822,10 +836,25 @@ impl Fmp {
                         && snap.is_healthy
                         && snap.existing_session_age_secs >= REKEY_MIN_SESSION_AGE_SECS;
                     if !is_rekey {
-                        // Duplicate msg1 — resend the stored msg2.
-                        return InboundDecision::ResendMsg2 {
-                            msg2: snap.existing_msg2.clone(),
-                        };
+                        // The stored msg2 names the setup msg1's sender index
+                        // and completes no other handshake, so it answers only
+                        // a resend of that msg1. The setup msg1 is also in the
+                        // answered record, so it is matched first or its
+                        // resend would be refused. A copy of an answered rekey
+                        // msg1 is refused here as on an older session; any
+                        // other msg1 is a fresh dial from a peer that lost its
+                        // side of the link.
+                        if snap.setup_match {
+                            return InboundDecision::ResendMsg2 {
+                                msg2: snap.existing_msg2.clone(),
+                            };
+                        }
+                        if snap.msg1_answered_before {
+                            return InboundDecision::Reject {
+                                reason: InboundReject::AnsweredBefore,
+                            };
+                        }
+                        return InboundDecision::ReplaceThenPromote { peer: peer_addr };
                     }
                     if !snap.msg1_on_link && snap.link_reachable {
                         // A peer that is already linked and dials a second

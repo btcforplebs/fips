@@ -32,7 +32,7 @@ const FRAMES: usize = 25;
 
 /// A config with rekey on, triggered `after_secs` after the last one and never
 /// by message count.
-fn rekey_config(after_secs: u64) -> crate::config::Config {
+pub(super) fn rekey_config(after_secs: u64) -> crate::config::Config {
     let mut config = crate::config::Config::new();
     config.node.rekey.enabled = true;
     config.node.rekey.after_secs = after_secs;
@@ -42,7 +42,7 @@ fn rekey_config(after_secs: u64) -> crate::config::Config {
 
 /// A session age past the jittered rekey trigger, and past the 30 s floor
 /// below which a msg1 from an established peer is a duplicate, not a rekey.
-fn trigger_age() -> Duration {
+pub(super) fn trigger_age() -> Duration {
     Duration::from_secs(REKEY_AFTER_SECS + crate::node::REKEY_JITTER_SECS as u64 + 1)
 }
 
@@ -61,7 +61,7 @@ pub(super) async fn deliver(tn: &mut TestNode) -> usize {
 }
 
 /// Deliver queued packets between the nodes until a round moves none.
-async fn pump(nodes: &mut [TestNode]) {
+pub(super) async fn pump(nodes: &mut [TestNode]) {
     for _ in 0..50 {
         tokio::time::sleep(Duration::from_millis(10)).await;
         if process_available_packets(nodes).await == 0 {
@@ -96,7 +96,10 @@ pub(super) fn age_link(nodes: &mut [TestNode], a: usize, b: usize, age: Duration
 }
 
 /// Two loopback nodes peered over FMP, node 0 dialling node 1.
-async fn linked_pair(cfg0: crate::config::Config, cfg1: crate::config::Config) -> Vec<TestNode> {
+pub(super) async fn linked_pair(
+    cfg0: crate::config::Config,
+    cfg1: crate::config::Config,
+) -> Vec<TestNode> {
     let mut nodes = vec![
         make_test_node_with_config(cfg0, 1280).await,
         make_test_node_with_config(cfg1, 1280).await,
@@ -115,7 +118,11 @@ async fn linked_pair(cfg0: crate::config::Config, cfg1: crate::config::Config) -
 /// Start `from`'s rekey to `to`, have `to` answer it as the responder, and
 /// complete it at `from`, leaving `from` holding an initiator pending. Returns
 /// the index of the pending `to` holds.
-async fn rekey_to_pending(nodes: &mut [TestNode], from: usize, to: usize) -> SessionIndex {
+pub(super) async fn rekey_to_pending(
+    nodes: &mut [TestNode],
+    from: usize,
+    to: usize,
+) -> SessionIndex {
     let from_addr = *nodes[from].node.node_addr();
     let to_addr = *nodes[to].node.node_addr();
     nodes[from].node.check_rekey().await;
@@ -155,7 +162,7 @@ async fn rekey_to_pending(nodes: &mut [TestNode], from: usize, to: usize) -> Ses
 }
 
 /// Run `node`'s rekey tick, which cuts over the pending it initiated.
-async fn cutover(tn: &mut TestNode, peer: &NodeAddr) {
+pub(super) async fn cutover(tn: &mut TestNode, peer: &NodeAddr) {
     let expected = tn.node.get_peer(peer).unwrap().pending_our_index();
     tn.node.check_rekey().await;
     let p = tn.node.get_peer(peer).unwrap();
