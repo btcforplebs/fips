@@ -17,7 +17,7 @@ interoperate:
 - FMP handshake failures across versions
 - `unknown FMP version` drops
 - FSP / FMP AEAD decrypt failures
-- replay storms / excessive-decrypt-failure removals
+- replay storms / decryption-failure threshold crossings
 - link or session teardowns
 - asymmetric connectivity drops
 - rekey (FMP link + FSP session) that completes within a version but stalls

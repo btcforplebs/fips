@@ -678,8 +678,10 @@ impl ActivePeer {
     // === Decryption Failure Tracking ===
 
     /// Increment consecutive decryption failure counter, returning new count.
+    /// Saturates at `u32::MAX`, since only an authenticated frame resets it.
     pub fn increment_decrypt_failures(&mut self) -> u32 {
-        self.send.consecutive_decrypt_failures += 1;
+        self.send.consecutive_decrypt_failures =
+            self.send.consecutive_decrypt_failures.saturating_add(1);
         self.send.consecutive_decrypt_failures
     }
 
@@ -1829,6 +1831,19 @@ mod tests {
         // Counter resumes at 1 after reset
         assert_eq!(peer.increment_decrypt_failures(), 1);
         assert_eq!(peer.consecutive_decrypt_failures(), 1);
+    }
+
+    #[test]
+    fn the_consecutive_decrypt_failure_counter_saturates_instead_of_overflowing() {
+        let identity = make_peer_identity();
+        let mut peer = ActivePeer::new(identity, LinkId::new(1), 1000);
+
+        // Nothing resets the counter between authenticated frames, so a long
+        // run of failures must not overflow it.
+        peer.send.consecutive_decrypt_failures = u32::MAX - 1;
+        assert_eq!(peer.increment_decrypt_failures(), u32::MAX);
+        assert_eq!(peer.increment_decrypt_failures(), u32::MAX);
+        assert_eq!(peer.consecutive_decrypt_failures(), u32::MAX);
     }
 
     #[test]

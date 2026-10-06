@@ -1,27 +1,52 @@
-//! Tests for the consecutive-decrypt-failure threshold force-removal path.
+//! Tests for the consecutive-decrypt-failure threshold.
 //!
 //! Covers `Node::handle_decrypt_failure` (in `node/dataplane/encrypted.rs`),
 //! which increments `ActivePeer::increment_decrypt_failures` on each AEAD
-//! verification failure and force-removes the peer once
-//! `DECRYPT_FAILURE_THRESHOLD` consecutive failures are observed. The
-//! threshold is a defensive signal against a peer whose session is
-//! desynchronized or under attack, so regression coverage of the wiring
-//! between counter, threshold, and peer eviction is security-relevant.
+//! verification failure and logs one warning when the count reaches
+//! `DECRYPT_FAILURE_THRESHOLD`. The peer is kept: a frame that does not
+//! authenticate names its peer only by a receiver index sent in clear, so
+//! anyone who has seen the index can produce the failures. The warning is
+//! what the integration harnesses grep for, so its once-per-run shape is
+//! part of the contract.
 
 use super::*;
 
-/// Drive a fully-promoted peer to the decrypt-failure threshold and verify
-/// it is removed from both `peers` and `peers_by_index`.
-///
-/// Setup uses the `make_completed_connection` harness so the peer has a
-/// real `our_index`/`transport_id`, ensuring `remove_active_peer` exercises
-/// the full `peers_by_index` cleanup path (not just the bare `peers` table).
-#[test]
-fn test_decrypt_failure_threshold_removes_peer() {
-    // Threshold constant in node/dataplane/encrypted.rs (kept in sync with
-    // production code; see DECRYPT_FAILURE_THRESHOLD).
-    const THRESHOLD: u32 = 20;
+/// Threshold constant in node/dataplane/encrypted.rs (kept in sync with
+/// production code; see DECRYPT_FAILURE_THRESHOLD).
+const THRESHOLD: u32 = 20;
 
+/// The prefix of the warning logged when the counter reaches the threshold.
+const WARNING: &str = "Excessive decryption failures";
+
+/// Warnings captured so far that carry the threshold message.
+fn threshold_warnings(logs: &crate::testutil::LogCapture) -> usize {
+    logs.warnings()
+        .iter()
+        .filter(|line| line.contains(WARNING))
+        .count()
+}
+
+/// Assert the peer and its index entry are still held, and return its
+/// consecutive failure count.
+fn held_count(node: &Node, node_addr: &NodeAddr, key: &(TransportId, u32), when: &str) -> u32 {
+    let count = node
+        .get_peer(node_addr)
+        .unwrap_or_else(|| panic!("peer present {when}"))
+        .consecutive_decrypt_failures();
+    assert_eq!(
+        node.peers_by_index.get(key),
+        Some(node_addr),
+        "peers_by_index still maps the index to the peer {when}"
+    );
+    count
+}
+
+/// Drive a fully-promoted peer to twice the decrypt-failure threshold and
+/// verify one warning is logged at the threshold and the peer is kept in both
+/// `peers` and `peers_by_index`. A later run of failures, after a reset, warns
+/// again.
+#[test]
+fn reaching_the_decrypt_failure_threshold_logs_one_warning_and_keeps_the_peer() {
     let mut node = make_node();
     let transport_id = TransportId::new(1);
     let link_id = LinkId::new(1);
@@ -33,60 +58,75 @@ fn test_decrypt_failure_threshold_removes_peer() {
 
     node.promote_connection(link_id, identity, 2_000).unwrap();
 
-    // Sanity: peer is registered and indexed.
     assert_eq!(node.peer_count(), 1, "peer should be present after promote");
     let our_index = node
         .get_peer(&node_addr)
         .and_then(|p| p.our_index())
         .expect("promoted peer must have our_index");
+    let key = (transport_id, our_index.as_u32());
     assert_eq!(
-        node.peers_by_index.get(&(transport_id, our_index.as_u32())),
-        Some(&node_addr),
-        "peers_by_index must be populated after promote"
-    );
-    assert_eq!(
-        node.get_peer(&node_addr)
-            .unwrap()
-            .consecutive_decrypt_failures(),
+        held_count(&node, &node_addr, &key, "after promote"),
         0,
         "fresh peer's failure counter must start at zero"
     );
 
-    // Drive failures up to (but not including) the threshold; peer must
-    // remain present and the counter must increase monotonically.
+    let (logs, guard) = crate::testutil::capture_logs_scoped();
+
     for expected in 1..THRESHOLD {
         node.handle_decrypt_failure(&node_addr);
-        let count = node
-            .get_peer(&node_addr)
-            .expect("peer must still be present below threshold")
-            .consecutive_decrypt_failures();
         assert_eq!(
-            count, expected,
-            "counter should track failures pre-threshold"
+            held_count(&node, &node_addr, &key, "below the threshold"),
+            expected,
+            "counter should track failures below the threshold"
         );
     }
     assert_eq!(
-        node.peer_count(),
-        1,
-        "peer must remain registered until threshold is reached"
+        threshold_warnings(&logs),
+        0,
+        "no threshold warning before the threshold-th failure"
     );
 
-    // The Nth failure crosses the threshold and triggers force-removal.
     node.handle_decrypt_failure(&node_addr);
-
-    assert!(
-        node.get_peer(&node_addr).is_none(),
-        "peer must be removed from peers table at threshold"
+    assert_eq!(
+        held_count(&node, &node_addr, &key, "at the threshold"),
+        THRESHOLD
     );
     assert_eq!(
-        node.peer_count(),
-        0,
-        "peer_count must be zero after eviction"
+        threshold_warnings(&logs),
+        1,
+        "one threshold warning at the threshold-th failure"
     );
-    assert!(
-        !node
-            .peers_by_index
-            .contains_key(&(transport_id, our_index.as_u32())),
-        "peers_by_index entry must be cleaned up at threshold"
+
+    for expected in THRESHOLD + 1..=2 * THRESHOLD {
+        node.handle_decrypt_failure(&node_addr);
+        assert_eq!(
+            held_count(&node, &node_addr, &key, "past the threshold"),
+            expected,
+            "counter keeps counting past the threshold"
+        );
+    }
+    assert_eq!(
+        threshold_warnings(&logs),
+        1,
+        "failures past the threshold do not warn again"
     );
+    assert_eq!(node.peer_count(), 1, "the peer is kept");
+
+    // An authenticated frame resets the counter; a later run warns again.
+    node.get_peer_mut(&node_addr)
+        .unwrap()
+        .reset_decrypt_failures();
+    for _ in 0..THRESHOLD {
+        node.handle_decrypt_failure(&node_addr);
+    }
+    assert_eq!(
+        held_count(&node, &node_addr, &key, "after a second run"),
+        THRESHOLD
+    );
+    assert_eq!(
+        threshold_warnings(&logs),
+        2,
+        "a second run of failures warns once more"
+    );
+    drop(guard);
 }

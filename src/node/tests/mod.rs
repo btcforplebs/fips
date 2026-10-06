@@ -15,6 +15,7 @@ mod connected_udp;
 mod control;
 mod coord_forgery;
 mod decrypt_failure;
+mod decrypt_forged;
 mod disconnect;
 mod discovery;
 mod establish_chartests;

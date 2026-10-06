@@ -9,7 +9,8 @@ use crate::proto::link::LinkMessageType;
 use crate::transport::ReceivedPacket;
 use tracing::{debug, trace, warn};
 
-/// Force-remove a peer after this many consecutive decryption failures.
+/// Consecutive decryption failures at which a peer's warning is logged. The
+/// peer is kept; a broken session ends at the link-dead timeout.
 const DECRYPT_FAILURE_THRESHOLD: u32 = 20;
 
 /// Which of a peer's link sessions authenticated an inbound frame.
@@ -618,23 +619,22 @@ impl Node {
         })
     }
 
-    /// Increment decrypt failure counter and force-remove peer if threshold exceeded.
+    /// Count a decryption failure and warn once when the count reaches the
+    /// threshold. The peer is kept: a frame that does not authenticate names
+    /// its peer only by a receiver index sent in clear, so anyone who has
+    /// seen the index can cause the failures. A genuinely broken session ends
+    /// at the link-dead timeout, which only authenticated frames hold off.
     pub(in crate::node) fn handle_decrypt_failure(&mut self, node_addr: &crate::NodeAddr) {
         if let Some(peer) = self.peers.get_mut(node_addr) {
             let count = peer.increment_decrypt_failures();
-            if count >= DECRYPT_FAILURE_THRESHOLD {
+            // Only an authenticated frame resets the count, so this fires
+            // once per run of failures.
+            if count == DECRYPT_FAILURE_THRESHOLD {
                 warn!(
                     peer = %self.peer_display_name(node_addr),
                     consecutive_failures = count,
-                    "Excessive decryption failures, removing peer"
+                    "Excessive decryption failures, peer kept"
                 );
-                let addr = *node_addr;
-                self.remove_active_peer(node_addr);
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0);
-                self.note_link_dead(addr, now_ms);
             }
         }
     }
