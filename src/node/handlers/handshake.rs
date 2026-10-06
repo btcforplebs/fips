@@ -23,7 +23,9 @@ use crate::proto::fmp::{
     NegotiationPayload, OutboundSnapshot, PromotionResult, RekeyClaim, RekeyMsg2Reject,
     RekeyMsg2Snapshot, WireOutcome, cross_connection_winner, decide_fmp_negotiation,
 };
-use crate::transport::{Link, LinkDirection, LinkId, ReceivedPacket, TransportError};
+use crate::transport::{
+    Link, LinkDirection, LinkId, ReceivedPacket, TransportAddr, TransportError, TransportId,
+};
 use crate::utils::index::SessionIndex;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
@@ -580,6 +582,18 @@ impl Node {
             }
         }
         None
+    }
+
+    /// Whether an active peer's traffic runs over `(transport_id, addr)`.
+    ///
+    /// A handshake leg that ends while its peer is already active may share
+    /// the peer's address. Closing the transport connection there by address
+    /// closes the peer's own link: on BLE, two nodes that dialled each other
+    /// at once have every channel between them at one address.
+    fn peer_uses_addr(&self, transport_id: TransportId, addr: &TransportAddr) -> bool {
+        self.peers
+            .values()
+            .any(|p| p.transport_id() == Some(transport_id) && p.current_addr() == Some(addr))
     }
 
     /// Handle handshake message 2 (phase 0x2).
@@ -1380,11 +1394,16 @@ impl Node {
 
             // Clean up outbound connection state
             self.pending_outbound.remove(&key);
-            // Close the losing TCP connection (no-op for connectionless)
+            // Close the losing TCP connection (no-op for connectionless),
+            // unless the peer's own link is at the same address, as every BLE
+            // channel between two nodes that dialled each other is. Closing
+            // there would take the msg3 just queued, and the link, with it.
             if let Some(link) = self.links.get(&link_id) {
                 let tid = link.transport_id();
                 let addr = link.remote_addr().clone();
-                if let Some(transport) = self.transports.get(&tid) {
+                if !self.peer_uses_addr(tid, &addr)
+                    && let Some(transport) = self.transports.get(&tid)
+                {
                     transport.close_connection(&addr).await;
                 }
             }

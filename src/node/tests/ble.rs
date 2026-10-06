@@ -541,3 +541,34 @@ async fn two_ble_nodes_that_dial_each_other_keep_one_link() {
 
     cleanup_nodes(&mut nodes).await;
 }
+
+/// As above, but node 1 answers node 0's msg1 before it sends its own, so
+/// node 0 sees an active peer when node 1's msg1 arrives and answers it,
+/// and node 1 then meets a msg2 for a peer it has already promoted. That
+/// cross-connection path closes the transport connection of its own
+/// handshake leg, which on BLE is the address both channels share.
+#[tokio::test]
+async fn two_ble_nodes_keep_one_link_when_one_answers_before_dialling() {
+    let mut nodes = two_racing_ble_nodes().await;
+
+    initiate_handshake(&mut nodes, 0, 1).await;
+    let mut answered = 0;
+    let end = tokio::time::Instant::now() + RACE_DEADLINE;
+    while tokio::time::Instant::now() < end {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        answered += process_available_packets(&mut nodes[1..2]).await;
+        if answered > 0 {
+            break;
+        }
+    }
+    assert_eq!(answered, 1, "node 1 handles node 0's msg1 first");
+    initiate_handshake(&mut nodes, 1, 0).await;
+    drain_all_packets(&mut nodes, false).await;
+    wait_for_one_channel_each(&mut nodes).await;
+    assert_one_working_link(&mut nodes, "after the handshakes").await;
+
+    age_past_linger_and_handshake_timeout(&mut nodes).await;
+    assert_one_working_link(&mut nodes, "past the handshake timeout").await;
+
+    cleanup_nodes(&mut nodes).await;
+}

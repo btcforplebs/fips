@@ -804,7 +804,11 @@ with v0.5.x or earlier peers.
   both ends then keep the channel the node with the smaller address
   dialled. The other channel finishes sending what it holds before it
   closes. The `duplicates_held` and `duplicates_closed` counters report
-  these races.
+  these races. A node that answers its peer's handshake before sending its
+  own no longer closes the link while settling the crossed handshakes: that
+  close was aimed at its own handshake's connection, and on BLE it took
+  every channel at the address, the peer's link and the handshake's last
+  message with it.
 
 #### Gateway
 
