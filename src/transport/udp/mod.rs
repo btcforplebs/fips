@@ -9,10 +9,13 @@ use super::{
 pub(crate) mod io;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) use io::{ConnectedPeerSocket, PeerRecvDrain, open_connected_fd};
+mod dns;
 mod stats;
 use super::resolve_socket_addr;
 use crate::config::UdpConfig;
 use crate::nostr::is_punch_packet;
+#[cfg(test)]
+pub(crate) use dns::TestResolver;
 use io::{AsyncUdpSocket, UdpRawSocket};
 pub(crate) use stats::UdpStats;
 use std::collections::HashMap;
@@ -61,8 +64,9 @@ pub struct UdpTransport {
     local_addr: Option<SocketAddr>,
     /// Transport statistics.
     stats: Arc<UdpStats>,
-    /// DNS resolution cache for hostname addresses.
-    dns_cache: StdMutex<HashMap<TransportAddr, (SocketAddr, Instant)>>,
+    /// DNS resolution cache for hostname addresses, and the lookups in
+    /// flight. Shared with the lookup tasks, which store their answers.
+    dns_cache: Arc<StdMutex<dns::DnsState>>,
 }
 
 impl UdpTransport {
@@ -83,7 +87,7 @@ impl UdpTransport {
             recv_task: None,
             local_addr: None,
             stats: Arc::new(UdpStats::new()),
-            dns_cache: StdMutex::new(HashMap::new()),
+            dns_cache: Arc::new(StdMutex::new(dns::DnsState::default())),
         }
     }
 
@@ -167,6 +171,11 @@ impl UdpTransport {
     /// Resolve a transport address (numeric `1.2.3.4:5678` or hostname)
     /// to a `SocketAddr` via the per-transport DNS cache. Public
     /// companion to `async_socket()` for off-task workers.
+    ///
+    /// Waits on DNS for at most `dns::DNS_COLD_WAIT`. If the name has no
+    /// address yet, it returns a "still pending" `SendFailed` and the lookup
+    /// carries on in the background; an expired address whose refresh is
+    /// still running is returned as it is. Nothing is held for a later send.
     pub async fn resolve_for_off_task(
         &self,
         addr: &TransportAddr,
@@ -183,41 +192,79 @@ impl UdpTransport {
 
     /// Resolve a transport address, using cached results for hostnames.
     ///
-    /// Numeric IP addresses bypass the cache entirely. Hostnames are
-    /// resolved via DNS and cached for `DNS_CACHE_TTL` to avoid
-    /// per-packet resolution overhead.
+    /// Numeric IP addresses bypass the cache entirely. Hostnames are cached
+    /// for `DNS_CACHE_TTL` to avoid per-packet resolution overhead, and are
+    /// looked up off this task (see `dns`), so this waits on DNS for at most
+    /// `dns::DNS_COLD_WAIT`. A stale address whose refresh is still running
+    /// is returned as it is; a name with no address yet gives a
+    /// "still pending" `SendFailed`.
     async fn resolve_cached(&self, addr: &TransportAddr) -> Result<SocketAddr, TransportError> {
-        // Fast path: try numeric IP parse (no cache, no DNS)
-        if let Some(s) = addr.as_str()
-            && let Ok(sock_addr) = s.parse::<SocketAddr>()
-        {
+        if let Some(sock_addr) = numeric(addr) {
             return Ok(sock_addr);
         }
+        match self.resolve_name(addr, Instant::now()).await {
+            dns::Resolve::Addr(resolved) | dns::Resolve::Stale(resolved) => Ok(resolved),
+            dns::Resolve::Pending => Err(dns::pending_error(addr)),
+            dns::Resolve::Failed(e) => Err(e),
+        }
+    }
 
-        // Check cache
+    /// Resolve a hostname at `now` through the cache and the lookup task.
+    async fn resolve_name(&self, addr: &TransportAddr, now: Instant) -> dns::Resolve {
+        #[cfg(test)]
         {
-            let cache = self.dns_cache.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(resolved) = cache_lookup(&cache, addr, Instant::now()) {
-                return Ok(resolved);
+            let hook = dns::lock(&self.dns_cache).test_resolver.clone();
+            if let Some(r) = hook {
+                return dns::resolve_with(&self.dns_cache, addr, now, move |a| r(a)).await;
             }
         }
+        dns::resolve_with(&self.dns_cache, addr, now, |a| async move {
+            resolve_socket_addr(&a).await
+        })
+        .await
+    }
 
-        // Cache miss or expired — resolve via DNS
-        let resolved = resolve_socket_addr(addr).await?;
-
-        // Store in cache
-        {
-            let mut cache = self.dns_cache.lock().unwrap_or_else(|e| e.into_inner());
-            cache_store(
-                &mut cache,
-                addr.clone(),
-                resolved,
-                Instant::now(),
-                DNS_CACHE_MAX_ENTRIES,
-            );
+    /// The address a send to `addr` goes to now, or `None` when the datagram
+    /// has been held for a lookup that will send it.
+    async fn send_target(
+        &self,
+        addr: &TransportAddr,
+        data: &[u8],
+    ) -> Result<Option<SocketAddr>, TransportError> {
+        if let Some(sock_addr) = numeric(addr) {
+            return Ok(Some(sock_addr));
         }
+        // One instant for both, so the resolve and the hold judge the
+        // entry's freshness alike.
+        let now = Instant::now();
+        match self.resolve_name(addr, now).await {
+            dns::Resolve::Addr(resolved) => Ok(Some(resolved)),
+            dns::Resolve::Stale(stale) => {
+                dns::hold_stale(&self.dns_cache, addr, now, data, self.sink()?, stale).map(Some)
+            }
+            dns::Resolve::Pending => {
+                match dns::hold(&self.dns_cache, addr, now, data, self.sink()?, None) {
+                    dns::Hold::Resolved(resolved) => Ok(Some(resolved)),
+                    dns::Hold::Held => {
+                        debug!(
+                            transport_id = %self.transport_id,
+                            addr = %addr,
+                            "UDP send held until its DNS lookup completes"
+                        );
+                        Ok(None)
+                    }
+                    dns::Hold::Duplicate | dns::Hold::Full => Err(dns::pending_error(addr)),
+                    dns::Hold::Gone => Err(dns::failed_error(addr)),
+                }
+            }
+            dns::Resolve::Failed(e) => Err(e),
+        }
+    }
 
-        Ok(resolved)
+    /// Where a lookup task sends the datagrams held on it.
+    fn sink(&self) -> Result<dns::Sink, TransportError> {
+        let socket = self.socket.as_ref().ok_or(TransportError::NotStarted)?;
+        Ok(dns::Sink::new(socket.clone(), self.stats.clone()))
     }
 
     /// Query transport-local congestion indicators.
@@ -376,6 +423,7 @@ impl UdpTransport {
 
         // Drop socket
         self.socket.take();
+        dns::drop_held(&self.dns_cache);
         self.local_addr = None;
 
         self.state = TransportState::Down;
@@ -406,7 +454,9 @@ impl UdpTransport {
             });
         }
 
-        let socket_addr = self.resolve_cached(addr).await?;
+        let Some(socket_addr) = self.send_target(addr, data).await? else {
+            return Ok(data.len());
+        };
         let socket = self.socket.as_ref().ok_or(TransportError::NotStarted)?;
 
         match socket.send_to(data, &socket_addr).await {
@@ -657,6 +707,12 @@ async fn udp_receive_loop(
     }
 }
 
+/// The address `addr` names when it is a numeric `ip:port`, which needs no
+/// cache and no DNS.
+fn numeric(addr: &TransportAddr) -> Option<SocketAddr> {
+    addr.as_str()?.parse::<SocketAddr>().ok()
+}
+
 /// A cached resolution for `key`, if one is present and still inside
 /// `DNS_CACHE_TTL` at `now`.
 fn cache_lookup(
@@ -673,12 +729,13 @@ fn cache_lookup(
 /// Record a resolution, keeping the cache at or below `cap` entries.
 ///
 /// Refreshing a name already present never evicts anything. Otherwise every
-/// entry past its TTL is dropped first, and only if that leaves the map full
-/// is the oldest remaining entry evicted. Eviction is by insertion time rather
-/// than by last use: the timestamp is already there as the TTL clock, and
-/// tracking last use would mean writing to the map on the read path of every
-/// dial. The sweep is linear in `cap` and runs only on a resolution miss, so
-/// at most once per TTL per name.
+/// entry past `dns::DNS_CACHE_STALE_LIMIT` is dropped first (an entry past its
+/// TTL but inside that limit still serves as its name's fallback address),
+/// and only if that leaves the map full is the oldest remaining entry
+/// evicted. Eviction is by insertion time rather than by last use: the
+/// timestamp is already there as the TTL clock, and tracking last use would
+/// mean writing to the map on the read path of every dial. The sweep is
+/// linear in `cap` and runs only when a lookup stores a new name.
 fn cache_store(
     cache: &mut HashMap<TransportAddr, (SocketAddr, Instant)>,
     key: TransportAddr,
@@ -691,7 +748,7 @@ fn cache_store(
         return;
     }
 
-    cache.retain(|_, (_, cached_at)| now.duration_since(*cached_at) < DNS_CACHE_TTL);
+    cache.retain(|_, (_, cached_at)| now.duration_since(*cached_at) < dns::DNS_CACHE_STALE_LIMIT);
 
     while cache.len() >= cap {
         let Some(oldest) = cache
@@ -747,26 +804,26 @@ mod tests {
     /// A stale entry used to be overwritten on the next dial of the same name
     /// and otherwise never removed, so a name dialed once sat there forever.
     #[test]
-    fn dns_cache_store_evicts_entries_past_their_ttl() {
-        let now = Instant::now();
-        let expired_at = now.checked_sub(DNS_CACHE_TTL * 2).expect("monotonic clock");
+    fn dns_cache_store_evicts_entries_past_the_stale_limit() {
+        let t0 = Instant::now();
+        let later = t0 + dns::DNS_CACHE_STALE_LIMIT + Duration::from_secs(1);
         let mut cache = HashMap::new();
-        cache.insert(dns_key(0), (dns_value(), expired_at));
+        cache.insert(dns_key(0), (dns_value(), t0));
 
         cache_store(
             &mut cache,
             dns_key(1),
             dns_value(),
-            now,
+            later,
             DNS_CACHE_MAX_ENTRIES,
         );
 
         assert!(
             !cache.contains_key(&dns_key(0)),
-            "an entry past its TTL should be swept, not left to accumulate"
+            "an entry past the stale limit should be swept, not left to accumulate"
         );
-        assert!(cache_lookup(&cache, &dns_key(0), now).is_none());
-        assert!(cache_lookup(&cache, &dns_key(1), now).is_some());
+        assert!(cache_lookup(&cache, &dns_key(0), later).is_none());
+        assert!(cache_lookup(&cache, &dns_key(1), later).is_some());
     }
 
     /// With nothing expired, the cap is enforced by dropping the oldest entry.
