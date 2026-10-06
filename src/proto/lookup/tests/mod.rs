@@ -2,6 +2,7 @@
 //! blocks in the sibling source modules. Shared helpers live in `util`.
 
 mod core;
+mod forward_sender;
 mod limits;
 mod util;
 mod wire;

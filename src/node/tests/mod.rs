@@ -22,6 +22,7 @@ mod establish_chartests;
 mod forwarding;
 mod handshake;
 mod heartbeat;
+mod lookup_echo;
 mod mmp_chartests;
 mod probe;
 mod rekey_parity;

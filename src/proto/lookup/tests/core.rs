@@ -15,7 +15,7 @@ fn picks_only_tree_peers_when_a_tree_peer_matches() {
         peers: vec![(tree_peer, true, true), (non_tree_peer, false, true)],
     };
     let mut request = make_request(3);
-    match plan_forward(&mut request, &rv) {
+    match plan_forward(&mut request, &make_node_addr(0xCC), &rv) {
         ForwardOutcome::Forward {
             actions,
             used_fallback,
@@ -41,7 +41,7 @@ fn falls_back_to_non_tree_peers_when_no_tree_peer_matches() {
         ],
     };
     let mut request = make_request(3);
-    match plan_forward(&mut request, &rv) {
+    match plan_forward(&mut request, &make_node_addr(0xCC), &rv) {
         ForwardOutcome::Forward {
             actions,
             used_fallback,
@@ -62,7 +62,7 @@ fn returns_no_peers_when_nothing_reaches_target() {
     };
     let mut request = make_request(3);
     assert!(matches!(
-        plan_forward(&mut request, &rv),
+        plan_forward(&mut request, &make_node_addr(0xCC), &rv),
         ForwardOutcome::NoPeers
     ));
 }
@@ -75,7 +75,7 @@ fn returns_ttl_exhausted_when_ttl_is_zero() {
     };
     let mut request = make_request(0);
     assert!(matches!(
-        plan_forward(&mut request, &rv),
+        plan_forward(&mut request, &make_node_addr(0xCC), &rv),
         ForwardOutcome::TtlExhausted
     ));
 }
