@@ -2869,6 +2869,50 @@ impl Node {
             .copied()
     }
 
+    /// Close the transport connection under handshake link `link_id`, unless
+    /// an active peer on another link sends over the same connection.
+    ///
+    /// A transport that keys its connections by remote address alone — BLE,
+    /// whose pool holds one L2CAP link per peer address — carries both legs
+    /// of a crossed handshake on one connection, so a losing or stale leg can
+    /// share its address with a live peer. Closing that address would take
+    /// the live peer's link down with it. On TCP the two legs are separate
+    /// sockets at different addresses, and a connectionless transport's close
+    /// is a no-op, so both are unaffected.
+    pub(in crate::node) async fn close_handshake_link_connection(&self, link_id: LinkId) {
+        let Some(link) = self.links.get(&link_id) else {
+            return;
+        };
+        let transport_id = link.transport_id();
+        let addr = link.remote_addr();
+        if self.addr_carries_other_peer(transport_id, addr, link_id) {
+            tracing::debug!(
+                link_id = %link_id,
+                addr = %addr,
+                "Handshake link shares its connection with an active peer; leaving it open"
+            );
+            return;
+        }
+        if let Some(transport) = self.transports.get(&transport_id) {
+            transport.close_connection(addr).await;
+        }
+    }
+
+    /// Whether an active peer on a link other than `link_id` sends over
+    /// `(transport_id, addr)`.
+    pub(in crate::node) fn addr_carries_other_peer(
+        &self,
+        transport_id: TransportId,
+        addr: &TransportAddr,
+        link_id: LinkId,
+    ) -> bool {
+        self.peers.values().any(|peer| {
+            peer.link_id() != link_id
+                && peer.transport_id() == Some(transport_id)
+                && peer.current_addr() == Some(addr)
+        })
+    }
+
     /// Remove a link.
     ///
     /// Drops every `addr_to_link` entry that still maps to this link, rather
