@@ -12,6 +12,7 @@ pub(crate) mod context;
 mod dataplane;
 #[cfg(unix)]
 pub(crate) mod decrypt_worker;
+pub(crate) mod diag;
 #[cfg(unix)]
 pub(crate) mod encrypt_worker;
 mod handlers;

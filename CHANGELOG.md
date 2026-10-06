@@ -223,6 +223,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The debug lines for handshake msg1 and msg2 handling, link promotion,
+  cross-connection resolution and the rekey responder now say where a message
+  came from and which handshake it belongs to. They carry the transport and
+  address the message arrived on (`transport_id`, `remote_addr`), the peer's
+  established link (`link_tid`, `link_addr`) and whether the two are the same
+  path (`same_path`), the msg1's sender index (`msg1_sidx`) and the first four
+  bytes of its SHA-256 digest (`msg1_dg`), the session age the rekey
+  classification compared (`age_s`), and the first four bytes of the
+  resulting session's handshake hash (`epoch`). Both ends of a link derive the
+  same digest and hash, so their logs can be joined on these fields, including
+  after a simultaneous dial. "Connection promoted to active peer" also logs
+  `direction`; the same-epoch duplicate resend logs the receiver index of the
+  msg2 it resends (`stored_ridx`) and whether that answers the msg1 just
+  received (`answers_it`); a rekey msg1 refused while a pending session is held
+  logs the digest of the msg1 that armed it (`held_dg`) and how long it has
+  been held (`pending_age_s`). Message texts and levels are unchanged.
+
 - The Windows service log is rolled at `node.log_max_size_mb` and keeps
   `node.log_max_files` old files. The defaults are the 10 MiB and four files it
   used before.

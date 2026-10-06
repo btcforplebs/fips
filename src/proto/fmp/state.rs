@@ -28,6 +28,7 @@
 //! [`Fmp`] is the separate, stateless lifecycle anchor owned by
 //! [`Node`](crate::node::Node); see its doc below.
 
+use super::core::Msg1Digest;
 use crate::PeerIdentity;
 use crate::transport::{LinkDirection, LinkId, LinkStats, TransportAddr, TransportId};
 use crate::utils::index::SessionIndex;
@@ -90,6 +91,10 @@ pub struct ConnectionState {
     /// Wire-format msg2 bytes for resend (responder only).
     handshake_msg2: Option<Vec<u8>>,
 
+    /// Digest of the msg1 this connection was opened by (responder only),
+    /// carried to the promotion line so both ends' logs join on it.
+    msg1_digest: Option<Msg1Digest>,
+
     /// Number of resends performed so far.
     resend_count: u32,
 }
@@ -117,6 +122,7 @@ impl ConnectionState {
             remote_epoch: None,
             handshake_msg1: None,
             handshake_msg2: None,
+            msg1_digest: None,
             resend_count: 0,
         }
     }
@@ -140,6 +146,7 @@ impl ConnectionState {
             remote_epoch: None,
             handshake_msg1: None,
             handshake_msg2: None,
+            msg1_digest: None,
             resend_count: 0,
         }
     }
@@ -168,6 +175,7 @@ impl ConnectionState {
             remote_epoch: None,
             handshake_msg1: None,
             handshake_msg2: None,
+            msg1_digest: None,
             resend_count: 0,
         }
     }
@@ -306,6 +314,17 @@ impl ConnectionState {
     /// Store the wire-format msg2 bytes for resend on duplicate msg1.
     pub fn set_handshake_msg2(&mut self, msg2: Vec<u8>) {
         self.handshake_msg2 = Some(msg2);
+    }
+
+    /// Record the digest of the msg1 that opened this inbound connection.
+    pub(crate) fn set_msg1_digest(&mut self, digest: Msg1Digest) {
+        self.msg1_digest = Some(digest);
+    }
+
+    /// The digest of the msg1 that opened this inbound connection, if
+    /// recorded.
+    pub(crate) fn msg1_digest(&self) -> Option<Msg1Digest> {
+        self.msg1_digest
     }
 
     /// Get the stored msg1 bytes (if any).

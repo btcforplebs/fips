@@ -1084,6 +1084,12 @@ impl ActivePeer {
         self.pending_since.is_some_and(|t| t.elapsed() >= hold)
     }
 
+    /// How long the pending session has been held since it was installed;
+    /// `None` when no pending session is held.
+    pub(crate) fn pending_age(&self) -> Option<Duration> {
+        self.pending_since.map(|t| t.elapsed())
+    }
+
     /// Store a completed rekey session and its indices.
     ///
     /// Called when the rekey handshake completes. The session is held

@@ -60,7 +60,7 @@
 use crate::identity::ErasingKeypair;
 use crate::noise::{self, NoiseError, NoiseSession};
 use crate::proto::fmp::{
-    ConnAction, ConnSnapshot, ConnectionState, EstablishSnapshot, Fmp, InboundDecision,
+    ConnAction, ConnSnapshot, ConnectionState, EstablishSnapshot, Fmp, InboundDecision, Msg1Digest,
     OutboundDecision, OutboundSnapshot, PeerSnapshot, PromotionResult, RekeyCfg,
     RekeyResendSnapshot, RekeyRole, WireOutcome,
 };
@@ -886,6 +886,18 @@ impl PeerMachine {
     /// carrier, mirroring the leg's responder write.
     pub(crate) fn set_conn_handshake_msg2(&mut self, msg2: Vec<u8>) {
         self.conn.set_handshake_msg2(msg2);
+    }
+
+    /// Record on the surviving carrier the digest of the msg1 that opened
+    /// this inbound connection, for the promotion line.
+    pub(crate) fn set_conn_msg1_digest(&mut self, digest: Msg1Digest) {
+        self.conn.set_msg1_digest(digest);
+    }
+
+    /// The digest of the msg1 that opened this inbound connection, if
+    /// recorded on the surviving carrier.
+    pub(crate) fn conn_msg1_digest(&self) -> Option<Msg1Digest> {
+        self.conn.msg1_digest()
     }
 
     /// The link this machine controls.

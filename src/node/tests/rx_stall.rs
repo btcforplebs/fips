@@ -1313,6 +1313,67 @@ async fn a_rekey_msg1_is_answered_on_its_connection_only_on_the_established_tran
     }
 }
 
+/// A rekey msg1 answered on its own connection, because the established
+/// connection has gone, logs the established link it could not use, and the
+/// rekey answer records that the msg1 did not arrive on that link.
+#[tokio::test]
+async fn a_rekey_msg1_answered_on_its_own_connection_logs_the_established_link() {
+    use crate::testutil::{capture_logs_scoped, log_field};
+
+    let mut bh = Blackhole::open(false);
+    let (mut node, sender, sender_addr, far_end) = peer_on_tcp(&bh).await;
+    let link = bh.transport_addr();
+    kill_link(&node, &mut bh, far_end).await;
+    node.get_peer_mut(&sender_addr)
+        .unwrap()
+        .test_backdate_session_established(Duration::from_secs(31));
+    let tcp_id = TransportId::new(TCP_ID);
+    let (mut client, from) = client_on(&node, tcp_id).await;
+    let data = craft_msg1(&node, &sender, 0x41);
+
+    let (logs, guard) = capture_logs_scoped();
+    let r = timed_process(&mut node, ReceivedPacket::new(tcp_id, from.clone(), data)).await;
+    drop(guard);
+    let answered = client_gets_msg2(&mut client).await;
+    stop_all(&mut node).await;
+    assert_no_dial("rekey msg1 on a new connection", &r);
+    assert!(answered, "the msg1's own connection got no msg2");
+
+    let field = |line: &str, name: &str| {
+        log_field(line, name)
+            .unwrap_or_else(|| panic!("no field {name} on {line}"))
+            .to_string()
+    };
+    let fallback = logs
+        .line("Established link not connected, answered on the msg1's connection")
+        .unwrap_or_else(|| panic!("no fallback line in {:#?}", logs.lines()));
+    assert_eq!(
+        field(&fallback, "transport_id"),
+        "transport:2",
+        "{fallback}"
+    );
+    assert_eq!(
+        field(&fallback, "remote_addr"),
+        from.to_string(),
+        "{fallback}"
+    );
+    assert_eq!(field(&fallback, "link_tid"), "transport:2", "{fallback}");
+    assert_eq!(
+        field(&fallback, "link_addr"),
+        link.to_string(),
+        "{fallback}"
+    );
+
+    let answer = logs
+        .line("Sent rekey msg2 response")
+        .unwrap_or_else(|| panic!("no rekey answer line in {:#?}", logs.lines()));
+    assert_eq!(field(&answer, "same_path"), "false", "{answer}");
+    assert_eq!(field(&answer, "transport_id"), "transport:2", "{answer}");
+    assert_eq!(field(&answer, "remote_addr"), from.to_string(), "{answer}");
+    assert_eq!(field(&answer, "link_tid"), "transport:2", "{answer}");
+    assert_eq!(field(&answer, "link_addr"), link.to_string(), "{answer}");
+}
+
 /// `may_dial` allows a connect only toward the address an outbound link was
 /// dialed at, on that link's transport: never for an inbound link, an
 /// address the link has since moved to, another transport, or an unknown

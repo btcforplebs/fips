@@ -158,6 +158,11 @@ impl Msg1Digest {
         use sha2::{Digest, Sha256};
         Self(Sha256::digest(wire_msg1).into())
     }
+
+    /// The first four bytes of the digest, the part the log lines carry.
+    pub(crate) fn prefix(&self) -> [u8; 4] {
+        [self.0[0], self.0[1], self.0[2], self.0[3]]
+    }
 }
 
 /// What this node sent when it answered a peer's rekey msg1 as the responder:

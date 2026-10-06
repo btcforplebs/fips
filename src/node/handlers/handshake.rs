@@ -4,6 +4,7 @@ use crate::NodeAddr;
 use crate::PeerIdentity;
 use crate::node::acl::PeerAclContext;
 use crate::node::dataplane::PeerActionCtx;
+use crate::node::diag::{self, Msg1Path, OrNone};
 use crate::node::rate_limit::Msg1Class;
 use crate::node::reject::{HandshakeReject, RejectReason};
 use crate::node::{Node, NodeError};
@@ -378,6 +379,9 @@ impl Node {
         debug!(
             peer = %self.peer_display_name(peer),
             remote_addr = %packet.remote_addr,
+            transport_id = %packet.transport_id,
+            link_tid = %tid,
+            link_addr = %addr,
             "Established link not connected, answered on the msg1's connection"
         );
         Ok(tid)
@@ -495,11 +499,15 @@ impl Node {
                             match transport.send_existing(&packet.remote_addr, &msg2).await {
                                 Ok(_) => debug!(
                                     remote_addr = %packet.remote_addr,
+                                    transport_id = %packet.transport_id,
+                                    link_id = %existing_link_id,
                                     "Resent msg2 for duplicate msg1"
                                 ),
                                 Err(e) => debug!(
                                     remote_addr = %packet.remote_addr,
                                     error = %e,
+                                    transport_id = %packet.transport_id,
+                                    link_id = %existing_link_id,
                                     "Failed to resend msg2"
                                 ),
                             }
@@ -561,6 +569,8 @@ impl Node {
             Err(e) => {
                 debug!(
                     error = %e,
+                    transport_id = %packet.transport_id,
+                    remote_addr = %packet.remote_addr,
                     "Failed to process msg1"
                 );
                 self.stats_mut()
@@ -627,6 +637,8 @@ impl Node {
             msg2_payload: msg2_response,
             msg1_digest: Msg1Digest::of(&packet.data),
         };
+        // The promotion line reads the msg1's digest from the carrier.
+        machine.set_conn_msg1_digest(wire.msg1_digest);
 
         // === PHASE C input ===
         // Snapshot the registry state the inbound classification reads about
@@ -635,6 +647,35 @@ impl Node {
         // tie-break). Taken before this connection is inserted into the
         // registry, matching the pre-refactor read points.
         let est = self.establish_snapshot(&peer_node_addr, &wire.msg1_digest);
+
+        // What the classification lines below log, read once here so each
+        // arm's only change is its log call. The snapshot values are copied
+        // out before the classification consumes it, and the established
+        // link is read before any arm can change it.
+        let age_s = est.existing_session_age_secs;
+        let held_dg = OrNone(est.held_answer.as_ref().map(|a| diag::msg1_tag(&a.msg1)));
+        // The receiver index of the stored msg2 a duplicate is answered with
+        // is the sender index of the msg1 it answers.
+        let stored_ridx = est
+            .existing_msg2
+            .as_deref()
+            .and_then(Msg2Header::parse)
+            .map(|h| h.receiver_idx);
+        let answers_it = OrNone(stored_ridx.map(|r| r == wire.their_index));
+        let stored_ridx = OrNone(stored_ridx);
+        let msg1_dg = diag::msg1_tag(&wire.msg1_digest);
+        let msg1_sidx = wire.their_index;
+        let path = Msg1Path::new(
+            packet.transport_id,
+            &packet.remote_addr,
+            self.established_link(&peer_node_addr),
+        );
+        let pending_age_s = OrNone(
+            self.peers
+                .get(&peer_node_addr)
+                .and_then(|p| p.pending_age())
+                .map(|d| d.as_secs()),
+        );
 
         // === PHASE C: structured classification ===
         // Evaluate the inbound decision once on a local establish leg and route
@@ -684,15 +725,28 @@ impl Node {
                 match reason {
                     InboundReject::PendingSession => debug!(
                         peer = %self.peer_display_name(&peer_node_addr),
+                        transport_id = %packet.transport_id,
+                        remote_addr = %packet.remote_addr,
+                        same_path = path.same_path(),
+                        msg1_dg = %msg1_dg,
+                        held_dg = %held_dg,
+                        pending_age_s = %pending_age_s,
                         "Rekey msg1 received but already have pending session, dropping"
                     ),
                     InboundReject::DualRekeyWon => debug!(
                         peer = %self.peer_display_name(&peer_node_addr),
+                        transport_id = %packet.transport_id,
+                        remote_addr = %packet.remote_addr,
+                        same_path = path.same_path(),
+                        msg1_dg = %msg1_dg,
                         "Dual rekey initiation: we win (smaller addr), dropping their msg1"
                     ),
                     InboundReject::AnsweredBefore => debug!(
                         peer = %self.peer_display_name(&peer_node_addr),
                         remote_addr = %packet.remote_addr,
+                        transport_id = %packet.transport_id,
+                        same_path = path.same_path(),
+                        msg1_dg = %msg1_dg,
                         "Rekey msg1 answered in an ended cycle, dropping the copy"
                     ),
                     InboundReject::AtMaxPeers => unreachable!(),
@@ -717,11 +771,31 @@ impl Node {
                     match self.answer_msg1(&peer_node_addr, &packet, msg2).await {
                         Ok(_) => debug!(
                             peer = %self.peer_display_name(&peer_node_addr),
+                            transport_id = %packet.transport_id,
+                            remote_addr = %packet.remote_addr,
+                            link_tid = %path.link_tid(),
+                            link_addr = %path.link_addr(),
+                            same_path = path.same_path(),
+                            msg1_sidx = %msg1_sidx,
+                            msg1_dg = %msg1_dg,
+                            age_s,
+                            stored_ridx = %stored_ridx,
+                            answers_it = %answers_it,
                             "Resent msg2 for duplicate msg1 (same epoch)"
                         ),
                         Err(e) => debug!(
                             peer = %self.peer_display_name(&peer_node_addr),
                             error = %e,
+                            transport_id = %packet.transport_id,
+                            remote_addr = %packet.remote_addr,
+                            link_tid = %path.link_tid(),
+                            link_addr = %path.link_addr(),
+                            same_path = path.same_path(),
+                            msg1_sidx = %msg1_sidx,
+                            msg1_dg = %msg1_dg,
+                            age_s,
+                            stored_ridx = %stored_ridx,
+                            answers_it = %answers_it,
                             "Failed to resend msg2"
                         ),
                     }
@@ -735,11 +809,17 @@ impl Node {
                 match self.answer_msg1(&peer, &packet, &msg2).await {
                     Ok(_) => debug!(
                         peer = %self.peer_display_name(&peer),
+                        transport_id = %packet.transport_id,
+                        remote_addr = %packet.remote_addr,
+                        same_path = path.same_path(),
                         "Resent rekey msg2 for a resent msg1"
                     ),
                     Err(e) => debug!(
                         peer = %self.peer_display_name(&peer),
                         error = %e,
+                        transport_id = %packet.transport_id,
+                        remote_addr = %packet.remote_addr,
+                        same_path = path.same_path(),
                         "Failed to resend rekey msg2"
                     ),
                 }
@@ -813,6 +893,13 @@ impl Node {
                         warn!(
                             peer = %self.peer_display_name(&peer),
                             error = %e,
+                            transport_id = %packet.transport_id,
+                            remote_addr = %packet.remote_addr,
+                            link_tid = %path.link_tid(),
+                            link_addr = %path.link_addr(),
+                            same_path = path.same_path(),
+                            msg1_sidx = %msg1_sidx,
+                            msg1_dg = %msg1_dg,
                             "Failed to send rekey msg2"
                         );
                         let _ = self.index_allocator.free(our_new_index);
@@ -824,6 +911,15 @@ impl Node {
                 debug!(
                     peer = %self.peer_display_name(&peer),
                     new_our_index = %our_new_index,
+                    transport_id = %packet.transport_id,
+                    remote_addr = %packet.remote_addr,
+                    link_tid = %path.link_tid(),
+                    link_addr = %path.link_addr(),
+                    same_path = path.same_path(),
+                    age_s,
+                    msg1_sidx = %msg1_sidx,
+                    msg1_dg = %msg1_dg,
+                    epoch = %diag::epoch_tag(&noise_session),
                     "Sent rekey msg2 response"
                 );
 
@@ -1285,6 +1381,8 @@ impl Node {
             None => {
                 debug!(
                     receiver_idx = %header.receiver_idx,
+                    transport_id = %packet.transport_id,
+                    remote_addr = %packet.remote_addr,
                     "No pending outbound handshake for index"
                 );
                 self.stats_mut()
@@ -1586,10 +1684,15 @@ impl Node {
             // right after the take — unconditionally, whether or not a
             // connection was carried — so none of this block's exits leave a
             // dangling machine.
-            let (taken_conn, carrier_our_index) = match self.peer_machines.get_mut(&link_id) {
-                Some(machine) => (machine.take_leg(), machine.our_index()),
-                None => (None, None),
-            };
+            let (taken_conn, carrier_our_index, sent_msg1_digest) =
+                match self.peer_machines.get_mut(&link_id) {
+                    Some(machine) => (
+                        machine.take_leg(),
+                        machine.our_index(),
+                        machine.conn_handshake_msg1().map(Msg1Digest::of),
+                    ),
+                    None => (None, None, None),
+                };
             self.remove_peer_machine(link_id);
             let mut conn = match taken_conn {
                 Some(c) => c,
@@ -1624,6 +1727,7 @@ impl Node {
 
                 if let Some(peer) = self.peers.get_mut(&peer_node_addr) {
                     let suppressed = peer.replay_suppressed_count();
+                    let epoch = diag::epoch_tag(&outbound_session);
                     let old_our_index = peer.replace_session(
                         outbound_session,
                         outbound_our_index,
@@ -1652,6 +1756,11 @@ impl Node {
                         peer = %self.peer_display_name(&peer_node_addr),
                         new_our_index = %outbound_our_index,
                         new_their_index = %header.sender_idx,
+                        transport_id = %packet.transport_id,
+                        remote_addr = %packet.remote_addr,
+                        msg1_sidx = %outbound_our_index,
+                        msg1_dg = %OrNone(sent_msg1_digest.as_ref().map(diag::msg1_tag)),
+                        epoch = %epoch,
                         "Cross-connection: swapped to outbound session (our outbound wins)"
                     );
 
@@ -1676,6 +1785,9 @@ impl Node {
                     debug!(
                         peer = %self.peer_display_name(&peer_node_addr),
                         kept_their_index = ?peer.their_index(),
+                        transport_id = %packet.transport_id,
+                        remote_addr = %packet.remote_addr,
+                        epoch = %OrNone(peer.noise_session().map(diag::epoch_tag)),
                         "Cross-connection: keeping inbound session and original their_index (peer outbound wins)"
                     );
                 }
@@ -1826,6 +1938,13 @@ impl Node {
         let carrier_is_outbound = machine.conn_is_outbound();
         let carrier_remote_epoch = machine.conn_remote_epoch();
         let link_stats = machine.conn_link_stats().clone();
+        let direction = machine.conn_direction();
+        // The msg1 this link was set up by: the one this node sent, or the
+        // one it answered.
+        let msg1_digest = match direction {
+            LinkDirection::Outbound => machine.conn_handshake_msg1().map(Msg1Digest::of),
+            LinkDirection::Inbound => machine.conn_msg1_digest(),
+        };
 
         // Verify handshake is complete and extract session
         if connection.noise_session.is_none() {
@@ -2024,6 +2143,11 @@ impl Node {
 
             self.seed_path_mtu_for_link_peer(&peer_node_addr, transport_id, &current_addr);
 
+            let remote_addr = current_addr.clone();
+            let epoch = diag::epoch_tag(&noise_session);
+            // The msg1's sender index is the initiator's, so both ends log
+            // the same one.
+            let msg1_sidx = if is_outbound { our_index } else { their_index };
             let mut new_peer = ActivePeer::with_session(
                 verified_identity,
                 link_id,
@@ -2059,6 +2183,12 @@ impl Node {
                 link_id = %link_id,
                 our_index = %our_index,
                 their_index = %their_index,
+                transport_id = %transport_id,
+                remote_addr = %remote_addr,
+                direction = %direction,
+                msg1_sidx = %msg1_sidx,
+                msg1_dg = %OrNone(msg1_digest.as_ref().map(diag::msg1_tag)),
+                epoch = %epoch,
                 "Connection promoted to active peer"
             );
 
