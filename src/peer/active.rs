@@ -87,6 +87,9 @@ struct PeerSendState {
     previous_our_index: Option<SessionIndex>,
     /// When the drain window started (None = no drain in progress).
     drain_started: Option<Instant>,
+    /// When the last cutover happened, in either role. Kept after the drain
+    /// completes, so a later removal can say how long ago it was.
+    last_cutover: Option<Instant>,
 
     // === Pending epoch slot ===
     /// Pending new session from completed rekey (before K-bit cutover).
@@ -137,6 +140,10 @@ struct PeerSendState {
     replay_suppressed_count: u32,
     /// Consecutive decryption failures (reset on any successful decrypt).
     consecutive_decrypt_failures: u32,
+    /// Frames authenticated on the previous session since the last cutover.
+    prev_frames: u64,
+    /// The receiver index of the last frame that failed to decrypt.
+    failed_idx: Option<SessionIndex>,
     /// Per-peer MMP state (None for legacy peers without Noise sessions).
     mmp: Option<MmpPeerState>,
 }
@@ -152,6 +159,7 @@ impl PeerSendState {
             previous_session: None,
             previous_our_index: None,
             drain_started: None,
+            last_cutover: None,
             pending_new_session: None,
             pending_our_index: None,
             pending_their_index: None,
@@ -168,6 +176,8 @@ impl PeerSendState {
             last_seen,
             replay_suppressed_count: 0,
             consecutive_decrypt_failures: 0,
+            prev_frames: 0,
+            failed_idx: None,
             mmp: None,
         }
     }
@@ -638,6 +648,31 @@ impl ActivePeer {
     /// Current consecutive decryption failure count.
     pub fn consecutive_decrypt_failures(&self) -> u32 {
         self.send.consecutive_decrypt_failures
+    }
+
+    /// Record the receiver index of a frame that failed to decrypt.
+    pub(crate) fn record_failed(&mut self, idx: SessionIndex) {
+        self.send.failed_idx = Some(idx);
+    }
+
+    /// The receiver index of the last frame that failed to decrypt.
+    pub(crate) fn last_failed(&self) -> Option<SessionIndex> {
+        self.send.failed_idx
+    }
+
+    /// Count one frame authenticated on the previous session.
+    pub(crate) fn count_previous(&mut self) {
+        self.send.prev_frames = self.send.prev_frames.saturating_add(1);
+    }
+
+    /// Frames authenticated on the previous session since the last cutover.
+    pub(crate) fn prev_frames(&self) -> u64 {
+        self.send.prev_frames
+    }
+
+    /// How long ago the last cutover happened; `None` if there has been none.
+    pub(crate) fn since_cutover(&self) -> Option<Duration> {
+        self.send.last_cutover.map(|t| t.elapsed())
     }
 
     // === Epoch Accessors ===
@@ -1176,6 +1211,8 @@ impl ActivePeer {
         self.send.previous_session = self.send.noise_session.take();
         self.send.previous_our_index = self.send.our_index;
         self.send.drain_started = Some(Instant::now());
+        self.send.last_cutover = self.send.drain_started;
+        self.send.prev_frames = 0;
 
         // Promote pending to current
         self.send.noise_session = Some(new_session);
@@ -1219,6 +1256,8 @@ impl ActivePeer {
         self.send.previous_session = self.send.noise_session.take();
         self.send.previous_our_index = self.send.our_index;
         self.send.drain_started = Some(Instant::now());
+        self.send.last_cutover = self.send.drain_started;
+        self.send.prev_frames = 0;
 
         // Promote pending to current
         self.send.noise_session = Some(new_session);
@@ -2013,5 +2052,89 @@ mod tests {
         assert!(!peer.pending_expired(Duration::from_secs(60)));
         peer.backdate_pending(Duration::from_secs(61));
         assert!(peer.pending_expired(Duration::from_secs(60)));
+    }
+
+    /// Both cutover bodies restart the previous-session frame count and stamp
+    /// the cutover time, and completing the drain keeps both.
+    #[test]
+    fn each_cutover_restarts_the_previous_frame_count_and_stamps_the_cutover() {
+        type Cutover = fn(&mut ActivePeer) -> Option<SessionIndex>;
+        let cutovers: [(&str, Cutover); 2] = [
+            ("initiator", ActivePeer::cutover_to_new_session),
+            ("responder", ActivePeer::handle_peer_kbit_flip),
+        ];
+        for (name, cutover) in cutovers {
+            let (_cur_send, cur_recv) = ik_session_pair();
+            let (_pend_send, pend_recv) = ik_session_pair();
+            let mut peer = peer_with_current(cur_recv);
+            assert!(peer.since_cutover().is_none(), "{name}: no cutover yet");
+            peer.count_previous();
+            peer.count_previous();
+            assert_eq!(peer.prev_frames(), 2);
+            peer.set_pending_session(pend_recv, SessionIndex::new(3), SessionIndex::new(4));
+
+            assert!(cutover(&mut peer).is_some(), "{name}: the cutover runs");
+            assert_eq!(peer.prev_frames(), 0, "{name}: the count restarts");
+            assert!(
+                peer.since_cutover().is_some(),
+                "{name}: the cutover is stamped"
+            );
+
+            peer.count_previous();
+            assert!(peer.complete_drain().is_some());
+            assert_eq!(peer.prev_frames(), 1, "{name}: the drain keeps the count");
+            assert!(
+                peer.since_cutover().is_some(),
+                "{name}: the drain keeps the stamp"
+            );
+        }
+    }
+
+    /// The last failing index is the one most recently recorded.
+    #[test]
+    fn the_last_failed_index_is_the_most_recent_one_recorded() {
+        let (_cur_send, cur_recv) = ik_session_pair();
+        let mut peer = peer_with_current(cur_recv);
+        assert_eq!(peer.last_failed(), None);
+        peer.record_failed(SessionIndex::new(5));
+        peer.record_failed(SessionIndex::new(6));
+        assert_eq!(peer.last_failed(), Some(SessionIndex::new(6)));
+    }
+
+    /// An index names the current, previous or pending slot it belongs to,
+    /// the pending one by the role that produced it, and any other index
+    /// names none.
+    #[test]
+    fn an_index_names_the_slot_of_the_session_it_belongs_to() {
+        use crate::node::diag::Slot;
+
+        let (_cur_send, cur_recv) = ik_session_pair();
+        let (_pend_send, pend_recv) = ik_session_pair();
+        let mut peer = peer_with_current(cur_recv);
+        assert_eq!(Slot::of(&peer, SessionIndex::new(1)), Slot::Current);
+        assert_eq!(Slot::of(&peer, SessionIndex::new(9)), Slot::Unknown);
+
+        peer.answer_rekey(
+            pend_recv,
+            SessionIndex::new(3),
+            SessionIndex::new(4),
+            answer(),
+        );
+        assert_eq!(
+            Slot::of(&peer, SessionIndex::new(3)),
+            Slot::PendingResponder
+        );
+        assert!(peer.handle_peer_kbit_flip().is_some());
+        assert_eq!(Slot::of(&peer, SessionIndex::new(3)), Slot::Current);
+        assert_eq!(Slot::of(&peer, SessionIndex::new(1)), Slot::Previous);
+
+        let (_next_send, next_recv) = ik_session_pair();
+        peer.set_pending_session(next_recv, SessionIndex::new(5), SessionIndex::new(6));
+        assert_eq!(
+            Slot::of(&peer, SessionIndex::new(5)),
+            Slot::PendingInitiator
+        );
+        assert_eq!(Slot::Unknown.to_string(), "none");
+        assert_eq!(Slot::PendingInitiator.to_string(), "pending-initiator");
     }
 }

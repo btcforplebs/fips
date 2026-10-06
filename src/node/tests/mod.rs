@@ -21,6 +21,7 @@ mod establish_chartests;
 mod forwarding;
 mod handshake;
 mod heartbeat;
+mod link_session_diag;
 mod link_setup_diag;
 mod mmp_chartests;
 mod netmon;

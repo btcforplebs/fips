@@ -7,11 +7,19 @@
 //! 4-byte prefix of a session's handshake hash, which both ends of a session
 //! hold. Every value here displays without spaces, and an absent one as
 //! `none`.
+//!
+//! Lines about a frame that failed to decrypt also say which of the peer's
+//! sessions its index names and what key state the peer held, and a
+//! per-packet line with no peer to suppress on shares one node-wide budget.
 
+use super::rate_limit::TokenBucket;
 use crate::noise::NoiseSession;
-use crate::proto::fmp::Msg1Digest;
+use crate::peer::ActivePeer;
+use crate::proto::fmp::{Msg1Digest, RekeyRole};
 use crate::transport::{TransportAddr, TransportId};
+use crate::utils::index::SessionIndex;
 use std::fmt;
+use std::time::Instant;
 
 /// A 4-byte prefix of a digest or hash, displayed as 8 lowercase hex digits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -85,6 +93,162 @@ impl Msg1Path {
     }
 }
 
+/// Which of a peer's sessions a receiver index names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Slot {
+    /// The session the peer sends and receives on.
+    Current,
+    /// The session a cutover retired, still draining.
+    Previous,
+    /// A pending session this node produced by answering the peer's rekey.
+    PendingResponder,
+    /// A pending session from a rekey this node initiated.
+    PendingInitiator,
+    /// No session the peer holds, such as one whose drain has completed.
+    Unknown,
+}
+
+impl Slot {
+    /// The slot `idx` names among `peer`'s sessions.
+    pub(crate) fn of(peer: &ActivePeer, idx: SessionIndex) -> Self {
+        if peer.our_index() == Some(idx) {
+            Self::Current
+        } else if peer.previous_our_index() == Some(idx) {
+            Self::Previous
+        } else if peer.pending_our_index() == Some(idx) {
+            match peer.pending_role() {
+                Some(RekeyRole::Responder) => Self::PendingResponder,
+                Some(RekeyRole::Initiator) => Self::PendingInitiator,
+                None => Self::Unknown,
+            }
+        } else {
+            Self::Unknown
+        }
+    }
+}
+
+impl fmt::Display for Slot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Current => "current",
+            Self::Previous => "previous",
+            Self::PendingResponder => "pending-responder",
+            Self::PendingInitiator => "pending-initiator",
+            Self::Unknown => "none",
+        })
+    }
+}
+
+/// The key state a decryption line logs, read from the peer as owned values
+/// so the caller can release its borrow of the peer before logging.
+pub(crate) struct KeyView {
+    /// The slot the frame's index names.
+    pub(crate) slot: Slot,
+    /// This node's current K-bit.
+    pub(crate) kbit_ours: OrNone<bool>,
+    /// The current session's tag.
+    pub(crate) epoch: OrNone<Tag4>,
+    /// The draining previous session's tag.
+    pub(crate) prev_epoch: OrNone<Tag4>,
+    /// The pending session's tag.
+    pub(crate) pending_epoch: OrNone<Tag4>,
+}
+
+impl KeyView {
+    /// The key state of `peer` for a frame naming `idx`. Every field is
+    /// `none` without a peer, and the slot is `none` without an index.
+    pub(crate) fn of(peer: Option<&ActivePeer>, idx: Option<SessionIndex>) -> Self {
+        let Some(p) = peer else {
+            return Self {
+                slot: Slot::Unknown,
+                kbit_ours: OrNone(None),
+                epoch: OrNone(None),
+                prev_epoch: OrNone(None),
+                pending_epoch: OrNone(None),
+            };
+        };
+        Self {
+            slot: idx.map_or(Slot::Unknown, |i| Slot::of(p, i)),
+            kbit_ours: OrNone(Some(p.current_k_bit())),
+            epoch: OrNone(p.noise_session().map(epoch_tag)),
+            prev_epoch: OrNone(p.previous_session().map(epoch_tag)),
+            pending_epoch: OrNone(p.pending_new_session().map(epoch_tag)),
+        }
+    }
+}
+
+/// Whether a failing frame was tried against the peer's pending session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Trial {
+    /// The peer held no pending session.
+    NotRunNoPending,
+    /// A pending session was held, but the frame's K-bit matched ours, so
+    /// the gate did not try it.
+    NotRunKbitEqual,
+    /// The gate tried the pending session and it did not authenticate the
+    /// frame.
+    Failed,
+}
+
+impl Trial {
+    /// The trial outcome for a frame that went on to fail: `pending` is
+    /// whether a pending session was held, `tried` is the gate's own
+    /// decision. A trial that succeeded never reaches a failure line.
+    pub(crate) fn of(pending: bool, tried: bool) -> Self {
+        match (pending, tried) {
+            (false, _) => Self::NotRunNoPending,
+            (true, false) => Self::NotRunKbitEqual,
+            (true, true) => Self::Failed,
+        }
+    }
+}
+
+impl fmt::Display for Trial {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::NotRunNoPending => "not-run-no-pending",
+            Self::NotRunKbitEqual => "not-run-kbit-equal",
+            Self::Failed => "failed",
+        })
+    }
+}
+
+/// Lines a [`LogBudget`] admits at once.
+const BUDGET_BURST: u32 = 10;
+/// Lines per second a [`LogBudget`] admits after its burst.
+const BUDGET_RATE: f64 = 1.0;
+
+/// One node-wide budget for a per-packet line that has no authenticated peer
+/// to suppress on. It holds no per-source state, so its size does not grow
+/// with the number of sources sending, which an unauthenticated sender
+/// chooses.
+pub(crate) struct LogBudget {
+    bucket: TokenBucket,
+    withheld: u64,
+}
+
+impl LogBudget {
+    /// A full budget as of `now`.
+    pub(crate) fn new(now: Instant) -> Self {
+        Self {
+            bucket: TokenBucket::with_params_at(BUDGET_BURST, BUDGET_RATE, now),
+            withheld: 0,
+        }
+    }
+
+    /// Whether to emit one more line at `now`. When admitted, returns how
+    /// many lines were withheld since the last admitted one and resets that
+    /// count; otherwise counts this line as withheld.
+    pub(crate) fn admit(&mut self, now: Instant) -> Option<u64> {
+        if self.bucket.try_acquire_at(now) {
+            Some(std::mem::take(&mut self.withheld))
+        } else {
+            self.withheld = self.withheld.saturating_add(1);
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -128,5 +292,44 @@ mod tests {
         let p = Msg1Path::new(t2, &other, link);
         assert_eq!(p.link_tid().to_string(), "transport:1");
         assert_eq!(p.link_addr().to_string(), "10.0.0.1:2121");
+    }
+
+    #[test]
+    fn the_trial_reads_whether_a_pending_was_held_and_whether_the_gate_tried_it() {
+        assert_eq!(Trial::of(false, false).to_string(), "not-run-no-pending");
+        assert_eq!(Trial::of(false, true).to_string(), "not-run-no-pending");
+        assert_eq!(Trial::of(true, false).to_string(), "not-run-kbit-equal");
+        assert_eq!(Trial::of(true, true).to_string(), "failed");
+    }
+
+    #[test]
+    fn the_log_budget_admits_its_burst_then_one_line_a_second_with_the_withheld_count() {
+        let t0 = Instant::now();
+        let mut budget = LogBudget::new(t0);
+        for _ in 0..BUDGET_BURST {
+            assert_eq!(budget.admit(t0), Some(0));
+        }
+        assert_eq!(budget.admit(t0), None);
+        assert_eq!(budget.admit(t0), None);
+
+        let t1 = t0 + std::time::Duration::from_secs(1);
+        assert_eq!(budget.admit(t1), Some(2), "the withheld count is reported");
+        assert_eq!(budget.admit(t1), None, "and only one line is admitted");
+        let t2 = t1 + std::time::Duration::from_secs(1);
+        assert_eq!(budget.admit(t2), Some(1), "the count was reset");
+    }
+
+    #[test]
+    fn a_key_view_without_a_peer_renders_none_for_every_field() {
+        let v = KeyView::of(None, None);
+        for value in [
+            v.slot.to_string(),
+            v.kbit_ours.to_string(),
+            v.epoch.to_string(),
+            v.prev_epoch.to_string(),
+            v.pending_epoch.to_string(),
+        ] {
+            assert_eq!(value, "none");
+        }
     }
 }

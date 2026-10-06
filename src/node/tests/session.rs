@@ -1225,20 +1225,20 @@ async fn rekey_cutover_preserves_data_plane() {
 /// A two-node pair with an FSP session over an FMP link whose link sessions
 /// have been aged, with a TUN receiver on each node. Built by
 /// [`aged_link_pair`].
-struct AgedLinkPair {
-    nodes: Vec<TestNode>,
-    node0_addr: NodeAddr,
-    node1_addr: NodeAddr,
-    fips0: crate::FipsAddress,
-    fips1: crate::FipsAddress,
-    tun0_rx: std::sync::mpsc::Receiver<Vec<u8>>,
-    tun1_rx: std::sync::mpsc::Receiver<Vec<u8>>,
+pub(super) struct AgedLinkPair {
+    pub(super) nodes: Vec<TestNode>,
+    pub(super) node0_addr: NodeAddr,
+    pub(super) node1_addr: NodeAddr,
+    pub(super) fips0: crate::FipsAddress,
+    pub(super) fips1: crate::FipsAddress,
+    pub(super) tun0_rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    pub(super) tun1_rx: std::sync::mpsc::Receiver<Vec<u8>>,
 }
 
 /// Build a two-node pair from `cfg0` and `cfg1`, peer node 0 to node 1 over
 /// FMP, open an FSP session from node 0, show that both directions decode,
 /// then backdate both link sessions by `age`.
-async fn aged_link_pair(
+pub(super) async fn aged_link_pair(
     cfg0: crate::config::Config,
     cfg1: crate::config::Config,
     age: Duration,
@@ -1322,18 +1322,18 @@ async fn aged_link_pair(
 
 /// A two-node pair caught mid FMP rekey, with node 1's msg2 held back from
 /// node 0. Built by [`rekey_pair_with_held_msg2`].
-struct HeldMsg2Pair {
-    nodes: Vec<TestNode>,
-    node0_addr: NodeAddr,
-    node1_addr: NodeAddr,
-    fips0: crate::FipsAddress,
-    fips1: crate::FipsAddress,
-    tun0_rx: std::sync::mpsc::Receiver<Vec<u8>>,
-    tun1_rx: std::sync::mpsc::Receiver<Vec<u8>>,
-    node0_idx_before: Option<crate::utils::index::SessionIndex>,
-    node1_idx_before: Option<crate::utils::index::SessionIndex>,
-    rekey_idx: crate::utils::index::SessionIndex,
-    held_msg2: crate::transport::ReceivedPacket,
+pub(super) struct HeldMsg2Pair {
+    pub(super) nodes: Vec<TestNode>,
+    pub(super) node0_addr: NodeAddr,
+    pub(super) node1_addr: NodeAddr,
+    pub(super) fips0: crate::FipsAddress,
+    pub(super) fips1: crate::FipsAddress,
+    pub(super) tun0_rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    pub(super) tun1_rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    pub(super) node0_idx_before: Option<crate::utils::index::SessionIndex>,
+    pub(super) node1_idx_before: Option<crate::utils::index::SessionIndex>,
+    pub(super) rekey_idx: crate::utils::index::SessionIndex,
+    pub(super) held_msg2: crate::transport::ReceivedPacket,
 }
 
 /// Build a two-node pair with an FSP session, age both link sessions past
@@ -1344,7 +1344,7 @@ struct HeldMsg2Pair {
 /// new session it committed at msg1 and node 0 is mid-cycle when this
 /// returns. Both directions are shown to decode before the rekey, so a later
 /// delivery failure is the rekey's and not the harness's.
-async fn rekey_pair_with_held_msg2() -> HeldMsg2Pair {
+pub(super) async fn rekey_pair_with_held_msg2() -> HeldMsg2Pair {
     use crate::proto::fmp::wire::{CommonPrefix, PHASE_MSG2};
     use crate::transport::ReceivedPacket;
 
@@ -1429,7 +1429,7 @@ async fn rekey_pair_with_held_msg2() -> HeldMsg2Pair {
 
 /// Deliver queued packets between the nodes until a round moves none, for at
 /// most 50 rounds of 10 ms.
-async fn pump_until_quiet(nodes: &mut [TestNode]) {
+pub(super) async fn pump_until_quiet(nodes: &mut [TestNode]) {
     for _ in 0..50 {
         tokio::time::sleep(Duration::from_millis(10)).await;
         if process_available_packets(nodes).await == 0 {

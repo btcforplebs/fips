@@ -240,6 +240,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   logs the digest of the msg1 that armed it (`held_dg`) and how long it has
   been held (`pending_age_s`). Message texts and levels are unchanged.
 
+- Decryption-failure lines now say which of the peer's sessions a failing
+  frame named and what key state each end held. "Decryption failed" and
+  "Worker FMP AEAD decryption failed" carry the frame's receiver index
+  (`receiver_idx`), the transport and address it arrived on (`transport_id`,
+  `remote_addr`), its K-bit and ours (`kbit_frame`, `kbit_ours`), the session
+  slot its index names (`slot`), and the tags of the current, previous and
+  pending sessions (`epoch`, `prev_epoch`, `pending_epoch`); the first also
+  says whether the pending session was tried (`trial`). "Excessive decryption
+  failures, removing peer" carries the same key state for the last failing
+  index, with how long the pending session has been held (`pending_age_s`) and
+  the time since the last cutover (`since_cutover_ms`). The rekey completion,
+  both cutover lines and the rekey answer log the new session's tag (`epoch`)
+  and this node's K-bit after the change (`kbit_ours`). "Removing peer: link
+  dead timeout" says whether the silence was measured from the last received
+  frame or from the session start (`basis`, `basis_age_ms`), the time since
+  the last cutover, the K-bit, how many frames arrived on the previous session
+  since then (`prev_slot_frames`), and the peer's link (`link_tid`,
+  `link_addr`). "Unknown session index, dropping" is now logged at debug
+  rather than trace, with the sender's address, under one node-wide budget of
+  10 lines and then one a second; each line reports how many were withheld
+  before it (`suppressed`). Message texts are unchanged.
+
 - The Windows service log is rolled at `node.log_max_size_mb` and keeps
   `node.log_max_files` old files. The defaults are the 10 MiB and four files it
   used before.

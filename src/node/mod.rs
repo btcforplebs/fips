@@ -628,6 +628,9 @@ pub struct Node {
     /// O(1) lookup: (transport_id, our_index) → NodeAddr.
     /// This maps our session index to the peer that uses it.
     peers_by_index: HashMap<(TransportId, u32), NodeAddr>,
+    /// Budget for the line logged for a frame naming an index that is not in
+    /// `peers_by_index`; its sender is not authenticated.
+    index_budget: diag::LogBudget,
     /// Pending outbound handshakes by our sender_idx.
     /// Tracks which LinkId corresponds to which session index.
     pending_outbound: HashMap<(TransportId, u32), LinkId>,
@@ -920,6 +923,7 @@ impl Node {
             ble_radio: None,
             index_allocator: IndexAllocator::new(),
             peers_by_index: HashMap::new(),
+            index_budget: diag::LogBudget::new(std::time::Instant::now()),
             pending_outbound: HashMap::new(),
             restart_dampener: HashMap::new(),
             msg1_rate_limiter,
@@ -1089,6 +1093,7 @@ impl Node {
             ble_radio: None,
             index_allocator: IndexAllocator::new(),
             peers_by_index: HashMap::new(),
+            index_budget: diag::LogBudget::new(std::time::Instant::now()),
             pending_outbound: HashMap::new(),
             restart_dampener: HashMap::new(),
             msg1_rate_limiter,

@@ -33,6 +33,7 @@
 
 use crate::PeerIdentity;
 use crate::node::Node;
+use crate::node::diag::{self, OrNone};
 use crate::node::reject::{HandshakeReject, RejectReason};
 use crate::peer::machine::{LostKind, PeerAction, PeerEvent};
 use crate::proto::fmp::PromotionResult;
@@ -446,6 +447,8 @@ impl Node {
                     let node_addr = *ambient.verified_identity.node_addr();
                     let did_cutover = if let Some(peer) = self.peers.get_mut(&node_addr) {
                         if let Some(_old_our_index) = peer.cutover_to_new_session() {
+                            let epoch = OrNone(peer.noise_session().map(diag::epoch_tag));
+                            let kbit_ours = peer.current_k_bit();
                             // New index was pre-registered in peers_by_index
                             // during msg2 handling (handshake.rs).
                             debug_assert!(
@@ -465,6 +468,8 @@ impl Node {
                                 // the target preserves the observable log contract.
                                 target: "fips::node::handlers::rekey",
                                 peer = %self.peer_display_name(&node_addr),
+                                epoch = %epoch,
+                                kbit_ours,
                                 "Rekey cutover complete (initiator), K-bit flipped"
                             );
                             true

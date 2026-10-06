@@ -676,6 +676,7 @@ impl Node {
                 .and_then(|p| p.pending_age())
                 .map(|d| d.as_secs()),
         );
+        let kbit_ours = OrNone(self.peers.get(&peer_node_addr).map(|p| p.current_k_bit()));
 
         // === PHASE C: structured classification ===
         // Evaluate the inbound decision once on a local establish leg and route
@@ -920,6 +921,7 @@ impl Node {
                     msg1_sidx = %msg1_sidx,
                     msg1_dg = %msg1_dg,
                     epoch = %diag::epoch_tag(&noise_session),
+                    kbit_ours = %kbit_ours,
                     "Sent rekey msg2 response"
                 );
 
@@ -1455,6 +1457,8 @@ impl Node {
                                 peer = %display_name,
                                 new_our_index = %our_index,
                                 new_their_index = %header.sender_idx,
+                                epoch = %OrNone(peer.pending_new_session().map(diag::epoch_tag)),
+                                kbit_ours = peer.current_k_bit(),
                                 "Rekey completed (initiator), pending K-bit cutover"
                             );
                             rekey_completed = true;

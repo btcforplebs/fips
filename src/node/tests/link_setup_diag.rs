@@ -35,24 +35,24 @@ fn msg1_tag(wire: &[u8]) -> String {
 }
 
 /// The tag a line should carry for `session`.
-fn session_tag(session: &NoiseSession) -> String {
+pub(super) fn session_tag(session: &NoiseSession) -> String {
     hex4(session.handshake_hash())
 }
 
 /// A session index as the lines display it.
-fn index_text(index: SessionIndex) -> String {
+pub(super) fn index_text(index: SessionIndex) -> String {
     format!("{:08x}", index.as_u32())
 }
 
 /// The line whose message is exactly `message`, or a panic listing every
 /// captured line.
-fn expect_line(logs: &LogCapture, message: &str) -> String {
+pub(super) fn expect_line(logs: &LogCapture, message: &str) -> String {
     logs.line(message)
         .unwrap_or_else(|| panic!("no line {message:?} in {:#?}", logs.lines()))
 }
 
 /// The value of `name` on `line`, or a panic naming the line.
-fn field(line: &str, name: &str) -> String {
+pub(super) fn field(line: &str, name: &str) -> String {
     log_field(line, name)
         .unwrap_or_else(|| panic!("no field {name} on {line}"))
         .to_string()

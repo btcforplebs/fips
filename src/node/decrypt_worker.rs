@@ -186,6 +186,15 @@ pub(crate) struct DecryptFailureReport {
     pub source_node_addr: NodeAddr,
     pub fmp_counter: u64,
     pub fmp_replay_highest: u64,
+    /// The frame's receiver index, so the failure line can say which of the
+    /// peer's sessions it named.
+    pub receiver_idx: u32,
+    /// Transport the frame arrived on.
+    pub transport_id: TransportId,
+    /// Address the frame arrived from.
+    pub remote_addr: TransportAddr,
+    /// The frame's FMP flags, carrying its K-bit.
+    pub fmp_flags: u8,
 }
 
 /// Event emitted by the decrypt worker to the rx_loop.
@@ -484,6 +493,10 @@ fn handle_job(
                 source_node_addr,
                 fmp_counter,
                 fmp_replay_highest,
+                receiver_idx: cache_key.1,
+                transport_id,
+                remote_addr,
+                fmp_flags,
             }));
             return Ok(());
         }
@@ -802,6 +815,13 @@ mod tests {
             DecryptWorkerEvent::DecryptFailure(report) => {
                 assert_eq!(report.source_node_addr, source_node_addr);
                 assert_eq!(report.fmp_counter, counter);
+                assert_eq!(report.receiver_idx, 77);
+                assert_eq!(report.transport_id, TransportId::new(1));
+                assert_eq!(
+                    report.remote_addr,
+                    crate::transport::TransportAddr::from_string("127.0.0.1:1234")
+                );
+                assert_eq!(report.fmp_flags, 0);
             }
             DecryptWorkerEvent::Plaintext(_) => panic!("expected decrypt failure report"),
         }
