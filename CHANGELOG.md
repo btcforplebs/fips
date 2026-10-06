@@ -262,7 +262,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dropping" is now logged at debug rather than trace, with the sender's
   address, under one node-wide budget of 10 lines and then one a second; each
   line reports how many were withheld before it (`suppressed`). Message texts
-  are unchanged.
+  are unchanged except the excessive-failures warning, which said "removing
+  peer" before the peer was kept.
 
 - "Unknown FMP version, dropping" and "FMP payload_len disagrees with frame
   length, dropping" now name the sender's address and the frame's first 8
