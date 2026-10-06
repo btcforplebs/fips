@@ -2572,6 +2572,36 @@ node:
     }
 
     #[test]
+    fn test_load_from_paths_layers_the_log_and_netmon_settings_per_key_including_defaults_set_by_a_later_file()
+     {
+        // These fields skip serialising at their defaults, so the all-keys
+        // test cannot reach them; a later file's default must still win.
+        let low = r#"
+node:
+  log_file: /var/log/fips/low.log
+  log_max_files: 7
+  netmon:
+    enabled: false
+    debounce_ms: 900
+"#;
+        let high = r#"
+node:
+  log_max_size_mb: 25
+  netmon:
+    enabled: true
+"#;
+        let config = load_layers(&[low, high]);
+        assert_eq!(
+            config.node.log_file,
+            Some("/var/log/fips/low.log".to_string())
+        );
+        assert_eq!(config.node.log_max_files, Some(7));
+        assert_eq!(config.node.netmon.debounce_ms, 900);
+        assert!(config.node.netmon.enabled);
+        assert_eq!(config.node.log_max_size_mb, Some(25));
+    }
+
+    #[test]
     fn test_search_paths_includes_expected() {
         let paths = Config::search_paths();
 
