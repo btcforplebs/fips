@@ -32,9 +32,12 @@ case "$backend" in
     dnsmasq)
         log "Removing dnsmasq drop-in"
         rm -f "$DNSMASQ_DROPIN"
-        service dnsmasq reload >/dev/null 2>&1 \
-            || service dnsmasq onerestart >/dev/null 2>&1 \
-            || log "WARNING: dnsmasq reload failed"
+        # Restart rather than reload (a SIGHUP does not re-read the
+        # configuration), and only a running dnsmasq.
+        if service dnsmasq onestatus >/dev/null 2>&1; then
+            service dnsmasq onerestart >/dev/null 2>&1 \
+                || log "WARNING: dnsmasq restart failed"
+        fi
         ;;
     none)
         log "No backend was configured; nothing to remove"

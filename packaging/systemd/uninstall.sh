@@ -71,10 +71,10 @@ if [ -f /etc/dnsmasq.d/fips.conf ]; then
     rm -f /etc/dnsmasq.d/fips.conf
     echo "Removed /etc/dnsmasq.d/fips.conf."
     if systemctl is-active --quiet dnsmasq.service 2>/dev/null; then
-        if systemctl reload dnsmasq; then
-            echo "dnsmasq reloaded."
+        if systemctl try-restart dnsmasq; then
+            echo "dnsmasq restarted."
         else
-            echo "Warning: could not reload dnsmasq; reload it to drop the .fips route." >&2
+            echo "Warning: could not restart dnsmasq; restart it to drop the .fips route." >&2
         fi
     fi
 fi
