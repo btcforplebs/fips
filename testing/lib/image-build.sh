@@ -1,12 +1,13 @@
 #!/bin/bash
 # Shared helpers for building test images and starting test containers.
 #
-# Source this file to get dump_output(), run_quiet(), build_inline() and
-# retry_build():
+# Source this file to get dump_output(), run_quiet(), build_inline(),
+# retry_build() and shared_tmpdir():
 #   source "$SCRIPT_DIR/../lib/image-build.sh"
 #   echo "$dockerfile" | run_quiet "docker build -t $tag" \
 #       docker build -t "$tag" -f - "$REPO_ROOT"
 #   retry_build "docker build $tag" docker build -t "$tag" "$context"
+#   dir="$(shared_tmpdir --sweep "$REPO_ROOT/target" my-suite)" || exit 2
 #
 # A build or a container start that fails for a reason outside the project,
 # such as a registry timeout, is indistinguishable from one the project caused
@@ -92,4 +93,59 @@ retry_build() {
         sleep "$wait"
         attempt=$((attempt + 1))
     done
+}
+
+# Create a temporary directory that can be a bind-mount source, and print its
+# path: shared_tmpdir [--sweep] ROOT NAME makes ROOT/NAME.XXXXXX.
+#
+# Use this, never a bare `mktemp -d`, for any directory or file that becomes a
+# `docker run -v` source; testing/check-mount-tmpdir.py enforces it. A
+# directory that stays on this side of the boundary, such as a build context
+# the docker CLI reads itself, does not need it.
+#
+# A bind-mount source is resolved by the Docker daemon in the host's mount
+# namespace, never in the caller's. Under a service sandbox that gives the unit
+# a private /tmp -- systemd's PrivateTmp=, which the CI worker on the builder
+# sets -- a path from `mktemp -d` exists only in the caller's namespace. The
+# daemon finds nothing at it and creates an empty directory instead, so a
+# socket the container binds lands where the caller cannot see it, a file the
+# container writes is never read back, and a file mount such as fips.yaml
+# arrives as a directory, which the daemon reports as EISDIR. None of these
+# says what happened. The suites failed all three ways on the builder while
+# passing on GitHub, whose runner has no such sandbox.
+#
+# So ROOT must be a path that resolves the same in both namespaces: the
+# worktree (its target/ is ignored), or a directory that is already a mount
+# source, such as a packaging script's output directory. The helper does not
+# check where ROOT is, because a caller's --output-dir may legitimately be
+# under /tmp on a host without a private /tmp; the guard instead refuses a
+# literal /tmp or $TMPDIR root.
+#
+# NAME is the directory's prefix and carries any leading dot. --sweep first
+# removes ROOT/NAME.* directories older than two hours, for a persistent ROOT
+# whose earlier runs may have been killed before their own cleanup ran. Two
+# hours is far above any run and far below the interval at which leftovers
+# would pile up. The swept trees can hold files a container wrote as root, so
+# a stale directory that cannot be removed is left alone silently: the sweep
+# never prints and never decides the exit status. Do not sweep inside a
+# per-run ROOT that the caller's own trap removes; there it gains nothing and
+# could remove a live sibling in a run longer than two hours.
+#
+# Returns 2 for a bad argument, 1 if ROOT or the directory cannot be created.
+shared_tmpdir() {
+    local sweep=0
+    if [ "${1:-}" = "--sweep" ]; then
+        sweep=1
+        shift
+    fi
+    local root="${1:-}" name="${2:-}"
+    if [ -z "$root" ] || [ -z "$name" ] || [[ "$name" == */* ]]; then
+        echo "shared_tmpdir: usage: shared_tmpdir [--sweep] ROOT NAME (NAME without '/')" >&2
+        return 2
+    fi
+    mkdir -p "$root" || return 1
+    if [ "$sweep" -eq 1 ]; then
+        find "$root" -maxdepth 1 -type d -name "$name.*" -mmin +120 -exec rm -rf {} + 2>/dev/null || :
+    fi
+    mktemp -d "$root/$name.XXXXXX" || return 1
 }

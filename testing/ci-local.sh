@@ -1572,6 +1572,18 @@ run_portable_atomics() {
     record "portable-atomics" $rc
 }
 
+# No bare mktemp result may become a docker bind-mount source. Under a private
+# /tmp, which the builder's CI worker has, the daemon cannot see that path and
+# mounts an empty directory instead, which no GitHub runner shows. Static, plus
+# a self-test of the shared_tmpdir helper; about a second. Not yet mirrored in
+# ci.yml's ci-parity job.
+run_mount_tmpdir() {
+    local rc=0
+    info "[mount-tmpdir] Checking that no bind-mount source comes from a bare mktemp"
+    python3 "$SCRIPT_DIR/check-mount-tmpdir.py" || rc=$?
+    record "mount-tmpdir" $rc
+}
+
 # The shell scripts the OpenWrt packages ship, and the nak installer. The
 # OpenWrt Package workflow lints them on GitHub, but only for trunk pushes,
 # tags and pull requests, so this is where a branch first sees a finding.
@@ -1678,6 +1690,7 @@ main() {
     run_action_pins
     run_comment_refs
     run_portable_atomics
+    run_mount_tmpdir
     run_shellcheck
     run_wait_converge
     run_package_versions
