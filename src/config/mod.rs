@@ -2617,6 +2617,20 @@ node:
     }
 
     #[test]
+    fn test_load_from_paths_lets_a_later_file_turn_disable_routing_back_off() {
+        // `disable_routing` skips serialising when false, so a later file's
+        // `false` must still replace an earlier file's `true`.
+        let config = load_layers(&[
+            "node:\n  disable_routing: true\n",
+            "node:\n  disable_routing: false\n",
+        ]);
+        assert!(!config.node.disable_routing);
+
+        let config = load_layers(&["node:\n  disable_routing: true\n"]);
+        assert!(config.node.disable_routing);
+    }
+
+    #[test]
     fn test_search_paths_includes_expected() {
         let paths = Config::search_paths();
 
