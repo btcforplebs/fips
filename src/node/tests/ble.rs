@@ -308,3 +308,71 @@ async fn test_ble_discovery() {
     }];
     cleanup_nodes(&mut nodes).await;
 }
+
+/// A stale outbound handshake leg whose connection is also an active peer's
+/// must not take that peer's link down when it is reaped.
+///
+/// BLE pools one L2CAP link per peer address, so a handshake leg that crossed
+/// an established peer's — both nodes dialling at once — sits on the very
+/// connection that peer runs on. Reaping the leg by address closed it, and
+/// the peer with it.
+#[tokio::test]
+async fn reaping_a_handshake_leg_keeps_the_peer_link_it_shares() {
+    let mut nodes = vec![make_test_node_ble(1).await, make_test_node_ble(2).await];
+    let bank: StreamBank = Arc::new(StdMutex::new(HashMap::new()));
+    wire_ble_connection(&nodes, 0, 1, &bank).await;
+    install_connect_handler(&nodes, 0, &bank);
+    establish_ble_connection(&nodes, 0, 1).await;
+    initiate_handshake(&mut nodes, 0, 1).await;
+    drain_all_packets(&mut nodes, false).await;
+
+    let peer_1 = *nodes[1].node.node_addr();
+    let transport_id = nodes[0].transport_id;
+    let peer_addr = nodes[1].addr.clone();
+    assert!(nodes[0].node.get_peer(&peer_1).is_some(), "peered");
+    let connected = |nodes: &[TestNode]| {
+        nodes[0]
+            .node
+            .transports
+            .get(&transport_id)
+            .unwrap()
+            .connection_state(&peer_addr)
+            == crate::transport::ConnectionState::Connected
+    };
+    assert!(connected(&nodes), "the peer's BLE link is up");
+
+    // A second, outbound handshake leg to the same peer, on the same address,
+    // as a crossed dial leaves behind.
+    let peer_identity = PeerIdentity::from_pubkey_full(nodes[1].node.identity().pubkey_full());
+    let node = &mut nodes[0].node;
+    let leg = node.allocate_link_id();
+    let our_index = node.index_allocator.allocate().unwrap();
+    node.seed_handshake_machine(
+        HandshakeSeed::outbound(leg, peer_identity, 1000)
+            .with_our_index(our_index)
+            .with_transport_id(transport_id)
+            .with_source_addr(peer_addr.clone()),
+    )
+    .unwrap();
+    node.links.insert(
+        leg,
+        Link::connectionless(
+            leg,
+            transport_id,
+            peer_addr.clone(),
+            LinkDirection::Outbound,
+            std::time::Duration::from_millis(100),
+        ),
+    );
+
+    node.cleanup_stale_connection(leg, 2000).await;
+
+    assert!(!nodes[0].node.links.contains_key(&leg), "the leg is reaped");
+    assert!(
+        connected(&nodes),
+        "the peer's link survives the leg it shared a connection with"
+    );
+    assert!(nodes[0].node.get_peer(&peer_1).is_some(), "still peered");
+
+    cleanup_nodes(&mut nodes).await;
+}

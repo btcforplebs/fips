@@ -158,14 +158,10 @@ impl Node {
         // Closing twice is harmless: every `close_connection` implementation
         // is `if let Some(conn) = pool.remove(addr)` and the connectionless
         // default is a no-op, so the handshake paths that already close and
-        // then drop a link cannot be disturbed by this.
-        if let Some(link) = self.links.get(&link_id) {
-            let tid = link.transport_id();
-            let addr = link.remote_addr().clone();
-            if let Some(transport) = self.transports.get(&tid) {
-                transport.close_connection(&addr).await;
-            }
-        }
+        // then drop a link cannot be disturbed by this. A connection an active
+        // peer also runs on (both legs of a BLE handshake share one) is left
+        // open: it is that peer's, not the stale handshake's.
+        self.close_handshake_link_connection(link_id).await;
 
         // Remove link and addr_to_link
         self.remove_link(&link_id);
