@@ -300,6 +300,8 @@ pub struct MockBleIo {
     advertised_psm: std::sync::Mutex<Option<u16>>,
     /// Number of times `stop_scanning` has been called.
     stop_scans: std::sync::atomic::AtomicUsize,
+    /// When set, `connect` never completes, so the caller's timeout fires.
+    connect_stalls: std::sync::atomic::AtomicBool,
 }
 
 impl MockBleIo {
@@ -318,6 +320,7 @@ impl MockBleIo {
             bound_psm: std::sync::Mutex::new(None),
             advertised_psm: std::sync::Mutex::new(None),
             stop_scans: std::sync::atomic::AtomicUsize::new(0),
+            connect_stalls: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -356,6 +359,13 @@ impl MockBleIo {
             .unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Make every `connect` hang until the caller gives up on it — a peer
+    /// that is out of reach, as opposed to one that refuses.
+    pub fn set_connect_stall(&self) {
+        self.connect_stalls
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Set a handler for outbound connect calls.
     pub fn set_connect_handler<F>(&self, handler: F)
     where
@@ -389,6 +399,12 @@ impl BleIo for MockBleIo {
     }
 
     async fn connect(&self, addr: &BleAddr, psm: u16) -> Result<Self::Stream, TransportError> {
+        if self
+            .connect_stalls
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            std::future::pending::<()>().await;
+        }
         let handler = self
             .connect_handler
             .lock()
