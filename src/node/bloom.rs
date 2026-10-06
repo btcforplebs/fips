@@ -136,6 +136,13 @@ impl Node {
     }
 
     /// Send pending rate-limited filter announces whose debounce has expired.
+    ///
+    /// A peer that has not sent an authenticated frame since it was promoted
+    /// is skipped, and its update stays pending for the first tick after that
+    /// frame. A peer that completes a handshake and then sends nothing would
+    /// otherwise draw an announce, and its resends, on every promotion. A
+    /// working peer sends its TreeAnnounce as soon as it promotes, so its
+    /// filter waits about one round trip.
     pub(super) async fn send_pending_filter_announces(&mut self) {
         // Monotonic: the debounce compares two reads, and a wall-clock step
         // back would hold announces for the size of the step.
@@ -143,9 +150,11 @@ impl Node {
 
         let ready: Vec<NodeAddr> = self
             .peers
-            .keys()
-            .filter(|addr| self.bloom_state.should_send_update(addr, now_ms))
-            .copied()
+            .iter()
+            .filter(|(addr, peer)| {
+                peer.heard() && self.bloom_state.should_send_update(addr, now_ms)
+            })
+            .map(|(addr, _)| *addr)
             .collect();
 
         if ready.is_empty() {

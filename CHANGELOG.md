@@ -285,6 +285,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`evicted_recently`). `show_bloom` peer rows carry `tree_role` (`parent`,
   `child` or `none`). Message texts are unchanged.
 
+- A FilterAnnounce to a newly connected peer is held until that peer sends its
+  first authenticated frame. A peer that completes a handshake and then sends
+  nothing no longer draws a filter, or its resends, on every connection; other
+  peers get theirs about one round trip later than before.
+
 - The Windows service log is rolled at `node.log_max_size_mb` and keeps
   `node.log_max_files` old files. The defaults are the 10 MiB and four files it
   used before.

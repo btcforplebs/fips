@@ -136,6 +136,9 @@ struct PeerSendState {
     link_stats: LinkStats,
     /// When this peer was last seen (any activity, Unix milliseconds).
     last_seen: u64,
+    /// Whether an authenticated frame from this peer has arrived since it was
+    /// promoted. Kept beside `last_seen` because `touch` writes both.
+    heard: bool,
     /// Number of replay detections suppressed since last session reset.
     replay_suppressed_count: u32,
     /// Consecutive decryption failures (reset on any successful decrypt).
@@ -174,6 +177,7 @@ impl PeerSendState {
             peer_recv_drain: None,
             link_stats: LinkStats::new(),
             last_seen,
+            heard: false,
             replay_suppressed_count: 0,
             consecutive_decrypt_failures: 0,
             prev_frames: 0,
@@ -799,6 +803,12 @@ impl ActivePeer {
         self.send.last_seen
     }
 
+    /// Whether an authenticated frame from this peer has arrived since it was
+    /// promoted.
+    pub(crate) fn heard(&self) -> bool {
+        self.send.heard
+    }
+
     /// Time since last activity.
     pub fn idle_time(&self, current_time_ms: u64) -> u64 {
         current_time_ms.saturating_sub(self.send.last_seen)
@@ -855,9 +865,11 @@ impl ActivePeer {
 
     // === State Updates ===
 
-    /// Update last seen timestamp.
+    /// Record an authenticated frame from this peer: refresh the last-seen
+    /// time and mark the peer as heard.
     pub fn touch(&mut self, current_time_ms: u64) {
         self.send.last_seen = current_time_ms;
+        self.send.heard = true;
     }
 
     /// Update the link ID (e.g., on reconnect).
@@ -2136,5 +2148,35 @@ mod tests {
         );
         assert_eq!(Slot::Unknown.to_string(), "none");
         assert_eq!(Slot::PendingInitiator.to_string(), "pending-initiator");
+    }
+
+    /// A peer starts unheard, is heard after its first authenticated frame, and
+    /// stays heard across either cutover and the drain that follows it.
+    #[test]
+    fn a_peer_is_unheard_until_its_first_frame_and_stays_heard_across_both_cutovers() {
+        let mut fresh = ActivePeer::new(make_peer_identity(), LinkId::new(1), 1000);
+        assert!(!fresh.heard(), "a new peer starts unheard");
+        fresh.touch(2000);
+        assert!(fresh.heard(), "a frame marks the peer heard");
+
+        type Cutover = fn(&mut ActivePeer) -> Option<SessionIndex>;
+        let cutovers: [(&str, Cutover); 2] = [
+            ("initiator", ActivePeer::cutover_to_new_session),
+            ("responder", ActivePeer::handle_peer_kbit_flip),
+        ];
+        for (name, cutover) in cutovers {
+            let (_cur_send, cur_recv) = ik_session_pair();
+            let (_pend_send, pend_recv) = ik_session_pair();
+            let mut peer = peer_with_current(cur_recv);
+            assert!(!peer.heard(), "{name}: a promoted peer starts unheard");
+            peer.touch(2000);
+            assert!(peer.heard(), "{name}: a frame marks the peer heard");
+            peer.set_pending_session(pend_recv, SessionIndex::new(3), SessionIndex::new(4));
+
+            assert!(cutover(&mut peer).is_some(), "{name}: the cutover runs");
+            assert!(peer.heard(), "{name}: the cutover keeps the peer heard");
+            assert!(peer.complete_drain().is_some(), "{name}: the drain runs");
+            assert!(peer.heard(), "{name}: the drain keeps the peer heard");
+        }
     }
 }
