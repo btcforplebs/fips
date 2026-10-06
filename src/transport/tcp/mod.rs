@@ -3823,6 +3823,61 @@ mod tests {
         t2.stop_async().await.unwrap();
     }
 
+    /// A pooled connection that cannot take a frame is still reported, as
+    /// `send_existing` finds it and fails on the enqueue rather than with
+    /// `NotConnected`. Holds for a full queue and for a writer that has gone
+    /// but not yet removed its entry. Reporting either as absent would let an
+    /// off-link msg1 be answered as a rekey whose reply cannot be sent.
+    #[tokio::test]
+    async fn has_connection_reports_a_pooled_connection_whose_queue_is_full_or_closed() {
+        let (tx, _rx) = packet_channel(100);
+        let mut t = TcpTransport::new(TransportId::new(1), None, make_outbound_config(), tx);
+        t.start_async().await.unwrap();
+        let remote = TransportAddr::from_string("127.0.0.1:9");
+
+        let (send_tx, send_rx) = mpsc::channel(1);
+        send_tx.try_send(vec![0]).unwrap();
+        t.pool.lock().await.insert(
+            PoolKey::outbound(remote.clone()),
+            TcpConnection {
+                send_tx,
+                send_task: tokio::spawn(async {}),
+                recv_task: tokio::spawn(async {}),
+                mtu: 1234,
+                established_at: Instant::now(),
+                direction: Direction::Outbound,
+                id: next_conn_id(),
+            },
+        );
+
+        assert!(
+            matches!(
+                t.send_existing(&remote, &msg1_frame()).await,
+                Err(TransportError::SendFailed(_))
+            ),
+            "a full queue fails the enqueue, not the lookup"
+        );
+        assert!(
+            t.has_connection(&remote).await,
+            "a pooled connection with a full queue is reported"
+        );
+
+        drop(send_rx);
+        assert!(
+            matches!(
+                t.send_existing(&remote, &msg1_frame()).await,
+                Err(TransportError::SendFailed(_))
+            ),
+            "a gone writer fails the enqueue, not the lookup"
+        );
+        assert!(
+            t.has_connection(&remote).await,
+            "a pooled connection whose writer has gone is reported"
+        );
+
+        t.stop_async().await.unwrap();
+    }
+
     /// A background connect that failed is dropped from the connecting map,
     /// the send fails with `NotConnected`, and `connect_async` can start again.
     #[tokio::test]
