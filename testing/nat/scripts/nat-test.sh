@@ -490,15 +490,41 @@ print(len(events))
     return 0
 }
 
+# Start one scenario's lab. Each step is checked here because these run under
+# relay_lab_start's caller's `||`, where `set -e` does not stop on a failure.
+start_cone() {
+    "${COMPOSE[@]}" --profile cone up -d --no-build --force-recreate || return 1
+    "$TOPOLOGY_SCRIPT" cone || return 1
+    return 0
+}
+
+start_symmetric() {
+    NAT_MODE_A=symmetric NAT_MODE_B=symmetric "${COMPOSE[@]}" --profile symmetric \
+        up -d --no-build --force-recreate || return 1
+    "$TOPOLOGY_SCRIPT" symmetric || return 1
+    return 0
+}
+
+start_lan() {
+    "${COMPOSE[@]}" --profile lan up -d --no-build --force-recreate || return 1
+    return 0
+}
+
 run_cone() {
     echo "=== NAT lab: cone ==="
     cleanup
     "$GENERATE_SCRIPT" cone
     # Build first, with retries, because the build pulls from registries that
-    # time out now and then; the start is not retried, since it is the test.
+    # time out now and then. The start is retried only when the relay faulted
+    # in its start window, a strfry crash at the nodes' first connects that
+    # reproduces with upstream's own image and config (relay-verdict.sh). A
+    # start that fails for any other reason is not retried, and a relay fault
+    # after the window still fails the run through assert_relay.
     retry_build "compose build (cone)" "${COMPOSE[@]}" --profile cone build
-    "${COMPOSE[@]}" --profile cone up -d --no-build --force-recreate
-    "$TOPOLOGY_SCRIPT" cone
+    relay_lab_start "$RELAY_CONTAINER" 2 45 start_cone cleanup || {
+        dump_cone_diagnostics
+        return 1
+    }
     wait_for_peers fips-nat-cone-a${FIPS_CI_NAME_SUFFIX:-} 1 45 || {
         dump_cone_diagnostics
         return 1
@@ -546,10 +572,16 @@ run_symmetric() {
     cleanup
     NAT_MODE_A=symmetric NAT_MODE_B=symmetric "$GENERATE_SCRIPT" symmetric
     # Build first, with retries, because the build pulls from registries that
-    # time out now and then; the start is not retried, since it is the test.
+    # time out now and then. The start is retried only when the relay faulted
+    # in its start window, a strfry crash at the nodes' first connects that
+    # reproduces with upstream's own image and config (relay-verdict.sh). A
+    # start that fails for any other reason is not retried, and a relay fault
+    # after the window still fails the run through assert_relay.
     NAT_MODE_A=symmetric NAT_MODE_B=symmetric retry_build "compose build (symmetric)" "${COMPOSE[@]}" --profile symmetric build
-    NAT_MODE_A=symmetric NAT_MODE_B=symmetric "${COMPOSE[@]}" --profile symmetric up -d --no-build --force-recreate
-    "$TOPOLOGY_SCRIPT" symmetric
+    relay_lab_start "$RELAY_CONTAINER" 2 45 start_symmetric cleanup || {
+        dump_symmetric_diagnostics
+        return 1
+    }
     wait_for_peers fips-nat-symmetric-a${FIPS_CI_NAME_SUFFIX:-} 1 60 || {
         dump_symmetric_diagnostics
         return 1
@@ -599,9 +631,16 @@ run_lan() {
     cleanup
     "$GENERATE_SCRIPT" lan
     # Build first, with retries, because the build pulls from registries that
-    # time out now and then; the start is not retried, since it is the test.
+    # time out now and then. The start is retried only when the relay faulted
+    # in its start window, a strfry crash at the nodes' first connects that
+    # reproduces with upstream's own image and config (relay-verdict.sh). A
+    # start that fails for any other reason is not retried, and a relay fault
+    # after the window still fails the run through assert_relay.
     retry_build "compose build (lan)" "${COMPOSE[@]}" --profile lan build
-    "${COMPOSE[@]}" --profile lan up -d --no-build --force-recreate
+    relay_lab_start "$RELAY_CONTAINER" 2 45 start_lan cleanup || {
+        dump_lan_diagnostics
+        return 1
+    }
     wait_for_peers fips-nat-lan-a${FIPS_CI_NAME_SUFFIX:-} 1 45 || {
         dump_lan_diagnostics
         return 1

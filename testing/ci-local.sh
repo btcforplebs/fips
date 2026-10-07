@@ -1639,6 +1639,19 @@ run_wait_converge() {
     record "wait-converge" $rc
 }
 
+# Unit tests for the NAT lab's start retry and relay guard. Hermetic: docker
+# and sleep are stubbed, no containers, about a second. The NAT suites decide
+# through relay_lab_start whether a relay fault at start is retried, and a
+# regression there either hides a relay crash or reds a suite on strfry's own
+# start fault, so it is gated here, before anything is built.
+run_relay_verdict_test() {
+    local rc=0
+    info "[relay-verdict] Running the NAT lab relay start and guard unit tests"
+    bash "$SCRIPT_DIR/lib/relay-verdict-test.sh" || rc=$?
+    record "relay-verdict" $rc
+    return 0
+}
+
 # The package versions the packaging workflows derive for a release tag, a
 # candidate tag and a branch. A candidate must sort below its release under the
 # package manager, which the tag's -rcN does not, so the workflows map it to
@@ -1698,6 +1711,7 @@ main() {
     run_mount_tmpdir
     run_shellcheck
     run_wait_converge
+    run_relay_verdict_test
     run_package_versions
     run_nextest_flaky
     run_glibc_floor

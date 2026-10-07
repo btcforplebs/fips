@@ -97,6 +97,11 @@ jobs:
       # a matrix suite.
       - name: Run convergence-gate unit tests
         run: bash testing/lib/wait-converge-test.sh
+      # Hermetic: docker and sleep stubbed, no containers, about a second. Kept
+      # in step with ci-local.sh's run_relay_verdict_test by hand, for the same
+      # reason as the convergence-gate step above.
+      - name: Run NAT lab relay start and guard unit tests
+        run: bash testing/lib/relay-verdict-test.sh
       # Runs the packaging workflows' own version derivations on a release
       # tag, a candidate tag and a branch. Not a matrix suite either, so it is
       # kept in step with ci-local.sh's run_package_versions by hand.
