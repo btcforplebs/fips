@@ -431,6 +431,38 @@ fn test_handle_parent_lost_finds_alternative() {
 }
 
 #[test]
+fn test_skipped_parent_forces_mandatory_switch() {
+    // A parent that has joined `skip_peers` (its profile changed to non-Full)
+    // must be left at once, even when the root and depths are unchanged.
+    let my_node = make_node_addr(5);
+    let mut state = TreeState::new(my_node, 1000);
+    let parent = make_node_addr(1);
+    let alt = make_node_addr(2);
+    let root = make_node_addr(0);
+    state.update_peer(
+        ParentDeclaration::new(parent, root, 1, 1000),
+        make_coords(&[1, 0]),
+    );
+    state.update_peer(
+        ParentDeclaration::new(alt, root, 1, 1000),
+        make_coords(&[2, 0]),
+    );
+    state.set_parent(parent, 1, 1000, 1000);
+    state.recompute_coords();
+
+    let skip: BTreeSet<_> = [parent].into_iter().collect();
+    assert!(matches!(
+        state.evaluate_parent(&BTreeMap::new(), &skip),
+        ParentEval::Mandatory(p) if p == alt
+    ));
+    // Control: unskipped, same state holds the parent.
+    assert!(matches!(
+        state.evaluate_parent(&BTreeMap::new(), &BTreeSet::new()),
+        ParentEval::None
+    ));
+}
+
+#[test]
 fn test_recover_skips_non_full_peers() {
     // Parent-loss recovery must honour the same parent-candidacy skip as the
     // announce and periodic paths. Self (5) loses its Full parent (1); the

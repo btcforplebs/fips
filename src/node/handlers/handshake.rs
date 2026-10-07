@@ -1276,14 +1276,18 @@ impl Node {
             // right after the take — unconditionally, whether or not a
             // connection was carried — so none of this block's exits leave a
             // dangling machine.
-            let (taken_conn, carrier_our_index, sent_msg1_digest) =
+            let (taken_conn, carrier_our_index, sent_msg1_digest, negotiated_profile) =
                 match self.peer_machines.get_mut(&link_id) {
-                    Some(machine) => (
-                        machine.take_leg(),
-                        machine.our_index(),
-                        machine.conn_handshake_msg1().map(Msg1Digest::of),
-                    ),
-                    None => (None, None, None),
+                    Some(machine) => {
+                        let negotiated_profile = machine.conn_peer_profile();
+                        (
+                            machine.take_leg(),
+                            machine.our_index(),
+                            machine.conn_handshake_msg1().map(Msg1Digest::of),
+                            negotiated_profile,
+                        )
+                    }
+                    None => (None, None, None, None),
                 };
             self.remove_peer_machine(link_id);
 
@@ -1406,6 +1410,10 @@ impl Node {
             if let Some(outcome) = cross_conn_outcome {
                 self.observe_cross_conn_resolved(&peer_node_addr, outcome);
             }
+
+            // Either resolution keeps the existing `ActivePeer`; carry over the
+            // profile this handshake negotiated.
+            self.refresh_peer_profile(&peer_node_addr, negotiated_profile);
 
             // Clean up outbound connection state
             self.pending_outbound.remove(&key);

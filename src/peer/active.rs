@@ -772,6 +772,13 @@ impl ActivePeer {
         self.peer_profile
     }
 
+    /// Replace the peer's node profile with the one negotiated on a newer
+    /// handshake. The node owns the routing, bloom and tree follow-up
+    /// (`Node::refresh_peer_profile`).
+    pub(crate) fn set_peer_profile(&mut self, profile: NodeProfile) {
+        self.peer_profile = profile;
+    }
+
     /// Whether to send sender reports to this peer.
     pub fn send_sr(&self) -> bool {
         self.send_sr
