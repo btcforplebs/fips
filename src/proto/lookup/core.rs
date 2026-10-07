@@ -19,6 +19,8 @@ use crate::NodeAddr;
 pub(crate) trait RoutingView {
     /// Is `addr` a spanning-tree peer (parent or child)?
     fn is_tree_peer(&self, addr: &NodeAddr) -> bool;
+    /// Is `addr` a directly connected peer, of any profile?
+    fn is_peer(&self, addr: &NodeAddr) -> bool;
     /// Peers whose bloom filter may reach `target` (i.e. `may_reach(target)`).
     fn peers_reaching(&self, target: &NodeAddr) -> Vec<NodeAddr>;
     /// Is this node a Leaf? Leaves do not transit-forward lookup requests.
@@ -84,7 +86,8 @@ pub(crate) enum ForwardOutcome {
 
 /// Plan the transit forward of an inbound LookupRequest.
 ///
-/// Decrements TTL; suppresses forwarding on a Leaf node; restricts candidates to
+/// Decrements TTL; suppresses forwarding on a Leaf node; hands the request
+/// straight to the target when it is a direct peer; otherwise restricts candidates to
 /// Full peers whose link satisfies the request's `min_mtu`; selects tree peers
 /// whose bloom matches the target, else a non-tree bloom-match fallback, never
 /// the peer the request came from; encodes the (decremented) request once and
@@ -103,6 +106,21 @@ pub(crate) fn plan_forward(
     }
     let target = request.target;
     let min_mtu = request.min_mtu;
+    // The target is our own peer: hand the request to it, whatever its
+    // profile. A NonRouting or Leaf peer sends no bloom filter and is never a
+    // forwarding candidate below, yet it is the only node that can sign the
+    // response. Without this, a cold lookup for a non-Full node dies at its
+    // Full peer, which already advertises it as a dependent in its own filter.
+    if rv.is_peer(&target) && target != *from && rv.peer_meets_mtu(&target, min_mtu) {
+        let bytes: Arc<[u8]> = Arc::from(request.encode());
+        return ForwardOutcome::Forward {
+            actions: vec![LookupAction::SendLink {
+                peer: target,
+                bytes,
+            }],
+            used_fallback: false,
+        };
+    }
     // Only Full peers whose outgoing link satisfies min_mtu are eligible.
     let eligible: Vec<NodeAddr> = rv
         .peers_reaching(&target)

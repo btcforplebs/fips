@@ -2703,3 +2703,47 @@ async fn a_native_first_send_through_discovery_is_still_delivered_when_the_tick_
 
     cleanup_nodes(&mut nodes).await;
 }
+
+/// Cold discovery of a non-Full node one hop past its Full peer:
+/// node0 (Full) — node1 (Full) — node2 (NonRouting | Leaf). node1 advertises
+/// node2 as a leaf dependent in its bloom, so node0's request reaches node1.
+async fn cold_lookup_reaches_non_full_target(profile: crate::proto::fmp::NodeProfile) {
+    use crate::proto::fmp::NodeProfile;
+    let profiles = [NodeProfile::Full, NodeProfile::Full, profile];
+    let edges = vec![(0, 1), (1, 2)];
+    let mut nodes = spanning_tree::run_tree_test_with_profiles(&profiles, &edges, false).await;
+
+    let node2_addr = *nodes[2].node.node_addr();
+    let node2_pubkey = nodes[2].node.identity().pubkey_full();
+    nodes[0].node.register_identity(node2_addr, node2_pubkey);
+    let sent = nodes[0].node.initiate_lookup(&node2_addr, 8).await;
+
+    for _ in 0..10 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        process_available_packets(&mut nodes).await;
+    }
+
+    let now_ms = wall_clock_ms();
+    let reached_target = !nodes[2].node.lookup.recent_requests.is_empty();
+    let cached = nodes[0].node.coord_cache().contains(&node2_addr, now_ms);
+    cleanup_nodes(&mut nodes).await;
+    assert!(
+        cached,
+        "{profile:?}: node0 must learn node2's coords (sent={sent}, target saw request={reached_target})"
+    );
+}
+
+#[tokio::test]
+async fn test_cold_lookup_reaches_nonrouting_behind_full_peer() {
+    cold_lookup_reaches_non_full_target(crate::proto::fmp::NodeProfile::NonRouting).await;
+}
+
+#[tokio::test]
+async fn test_cold_lookup_reaches_leaf_behind_full_peer() {
+    cold_lookup_reaches_non_full_target(crate::proto::fmp::NodeProfile::Leaf).await;
+}
+
+#[tokio::test]
+async fn test_cold_lookup_reaches_full_control() {
+    cold_lookup_reaches_non_full_target(crate::proto::fmp::NodeProfile::Full).await;
+}

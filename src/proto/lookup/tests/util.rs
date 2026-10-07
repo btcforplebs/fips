@@ -29,6 +29,9 @@ impl RoutingView for MockRoutingView {
             .map(|(_, is_tree, _)| *is_tree)
             .unwrap_or(false)
     }
+    fn is_peer(&self, addr: &NodeAddr) -> bool {
+        self.peers.iter().any(|(a, _, _)| a == addr)
+    }
     fn peers_reaching(&self, _target: &NodeAddr) -> Vec<NodeAddr> {
         self.peers
             .iter()

@@ -67,6 +67,9 @@ impl crate::proto::lookup::RoutingView for NodeRoutingView<'_> {
     fn is_tree_peer(&self, addr: &NodeAddr) -> bool {
         self.node.is_tree_peer(addr)
     }
+    fn is_peer(&self, addr: &NodeAddr) -> bool {
+        self.node.peers.contains_key(addr)
+    }
     fn peers_reaching(&self, target: &NodeAddr) -> Vec<NodeAddr> {
         self.node
             .peers

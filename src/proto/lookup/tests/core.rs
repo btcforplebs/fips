@@ -167,6 +167,60 @@ fn forward_excludes_non_full_peers() {
 }
 
 #[test]
+fn forward_hands_the_request_to_a_non_full_target_peer() {
+    let target = make_node_addr(0xAA);
+    let full_tree = make_node_addr(1);
+    let rv = MockRoutingView {
+        // The target sends no filter, so it never matches the bloom.
+        peers: vec![(full_tree, true, true), (target, true, false)],
+        not_full: vec![target],
+        ..Default::default()
+    };
+    let mut request = make_request(3);
+    match plan_forward(&mut request, &make_node_addr(0xCC), &rv) {
+        ForwardOutcome::Forward {
+            actions,
+            used_fallback,
+        } => {
+            assert!(!used_fallback);
+            assert_eq!(action_peers(&actions), vec![target]);
+        }
+        _ => panic!("expected Forward to the target peer only"),
+    }
+}
+
+#[test]
+fn forward_does_not_echo_to_a_target_peer_that_sent_the_request() {
+    let target = make_node_addr(0xAA);
+    let rv = MockRoutingView {
+        peers: vec![(target, true, false)],
+        not_full: vec![target],
+        ..Default::default()
+    };
+    let mut request = make_request(3);
+    assert!(matches!(
+        plan_forward(&mut request, &target, &rv),
+        ForwardOutcome::NoPeers
+    ));
+}
+
+#[test]
+fn forward_skips_a_target_peer_below_min_mtu() {
+    let target = make_node_addr(0xAA);
+    let rv = MockRoutingView {
+        peers: vec![(target, true, false)],
+        not_full: vec![target],
+        mtu_fail: vec![target],
+        ..Default::default()
+    };
+    let mut request = make_request(3);
+    assert!(matches!(
+        plan_forward(&mut request, &make_node_addr(0xCC), &rv),
+        ForwardOutcome::NoPeers
+    ));
+}
+
+#[test]
 fn forward_excludes_peers_below_min_mtu() {
     let ok_tree = make_node_addr(1);
     let small_tree = make_node_addr(2);
