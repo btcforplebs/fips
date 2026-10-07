@@ -167,7 +167,7 @@ fn forward_excludes_non_full_peers() {
 }
 
 #[test]
-fn forward_hands_the_request_to_a_non_full_target_peer() {
+fn forward_adds_a_non_full_target_peer_to_the_candidates() {
     let target = make_node_addr(0xAA);
     let full_tree = make_node_addr(1);
     let rv = MockRoutingView {
@@ -183,9 +183,27 @@ fn forward_hands_the_request_to_a_non_full_target_peer() {
             used_fallback,
         } => {
             assert!(!used_fallback);
-            assert_eq!(action_peers(&actions), vec![target]);
+            // The bloom candidate is kept: it may be the target's other upstream.
+            assert_eq!(action_peers(&actions), vec![full_tree, target]);
         }
-        _ => panic!("expected Forward to the target peer only"),
+        _ => panic!("expected Forward to the candidate and the target"),
+    }
+}
+
+#[test]
+fn forward_sends_a_full_target_peer_one_copy() {
+    let target = make_node_addr(0xAA);
+    let other = make_node_addr(1);
+    let rv = MockRoutingView {
+        peers: vec![(target, true, true), (other, true, true)],
+        ..Default::default()
+    };
+    let mut request = make_request(3);
+    match plan_forward(&mut request, &make_node_addr(0xCC), &rv) {
+        ForwardOutcome::Forward { actions, .. } => {
+            assert_eq!(action_peers(&actions), vec![target, other]);
+        }
+        _ => panic!("expected Forward"),
     }
 }
 
