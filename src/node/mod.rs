@@ -70,12 +70,11 @@ use crate::node::session::SessionEntry;
 use crate::peer::machine::{PeerMachine, TimerKind};
 use crate::peer::{ActivePeer, ConnectivityState};
 use crate::proto::bloom::{BloomFilter, BloomState};
-use crate::proto::fmp::Fmp;
-use crate::proto::fmp::NodeProfile;
 use crate::proto::fmp::wire::{
     ESTABLISHED_HEADER_SIZE, FLAG_CE, FLAG_KEY_EPOCH, build_encrypted, build_established_header,
     prepend_inner_header,
 };
+use crate::proto::fmp::{Fmp, NodeProfile, SilentSessions};
 use crate::proto::fsp::Fsp;
 use crate::proto::fsp::quorum::LinkQuorum;
 use crate::proto::lookup::{Lookup, LookupBackoff, LookupForwardRateLimiter};
@@ -675,6 +674,11 @@ pub struct Node {
     /// the peer entry itself. Pruned on insert; see
     /// `EPOCH_RESTART_MIN_INTERVAL_SECS`.
     restart_dampener: HashMap<NodeAddr, std::time::Instant>,
+    /// Each identity's recent link sessions that ended without one
+    /// authenticated frame, and the msg1 refusal they drive. Held here, not
+    /// on `ActivePeer`, for the same reason as `restart_dampener`: the
+    /// removal it counts destroys the peer entry.
+    silent_sessions: SilentSessions,
 
     // === Rate Limiting ===
     /// Rate limiter for msg1 processing (DoS protection).
@@ -968,6 +972,7 @@ impl Node {
             pending_outbound: HashMap::new(),
             pending_inbound: HashMap::new(),
             restart_dampener: HashMap::new(),
+            silent_sessions: SilentSessions::new(),
             msg1_rate_limiter,
             setup_rate_limiter,
             icmp_rate_limiter: IcmpRateLimiter::new(),
@@ -1148,6 +1153,7 @@ impl Node {
             pending_outbound: HashMap::new(),
             pending_inbound: HashMap::new(),
             restart_dampener: HashMap::new(),
+            silent_sessions: SilentSessions::new(),
             msg1_rate_limiter,
             setup_rate_limiter,
             icmp_rate_limiter: IcmpRateLimiter::new(),
@@ -1628,8 +1634,10 @@ impl Node {
     /// transports, and log it if it moved.
     ///
     /// Called wherever the bound set can change — the presence edges that
-    /// bind and unbind an interface-bound transport, and a child exiting —
-    /// so the clamp the TUN threads apply keeps agreeing with the
+    /// bind and unbind an interface-bound transport, a child exiting, a NAT
+    /// traversal transport being adopted (and removed again when its
+    /// handshake cannot start), and an unused bootstrap transport being
+    /// dropped — so the clamp the TUN threads apply keeps agreeing with the
     /// `effective_ipv6_mtu` this node reports in `show_status`.
     ///
     /// Moves in **both** directions, deliberately. A narrow interface
@@ -2308,6 +2316,8 @@ impl Node {
             .collect();
         let routing_view = snap::RoutingView {
             pending_lookups,
+            pending_native_destinations: self.pending_native_destinations(),
+            pending_native_datagrams: self.pending_native_datagrams(),
             pending_tun_destinations: self.pending_tun_destinations(),
             pending_tun_packets: self.pending_tun_total_packets(),
             recent_requests: self.recent_request_count(),
@@ -3145,6 +3155,7 @@ impl Node {
             .remove_bootstrap_transport(&transport_id);
         self.transport_drops.remove(&transport_id);
         self.transports.remove(&transport_id);
+        self.refresh_tun_mss_ceiling();
     }
 
     /// Iterate over all links.
@@ -3602,6 +3613,31 @@ impl Node {
     /// Total TUN packets queued across all destinations.
     pub fn pending_tun_total_packets(&self) -> usize {
         self.pending_tun_packets.values().map(|q| q.len()).sum()
+    }
+
+    /// Count of destinations with native datagrams held awaiting session setup.
+    pub(crate) fn pending_native_destinations(&self) -> usize {
+        self.pending_native.len()
+    }
+
+    /// Total native datagrams held across all destinations.
+    pub(crate) fn pending_native_datagrams(&self) -> usize {
+        self.pending_native.values().map(|q| q.len()).sum()
+    }
+
+    /// Queue a native datagram for a destination directly (for tests that need
+    /// a held native queue without driving a native API client).
+    #[cfg(test)]
+    pub(crate) fn queue_pending_native_for_test(&mut self, dest: NodeAddr, payload: Vec<u8>) {
+        let key = crate::native::registry::FlowKey {
+            peer: dest,
+            remote: 1,
+            local: 1,
+        };
+        self.pending_native
+            .entry(dest)
+            .or_default()
+            .push_back(crate::node::handlers::PendingNative { key, payload });
     }
 
     /// Iterate over retry state for diagnostics.

@@ -91,6 +91,7 @@ pub(super) fn establish_snapshot(our_byte: u8) -> EstablishSnapshot {
         peering_idle_ms: u64::MAX,
         epoch_restart_dampened: false,
         our_node_addr: make_node_addr(our_byte),
+        silent_backoff: None,
     }
 }
 

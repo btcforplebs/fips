@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Build the fips-git AUR package and validate with namcap.
+# Build the fips-git AUR package and validate it with the namcap gate,
+# failing on namcap error-level findings.
 #
 # Usage: ./build-aur.sh
 #
@@ -26,8 +27,8 @@ cd "${SCRIPT_DIR}"
 echo "Building fips-git AUR package..."
 makepkg -sf -p PKGBUILD-git
 
+# Through the gate, not bare namcap: namcap exits 0 on error-level findings.
 echo "Running namcap validation..."
-namcap PKGBUILD-git
-namcap fips-git-*.pkg.tar.zst
+bash "${SCRIPT_DIR}/namcap-gate.sh" PKGBUILD-git fips-git-*.pkg.tar.zst
 
 echo "Done."

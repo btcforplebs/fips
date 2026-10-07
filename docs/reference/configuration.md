@@ -468,6 +468,7 @@ Controls tree construction and parent selection.
 |-----------|------|---------|-------------|
 | `node.bloom.update_debounce_ms` | u64 | `500` | Debounce interval for filter update propagation |
 | `node.bloom.max_inbound_fpr` | f64 | `0.20` | Antipoison cap: reject inbound `FilterAnnounce` frames whose advertised false-positive rate exceeds this value. Valid range `(0.0, 1.0)`. The default `0.20` corresponds to fill 0.7248 at k=5 (≈2,114 entries on the 1 KB filter); a saturated/poisoned filter is still ~100% FPR and rejected |
+| `node.bloom.child_echo_threshold` | f64 | `0.8` | Child echo guard: reject a `FilterAnnounce` from a tree child, keeping its previous filter, when the filter contains more than this share of the filter last sent to that child beyond what its own fill explains by chance (overlap above `fill + threshold × (1 − fill)`). Applies only when the child already has a stored filter and the filter last sent to it has at least 128 set bits. Meaningful in `[0.0, 1.0)`: `1.0` or above disables the guard, a value below `0.0` rejects any child filter overlapping what was sent above chance, and NaN never rejects. Rejections are counted in `bloom.child_role_rejected` |
 
 Bloom filter size (1 KB), hash count (5), and size classes are protocol
 constants and not configurable.
@@ -804,6 +805,7 @@ overhead.
 | `transports.tcp.recv_buf_size` | usize | `2097152` | Socket receive buffer size in bytes (2 MB) |
 | `transports.tcp.send_buf_size` | usize | `2097152` | Socket send buffer size in bytes (2 MB) |
 | `transports.tcp.max_inbound_connections` | usize | `256` | Maximum simultaneous inbound connections |
+| `transports.tcp.max_inbound_per_source` | usize | `8` | Maximum simultaneous inbound connections from one source: one IPv4 address, or one IPv6 /64. Refusals are counted in the `source_rejected` statistic. To turn the limit off, set it at or above the transport's inbound cap (`max_inbound_connections`, or `node.limits.max_connections` when that is unset). If inbound TCP reaches FIPS through a local proxy (sslh, stunnel, a userland port forwarder), every peer arrives from the proxy's address and shares this limit; raise it. |
 | `transports.tcp.advertise_on_nostr` | bool | `false` | Include this TCP transport in Nostr endpoint adverts |
 | `transports.tcp.external_addr` | string | *(none)* | Explicit advertise-as override. Bare IP or full `host:port`. **Required** when `bind_addr` is wildcard (e.g. `"0.0.0.0:443"`) and `advertise_on_nostr: true`, since TCP has no STUN equivalent for autodiscovery. Common on cloud 1:1 NAT / EIP setups where the public IP isn't bindable on the host. |
 
@@ -1350,6 +1352,7 @@ node:
   bloom:
     update_debounce_ms: 500
     max_inbound_fpr: 0.20            # antipoison cap on inbound FilterAnnounce FPR
+    child_echo_threshold: 0.8        # reject a tree child's filter that returns ours (1.0 = off)
   session:
     default_ttl: 64
     pending_packets_per_dest: 16
@@ -1426,6 +1429,7 @@ transports:
   #   recv_buf_size: 2097152         # 2 MB
   #   send_buf_size: 2097152         # 2 MB
   #   max_inbound_connections: 256   # resource protection limit
+  #   max_inbound_per_source: 8      # per IPv4 address or IPv6 /64
   # tor:                             # uncomment to enable Tor transport
   #   mode: "socks5"                 # "socks5", "control_port", or "directory"
   #   socks5_addr: "127.0.0.1:9050" # SOCKS5 proxy address

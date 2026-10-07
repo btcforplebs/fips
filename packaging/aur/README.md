@@ -18,8 +18,9 @@ This directory contains Arch Linux packaging files for two AUR packages:
 | `fips.tmpfiles` | tmpfiles.d fragment (creates `/run/fips/`) |
 | `fips.service` | Symlink to `../debian/fips.service` |
 | `fips-dns.service` | Symlink to `../debian/fips-dns.service` |
-| `build-aur.sh` | Local `fips-git` build plus namcap validation (run by `make aur`) |
+| `build-aur.sh` | Local `fips-git` build plus the namcap gate (run by `make aur`) |
 | `patch-pkgbuild.sh` | Rewrites `pkgver`, `pkgrel`, `conflicts`, `options`, and `b2sums` in the PKGBUILD at publish time |
+| `patch-pkgbuild-git.sh` | Rewrites the asset `b2sums` in `PKGBUILD-git` at publish time |
 | `await-package-runs.sh` | Holds the AUR publish until every `package-*.yml` run for the release tag has succeeded |
 | `test-await-package-runs.sh` | Fixture tests for `await-package-runs.sh`, run by the `aur-build` job |
 | `namcap-gate.sh` | Fails the `aur-build` job on namcap error-level findings; warnings are advisory |
@@ -60,7 +61,10 @@ Build and validate the `-git` package locally using the Makefile target:
 make -C packaging aur
 ```
 
-This runs `makepkg -sf` followed by `namcap` on the resulting package.
+This runs `makepkg -sf` followed by the namcap gate (`namcap-gate.sh`) on
+`PKGBUILD-git` and the resulting package, and fails on an error-level finding.
+The gate lints every `fips-git-*.pkg.tar.zst` in the directory, so remove
+packages left by earlier builds first.
 
 For manual testing of individual steps:
 
@@ -271,9 +275,9 @@ Then run the same verification commands above.
 ## GitHub Secrets for CI
 
 AUR publication is automated: `.github/workflows/aur-publish.yml` pushes the
-release package, and `aur-publish-git.yml` pushes `fips-git`. The manual steps
-above are the fallback for when the workflow cannot be used. The automation
-needs a separate SSH key.
+release package, and `aur-publish-git.yml` lints and pushes `fips-git`. The
+manual steps above are the fallback for when the workflow cannot be used. The
+automation needs a separate SSH key.
 
 ### Step 1: Generate a CI-Specific Key
 

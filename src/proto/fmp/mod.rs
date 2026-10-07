@@ -21,6 +21,9 @@
 //!   [`cross_connection_winner`] tie-break helper, and the FMP negotiation
 //!   decision logic (version agreement, profile validation).
 //! - `limits.rs` — the pure connection-retry backoff math.
+//! - `silent.rs` — [`SilentSessions`], the per-identity record of link
+//!   sessions that ended without an authenticated frame, and the msg1
+//!   refusal it drives.
 //! - `state.rs` — [`ConnectionState`], the pure handshake-phase connection
 //!   bookkeeping (owned by the per-peer control machine beside its Noise
 //!   crypto carrier), plus [`Fmp`], the (stateless) lifecycle anchor owned by
@@ -34,6 +37,7 @@
 
 mod core;
 mod limits;
+mod silent;
 mod state;
 pub(crate) mod wire;
 
@@ -49,6 +53,7 @@ pub(crate) use core::{
 };
 pub use core::{PromotionResult, cross_connection_winner};
 pub(crate) use limits::backoff_ms;
+pub(crate) use silent::SilentSessions;
 pub(crate) use state::{ConnectionState, Fmp};
 pub(crate) use wire::{Disconnect, DisconnectReason};
 pub use wire::{HandshakeMessageType, NegotiationPayload, NodeProfile, TlvEntry};

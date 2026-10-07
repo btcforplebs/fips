@@ -1797,6 +1797,9 @@ impl Node {
             peer_node_addr,
             remote_epoch,
         };
+        let silent_backoff = self
+            .silent_sessions
+            .refusing(&peer_node_addr, crate::time::mono_ms());
         let snap = match self.peers.get(&peer_node_addr) {
             Some(existing_peer) => EstablishSnapshot {
                 has_existing_peer: true,
@@ -1813,6 +1816,7 @@ impl Node {
                     .restart_dampener
                     .get(&peer_node_addr)
                     .is_some_and(|t| t.elapsed().as_secs() < EPOCH_RESTART_MIN_INTERVAL_SECS),
+                silent_backoff,
             },
             None => EstablishSnapshot {
                 has_existing_peer: false,
@@ -1827,6 +1831,7 @@ impl Node {
                 // No existing peering, so neither gate applies.
                 peering_idle_ms: u64::MAX,
                 epoch_restart_dampened: false,
+                silent_backoff,
             },
         };
 
@@ -1901,6 +1906,32 @@ impl Node {
                 self.remove_peer_machine(link_id);
                 self.stats_mut()
                     .record_reject(RejectReason::Handshake(HandshakeReject::BadState));
+            }
+            InboundDecision::Reject {
+                reason: InboundReject::SilentBackoff,
+            } => {
+                // The identity's last sessions at this epoch carried no frame
+                // and its back-off is running. On XX the identity is first
+                // known here, after our msg2 has gone, so the refusal is to
+                // promote: no msg2 resend, no peer entry, no TreeAnnounce. The
+                // machine's `FreeIndex` returns the msg1-allocated index.
+                debug!(
+                    peer = %self.peer_display_name(&peer_node_addr),
+                    transport_id = %packet.transport_id,
+                    remote_addr = %packet.remote_addr,
+                    silent = %OrNone(silent_backoff.map(|b| b.silent)),
+                    remaining_s = %OrNone(silent_backoff.map(|b| b.remaining_ms.div_ceil(1000))),
+                    "Msg3 from a peer whose recent sessions carried no frame, refusing during its back-off"
+                );
+                self.execute_peer_actions(link_id, &ambient, actions).await;
+                debug_assert!(
+                    !self.index_allocator.is_allocated(our_index),
+                    "inbound index freed exactly once via the machine action"
+                );
+                self.remove_link(&link_id);
+                self.remove_peer_machine(link_id);
+                self.stats_mut()
+                    .record_reject(RejectReason::Handshake(HandshakeReject::SilentBackoff));
             }
             InboundDecision::Reject {
                 reason: InboundReject::DualRekeyWon,

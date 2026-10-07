@@ -65,7 +65,7 @@ the file one that rule 2 reads; a quoted string spanning several lines, such
 as a multi-line `bash -c '...'` script, is read line by line as if unquoted,
 so a `mktemp -d` inside one still counts for rule 2; run as root, the
 self-test's unremovable-directory case is removable and so does not exercise
-the failure it targets. GitHub CI does not run this check yet; local CI does.
+the failure it targets.
 
 Exit codes:
     0 - nothing flagged

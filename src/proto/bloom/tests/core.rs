@@ -491,3 +491,83 @@ fn overlap_is_undefined_against_an_empty_filter_or_across_sizes() {
     assert_eq!(a.overlap(&small), None);
     assert_eq!(small.overlap(&a), None);
 }
+
+/// A filter holding `count` distinct addresses whose first byte is `tag`,
+/// starting at index `from`.
+fn entries(tag: u8, from: u16, count: u16) -> BloomFilter {
+    let mut f = BloomFilter::new();
+    for i in from..from + count {
+        let mut bytes = [tag; 16];
+        bytes[1..3].copy_from_slice(&i.to_le_bytes());
+        f.insert(&NodeAddr::from_bytes(bytes));
+    }
+    f
+}
+
+#[test]
+fn a_filter_returning_what_was_sent_plus_one_entry_echoes_it() {
+    let sent = entries(0xA1, 0, 1000);
+    let mut got = sent.clone();
+    got.insert(&make_node_addr(7));
+    assert!(got.echoes(&sent, 0.8));
+}
+
+#[test]
+fn an_unrelated_200_entry_filter_does_not_echo_a_1000_entry_one() {
+    let sent = entries(0xA1, 0, 1000);
+    let got = entries(0xB2, 0, 200);
+    assert!(!got.echoes(&sent, 0.8));
+    // A negative threshold puts the bound below chance, so the same filter
+    // is rejected: the comparison reads the overlap, not only the sizes.
+    assert!(got.echoes(&sent, -1.0));
+}
+
+#[test]
+fn a_subset_holding_half_of_what_was_sent_echoes_only_at_a_low_threshold() {
+    let sent = entries(0xA1, 0, 1000);
+    let half = entries(0xA1, 0, 500);
+    assert!(!half.echoes(&sent, 0.8));
+    assert!(half.echoes(&sent, 0.3));
+}
+
+#[test]
+fn an_exact_return_of_a_filter_below_the_bit_floor_does_not_echo() {
+    use crate::proto::bloom::ECHO_MIN_BITS;
+    let small = entries(0xA1, 0, 20);
+    assert!(small.count_ones() < ECHO_MIN_BITS, "precondition");
+    assert!(!small.echoes(&small, 0.8));
+    // Just above the floor the same exact return is caught.
+    let large = entries(0xA1, 0, 30);
+    assert!(large.count_ones() >= ECHO_MIN_BITS, "precondition");
+    assert!(large.echoes(&large, 0.8));
+}
+
+#[test]
+fn a_threshold_of_one_or_nan_never_echoes_even_an_exact_return() {
+    let sent = entries(0xA1, 0, 1000);
+    assert!(!sent.echoes(&sent, 1.0));
+    assert!(!sent.echoes(&sent, 1.5));
+    assert!(!sent.echoes(&sent, f64::NAN));
+    // Just below one the exact return is still caught, so the disable is
+    // the threshold check and not rounding in the bound.
+    assert!(sent.echoes(&sent, 1.0 - 1e-12));
+}
+
+#[test]
+fn echo_is_false_across_sizes_against_an_empty_filter_and_for_a_saturated_one() {
+    let sent = entries(0xA1, 0, 1000);
+    let mut other_size = BloomFilter::with_params(1024, DEFAULT_HASH_COUNT).unwrap();
+    for i in 0u16..100 {
+        other_size.insert_bytes(&i.to_le_bytes());
+    }
+    // Above the floor, so only the size difference can decide it.
+    assert!(other_size.count_ones() >= crate::proto::bloom::ECHO_MIN_BITS);
+    assert!(!other_size.echoes(&sent, 0.8));
+    assert!(!sent.echoes(&other_size, 0.8));
+    assert!(!sent.echoes(&BloomFilter::new(), 0.8));
+    let all_ones =
+        BloomFilter::from_bytes(vec![0xFF; DEFAULT_FILTER_SIZE_BITS / 8], DEFAULT_HASH_COUNT)
+            .unwrap();
+    assert!(!all_ones.echoes(&sent, 0.8));
+    assert!(!all_ones.echoes(&sent, -1.0));
+}

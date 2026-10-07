@@ -462,6 +462,9 @@ impl TreeState {
     /// Returns a [`ParentEval`] describing whether a parent switch is warranted:
     /// `Mandatory` (path-breaking / root-correcting — always taken), `Discretionary`
     /// (an improvement the caller applies only if its veto is inactive), or `None`.
+    /// The root-correcting case fires when the best candidate advertises a smaller
+    /// root than ours, or a smaller root than the one our parent now advertises
+    /// by a path that does not run through our parent.
     ///
     /// This core is clock-free: it no longer applies the flap-dampening / hold-down
     /// veto. The caller reads the clock, computes the veto verdict via
@@ -575,8 +578,31 @@ impl TreeState {
             return ParentEval::Mandatory(best_peer_id);
         }
 
-        // Switching roots (smaller root found) → always switch
-        if smallest_root < self.root || (self.is_root() && smallest_root < self.my_node_addr) {
+        // Switching roots (smaller root found) → always switch.
+        //
+        // On an announce from our parent, `self.root` still holds the root from
+        // the parent's previous ancestry, while staying put would adopt the
+        // parent's newly advertised root. Compare against that too, so a parent
+        // that has just moved to a worse root loses to a peer still on a better
+        // one now, not at the next periodic re-evaluation. A candidate whose
+        // stored path runs through our parent is excluded from this comparison:
+        // that path is stale (its root would match the parent's otherwise), and
+        // the candidate's own update follows.
+        let parent_root = if self.is_root() {
+            None
+        } else {
+            self.peer_ancestry
+                .get(self.my_declaration.parent_id())
+                .map(|c| *c.root_id())
+        };
+        let via_parent = self
+            .peer_ancestry
+            .get(&best_peer_id)
+            .is_some_and(|c| c.contains(self.my_declaration.parent_id()));
+        if smallest_root < self.root
+            || (!via_parent && parent_root.is_some_and(|r| smallest_root < r))
+            || (self.is_root() && smallest_root < self.my_node_addr)
+        {
             return ParentEval::Mandatory(best_peer_id);
         }
 

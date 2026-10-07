@@ -34,7 +34,7 @@ use crate::transport::socks5::{
     Socks5Auth, Socks5Dialer, SocksTarget, existing_sender, poll_connecting, proxied_receive_loop,
     proxied_send_loop,
 };
-use crate::transport::stream::{ConnId, WRITER_DRAIN_TIMEOUT, drain_writer, next_conn_id};
+use crate::transport::stream::{ConnId, DrainingWriters, WRITER_DRAIN_TIMEOUT, next_conn_id};
 use crate::transport::tcp::{INBOUND_FIRST_FRAME_TIMEOUT, INBOUND_IDLE_TIMEOUT, InboundDeadline};
 use control::{ControlAuth, TorControlClient, TorMonitoringInfo};
 use stats::TorStats;
@@ -140,6 +140,9 @@ pub struct TorTransport {
     packet_tx: PacketTx,
     /// Transport statistics.
     stats: Arc<TorStats>,
+    /// Writers of deliberately closed connections still finishing their
+    /// queues, which `stop_async` must also stop.
+    draining: DrainingWriters,
     /// Accept loop task handle (active when onion service is running).
     accept_task: Option<JoinHandle<()>>,
     /// Onion service hostname (e.g., "abcdef...xyz.onion").
@@ -174,6 +177,7 @@ impl TorTransport {
             connecting: Arc::new(Mutex::new(HashMap::new())),
             packet_tx,
             stats: Arc::new(TorStats::new()),
+            draining: DrainingWriters::default(),
             accept_task: None,
             onion_address: None,
             control_client: None,
@@ -537,6 +541,10 @@ impl TorTransport {
             );
         }
         drop(pool);
+
+        // Writers of connections closed before the stop are out of the pool,
+        // so the loop above does not reach them.
+        self.draining.stop().await;
 
         self.state = TransportState::Down;
 
@@ -1100,8 +1108,9 @@ impl TorTransport {
     /// Close a specific connection asynchronously.
     ///
     /// Aborts the receive task and lets the writer finish the frames already
-    /// queued, within [`WRITER_DRAIN_TIMEOUT`], without waiting for it. This
-    /// mirrors `TcpTransport::close_connection_async`.
+    /// queued, within [`WRITER_DRAIN_TIMEOUT`], without waiting for it.
+    /// Stopping the transport ends a writer still draining. This mirrors
+    /// `TcpTransport::close_connection_async`.
     pub async fn close_connection_async(&self, addr: &TransportAddr) {
         let mut pool = self.pool.lock().await;
         if let Some(conn) = pool.remove(addr) {
@@ -1114,7 +1123,7 @@ impl TorTransport {
             } = conn;
             drop(send_tx);
             recv_task.abort();
-            drain_writer(send_task, WRITER_DRAIN_TIMEOUT);
+            self.draining.drain(send_task, WRITER_DRAIN_TIMEOUT);
             match meta {
                 Direction::Inbound => self.stats.record_pool_inbound_removed(),
                 Direction::Outbound => self.stats.record_pool_outbound_removed(),
@@ -2799,6 +2808,50 @@ mod tests {
 
         tor.stop_async().await.unwrap();
         dest.stop_async().await.unwrap();
+    }
+
+    /// Stopping the transport must stop a writer that is still draining after
+    /// a deliberate close, rather than leave it to its drain timer.
+    ///
+    /// The writer holds a oneshot sender and never finishes, so the sender is
+    /// dropped only once the task has been aborted.
+    #[tokio::test]
+    async fn tor_stop_ends_a_writer_still_draining_after_a_close() {
+        let (tx, _rx) = packet_channel(32);
+        let mut tor = TorTransport::new(TransportId::new(1), None, make_config(), tx);
+        tor.start_async().await.unwrap();
+        let remote = TransportAddr::from_string("abcdef1234567890.onion:2121");
+        let (guard_tx, mut guard_rx) = tokio::sync::oneshot::channel::<()>();
+        tor.pool.lock().await.insert(
+            remote.clone(),
+            ProxiedConnection {
+                send_tx: tokio::sync::mpsc::channel(1).0,
+                send_task: tokio::spawn(async move {
+                    let _guard = guard_tx;
+                    std::future::pending::<()>().await
+                }),
+                recv_task: tokio::spawn(std::future::pending::<()>()),
+                mtu: 1400,
+                established_at: Instant::now(),
+                meta: Direction::Outbound,
+                id: next_conn_id(),
+            },
+        );
+        tor.stats.record_pool_outbound_added();
+
+        tor.close_connection_async(&remote).await;
+        tokio::time::timeout(Duration::from_secs(2), tor.stop_async())
+            .await
+            .expect("stop waited on a draining writer")
+            .unwrap();
+
+        assert!(
+            matches!(
+                guard_rx.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+            ),
+            "a writer still draining after a close outlived the transport's stop"
+        );
     }
 
     /// A destination TCP transport behind a mock SOCKS5 proxy, and a

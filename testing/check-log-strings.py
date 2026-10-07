@@ -45,6 +45,10 @@ ALLOWED = {
         "read from the strfry relay container's log, not the fips daemon's — "
         "the C++ runtime writes it on an uncaught exception"
     ),
+    "] Connect from ": (
+        "read from the strfry relay container's log, not the fips daemon's — "
+        "strfry's websocket server writes it for each client it accepts"
+    ),
     "Bootstrapped 100%": (
         "read from the tor-daemon container's log, not the fips daemon's — "
         "Tor's own bootstrap progress line"

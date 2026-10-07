@@ -330,6 +330,7 @@ impl Node {
         let ce_flag = header.flags & FLAG_CE != 0;
 
         let mut address_changed = false;
+        let mut first_frame = false;
         if let Some(peer) = self.peers.get_mut(&node_addr) {
             // Initiator-side msg3 confirm (see process_authentic_fmp_plaintext):
             // a frame authenticated against post-cutover `current` (no pending)
@@ -358,10 +359,14 @@ impl Node {
                 peer.set_current_addr(packet.transport_id, packet.remote_addr.clone());
             peer.link_stats_mut()
                 .record_recv(packet.data.len(), packet.timestamp_ms);
+            first_frame = !peer.heard();
             peer.touch(packet.timestamp_ms);
             if slot == LinkSlot::Previous {
                 peer.count_previous();
             }
+        }
+        if first_frame {
+            self.silent_sessions.heard(&node_addr);
         }
 
         // Address rotation invalidates the per-peer connect()-ed UDP socket,
@@ -496,6 +501,7 @@ impl Node {
         };
         let now_ms = crate::time::mono_ms();
         let mut address_changed = false;
+        let mut first_frame = false;
         if let Some(peer) = self.peers.get_mut(node_addr) {
             peer.reset_decrypt_failures();
             // If we are the rekey initiator that already cut over on its
@@ -517,6 +523,7 @@ impl Node {
             address_changed = peer.set_current_addr(transport_id, remote_addr.clone());
             peer.link_stats_mut()
                 .record_recv(packet_len, packet_timestamp_ms);
+            first_frame = !peer.heard();
             peer.touch(packet_timestamp_ms);
             if slot == LinkSlot::Previous {
                 peer.count_previous();
@@ -527,6 +534,12 @@ impl Node {
                 mmp.receiver
                     .record_recv(fmp_counter, inner_ts, packet_len, ce_flag, now_ms);
             }
+        }
+        // A session's first authenticated frame clears its identity's
+        // silent-session record: one identity has one peer entry, and a
+        // record grows only when an unheard session ends.
+        if first_frame {
+            self.silent_sessions.heard(node_addr);
         }
         // Address rotation invalidates the per-peer connect()-ed UDP
         // socket. Drop the connected socket + drain so the wildcard

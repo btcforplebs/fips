@@ -179,6 +179,10 @@ pub struct HandshakeStats {
     /// kept. A sustained rate here is an on-path attacker forging rekey
     /// msg2, not routine handshake noise.
     pub rekey_static_mismatch: u64,
+    /// Inbound msg3 refused because the identity's recent sessions at that
+    /// startup epoch ended without an authenticated frame and its back-off
+    /// is running. Not part of `bad_state`.
+    pub silent_backoff: u64,
 }
 
 impl HandshakeStats {
@@ -187,6 +191,7 @@ impl HandshakeStats {
             bad_state: self.bad_state,
             unknown_connection: self.unknown_connection,
             rekey_static_mismatch: self.rekey_static_mismatch,
+            silent_backoff: self.silent_backoff,
         }
     }
 
@@ -195,6 +200,7 @@ impl HandshakeStats {
             HandshakeReject::BadState => self.bad_state += 1,
             HandshakeReject::UnknownConnection => self.unknown_connection += 1,
             HandshakeReject::RekeyStaticMismatch => self.rekey_static_mismatch += 1,
+            HandshakeReject::SilentBackoff => self.silent_backoff += 1,
         }
     }
 }
@@ -413,6 +419,7 @@ pub struct BloomStatsSnapshot {
     pub unknown_peer: u64,
     pub stale: u64,
     pub fill_exceeded: u64,
+    pub child_role_rejected: u64,
     pub accepted: u64,
     pub sent: u64,
     pub debounce_suppressed: u64,
@@ -452,6 +459,7 @@ pub struct HandshakeStatsSnapshot {
     pub bad_state: u64,
     pub unknown_connection: u64,
     pub rekey_static_mismatch: u64,
+    pub silent_backoff: u64,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -628,6 +636,17 @@ mod tests {
         stats.record_reject(HandshakeReject::BadState);
         assert_eq!(stats.bad_state, 3);
         assert_eq!(stats.unknown_connection, 0);
+    }
+
+    #[test]
+    fn handshake_stats_record_reject_silent_backoff() {
+        let mut stats = HandshakeStats::default();
+        stats.record_reject(HandshakeReject::SilentBackoff);
+        stats.record_reject(HandshakeReject::SilentBackoff);
+        assert_eq!(stats.silent_backoff, 2);
+        assert_eq!(stats.bad_state, 0);
+        assert_eq!(stats.unknown_connection, 0);
+        assert_eq!(stats.snapshot().silent_backoff, 2);
     }
 
     #[test]

@@ -31,7 +31,8 @@ module.
 | `mtu_exceeded` | Packets rejected for MTU violation |
 | `connections_established` | Successful outbound connections |
 | `connections_accepted` | Accepted inbound connections |
-| `connections_rejected` | Rejected inbound connections (limit exceeded) |
+| `connections_rejected` | Rejected inbound connections (either limit exceeded) |
+| `source_rejected` | Inbound connections rejected because their source (one IPv4 address or IPv6 /64) already held `max_inbound_per_source` connections; also counted in `connections_rejected` |
 | `connect_timeouts` | Connection timeout count |
 | `connect_refused` | Connection refused count |
 | `pool_inbound` | Current inbound connections held in the connection pool (gauge) |

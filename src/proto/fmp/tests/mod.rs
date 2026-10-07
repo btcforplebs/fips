@@ -3,6 +3,7 @@
 
 mod core;
 mod limits;
+mod silent;
 mod state;
 mod util;
 mod wire;

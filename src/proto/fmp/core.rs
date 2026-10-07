@@ -16,6 +16,7 @@
 //! onto an [`InboundDecision`] the shell dispatches for `handle_msg3`. The
 //! born-on-next Noise leaf (`handle_msg{1,2,3}` crypto) remains shell-side.
 
+use super::silent::{ActiveBackoff, epochs_differ};
 use super::state::Fmp;
 use super::wire::{
     FMP_FEAT_PROFILE_MASK, FMP_FEAT_PROVIDES_RR, FMP_FEAT_PROVIDES_SR, FMP_FEAT_WANTS_RR,
@@ -315,6 +316,10 @@ pub(crate) struct EstablishSnapshot {
     /// This peer identity accepted an epoch change inside the dampening
     /// interval. Resolved shell-side because the stamp lives in the registry.
     pub epoch_restart_dampened: bool,
+    /// The refusal in force for this identity after its sessions ended
+    /// without an authenticated frame, read shell-side from its
+    /// [`SilentSessions`](super::SilentSessions) record. `None` when none is.
+    pub silent_backoff: Option<ActiveBackoff>,
 }
 
 /// What an inbound `msg3` declares about replacing a session we already hold.
@@ -516,15 +521,20 @@ pub(crate) enum InboundDecision {
     /// (`None` → nothing to resend, the silent no-op preserved from the
     /// pre-refactor path). The active peer is left untouched.
     ResendMsg2 { msg2: Option<Vec<u8>> },
-    /// Drop this `msg3` with a handshake reject (`HandshakeReject::BadState`) and
-    /// no promotion. `reason` selects only the diagnostic log line.
+    /// Drop this `msg3` with a handshake reject and no promotion. Every reject
+    /// but [`InboundReject::SilentBackoff`] records `HandshakeReject::BadState`;
+    /// that one records its own reason. `reason` otherwise selects only the
+    /// diagnostic log line.
     Reject { reason: InboundReject },
 }
 
-/// Why an inbound XX `msg3` was dropped by the core classification. XX reaches
-/// the core with a single reject cause; the negotiation reject and the late ACL
-/// reject are shell steps that run *before* the decision, and the max-peers cap
-/// is a late gate inside `promote_connection` — none of them reach here.
+/// Why an inbound XX `msg3` was dropped by the core classification. The
+/// negotiation reject and the late ACL reject are shell steps that run *before*
+/// the decision, and the max-peers cap is a late gate inside
+/// `promote_connection` — none of them reach here. Every variant records
+/// `HandshakeReject::BadState` except
+/// [`SilentBackoff`](InboundReject::SilentBackoff), which records its own
+/// reason.
 #[derive(Debug)]
 pub(crate) enum InboundReject {
     /// Dual rekey initiation and we are the tie-break *winner* (smaller
@@ -535,6 +545,12 @@ pub(crate) enum InboundReject {
     /// inside the dampening interval. Drop it; see
     /// [`EPOCH_RESTART_MIN_INTERVAL_SECS`].
     EpochRestartDampened,
+    /// The identity's last sessions at this `msg3`'s epoch, at least
+    /// [`SILENT_SESSION_LIMIT`](super::silent::SILENT_SESSION_LIMIT) in a
+    /// row, ended without one authenticated frame, and the back-off they
+    /// started is still running. Checked only where the `msg3` would promote
+    /// a session for an identity with no peer entry.
+    SilentBackoff,
 }
 
 /// The classification outcome for one outbound `handle_msg2` completion, decided
@@ -786,7 +802,9 @@ impl Fmp {
     /// age-based split misread real rekeys as cross-connections and left the two
     /// ends of a link on different sessions.
     ///
-    /// 1. No existing peer → net-new [`Promote`](InboundDecision::Promote).
+    /// 1. No existing peer → net-new [`Promote`](InboundDecision::Promote),
+    ///    unless a silent-session refusal at this epoch is in force for the
+    ///    identity ([`InboundReject::SilentBackoff`]).
     /// 2. Existing peer, different epoch → [`RestartThenPromote`].
     /// 3. Same epoch, marker naming a session we do not hold
     ///    ([`Mismatch`](RekeyClaim::Mismatch)) → [`ResendMsg2`], not a reject:
@@ -821,6 +839,11 @@ impl Fmp {
         wire: &WireOutcome,
     ) -> InboundDecision {
         if !snap.has_existing_peer {
+            if silent_refusal(snap, wire) {
+                return InboundDecision::Reject {
+                    reason: InboundReject::SilentBackoff,
+                };
+            }
             // No existing peer for this identity → net-new promote.
             return InboundDecision::Promote;
         }
@@ -1109,4 +1132,13 @@ pub(crate) fn decide_fmp_negotiation(
     let their_profile = their_payload.node_profile()?;
     NegotiationPayload::validate_profiles(our_profile, their_profile)?;
     Ok(their_profile)
+}
+
+/// Whether a refusal for silent sessions covers this `msg3`: one is in force
+/// for the identity and the `msg3` is at the epoch it counted. A `msg3` at
+/// another epoch is a restart and is left to the restart guard.
+fn silent_refusal(snap: &EstablishSnapshot, wire: &WireOutcome) -> bool {
+    snap.silent_backoff
+        .as_ref()
+        .is_some_and(|b| !epochs_differ(b.epoch, wire.remote_epoch))
 }

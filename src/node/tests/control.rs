@@ -136,6 +136,10 @@ async fn test_api_connect_on_current_fresh_path_is_a_no_op() {
         "re-announcing the current fresh path is a no-op"
     );
     assert_eq!(
+        data["detail"], "peer live, not dialled",
+        "the response says the live peer was not dialled"
+    );
+    assert_eq!(
         outbound_leg_count(&nodes[0].node, &node1_addr),
         legs_before,
         "no new handshake leg for the path the peer is already on"
@@ -149,24 +153,65 @@ async fn test_api_connect_on_current_fresh_path_is_a_no_op() {
     cleanup_nodes(&mut nodes).await;
 }
 
-/// `connect` naming a *different* address for a peer the node is already
-/// connected to starts an alternate-path handshake instead of silently doing
-/// nothing — the fix.
+/// `connect` naming a *different* address for a peer the node holds but has
+/// not heard from for longer than the heartbeat interval dials that address,
+/// and the dial leaves the link where it was at both ends. This is the
+/// failover path; a live peer is not dialled at all.
 ///
-/// The existing peer stays put while that handshake runs: promotion is the
-/// handshake's job, not the command's. Both sessions are aged past 30 s, and
-/// the alternate-path handshake declares no rekey, so it resolves as a
-/// cross-connection; once it does, each end's frames must still authenticate
-/// at the other, whichever end dialled.
+/// Both sessions are aged past 30 s, and the alternate-path handshake declares
+/// no rekey, so each end resolves it as a cross-connection by node order:
+///
+/// - dialer smaller: both ends swap to the alternate-path session;
+/// - dialer larger: both ends keep the session they had.
+///
+/// Either way neither end is left holding a pending session, and in neither
+/// orientation does the link, its transport or its remote address change at
+/// either end. Only the dialer's view of the peer is quiet; the peer still
+/// hears the dialer.
 #[tokio::test]
-async fn test_api_connect_starts_alternate_path_for_active_peer() {
+async fn test_api_connect_to_a_second_address_of_a_quiet_peer_dials_it_and_leaves_the_link_on_its_path()
+ {
     for dialer_smaller in [true, false] {
-        alternate_path_for_active_peer(dialer_smaller).await;
+        alternate_path_for_quiet_peer(dialer_smaller).await;
     }
 }
 
-/// One orientation of [`test_api_connect_starts_alternate_path_for_active_peer`].
-async fn alternate_path_for_active_peer(dialer_smaller: bool) {
+/// Make `tn` see `peer` as quiet: last heard one second past the heartbeat
+/// interval, so its link is no longer live.
+pub(super) fn quieten(tn: &mut TestNode, peer: &NodeAddr) {
+    let quiet_ms = (tn.node.config().node.heartbeat_interval_secs + 1) * 1000;
+    tn.node
+        .get_peer_mut(peer)
+        .expect("the node holds the peer")
+        .touch(Node::now_ms().saturating_sub(quiet_ms));
+}
+
+/// Where one end's link to the other sits, and which session it is on.
+#[derive(Debug, Clone, PartialEq)]
+struct LinkView {
+    link_id: LinkId,
+    transport_id: Option<TransportId>,
+    current_addr: Option<TransportAddr>,
+    our_index: Option<SessionIndex>,
+}
+
+/// Read `tn`'s view of its link to `peer`.
+fn link_view(tn: &TestNode, peer: &NodeAddr) -> LinkView {
+    let p = tn
+        .node
+        .get_peer(peer)
+        .expect("the node still holds the peer");
+    LinkView {
+        link_id: p.link_id(),
+        transport_id: p.transport_id(),
+        current_addr: p.current_addr().cloned(),
+        our_index: p.our_index(),
+    }
+}
+
+/// One orientation of
+/// [`test_api_connect_to_a_second_address_of_a_quiet_peer_dials_it_and_leaves_the_link_on_its_path`].
+async fn alternate_path_for_quiet_peer(dialer_smaller: bool) {
     use super::rekey_parity::{age_link, deliver, failures, heartbeat};
 
     let mut nodes = run_tree_test(2, &[(0, 1)], false).await;
@@ -181,17 +226,20 @@ async fn alternate_path_for_active_peer(dialer_smaller: bool) {
     let peer_npub = nodes[p].node.npub();
     let transport_id = nodes[d].transport_id;
     age_link(&mut nodes, d, p, Duration::from_secs(31));
+    quieten(&mut nodes[d], &peer_addr);
 
     // A second address that reaches the peer, standing in for a second path
     // coming up.
     let alternate = add_loopback_alias(&nodes[p].addr);
     assert_ne!(alternate, nodes[p].addr);
 
-    let link_before = nodes[d]
-        .node
-        .get_peer(&peer_addr)
-        .expect("the dialer should have the peer")
-        .link_id();
+    let dialer_before = link_view(&nodes[d], &peer_addr);
+    let peer_before = link_view(&nodes[p], &dialer_addr);
+    assert_eq!(
+        dialer_before.current_addr.as_ref(),
+        Some(&nodes[p].addr),
+        "precondition: the dialer reaches the peer on its primary address"
+    );
 
     let data = nodes[d]
         .node
@@ -209,28 +257,80 @@ async fn alternate_path_for_active_peer(dialer_smaller: bool) {
             .is_connecting_to_peer_on_path(&peer_addr, transport_id, &alternate),
         "an outbound leg should exist on the alternate path"
     );
-    let peer = nodes[d]
-        .node
-        .get_peer(&peer_addr)
-        .expect("the existing peer must survive the parallel handshake");
-    assert_eq!(
-        peer.link_id(),
-        link_before,
-        "the alternate handshake must not tear the live link down before it authenticates"
-    );
 
-    // Let the alternate handshake run to completion; the peer must still be
-    // there afterwards.
+    // Let the alternate handshake run to completion.
     for _ in 0..20 {
         if process_available_packets(&mut nodes).await == 0 {
             break;
         }
     }
-    assert!(
-        nodes[d].node.get_peer(&peer_addr).is_some(),
-        "the peer should still be a peer after the alternate path resolves (dialer smaller: {dialer_smaller})"
+
+    // The link stays on its path at both ends.
+    let dialer_after = link_view(&nodes[d], &peer_addr);
+    let peer_after = link_view(&nodes[p], &dialer_addr);
+    assert_eq!(
+        (
+            dialer_after.link_id,
+            dialer_after.transport_id,
+            dialer_after.current_addr.as_ref()
+        ),
+        (
+            dialer_before.link_id,
+            dialer_before.transport_id,
+            Some(&nodes[p].addr)
+        ),
+        "the dialer's link must stay on the peer's primary address (dialer smaller: {dialer_smaller})"
+    );
+    assert_eq!(
+        (
+            peer_after.link_id,
+            peer_after.transport_id,
+            peer_after.current_addr.as_ref()
+        ),
+        (
+            peer_before.link_id,
+            peer_before.transport_id,
+            peer_before.current_addr.as_ref()
+        ),
+        "the peer's link must stay where it was (dialer smaller: {dialer_smaller})"
     );
 
+    // The msg2 consumed the dialer's leg.
+    assert_eq!(
+        outbound_leg_count(&nodes[d].node, &peer_addr),
+        0,
+        "the dialer holds no leg toward the peer once the dial resolves (dialer smaller: {dialer_smaller})"
+    );
+
+    // Session: by node order, both ends swap when the dialer is the smaller,
+    // and both keep their own when it is the larger.
+    for (end, before, after) in [
+        ("dialer", &dialer_before, &dialer_after),
+        ("peer", &peer_before, &peer_after),
+    ] {
+        if dialer_smaller {
+            assert_ne!(
+                after.our_index, before.our_index,
+                "the {end} swaps to the alternate-path session when the dialer is the smaller"
+            );
+        } else {
+            assert_eq!(
+                after.our_index, before.our_index,
+                "the {end} keeps its own session when the dialer is the larger"
+            );
+        }
+    }
+    for (end, tn, other) in [("dialer", d, peer_addr), ("peer", p, dialer_addr)] {
+        assert!(
+            nodes[tn]
+                .node
+                .get_peer(&other)
+                .unwrap()
+                .pending_new_session()
+                .is_none(),
+            "the {end} holds no pending session (dialer smaller: {dialer_smaller})"
+        );
+    }
     // Each end's next frame must authenticate at the other.
     for (from, to, from_addr, to_addr) in [
         (d, p, dialer_addr, peer_addr),
@@ -260,6 +360,88 @@ async fn alternate_path_for_active_peer(dialer_smaller: bool) {
             "node {from}'s heartbeat must authenticate at node {to} (dialer smaller: {dialer_smaller})"
         );
     }
+
+    cleanup_nodes(&mut nodes).await;
+}
+
+/// `connect` naming a different address for a peer whose link is live does
+/// not dial it, says so, and leaves both ends exactly as they were.
+///
+/// Between two nodes on this code, a dial to a live peer did not move its
+/// link; both ends resolved it as a crossing dial on the link they already
+/// had. So a live link is kept, the same rule discovery applies.
+#[tokio::test]
+async fn test_api_connect_to_a_live_peer_on_another_address_dials_nothing_and_changes_neither_end()
+{
+    for dialer_smaller in [true, false] {
+        connect_to_live_peer_on_another_address(dialer_smaller).await;
+    }
+}
+
+/// One orientation of
+/// [`test_api_connect_to_a_live_peer_on_another_address_dials_nothing_and_changes_neither_end`].
+async fn connect_to_live_peer_on_another_address(dialer_smaller: bool) {
+    use super::rekey_parity::{age_link, deliver};
+
+    let mut nodes = run_tree_test(2, &[(0, 1)], false).await;
+    let zero_smaller = nodes[0].node.node_addr() < nodes[1].node.node_addr();
+    let (d, p) = if zero_smaller == dialer_smaller {
+        (0, 1)
+    } else {
+        (1, 0)
+    };
+    let dialer_addr = *nodes[d].node.node_addr();
+    let peer_addr = *nodes[p].node.node_addr();
+    let peer_npub = nodes[p].node.npub();
+    age_link(&mut nodes, d, p, Duration::from_secs(31));
+    let alternate = add_loopback_alias(&nodes[p].addr);
+
+    let dialer_before = link_view(&nodes[d], &peer_addr);
+    let peer_before = link_view(&nodes[p], &dialer_addr);
+
+    let data = nodes[d]
+        .node
+        .api_connect(&peer_npub, &alternate.to_string(), "loopback")
+        .await
+        .expect("api_connect to a live peer is not an error");
+
+    assert_eq!(
+        data["refreshed"], false,
+        "a live peer is not dialled (dialer smaller: {dialer_smaller})"
+    );
+    assert_eq!(
+        data["detail"], "peer live, not dialled",
+        "the response says why nothing was dialled (dialer smaller: {dialer_smaller})"
+    );
+    assert_eq!(
+        outbound_leg_count(&nodes[d].node, &peer_addr),
+        0,
+        "no handshake leg toward a live peer (dialer smaller: {dialer_smaller})"
+    );
+    assert_eq!(
+        deliver(&mut nodes[p]).await,
+        0,
+        "nothing reaches the peer (dialer smaller: {dialer_smaller})"
+    );
+    assert_eq!(
+        link_view(&nodes[d], &peer_addr),
+        dialer_before,
+        "the dialer's link and session are unchanged (dialer smaller: {dialer_smaller})"
+    );
+    assert_eq!(
+        link_view(&nodes[p], &dialer_addr),
+        peer_before,
+        "the peer's link and session are unchanged (dialer smaller: {dialer_smaller})"
+    );
+    assert!(
+        nodes[p]
+            .node
+            .get_peer(&dialer_addr)
+            .unwrap()
+            .pending_new_session()
+            .is_none(),
+        "the peer holds no pending session (dialer smaller: {dialer_smaller})"
+    );
 
     cleanup_nodes(&mut nodes).await;
 }

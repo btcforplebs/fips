@@ -2,7 +2,7 @@
 
 use core::fmt;
 
-use super::{BloomError, DEFAULT_FILTER_SIZE_BITS, DEFAULT_HASH_COUNT};
+use super::{BloomError, DEFAULT_FILTER_SIZE_BITS, DEFAULT_HASH_COUNT, ECHO_MIN_BITS};
 use crate::NodeAddr;
 
 /// A Bloom filter for probabilistic set membership.
@@ -157,6 +157,41 @@ impl BloomFilter {
             .map(|(a, b)| (a & b).count_ones() as usize)
             .sum();
         Some(both as f64 / sent_ones as f64)
+    }
+
+    /// Whether this filter, announced by a tree child, returns the filter
+    /// `sent` that we last sent that child.
+    ///
+    /// True when [`overlap`](Self::overlap) exceeds
+    /// [`echo_bound`](Self::echo_bound): more than `threshold` of the part
+    /// of `sent` that this filter's fill does not explain by chance. An
+    /// unrelated filter overlaps `sent` at about its own fill ratio; a filter
+    /// containing everything sent overlaps it at 1.0, whatever its fill.
+    ///
+    /// Always false when `threshold` is 1.0 or above (the guard is off;
+    /// checked here so rounding in the bound cannot reject an exact return),
+    /// when `sent` has fewer than [`ECHO_MIN_BITS`] set bits (an honest
+    /// child can match a small filter by chance), when the sizes differ, and
+    /// when this filter is saturated (no headroom; the FPR cap rejects it
+    /// first). A NaN threshold compares false and so never rejects.
+    pub fn echoes(&self, sent: &BloomFilter, threshold: f64) -> bool {
+        if threshold >= 1.0 || sent.count_ones() < ECHO_MIN_BITS {
+            return false;
+        }
+        let Some(overlap) = self.overlap(sent) else {
+            return false;
+        };
+        if self.count_ones() >= self.num_bits {
+            return false;
+        }
+        overlap > self.echo_bound(threshold)
+    }
+
+    /// The overlap above which [`echoes`](Self::echoes) calls this filter a
+    /// return: its fill ratio plus `threshold` of the headroom above it.
+    pub fn echo_bound(&self, threshold: f64) -> f64 {
+        let fill = self.fill_ratio();
+        fill + threshold * (1.0 - fill)
     }
 
     /// Estimate the fill ratio (set bits / total bits).

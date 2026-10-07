@@ -34,7 +34,7 @@ use crate::config::TcpConfig;
 use crate::proto::fmp::wire::{FMP_VERSION, PHASE_MSG2};
 use crate::transport::framing::{StreamError, read_fmp_packet};
 use crate::transport::stream::{
-    ConnId, WRITER_DRAIN_TIMEOUT, drain_writer, next_conn_id, remove_own,
+    ConnId, DrainingWriters, WRITER_DRAIN_TIMEOUT, next_conn_id, remove_own,
 };
 use pool::{
     ConnectingEntry, ConnectingPool, ConnectionPool, Direction, PoolKey, TcpConnection,
@@ -94,6 +94,9 @@ pub struct TcpTransport {
     /// Longest wait for each later complete inbound frame. Defaults to
     /// `INBOUND_IDLE_TIMEOUT`; the node sets it from its liveness timers.
     idle_timeout: Duration,
+    /// Writers of deliberately closed connections still finishing their
+    /// queues, which `stop_async` must also stop.
+    draining: DrainingWriters,
     /// Transport statistics.
     stats: Arc<TcpStats>,
 }
@@ -119,6 +122,7 @@ impl TcpTransport {
             node_max_connections: None,
             first_frame_timeout: INBOUND_FIRST_FRAME_TIMEOUT,
             idle_timeout: INBOUND_IDLE_TIMEOUT,
+            draining: DrainingWriters::default(),
             stats: Arc::new(TcpStats::new()),
         }
     }
@@ -234,6 +238,7 @@ impl TcpTransport {
             let cfg = AcceptConfig {
                 mtu: self.config.mtu(),
                 max_inbound: self.effective_max_inbound(),
+                source_cap: self.config.max_inbound_per_source(),
                 nodelay: self.config.nodelay(),
                 keepalive_secs: self.config.keepalive_secs(),
                 recv_buf: self.config.recv_buf_size(),
@@ -315,6 +320,10 @@ impl TcpTransport {
             );
         }
         drop(pool);
+
+        // Writers of connections closed before the stop are out of the pool,
+        // so the loop above does not reach them.
+        self.draining.stop().await;
 
         self.local_addr = None;
         self.state = TransportState::Down;
@@ -595,7 +604,8 @@ impl TcpTransport {
     /// timer aborts it if it is still writing after [`WRITER_DRAIN_TIMEOUT`],
     /// so this call never waits on the peer. Stopping the transport, and every
     /// teardown after a connection has failed, abort the writer instead and
-    /// discard what it had queued.
+    /// discard what it had queued; stopping also ends a writer still draining
+    /// from an earlier close.
     pub async fn close_connection_async(&self, addr: &TransportAddr) {
         let mut pool = self.pool.lock().await;
         let key = key_for_remote(&pool, addr);
@@ -609,7 +619,7 @@ impl TcpTransport {
             } = conn;
             drop(send_tx);
             recv_task.abort();
-            drain_writer(send_task, WRITER_DRAIN_TIMEOUT);
+            self.draining.drain(send_task, WRITER_DRAIN_TIMEOUT);
             match direction {
                 Direction::Inbound => self.stats.record_pool_inbound_removed(),
                 Direction::Outbound => self.stats.record_pool_outbound_removed(),
@@ -991,6 +1001,9 @@ impl InboundDeadline {
 struct AcceptConfig {
     mtu: u16,
     max_inbound: usize,
+    /// Most inbound connections one source (IPv4 address or IPv6 /64) may
+    /// hold at once.
+    source_cap: usize,
     nodelay: bool,
     keepalive_secs: u64,
     recv_buf: usize,
@@ -1011,6 +1024,7 @@ async fn accept_loop(
     let AcceptConfig {
         mtu,
         max_inbound,
+        source_cap,
         nodelay,
         keepalive_secs,
         recv_buf,
@@ -1052,6 +1066,25 @@ async fn accept_loop(
                         peer_addr = %peer_addr,
                         max = max_inbound,
                         "Rejecting inbound TCP connection (max_inbound_connections reached)"
+                    );
+                    continue;
+                }
+
+                // Per-source cap: one address (or IPv6 /64) may not take
+                // every inbound slot. Counted from the pool rather than a
+                // separate per-source counter so it cannot drift from it.
+                // This loop is the only inserter of inbound entries, so
+                // between here and the insert below the count can only fall.
+                let from_source = inbound_from_source(&*pool.lock().await, peer_addr.ip());
+                if from_source >= source_cap {
+                    stats.record_connection_rejected();
+                    stats.record_source_rejected();
+                    debug!(
+                        transport_id = %transport_id,
+                        peer_addr = %peer_addr,
+                        open_from_source = from_source,
+                        max = source_cap,
+                        "Rejecting inbound TCP connection (max_inbound_per_source reached)"
                     );
                     continue;
                 }
@@ -1162,16 +1195,11 @@ async fn accept_loop(
                     id,
                 };
 
-                let mut pool_guard = pool.lock().await;
-                pool_guard.insert(key, conn);
-                // Counted under the lock already held for the insert, and
-                // only when the line below will be logged.
-                let open_from_source = if tracing::enabled!(tracing::Level::DEBUG) {
-                    inbound_from_source(&pool_guard, peer_addr.ip())
-                } else {
-                    0
-                };
-                drop(pool_guard);
+                pool.lock().await.insert(key, conn);
+                // The count taken at the gate plus this connection. It can
+                // read one high if a connection from the same source closed
+                // since the gate.
+                let open_from_source = from_source + 1;
 
                 stats.record_connection_accepted();
                 stats.record_pool_inbound_added();
@@ -3592,6 +3620,86 @@ mod tests {
         t1.stop_async().await.unwrap();
     }
 
+    /// Stopping the transport must stop a writer that is still draining after
+    /// a deliberate close, rather than leave it to its drain timer.
+    ///
+    /// The writer holds a oneshot sender and never finishes, so the sender is
+    /// dropped only once the task has been aborted. A stop that left it
+    /// draining returns with the sender still held.
+    #[tokio::test]
+    async fn stopping_the_transport_ends_a_writer_still_draining_after_a_close() {
+        let (tx1, _rx1) = packet_channel(100);
+        let mut t1 = TcpTransport::new(TransportId::new(1), None, make_outbound_config(), tx1);
+        t1.start_async().await.unwrap();
+        let remote = TransportAddr::from_string("127.0.0.1:9");
+        let (guard_tx, mut guard_rx) = tokio::sync::oneshot::channel::<()>();
+        t1.pool.lock().await.insert(
+            PoolKey::outbound(remote.clone()),
+            TcpConnection {
+                send_tx: mpsc::channel(1).0,
+                send_task: tokio::spawn(async move {
+                    let _guard = guard_tx;
+                    std::future::pending::<()>().await
+                }),
+                recv_task: tokio::spawn(std::future::pending::<()>()),
+                mtu: 1400,
+                established_at: Instant::now(),
+                direction: Direction::Outbound,
+                id: next_conn_id(),
+            },
+        );
+        t1.stats.record_pool_outbound_added();
+
+        t1.close_connection_async(&remote).await;
+        timeout(Duration::from_secs(2), t1.stop_async())
+            .await
+            .expect("stop waited on a draining writer")
+            .unwrap();
+
+        assert!(
+            matches!(
+                guard_rx.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+            ),
+            "a writer still draining after a close outlived the transport's stop"
+        );
+    }
+
+    /// No frame a deliberate close left queued may reach the peer after the
+    /// transport has stopped.
+    ///
+    /// The writer is parked on a peer that does not read, with a full queue,
+    /// and the connection is closed and the transport stopped before the peer
+    /// reads anything. A writer left draining delivers every frame it had
+    /// queued once the peer reads; a stopped one delivers fewer, since the
+    /// queue alone holds more frames than the kernel buffers leave unread.
+    #[tokio::test]
+    async fn no_queued_frame_reaches_the_peer_after_the_transport_stops() {
+        let (tx1, _rx1) = packet_channel(100);
+        let mut t1 = TcpTransport::new(TransportId::new(1), None, make_outbound_config(), tx1);
+        t1.start_async().await.unwrap();
+        let listener = capped_deaf_listener();
+        let remote = TransportAddr::from_string(&listener.local_addr().unwrap().to_string());
+        let frame = vec![0xAB; 1400];
+
+        let queued = park_tcp_writer(&t1, &remote, &frame).await;
+        let (mut peer, _) = listener.accept().await.unwrap();
+
+        t1.close_connection_async(&remote).await;
+        t1.stop_async().await.unwrap();
+
+        let read = read_to_eof(&mut peer, Duration::from_secs(10))
+            .await
+            .expect("the connection was never closed toward the peer");
+        assert!(read > 0, "the kernel buffers held written frames");
+        assert!(
+            read < queued * frame.len(),
+            "the writer kept writing after the transport stopped: \
+             read={read} queued_bytes={}",
+            queued * frame.len()
+        );
+    }
+
     // ========================================================================
     // Inbound pool keying
     // ========================================================================
@@ -3974,6 +4082,134 @@ mod tests {
         transport.stop_async().await.unwrap();
     }
 
+    fn source_capped_config(source_cap: usize) -> TcpConfig {
+        TcpConfig {
+            max_inbound_per_source: Some(source_cap),
+            ..capped_config(16)
+        }
+    }
+
+    /// Open a connection to `listen` that sends one msg1 frame, and wait
+    /// for the frame to be delivered.
+    async fn admitted_peer(listen: SocketAddr, rx: &mut crate::transport::PacketRx) -> TcpStream {
+        let mut peer = TcpStream::connect(listen).await.unwrap();
+        peer.write_all(&build_msg1_frame()).await.unwrap();
+        let packet = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timeout waiting for an admitted peer's frame")
+            .expect("packet channel closed");
+        assert_eq!(packet.data, build_msg1_frame());
+        peer
+    }
+
+    /// With a per-source bound below the global cap, the connection past
+    /// the bound from one address is closed and counted, while a connection
+    /// from another address is still admitted.
+    ///
+    /// Break-check: without the per-source gate the fourth connection's
+    /// frame is delivered and `source_rejected` stays 0.
+    #[tokio::test]
+    async fn inbound_connections_beyond_the_per_source_bound_are_refused_and_counted_while_another_source_is_admitted()
+     {
+        use tokio::io::AsyncReadExt;
+
+        const N: usize = 3;
+        let (tx, mut rx) = packet_channel(100);
+        let mut transport =
+            TcpTransport::new(TransportId::new(1), None, source_capped_config(N), tx);
+        transport.start_async().await.unwrap();
+        let listen = transport.local_addr().unwrap();
+
+        let mut held = Vec::new();
+        for _ in 0..N {
+            held.push(admitted_peer(listen, &mut rx).await);
+        }
+        assert_eq!(transport.stats().pool_inbound_count(), N as u64);
+
+        let mut over = TcpStream::connect(listen).await.unwrap();
+        let _ = over.write_all(&build_msg1_frame()).await;
+        assert!(
+            timeout(Duration::from_millis(250), rx.recv())
+                .await
+                .is_err(),
+            "a connection past the per-source bound must not be admitted"
+        );
+        let mut buf = [0u8; 16];
+        match timeout(Duration::from_secs(2), over.read(&mut buf)).await {
+            Ok(Ok(0)) | Ok(Err(_)) => {}
+            Ok(Ok(n)) => panic!("the refused connection received {n} bytes"),
+            Err(_) => panic!("the refused connection was left open"),
+        }
+        let stats = transport.stats().clone();
+        assert!(
+            wait_until(
+                || stats.snapshot().source_rejected == 1,
+                Duration::from_secs(2)
+            )
+            .await,
+            "the refusal should be counted as per-source"
+        );
+        assert_eq!(stats.snapshot().connections_rejected, 1);
+        assert_eq!(stats.pool_inbound_count(), N as u64);
+
+        // Another address of the same host is a different source.
+        #[cfg(target_os = "linux")]
+        {
+            let socket = tokio::net::TcpSocket::new_v4().unwrap();
+            socket.bind("127.0.0.2:0".parse().unwrap()).unwrap();
+            let mut other = socket.connect(listen).await.unwrap();
+            other.write_all(&build_msg1_frame()).await.unwrap();
+            let packet = timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("a connection from another source should be admitted")
+                .expect("packet channel closed");
+            assert_eq!(packet.data, build_msg1_frame());
+            assert_eq!(stats.snapshot().source_rejected, 1);
+            held.push(other);
+        }
+
+        drop(held);
+        drop(over);
+        transport.stop_async().await.unwrap();
+    }
+
+    /// The per-source count follows the pool, so a source at its bound is
+    /// admitted again once one of its connections closes.
+    ///
+    /// Break-check: a per-source count that is never released on close
+    /// refuses the new connection.
+    #[tokio::test]
+    async fn a_source_at_its_per_source_bound_is_admitted_again_after_one_of_its_connections_closes()
+     {
+        const N: usize = 3;
+        let (tx, mut rx) = packet_channel(100);
+        let mut transport =
+            TcpTransport::new(TransportId::new(1), None, source_capped_config(N), tx);
+        transport.start_async().await.unwrap();
+        let listen = transport.local_addr().unwrap();
+
+        let mut held = Vec::new();
+        for _ in 0..N {
+            held.push(admitted_peer(listen, &mut rx).await);
+        }
+        drop(held.pop());
+        assert!(
+            wait_until(
+                || transport.stats().pool_inbound_count() == (N - 1) as u64,
+                Duration::from_secs(2)
+            )
+            .await,
+            "the closed connection should leave the pool"
+        );
+
+        held.push(admitted_peer(listen, &mut rx).await);
+        assert_eq!(transport.stats().snapshot().source_rejected, 0);
+        assert_eq!(transport.stats().pool_inbound_count(), N as u64);
+
+        drop(held);
+        transport.stop_async().await.unwrap();
+    }
+
     #[tokio::test]
     async fn a_silent_inbound_connection_logs_its_close_at_the_first_frame_deadline() {
         let (tx, _rx) = packet_channel(100);
@@ -4200,5 +4436,42 @@ mod tests {
             "neighbouring /64s are different sources"
         );
         assert_eq!(source_of(ip("2001:db8:1:2::1")), ip("2001:db8:1:2::"));
+    }
+
+    /// The per-source count reads IPv6 pool keys back and groups them by
+    /// /64, counting only inbound entries.
+    #[tokio::test]
+    async fn inbound_from_source_counts_inbound_ipv6_entries_by_slash_64() {
+        let local: SocketAddr = "[2001:db8:ffff::1]:443".parse().unwrap();
+        let entry = |direction| TcpConnection {
+            send_tx: mpsc::channel(1).0,
+            send_task: tokio::spawn(async {}),
+            recv_task: tokio::spawn(async {}),
+            mtu: 1400,
+            established_at: Instant::now(),
+            direction,
+            id: next_conn_id(),
+        };
+        let remote = |s: &str| TransportAddr::from_string(s);
+        let mut pool = PoolMap::new();
+        for addr in ["[2001:db8:1:2::1]:5000", "[2001:db8:1:2::abcd]:5001"] {
+            pool.insert(
+                PoolKey::inbound(remote(addr), local),
+                entry(Direction::Inbound),
+            );
+        }
+        pool.insert(
+            PoolKey::inbound(remote("[2001:db8:1:3::1]:5000"), local),
+            entry(Direction::Inbound),
+        );
+        pool.insert(
+            PoolKey::outbound(remote("[2001:db8:1:2::2]:8443")),
+            entry(Direction::Outbound),
+        );
+
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        assert_eq!(inbound_from_source(&pool, ip("2001:db8:1:2::ffff")), 2);
+        assert_eq!(inbound_from_source(&pool, ip("2001:db8:1:3::9")), 1);
+        assert_eq!(inbound_from_source(&pool, ip("2001:db8:1:4::1")), 0);
     }
 }

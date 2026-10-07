@@ -81,15 +81,32 @@ pub(crate) fn report_thread(
     }
 }
 
+/// What [`Node::try_active_peer_alternative_addresses`] did for a held peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AltDial {
+    /// A handshake was started on at least one candidate.
+    Started,
+    /// The peer's link is live, so nothing was dialled.
+    PeerLive,
+    /// The peer is quiet but has no concrete candidate to dial.
+    NoNewPath,
+}
+
+/// The `detail` a control-API `connect` reports for a held peer whose link
+/// is live.
+const PEER_LIVE_DETAIL: &str = "peer live, not dialled";
+
 impl Node {
     /// Replace the runtime peer list.
     ///
     /// Newly added auto-connect peers are dialed immediately, removed peers
     /// are dropped from retry bookkeeping, and existing peers get fresh
-    /// address hints without tearing down an active link. If an existing peer
-    /// is already connected and a new concrete candidate appears, FIPS starts
-    /// an alternate handshake in parallel; promotion switches only after that
-    /// handshake authenticates.
+    /// address hints without tearing down an active link. An existing peer
+    /// whose link is live keeps it and is not dialled, whatever addresses the
+    /// new list gives it. One that has gone quiet past the heartbeat interval
+    /// is dialled on its candidates, addresses other than its current one
+    /// first, in parallel with the link it holds. The new addresses are kept
+    /// for the reconnect after a link loss.
     ///
     /// Peer aliases follow the new list: `.fips` names, display names and
     /// peer ACL entries written as an alias are rebuilt from it, with the
@@ -232,11 +249,13 @@ impl Node {
                     .try_active_peer_alternative_addresses(&peer_config, identity)
                     .await
                 {
-                    Ok(true) => debug!(
+                    Ok(AltDial::Started) => debug!(
                         peer = %self.peer_display_name(&node_addr),
-                        "Started alternate-path handshake for active peer"
+                        "Started alternate-path handshake for quiet active peer"
                     ),
-                    Ok(false) => {}
+                    // An embedder may call this periodically; a line per call
+                    // for every live peer would be noise.
+                    Ok(AltDial::PeerLive | AltDial::NoNewPath) => {}
                     Err(err) => debug!(
                         npub = %peer_config.npub,
                         error = %err,
@@ -3206,12 +3225,31 @@ impl Node {
         )))
     }
 
+    /// Dial a peer we already hold on its configured candidates, as an
+    /// alternate path beside the link it has.
+    ///
+    /// A peer whose link is live is not dialled at all and reports
+    /// [`AltDial::PeerLive`]. Between two nodes on this code such a dial did
+    /// not move the link; both ends resolved it as a crossing dial on the link
+    /// they already had. This is the rule discovery's dial gate applies, and
+    /// it is checked before the candidate lookup, so a live peer with no known
+    /// address is `PeerLive` rather than an error.
+    ///
+    /// A peer gone quiet past the heartbeat interval is dialled on the
+    /// candidates that differ from its current path, or on every concrete
+    /// candidate when none does, and reports [`AltDial::Started`].
+    ///
+    /// [`Self::active_peer_link_is_live`] holds for a peer we do not hold, so
+    /// callers must check `self.peers` first; both do.
     async fn try_active_peer_alternative_addresses(
         &mut self,
         peer_config: &PeerConfig,
         peer_identity: PeerIdentity,
-    ) -> Result<bool, NodeError> {
+    ) -> Result<AltDial, NodeError> {
         let peer_node_addr = *peer_identity.node_addr();
+        if self.active_peer_link_is_live(&peer_node_addr) {
+            return Ok(AltDial::PeerLive);
+        }
         let candidates = self.peer_address_candidates(peer_config).await;
 
         if candidates.is_empty() {
@@ -3225,27 +3263,24 @@ impl Node {
             .into_iter()
             .filter(|addr| !(addr.transport == "udp" && addr.addr.eq_ignore_ascii_case("nat")))
             .collect();
-        let has_alternative = concrete
+        let alternatives: Vec<_> = concrete
             .iter()
-            .any(|addr| !self.active_peer_matches_candidate(&peer_node_addr, addr));
-        let attempt_candidates: Vec<_> = if has_alternative {
-            concrete
-                .into_iter()
-                .filter(|addr| !self.active_peer_matches_candidate(&peer_node_addr, addr))
-                .collect()
-        } else if self.active_peer_needs_same_path_refresh(&peer_node_addr) {
+            .filter(|addr| !self.active_peer_matches_candidate(&peer_node_addr, addr))
+            .cloned()
+            .collect();
+        let attempt_candidates = if alternatives.is_empty() {
             concrete
         } else {
-            Vec::new()
+            alternatives
         };
 
         if attempt_candidates.is_empty() {
-            return Ok(false);
+            return Ok(AltDial::NoNewPath);
         }
 
         self.attempt_peer_address_list(peer_config, peer_identity, false, &attempt_candidates)
             .await?;
-        Ok(true)
+        Ok(AltDial::Started)
     }
 
     async fn peer_address_candidates(&self, peer_config: &PeerConfig) -> Vec<PeerAddress> {
@@ -3344,14 +3379,14 @@ impl Node {
     /// auto-reconnect). Reuses the same connection path as auto-connect
     /// peers. Returns JSON data on success or an error message.
     ///
-    /// For a peer the node is already connected to, the supplied address is
-    /// tried as an *alternate path* rather than ignored — the same treatment
-    /// [`Node::update_peers`] gives a refreshed runtime peer. The handshake
-    /// runs in parallel with the live link and promotion happens only once it
-    /// authenticates, so an address the caller got wrong cannot displace a
-    /// healthy path. The response's `refreshed` field reports whether such a
-    /// handshake was started; it is `false` when the peer is already on this
-    /// exact path and that path is fresh.
+    /// For a peer the node already holds, the treatment is the one
+    /// [`Node::update_peers`] gives a refreshed runtime peer. A peer whose
+    /// link is live is not dialled: the response's `refreshed` is `false` and
+    /// its `detail` is `"peer live, not dialled"`. This is not an error, so a
+    /// script that re-announces a live peer does not fail. A peer gone quiet
+    /// past the heartbeat interval is dialled on the supplied address as an
+    /// alternate path, in parallel with the link it holds, and `refreshed` is
+    /// `true`.
     pub(crate) async fn api_connect(
         &mut self,
         npub: &str,
@@ -3385,23 +3420,30 @@ impl Node {
         if let Some(identity) = peer_identity
             && self.peers.contains_key(identity.node_addr())
         {
-            let refreshed = self
+            let dial = self
                 .try_active_peer_alternative_addresses(&peer_config, identity)
                 .await
                 .map_err(|e| e.to_string())?;
+            let refreshed = dial == AltDial::Started;
+            let peer_live = dial == AltDial::PeerLive;
             info!(
                 npub = %npub,
                 address = %address,
                 transport = %transport,
                 refreshed = refreshed,
+                peer_live = peer_live,
                 "API connect resolved against an already-connected peer"
             );
-            return Ok(serde_json::json!({
+            let mut data = serde_json::json!({
                 "npub": npub,
                 "address": address,
                 "transport": transport,
                 "refreshed": refreshed,
-            }));
+            });
+            if peer_live {
+                data["detail"] = serde_json::json!(PEER_LIVE_DETAIL);
+            }
+            return Ok(data);
         }
 
         self.initiate_peer_connection(&peer_config)
@@ -3590,6 +3632,9 @@ impl Node {
         self.supervisor
             .nostr_rendezvous
             .insert_bootstrap_transport(transport_id, traversal.peer_npub.clone());
+        // The adopted transport is bound from here on, so it already counts
+        // toward `transport_mtu()`; the SYN clamp has to follow it now.
+        self.refresh_tun_mss_ceiling();
 
         let remote_addr = TransportAddr::from_string(&traversal.remote_addr.to_string());
         if let Err(err) = self
@@ -3602,6 +3647,7 @@ impl Node {
             if let Some(mut handle) = self.transports.remove(&transport_id) {
                 let _ = handle.stop().await;
             }
+            self.refresh_tun_mss_ceiling();
             return Err(err);
         }
 

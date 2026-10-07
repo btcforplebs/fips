@@ -1603,6 +1603,17 @@ impl PeerMachine {
                 actions
             }
             InboundDecision::Reject {
+                reason: InboundReject::SilentBackoff,
+            } => {
+                // The identity's recent sessions carried no frame and its
+                // back-off is running, so this msg3 promotes nothing. No peer
+                // entry exists to touch; this temporary leg is discarded,
+                // returning the msg1-allocated index.
+                let actions = vec![PeerAction::FreeIndex { index: our_index }];
+                let _ = self.fail(FailReason::Rejected);
+                actions
+            }
+            InboundDecision::Reject {
                 reason: InboundReject::DualRekeyWon,
             } => {
                 // Dual-init rekey tie-break: we win (smaller NodeAddr), drop the
@@ -2316,6 +2327,7 @@ mod tests {
             peering_idle_ms: u64::MAX,
             epoch_restart_dampened: false,
             our_node_addr: our,
+            silent_backoff: None,
         }
     }
 

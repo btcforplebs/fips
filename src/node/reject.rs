@@ -99,6 +99,11 @@ pub enum BloomReject {
     /// `max_inbound_fpr` antipoison cap. Tracked via
     /// [`BloomStats::fill_exceeded`](crate::node::stats::BloomStats).
     FillExceeded,
+    /// Announce from a tree child returns the filter we last sent it
+    /// (`BloomFilter::echoes` above `node.bloom.child_echo_threshold`).
+    /// Tracked via
+    /// [`BloomStats::child_role_rejected`](crate::node::stats::BloomStats).
+    ChildRole,
 }
 
 /// Discovery rejection reasons.
@@ -189,7 +194,8 @@ pub enum DiscoveryReject {
 /// outbound for the receiver_idx in msg2; duplicate msg1 with no stored
 /// msg2 to resend). `RekeyStaticMismatch` is carved out of the
 /// `BadState` bulk so the one attacker-driven arm in the cluster has a
-/// counter of its own.
+/// counter of its own. `SilentBackoff` covers a msg3 refused because the
+/// identity's recent sessions ended without an authenticated frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum HandshakeReject {
@@ -220,6 +226,12 @@ pub enum HandshakeReject {
     /// attacker is forging rekey msg2. Tracked via
     /// [`HandshakeStats::rekey_static_mismatch`](crate::node::stats::HandshakeStats).
     RekeyStaticMismatch,
+    /// Inbound msg3 refused, without promotion or an answer, because the
+    /// identity's last sessions at that startup epoch (three or more in a
+    /// row) ended without one authenticated frame and the back-off they
+    /// started is running. Not counted in `bad_state`. Tracked via
+    /// [`HandshakeStats::silent_backoff`](crate::node::stats::HandshakeStats).
+    SilentBackoff,
 }
 
 /// FSP session rejection reasons.
@@ -426,6 +438,7 @@ mod tests {
             BloomReject::UnknownPeer,
             BloomReject::Stale,
             BloomReject::FillExceeded,
+            BloomReject::ChildRole,
         ];
         for v in variants {
             let r = RejectReason::Bloom(v);

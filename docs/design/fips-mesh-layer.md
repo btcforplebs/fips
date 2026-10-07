@@ -159,6 +159,21 @@ handshake completes successfully, it replaces the old session. This handles
 legitimate reconnection (network change, process restart, NAT rebinding)
 without disrupting ongoing traffic until the new session is confirmed.
 
+A peer whose sessions keep ending without one authenticated frame is refused
+for a while. When three link sessions of one identity in a row, at one startup
+epoch, end without carrying an authenticated frame (removed by the link-dead
+timeout, or torn down any other way), the node stops promoting that identity's
+inbound handshakes at that epoch for 30 seconds; each further such session
+doubles the refusal, up to 10 minutes. The identity is first known at msg3, so
+the msg2 has already gone: the msg3 is dropped, with no peer entry made and
+nothing sent back. Any authenticated frame from the identity clears its
+record. A handshake at a new epoch (a restart) is not refused, handshakes on a
+link the node already holds (duplicates, rekeys, crossing dials) are handled
+as before, and the node's own dials to the peer are unaffected. A replayed
+msg1 cannot add to the count, since a session is promoted only on a msg3 bound
+to the node's fresh msg2. Each refused msg3 is counted as a `silent_backoff`
+handshake reject.
+
 ### Auto-Reconnect
 
 When MMP's liveness detection removes a peer (dead timeout exceeded), FMP

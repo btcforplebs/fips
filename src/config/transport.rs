@@ -394,6 +394,10 @@ const DEFAULT_TCP_SEND_BUF: usize = 2 * 1024 * 1024;
 /// Default maximum inbound TCP connections.
 const DEFAULT_TCP_MAX_INBOUND: usize = 256;
 
+/// Default maximum inbound TCP connections from one source (one IPv4
+/// address or one IPv6 /64).
+const DEFAULT_TCP_MAX_INBOUND_PER_SOURCE: usize = 8;
+
 /// TCP transport instance configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -430,6 +434,12 @@ pub struct TcpConfig {
     /// Maximum simultaneous inbound connections. Defaults to 256.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_inbound_connections: Option<usize>,
+
+    /// Maximum simultaneous inbound connections from one source: one IPv4
+    /// address, or one IPv6 /64. Defaults to 8. Set it at or above the
+    /// transport's inbound cap to turn the per-source limit off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_inbound_per_source: Option<usize>,
 
     /// Whether this transport should be advertised on Nostr overlay discovery.
     /// Default: false.
@@ -483,6 +493,13 @@ impl TcpConfig {
     pub fn max_inbound_connections(&self) -> usize {
         self.max_inbound_connections
             .unwrap_or(DEFAULT_TCP_MAX_INBOUND)
+    }
+
+    /// Get the maximum number of inbound connections from one source (one
+    /// IPv4 address or one IPv6 /64). Default: 8.
+    pub fn max_inbound_per_source(&self) -> usize {
+        self.max_inbound_per_source
+            .unwrap_or(DEFAULT_TCP_MAX_INBOUND_PER_SOURCE)
     }
 
     /// Whether this TCP transport should be advertised on Nostr discovery.
@@ -1076,6 +1093,13 @@ mod tests {
         assert_eq!(parse_bind_port("0.0.0.0:2121"), Some(2121));
         assert_eq!(parse_bind_port("[::]:443"), Some(443));
         assert_eq!(parse_bind_port("not-a-socket-addr"), None);
+    }
+
+    #[test]
+    fn tcp_max_inbound_per_source_defaults_to_8_and_is_read_from_yaml() {
+        assert_eq!(TcpConfig::default().max_inbound_per_source(), 8);
+        let set: TcpConfig = serde_yaml::from_str("max_inbound_per_source: 2\n").unwrap();
+        assert_eq!(set.max_inbound_per_source(), 2);
     }
 
     #[test]
