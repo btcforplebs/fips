@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `node.leaf_only` now takes effect. A leaf-only node stays reachable but
+  never carries other nodes' traffic: it sends its TreeAnnounce only to its
+  parent, advertises only itself in bloom filters, drops transit datagrams as
+  no-route, and does not forward lookups for other targets. Before this the
+  flag was reported in `show_status` and changed nothing else. No wire format
+  change.
+
 ## [0.5.3] - 2026-10-16
 
 ### Added

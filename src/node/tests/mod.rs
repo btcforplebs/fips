@@ -28,6 +28,7 @@ mod forwarding;
 mod handshake;
 mod heartbeat;
 mod lan_label;
+mod leaf_only;
 mod lookup_echo;
 mod mmp_chartests;
 mod probe;

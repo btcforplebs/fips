@@ -18,8 +18,14 @@ impl Node {
     ///
     /// Returns a map of (peer_node_addr -> filter) for peers that
     /// have sent us a FilterAnnounce.
+    ///
+    /// Empty for a leaf-only node: it advertises only itself, so no peer
+    /// learns to reach any other destination through it.
     pub(super) fn peer_inbound_filters(&self) -> BTreeMap<NodeAddr, BloomFilter> {
         let mut filters = BTreeMap::new();
+        if self.is_leaf_only() {
+            return filters;
+        }
         for (addr, peer) in &self.peers {
             if self.is_tree_peer(addr)
                 && let Some(filter) = peer.inbound_filter()
