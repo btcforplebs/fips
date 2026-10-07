@@ -3938,6 +3938,13 @@ mod tests {
         let dials2 = cross_wire(&t2, &t1, test_addr(2 + offset), l2_rx);
         t1.start_async().await.unwrap();
         t2.start_async().await.unwrap();
+        let race = Race {
+            case: &case,
+            t1: &t1,
+            t2: &t2,
+            dials1,
+            dials2,
+        };
 
         match dial {
             Dial::Probe => {
@@ -3953,7 +3960,14 @@ mod tests {
                     .unwrap();
             }
         }
-        settle().await;
+        // No gate opens until both dials are in flight. A side whose dial
+        // had not started yet would find the other's link already in its
+        // pool and never dial at all: no race, one link, and a count that
+        // can never reach two.
+        race.wait("both sides to dial", |s1, s2| {
+            s1.dials == 1 && s2.dials == 1
+        })
+        .await;
 
         // T1 completes L1 as its dialler and L2 as its acceptor; T2 the
         // reverse. A gate on a link that has already closed has no reader;
@@ -3970,14 +3984,6 @@ mod tests {
             Link::L1 => Link::L2,
             Link::L2 => Link::L1,
         };
-        let race = Race {
-            case: &case,
-            t1: &t1,
-            t2: &t2,
-            dials1,
-            dials2,
-        };
-
         open_at_t1(first_at_t1);
         race.wait("T1 to admit its first link", |s1, _| s1.admitted() == 1)
             .await;
