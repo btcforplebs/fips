@@ -49,6 +49,18 @@ pub struct TreeState {
     parent_hysteresis: f64,
     /// Flap-dampening / hold-down state machine.
     flap: FlapDampener,
+    /// Whether this node runs leaf-only (`node.leaf_only`).
+    ///
+    /// A leaf cannot carry transit, so it must never self-elect as tree root:
+    /// a leaf root announces to nobody, its peers never join under it, and it
+    /// sits on an island of its own coordinate tree. When `true`, the node is
+    /// excluded from root self-election and attaches under a peer instead,
+    /// holding that subtree's coordinate even when `self < root`. A leaf
+    /// announces only to its parent, and the parent accepts that `self < root`
+    /// entry 0 because the declaration names it as the parent
+    /// (`TreeAnnounce::validate_semantics_for`). Defaults to `false`; the shell
+    /// sets it from the config.
+    self_is_leaf: bool,
 }
 
 impl TreeState {
@@ -73,6 +85,7 @@ impl TreeState {
             announced: BTreeMap::new(),
             parent_hysteresis: 0.0,
             flap: FlapDampener::new(),
+            self_is_leaf: false,
         }
     }
 
@@ -271,10 +284,16 @@ impl TreeState {
         let parent_id = self.my_declaration.parent_id();
         if let Some(parent_coords) = self.peer_ancestry.get(parent_id) {
             let parent_root = *parent_coords.root_id();
-            if self.my_node_addr <= parent_root {
+            if !self.self_is_leaf && self.my_node_addr <= parent_root {
                 // Prepending self would put a smaller-or-equal node at depth 0,
                 // breaking the "advertised root = min path entry" invariant.
                 // Demote to self-root rather than emit a path peers will reject.
+                //
+                // A leaf is exempt: it keeps the `[self, parent, …, root]`
+                // coordinate so it lives inside its parent's tree rather than
+                // on an island of its own. It announces that coordinate only
+                // to its parent, which relaxes the root-min rule for a child's
+                // entry 0 (`validate_semantics_for`).
                 let seq = self.my_declaration.sequence();
                 let ts = self.my_declaration.timestamp();
                 self.my_declaration = ParentDeclaration::self_root(self.my_node_addr, seq, ts);
@@ -296,17 +315,35 @@ impl TreeState {
     }
 
     /// Smallest root_id visible across known peers.
+    ///
+    /// A stored path that breaks the strict root-min rule (a leaf child's
+    /// relaxed entry 0) is left out: `evaluate_parent` never adopts it, so its
+    /// root is not reachable through that peer.
     pub fn smallest_visible_root(&self) -> Option<NodeAddr> {
-        self.peer_ancestry.values().map(|c| *c.root_id()).min()
+        self.peer_ancestry
+            .values()
+            .filter(|c| is_strict_path(c))
+            .map(|c| *c.root_id())
+            .min()
     }
 
     /// Whether this node should be the tree root: either there are no peers,
     /// or our NodeAddr is `<=` every visible root.
+    ///
+    /// A leaf never self-elects as root while it has a peer to attach under;
+    /// see the `self_is_leaf` field docs. An isolated leaf (no visible root)
+    /// is still its own root, which is harmless.
     pub fn should_be_root(&self) -> bool {
         match self.smallest_visible_root() {
-            Some(sr) => self.my_node_addr <= sr,
+            Some(sr) => !self.self_is_leaf && self.my_node_addr <= sr,
             None => true,
         }
+    }
+
+    /// Mark this node as leaf-only (or not), gating it out of root
+    /// self-election. See the `self_is_leaf` field docs.
+    pub fn set_self_is_leaf(&mut self, is_leaf: bool) {
+        self.self_is_leaf = is_leaf;
     }
 
     /// Promote self to root with an incremented sequence number.
@@ -443,23 +480,9 @@ impl TreeState {
             return ParentEval::None;
         }
 
-        // Find the smallest root visible across all peers
-        let mut smallest_root: Option<NodeAddr> = None;
-        for coords in self.peer_ancestry.values() {
-            let peer_root = coords.root_id();
-            smallest_root = Some(match smallest_root {
-                None => *peer_root,
-                Some(current) => {
-                    if *peer_root < current {
-                        *peer_root
-                    } else {
-                        current
-                    }
-                }
-            });
-        }
-
-        let smallest_root = match smallest_root {
+        // Find the smallest root visible across peers whose path could be
+        // adopted (see `smallest_visible_root`).
+        let smallest_root = match self.smallest_visible_root() {
             Some(r) => r,
             None => return ParentEval::None,
         };
@@ -471,7 +494,10 @@ impl TreeState {
         // `self` to that peer's ancestry would put `self` at depth 0 and the
         // peer's larger root at the tail — violating "advertised root = min path
         // entry" and getting rejected by recipients' `validate_semantics`.
-        if self.my_node_addr <= smallest_root {
+        //
+        // A leaf is exempt: it must not self-elect as root (see the
+        // `self_is_leaf` field docs) and falls through to pick a parent.
+        if !self.self_is_leaf && self.my_node_addr <= smallest_root {
             return ParentEval::None;
         }
 
@@ -488,6 +514,12 @@ impl TreeState {
             }
             // Reject candidates whose ancestry contains us (would create a loop)
             if coords.contains(&self.my_node_addr) {
+                continue;
+            }
+            // Never adopt a path that breaks the strict root-min rule: our own
+            // path would carry that node below the root. Such a path never
+            // sets `smallest_root` either, so this is a backstop.
+            if !is_strict_path(coords) {
                 continue;
             }
             // If any peer has MMP cost data, only consider measured peers.
@@ -661,4 +693,9 @@ impl fmt::Debug for TreeState {
             .field("peers", &self.peer_count())
             .finish()
     }
+}
+
+/// Whether `coords` keeps the strict "advertised root = min path entry" rule.
+fn is_strict_path(coords: &TreeCoordinate) -> bool {
+    coords.node_addrs().min() == Some(coords.root_id())
 }

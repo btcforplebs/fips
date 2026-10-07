@@ -262,7 +262,9 @@ impl Node {
             return;
         }
 
-        if let Err(e) = announce.validate_semantics() {
+        // A leaf child may sit below the root at entry 0; only its parent
+        // accepts that (see `validate_semantics_for`).
+        if let Err(e) = announce.validate_semantics_for(Some(self.node_addr())) {
             self.metrics()
                 .tree
                 .record_reject(TreeReject::AncestryInvalid);
