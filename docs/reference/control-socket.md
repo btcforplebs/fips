@@ -174,13 +174,20 @@ not reproduced here to avoid duplicating the source.
 | `probe_poll` | `probe_id` (integer) | Reports a probe's progress. `data`: `state` (`running` / `done`) and `report`. A terminal job is removed on the poll that observes it, so the report is delivered once. |
 | `probe_cancel` | `probe_id` (integer) | Runs the probe's terminal actions immediately, without the teardown grace tick. |
 
-`connect` on a peer the node is **already connected to** neither tears the
-live link down nor ignores the address: the address is tried as an alternate
-path alongside the existing one, and the peer moves to it only if that
-handshake authenticates. The response carries `refreshed` — `true` when such a
-handshake was started, `false` when the peer is already on this exact path and
-that path is fresh (a successful no-op). A `connect` that starts an ordinary
-dial to a peer the node does not yet hold also reports `refreshed: false`.
+`connect` on a peer the node is **already connected to** never tears the
+link down. What it does depends on whether the link is live:
+
+- If the node has heard from the peer within the heartbeat interval, the link
+  is live and nothing is dialled, on this address or any other. The response
+  carries `refreshed: false` and `detail: "peer live, not dialled"`. This is a
+  successful response, not an error, so a script that re-announces a live peer
+  does not fail.
+- If the peer has gone quiet for longer than the heartbeat interval, the
+  address is dialled alongside the existing link, and the response carries
+  `refreshed: true`. This is the failover path.
+
+A `connect` that starts an ordinary dial to a peer the node does not yet hold
+reports `refreshed: false` and no `detail`.
 
 `connect` is ephemeral either way: the peer is not written to the config file
 and gets no auto-reconnect, so an attempt that fails leaves no residue.

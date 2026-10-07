@@ -576,13 +576,16 @@ async fn a_k_flipped_frame_on_the_current_index_that_fails_the_trial_still_decry
     cleanup_nodes(&mut nodes).await;
 }
 
-/// A second-path dial to an aged live peer is answered as a rekey by the
+/// A second-path dial on an aged session is answered as a rekey by the
 /// larger node and completed as a cross-connection swap by the smaller one,
 /// which keeps its K-bit. The smaller node's frames on the new session must
 /// promote the larger node's pending session, leave the two K-bits equal,
 /// and count no decryption failure.
+///
+/// The smaller node sees the larger as quiet, since a peer whose link is
+/// live is not dialled; the larger node still hears the smaller one.
 #[tokio::test]
-async fn an_alternate_path_dial_to_an_aged_live_peer_leaves_both_ends_able_to_authenticate() {
+async fn an_alternate_path_dial_on_an_aged_session_leaves_both_ends_able_to_authenticate() {
     let mut nodes = run_tree_test(2, &[(0, 1)], false).await;
     let (s, l) = if nodes[0].node.node_addr() < nodes[1].node.node_addr() {
         (0, 1)
@@ -592,6 +595,7 @@ async fn an_alternate_path_dial_to_an_aged_live_peer_leaves_both_ends_able_to_au
     let s_addr = *nodes[s].node.node_addr();
     let l_addr = *nodes[l].node.node_addr();
     age_link(&mut nodes, s, l, Duration::from_secs(31));
+    super::control::quieten(&mut nodes[s], &l_addr);
     let s_index_before = nodes[s].node.get_peer(&l_addr).unwrap().our_index();
 
     // The smaller node dials the larger one on a second address.

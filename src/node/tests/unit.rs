@@ -1441,8 +1441,20 @@ async fn node_context_mirrors_config_and_immutable_facades() {
     assert_eq!(node.config().peers()[0].npub, peer.npub());
 }
 
-#[tokio::test]
-async fn update_peers_races_new_alternative_without_dropping_active_peer() {
+/// A node holding one auto-connect UDP peer on `127.0.0.1:9`, last heard at
+/// `last_seen_ms`, and that peer's config re-announced with a second address
+/// `127.0.0.1:10`.
+struct HeldPeerUpdate {
+    node: Node,
+    new_peer: crate::config::PeerConfig,
+    peer_node_addr: NodeAddr,
+    current_addr: TransportAddr,
+    new_addr: TransportAddr,
+    link_id: LinkId,
+}
+
+/// Build a [`HeldPeerUpdate`] whose peer was last heard at `last_seen_ms`.
+async fn held_peer_with_new_address(last_seen_ms: u64) -> HeldPeerUpdate {
     // The node's *current* (pre-update) peer set must contain `old_peer`, so it
     // is baked into the Config at construction (immutable context = sole store).
     let peer_full = Identity::generate();
@@ -1479,14 +1491,14 @@ async fn update_peers_races_new_alternative_without_dropping_active_peer() {
     let peer_node_addr = *peer_identity.node_addr();
     let current_addr = TransportAddr::from_string("127.0.0.1:9");
     let new_addr = TransportAddr::from_string("127.0.0.1:10");
-    let old_link_id = LinkId::new(7);
-    let mut active_peer = ActivePeer::new(peer_identity, old_link_id, Node::now_ms());
+    let link_id = LinkId::new(7);
+    let mut active_peer = ActivePeer::new(peer_identity, link_id, last_seen_ms);
     active_peer.set_current_addr(transport_id, current_addr.clone());
     node.peers.insert(peer_node_addr, active_peer);
     node.links.insert(
-        old_link_id,
+        link_id,
         Link::connectionless(
-            old_link_id,
+            link_id,
             transport_id,
             current_addr.clone(),
             LinkDirection::Outbound,
@@ -1499,8 +1511,66 @@ async fn update_peers_races_new_alternative_without_dropping_active_peer() {
             crate::config::PeerAddress::new("udp", "127.0.0.1:9"),
             crate::config::PeerAddress::new("udp", "127.0.0.1:10"),
         ],
-        ..old_peer.clone()
+        ..old_peer
     };
+
+    HeldPeerUpdate {
+        node,
+        new_peer,
+        peer_node_addr,
+        current_addr,
+        new_addr,
+        link_id,
+    }
+}
+
+#[tokio::test]
+async fn update_peers_does_not_dial_a_new_address_for_a_live_peer() {
+    let HeldPeerUpdate {
+        mut node,
+        new_peer,
+        peer_node_addr,
+        current_addr,
+        link_id,
+        ..
+    } = held_peer_with_new_address(Node::now_ms()).await;
+
+    let outcome = node.update_peers(vec![new_peer]).await.unwrap();
+
+    assert_eq!(outcome.updated, 1);
+    assert_eq!(node.peer_count(), 1, "the live peer is kept");
+    assert_eq!(
+        node.connection_count(),
+        0,
+        "a new address for a live peer is not dialled"
+    );
+    let active = node.get_peer(&peer_node_addr).unwrap();
+    assert_eq!(active.link_id(), link_id);
+    assert_eq!(active.current_addr(), Some(&current_addr));
+
+    for transport in node.transports.values_mut() {
+        transport.stop().await.ok();
+    }
+}
+
+#[tokio::test]
+async fn update_peers_races_new_alternative_for_a_quiet_peer_without_dropping_it() {
+    // Quiet past the heartbeat interval of the config the helper builds.
+    let stale_at = Node::now_ms().saturating_sub(
+        Config::new()
+            .node
+            .heartbeat_interval_secs
+            .saturating_add(1)
+            .saturating_mul(1000),
+    );
+    let HeldPeerUpdate {
+        mut node,
+        new_peer,
+        peer_node_addr,
+        current_addr,
+        new_addr,
+        link_id,
+    } = held_peer_with_new_address(stale_at).await;
 
     let outcome = node.update_peers(vec![new_peer]).await.unwrap();
 
@@ -1514,7 +1584,7 @@ async fn update_peers_races_new_alternative_without_dropping_active_peer() {
         Some(&new_addr)
     );
     let active = node.get_peer(&peer_node_addr).unwrap();
-    assert_eq!(active.link_id(), old_link_id);
+    assert_eq!(active.link_id(), link_id);
     assert_eq!(active.current_addr(), Some(&current_addr));
 
     for transport in node.transports.values_mut() {
