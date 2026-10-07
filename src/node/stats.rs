@@ -404,6 +404,7 @@ pub struct BloomStatsSnapshot {
     pub unknown_peer: u64,
     pub stale: u64,
     pub fill_exceeded: u64,
+    pub child_role_rejected: u64,
     pub accepted: u64,
     pub sent: u64,
     pub debounce_suppressed: u64,

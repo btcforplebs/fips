@@ -13,6 +13,16 @@ use super::{Node, NodeError, diag};
 use std::collections::BTreeMap;
 use tracing::{debug, warn};
 
+/// What a rejected child announce is logged with.
+struct ChildEcho {
+    /// Share of the filter we sent that the announce contains.
+    overlap: f64,
+    /// The overlap above which the announce was rejected.
+    bound: f64,
+    /// Digest of the filter we sent, to match against our send log.
+    sent_digest: diag::Tag<8>,
+}
+
 impl Node {
     /// Collect inbound filters from all peers for outgoing filter computation.
     ///
@@ -260,6 +270,27 @@ impl Node {
             return;
         }
 
+        // Child echo guard. A tree child's filter is merged into the one we
+        // send our parent, so a child that returns what we sent it would make
+        // that filter claim everything we already know. Like the FPR cap,
+        // the rejection leaves the stored filter and filter_sequence as they
+        // were. It applies only when there is a stored filter to keep: with
+        // none, a false rejection would drop the child's subtree outright.
+        if let Some(echo) = self.child_echo(from, &announce.filter) {
+            self.metrics().bloom.record_reject(BloomReject::ChildRole);
+            warn!(
+                from = %self.peer_display_name(from),
+                seq = announce.sequence,
+                fill = format_args!("{:.3}", fill),
+                overlap = format_args!("{:.3}", echo.overlap),
+                bound = format_args!("{:.3}", echo.bound),
+                digest = %diag::filter_tag(&announce.filter),
+                sent_digest = %echo.sent_digest,
+                "FilterAnnounce from a tree child returns the filter we sent it, kept its previous filter"
+            );
+            return;
+        }
+
         self.metrics().bloom.accepted.inc();
 
         let now_ms = std::time::SystemTime::now()
@@ -295,6 +326,30 @@ impl Node {
         let peer_filters = self.peer_inbound_filters();
         self.bloom_state
             .mark_changed_peers(from, &peer_addrs, &peer_filters);
+    }
+
+    /// The readings behind rejecting `got` from `from` as a return of the
+    /// filter we last sent it, or `None` to accept it.
+    ///
+    /// Applies only when `from` is our tree child, already has a stored
+    /// filter (the one a rejection keeps), and we have sent it a filter;
+    /// the test itself is [`BloomFilter::echoes`] at
+    /// `node.bloom.child_echo_threshold`.
+    fn child_echo(&self, from: &NodeAddr, got: &BloomFilter) -> Option<ChildEcho> {
+        if self.tree_role(from) != diag::TreeRole::Child {
+            return None;
+        }
+        self.peers.get(from)?.inbound_filter()?;
+        let sent = self.bloom_state.last_sent_filter(from)?;
+        let threshold = self.config().node.bloom.child_echo_threshold;
+        if !got.echoes(sent, threshold) {
+            return None;
+        }
+        Some(ChildEcho {
+            overlap: got.overlap(sent)?,
+            bound: got.echo_bound(threshold),
+            sent_digest: diag::filter_tag(sent),
+        })
     }
 
     /// How much of the filter last sent to `from` the filter it announced

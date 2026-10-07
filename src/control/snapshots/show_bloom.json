@@ -8,6 +8,7 @@
     "sequence": 0,
     "stats": {
       "accepted": 0,
+      "child_role_rejected": 0,
       "debounce_suppressed": 0,
       "decode_error": 0,
       "fill_exceeded": 0,

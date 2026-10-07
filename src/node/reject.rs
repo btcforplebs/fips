@@ -99,6 +99,11 @@ pub enum BloomReject {
     /// `max_inbound_fpr` antipoison cap. Tracked via
     /// [`BloomStats::fill_exceeded`](crate::node::stats::BloomStats).
     FillExceeded,
+    /// Announce from a tree child returns the filter we last sent it
+    /// (`BloomFilter::echoes` above `node.bloom.child_echo_threshold`).
+    /// Tracked via
+    /// [`BloomStats::child_role_rejected`](crate::node::stats::BloomStats).
+    ChildRole,
 }
 
 /// Discovery rejection reasons.
@@ -404,6 +409,7 @@ mod tests {
             BloomReject::UnknownPeer,
             BloomReject::Stale,
             BloomReject::FillExceeded,
+            BloomReject::ChildRole,
         ];
         for v in variants {
             let r = RejectReason::Bloom(v);

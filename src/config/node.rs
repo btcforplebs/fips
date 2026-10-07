@@ -814,6 +814,15 @@ pub struct BloomConfig {
     /// different knobs.
     #[serde(default = "BloomConfig::default_max_inbound_fpr")]
     pub max_inbound_fpr: f64,
+    /// Child echo guard (`node.bloom.child_echo_threshold`): a tree child's
+    /// announce is rejected, and its previous filter kept, when it contains
+    /// more than this share of the filter we last sent it beyond what its
+    /// own fill explains by chance. Default `0.8`; meaningful in `[0.0,
+    /// 1.0)`. `1.0` or above disables the guard; below `0.0` rejects any
+    /// child filter overlapping what we sent above chance; NaN never
+    /// rejects. Counted in `bloom.child_role_rejected`.
+    #[serde(default = "BloomConfig::default_child_echo_threshold")]
+    pub child_echo_threshold: f64,
 }
 
 impl Default for BloomConfig {
@@ -821,6 +830,7 @@ impl Default for BloomConfig {
         Self {
             update_debounce_ms: Self::default_update_debounce_ms(),
             max_inbound_fpr: Self::default_max_inbound_fpr(),
+            child_echo_threshold: Self::default_child_echo_threshold(),
         }
     }
 }
@@ -831,6 +841,9 @@ impl BloomConfig {
     }
     fn default_max_inbound_fpr() -> f64 {
         0.20
+    }
+    fn default_child_echo_threshold() -> f64 {
+        0.8
     }
 }
 

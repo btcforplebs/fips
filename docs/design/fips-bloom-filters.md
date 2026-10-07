@@ -426,6 +426,31 @@ candidate evaluation cost without contributing useful discrimination.
 The cap also gates filters from feeding into mesh size estimation,
 as described above.
 
+## Child Echo Guard
+
+A tree child's inbound filter is merged into every outgoing filter,
+including the one sent to the parent. A child that returns the filter
+it was sent would make that upward filter claim everything the node
+already knows. Each `FilterAnnounce` from a tree child is therefore
+compared with the filter last sent to that child: its overlap is the
+share of the sent filter's set bits that the announced filter also
+sets. An unrelated filter overlaps at about its own fill ratio, and a
+returned one at 1.0. The announce is rejected when the overlap exceeds
+`fill + δ × (1 − fill)`, with δ = `node.bloom.child_echo_threshold`
+(default `0.8`, `1.0` disables it). The scaled form rejects a full
+return at any fill below the FPR cap while still merging a subtree
+that was already in the sent filter, as happens when a peer with
+descendants becomes a child.
+
+The guard applies only when the filter last sent to the child has at
+least 128 set bits (below that an honest child can match it by
+chance) and the child already has a stored filter. Like the FPR cap,
+a rejection is silent on the wire and leaves the stored filter and
+its sequence untouched, so the previous filter is kept. Rejections
+are counted in `bloom.child_role_rejected` and logged at WARN with
+the overlap, the bound, and the digests of both filters. Parents and
+non-tree peers are not checked.
+
 ## Implementation Status
 
 | Feature | Status |
