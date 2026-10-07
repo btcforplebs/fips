@@ -334,3 +334,43 @@ fn test_tree_announce_validate_semantics_rejects_root_with_ancestors() {
         Err(TreeError::RootDeclarationMismatch)
     ));
 }
+
+/// A leaf child's entry 0 may sit below the root, but only for the parent it
+/// names, and only entry 0.
+#[test]
+fn test_validate_semantics_for_relaxes_child_entry0_only() {
+    let leaf = make_node_addr(0);
+    let parent = make_node_addr(5);
+    let other = make_node_addr(9);
+    let root = make_node_addr(2);
+
+    let announce = TreeAnnounce::new(
+        ParentDeclaration::new(leaf, parent, 3, 1000),
+        make_coords(&[0, 5, 2]),
+    );
+    assert!(announce.validate_semantics_for(Some(&parent)).is_ok());
+    for receiver in [None, Some(&other), Some(&root)] {
+        assert!(matches!(
+            announce.validate_semantics_for(receiver),
+            Err(TreeError::AncestryRootNotMinimum { advertised, minimum })
+                if advertised == root && minimum == leaf
+        ));
+    }
+
+    // An ancestor below the root is still refused, even by the parent.
+    let deep = TreeAnnounce::new(
+        ParentDeclaration::new(leaf, parent, 3, 1000),
+        make_coords(&[0, 5, 1, 2]),
+    );
+    assert!(matches!(
+        deep.validate_semantics_for(Some(&parent)),
+        Err(TreeError::AncestryRootNotMinimum { minimum, .. }) if minimum == make_node_addr(1)
+    ));
+
+    // A root declaration gets no exemption.
+    let self_root = TreeAnnounce::new(
+        ParentDeclaration::self_root(leaf, 3, 1000),
+        make_coords(&[0]),
+    );
+    assert!(self_root.validate_semantics_for(Some(&parent)).is_ok());
+}

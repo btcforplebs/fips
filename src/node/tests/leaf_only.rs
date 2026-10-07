@@ -237,23 +237,83 @@ async fn test_leaf_does_not_forward_lookups_for_others() {
 }
 
 #[tokio::test]
-async fn test_leaf_as_root_announces_to_nobody() {
-    // Topology: leaf(0) — node1. The leaf has the smallest address, so it is
-    // root. It must not pull node1 under it.
+async fn test_smallest_leaf_attaches_below_root() {
+    // Topology: leaf(0) — node1. The leaf has the smallest address but must
+    // not self-elect: it attaches under node1, which stays root and learns
+    // the leaf as its child.
     let configs = ordered_configs(2, 0);
     let edges = vec![(0, 1)];
     let mut nodes = run_tree_test_with_configs(configs, &edges).await;
 
     let leaf_addr = *nodes[0].node.node_addr();
-    assert!(nodes[0].node.tree_state().is_root());
+    let node1_addr = *nodes[1].node.node_addr();
+    assert!(!nodes[0].node.tree_state().is_root(), "leaf self-elected");
+    assert_eq!(
+        nodes[0].node.tree_state().my_declaration().parent_id(),
+        &node1_addr
+    );
+    assert_eq!(nodes[0].node.tree_state().root(), &node1_addr);
     assert!(nodes[1].node.tree_state().is_root());
-    assert!(
+    assert_eq!(
         nodes[1]
             .node
             .tree_state()
             .peer_declaration(&leaf_addr)
-            .is_none()
+            .map(|d| *d.parent_id()),
+        Some(node1_addr),
+        "the parent must accept the leaf's below-root announce"
     );
+    assert_eq!(
+        nodes[1].node.metrics().tree.ancestry_invalid.get(),
+        0,
+        "the parent rejected the leaf's announce"
+    );
+
+    cleanup_nodes(&mut nodes).await;
+}
+
+#[tokio::test]
+async fn test_smallest_leaf_is_reachable_and_reaches_across_the_mesh() {
+    // Topology: leaf(0) — node1 — node2. Before the gate the leaf rooted an
+    // island of its own; now it shares node1's tree, node2 learns it through
+    // node1's bloom filter, and traffic flows both ways through node1.
+    let configs = ordered_configs(3, 0);
+    let edges = vec![(0, 1), (1, 2)];
+    let mut nodes = run_tree_test_with_configs(configs, &edges).await;
+    pump(&mut nodes, 5).await;
+    populate_all_coord_caches(&mut nodes);
+
+    let leaf_addr = *nodes[0].node.node_addr();
+    let node1_addr = *nodes[1].node.node_addr();
+    let node2_addr = *nodes[2].node.node_addr();
+    assert_eq!(nodes[0].node.tree_state().root(), &node1_addr);
+    assert_eq!(nodes[2].node.tree_state().root(), &node1_addr);
+    assert!(
+        nodes[2]
+            .node
+            .get_peer(&node1_addr)
+            .and_then(|p| p.inbound_filter())
+            .is_some_and(|f| f.contains(&leaf_addr)),
+        "node2 must learn the leaf through node1"
+    );
+
+    let to_leaf = SessionDatagram::new(node2_addr, leaf_addr, vec![0x10, 0x00, 0x04, 0x00, 1, 2]);
+    nodes[2]
+        .node
+        .send_encrypted_link_message(&node1_addr, &to_leaf.encode())
+        .await
+        .unwrap();
+    let from_leaf = SessionDatagram::new(leaf_addr, node2_addr, vec![0x10, 0x00, 0x04, 0x00, 3, 4]);
+    nodes[0]
+        .node
+        .send_encrypted_link_message(&node1_addr, &from_leaf.encode())
+        .await
+        .unwrap();
+    pump(&mut nodes, 5).await;
+
+    assert_eq!(counts(&nodes[1]).0, 2, "node1 should forward both ways");
+    assert_eq!(counts(&nodes[0]).2, 1, "leaf should receive its traffic");
+    assert_eq!(counts(&nodes[2]).2, 1, "node2 should receive the leaf's");
 
     cleanup_nodes(&mut nodes).await;
 }

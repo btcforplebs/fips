@@ -1128,3 +1128,75 @@ fn test_single_peer_no_reeval_benefit() {
         .switch_target();
     assert_eq!(result, None);
 }
+
+#[test]
+fn test_leaf_does_not_self_elect_when_smallest() {
+    // Leaf 0 sees peer 5 rooted at 2. A full node 0 would stay root; a leaf
+    // attaches under 5 and keeps the `[0, 5, 2]` coordinate.
+    let my_node = make_node_addr(0);
+    let peer5 = make_node_addr(5);
+    let mut state = TreeState::new(my_node, 1000);
+    state.update_peer(
+        ParentDeclaration::new(peer5, make_node_addr(2), 1, 1000),
+        make_coords(&[5, 2]),
+    );
+    assert!(state.should_be_root());
+    assert_eq!(
+        state
+            .evaluate_parent(&BTreeMap::new(), &BTreeSet::new())
+            .switch_target(),
+        None
+    );
+
+    state.set_self_is_leaf(true);
+    assert!(!state.should_be_root());
+    assert_eq!(
+        state
+            .evaluate_parent(&BTreeMap::new(), &BTreeSet::new())
+            .switch_target(),
+        Some(peer5)
+    );
+
+    state.set_parent(peer5, 2, 1001, 1_001_000);
+    state.recompute_coords();
+    assert!(!state.is_root());
+    assert_eq!(
+        state.my_coords().node_addrs().copied().collect::<Vec<_>>(),
+        [0, 5, 2].map(make_node_addr)
+    );
+    assert_eq!(state.root(), &make_node_addr(2));
+}
+
+#[test]
+fn test_relaxed_child_path_is_never_a_root_or_parent() {
+    // We are 5, rooted at 2 via 3. Leaf child 0 stores `[0, 5, 2]`: its
+    // entry 0 is below the root. It must not count as a smaller visible root,
+    // and a relaxed path must never be adopted as a parent.
+    let my_node = make_node_addr(5);
+    let mut state = TreeState::new(my_node, 1000);
+    state.update_peer(
+        ParentDeclaration::new(make_node_addr(3), make_node_addr(2), 1, 1000),
+        make_coords(&[3, 2]),
+    );
+    state.update_peer(
+        ParentDeclaration::new(make_node_addr(0), my_node, 1, 1000),
+        make_coords(&[0, 5, 2]),
+    );
+    assert_eq!(state.smallest_visible_root(), Some(make_node_addr(2)));
+
+    // A relaxed path that does not contain us (a forged one) is still not a
+    // candidate, and its root does not count.
+    let mut other = TreeState::new(make_node_addr(7), 1000);
+    other.update_peer(
+        ParentDeclaration::new(make_node_addr(0), make_node_addr(6), 1, 1000),
+        make_coords(&[0, 6, 1]),
+    );
+    assert_eq!(other.smallest_visible_root(), None);
+    assert!(other.should_be_root());
+    assert_eq!(
+        other
+            .evaluate_parent(&BTreeMap::new(), &BTreeSet::new())
+            .switch_target(),
+        None
+    );
+}
