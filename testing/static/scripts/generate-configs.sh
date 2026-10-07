@@ -194,6 +194,20 @@ generate_config() {
 
     echo "$config" > "$output_file"
 
+    # Post-process: a node marked `leaf_only: true` in the topology runs
+    # leaf-only.
+    # get_node_attr strips quoted values only, so match the bare `true` too.
+    if node_block "$topology_file" "$node_id" | grep -qE '^ *leaf_only: *"?true"? *$'; then
+        python3 -c "
+import yaml
+with open('$output_file') as f:
+    cfg = yaml.safe_load(f)
+cfg.setdefault('node', {})['leaf_only'] = True
+with open('$output_file', 'w') as f:
+    yaml.dump(cfg, f, default_flow_style=False, sort_keys=False)
+"
+    fi
+
     # Post-process: inject TCP transport config for TCP topologies
     local transport
     transport=$(get_default_transport "$topology_file")

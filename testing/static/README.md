@@ -2,7 +2,8 @@
 
 Multi-node integration test for FIPS using Docker containers with fixed
 topologies. Multiple topologies are provided: a sparse mesh (5 nodes, 6
-links), a linear chain (5 nodes, 4 links), a gateway topology (3 nodes plus a
+links), a linear chain (5 nodes, 4 links), a ring with one leaf-only node
+(5 nodes, 5 links), a gateway topology (3 nodes plus a
 non-FIPS LAN client), and three rekey variants. All exercise the full FIPS
 stack including TUN devices, DNS resolution, peer link encryption, spanning
 tree construction, and discovery-driven multi-hop routing.
