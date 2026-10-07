@@ -1,0 +1,48 @@
+# Leaf Topology Definition
+#
+# Five nodes in a ring: A — B — C — D — E — A. Node E runs leaf-only
+# (`node.leaf_only: true`). E sits on the short way round between A and D,
+# so without leaf-only D would take E as its parent (depth 2 via E against
+# 3 via C) and A ↔ D traffic would cross E. With leaf-only, E announces its
+# tree position to its parent A alone: D never sees E as a parent candidate
+# and every path between other nodes goes the long way round through B and C.
+#
+# Node addresses (SHA-256 of the pubkey, first 16 bytes) put A smallest and
+# E largest, so A is the root and E is never root.
+
+nodes:
+  a:
+    nsec: "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"
+    npub: "npub1sjlh2c3x9w7kjsqg2ay080n2lff2uvt325vpan33ke34rn8l5jcqawh57m"
+    docker_ip: "172.20.0.10"
+    peers: [b, e]
+
+  b:
+    nsec: "b102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1fb0"
+    npub: "npub1tdwa4vjrjl33pcjdpf2t4p027nl86xrx24g4d3avg4vwvayr3g8qhd84le"
+    docker_ip: "172.20.0.11"
+    peers: [a, c]
+
+  c:
+    nsec: "c102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1fc0"
+    npub: "npub1cld9yay0u24davpu6c35l4vldrhzvaq66pcqtg9a0j2cnjrn9rtsxx2pe6"
+    docker_ip: "172.20.0.12"
+    peers: [b, d]
+
+  d:
+    nsec: "d102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1fd0"
+    npub: "npub1n9lpnv0592cc2ps6nm0ca3qls642vx7yjsv35rkxqzj2vgds52sqgpverl"
+    docker_ip: "172.20.0.13"
+    peers: [c, e]
+
+  e:
+    nsec: "e102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1fe0"
+    npub: "npub1wf8akf8lu2zdkjkmwhl75pqvven654mpv4sz2x2tprl5265mgrzq8nhak4"
+    docker_ip: "172.20.0.14"
+    peers: [d, a]
+    leaf_only: true
+
+# Expected spanning tree (rooted at A):
+# - A — B — C — D (tree edges)
+# - A — E (E's parent is A; E has no children)
+# - D — E (non-tree link: D holds no tree position for E)
