@@ -978,6 +978,74 @@ async fn non_routing_parent_loss_with_only_phone_peer_self_roots() {
     cleanup_nodes(&mut nodes).await;
 }
 
+/// A NonRouting peer that declares itself root must not steer a Full node's
+/// parent choice. Its root is unreachable through it, so counting it would
+/// leave the Full node an island when its parent goes.
+///
+/// N(NonRouting) < R < B < C < A, pinned. R — B — A and R — C — A, with N
+/// linked to A only. N is forced back to a signed self-root (a stale boot
+/// declaration, or a lying phone) and announces it to A. A then loses B and
+/// must move to C, still on R.
+#[tokio::test]
+async fn non_routing_self_root_does_not_strand_full_peer() {
+    use crate::proto::fmp::NodeProfile;
+
+    // 0=N NonRouting; 1=R, 2=B, 3=C, 4=A Full.
+    let profiles = [
+        NodeProfile::NonRouting,
+        NodeProfile::Full,
+        NodeProfile::Full,
+        NodeProfile::Full,
+        NodeProfile::Full,
+    ];
+    let edges = [(1, 2), (1, 3), (2, 4), (3, 4), (0, 4)];
+    let mut nodes = run_tree_test_with_profiles_ordered(&profiles, &edges).await;
+    let n_addr = *nodes[0].node.node_addr();
+    let r_addr = *nodes[1].node.node_addr();
+    let b_addr = *nodes[2].node.node_addr();
+    let c_addr = *nodes[3].node.node_addr();
+    let a_addr = *nodes[4].node.node_addr();
+    assert_eq!(
+        nodes[4].node.tree_state().my_declaration().parent_id(),
+        &b_addr,
+        "A sits under B; {}",
+        mesh_state(&nodes)
+    );
+
+    nodes[0].node.tree_state_mut().become_root(1000);
+    {
+        let identity = nodes[0].node.identity().clone();
+        let decl = nodes[0].node.tree_state_mut().my_declaration_mut();
+        crate::node::tree::sign_declaration(decl, &identity).unwrap();
+    }
+    nodes[0]
+        .node
+        .send_tree_announce_to_peer(&a_addr)
+        .await
+        .expect("N announces its self-root to A");
+    drain_all_packets(&mut nodes, false).await;
+    assert_eq!(
+        nodes[4]
+            .node
+            .tree_state()
+            .peer_coords(&n_addr)
+            .map(|c| *c.root_id()),
+        Some(n_addr),
+        "A stored N's self-root"
+    );
+
+    nodes[4].node.remove_active_peer(&b_addr);
+    assert_eq!(
+        nodes[4].node.tree_state().my_declaration().parent_id(),
+        &c_addr,
+        "A must move to C, not strand on N's root; {}",
+        mesh_state(&nodes)
+    );
+    assert_eq!(nodes[4].node.tree_state().root(), &r_addr);
+
+    cleanup_nodes(&mut nodes).await;
+}
+
 /// Restart node `idx` with `profile` and have node `dialer` dial it. The dialer
 /// still holds the old `ActivePeer`, so its msg2 resolves as a cross-connection
 /// onto that peer rather than a fresh promotion.
