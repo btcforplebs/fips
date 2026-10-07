@@ -30,11 +30,21 @@ jobs:
   # branch/PR builds and unreleased rc tags whose GitHub source archive does not
   # exist yet. The lint fails the job on namcap error-level (E:) findings;
   # warnings (W:) are advisory. This job never publishes.
+  #
+  # The tree it builds and lints is the tree the publish job below publishes:
+  # a dispatch naming a tag checks out that tag here too, and every other
+  # trigger checks out the event's own ref, which is what the publish job
+  # resolves when no tag is given. The gate scripts and their fixture tests
+  # come from this workflow's own revision instead (gate-src), so republishing
+  # a tag cut before they existed still runs them. The job reports the commit
+  # it linted, and the publish job refuses any other.
   # ───────────────────────────────────────────────────────────────────────────
   aur-build:
     name: Build and lint fips AUR package
     runs-on: ubuntu-latest
     container: archlinux:base-devel
+    outputs:
+      linted: ${{ steps.linted.outputs.sha }}
 
     steps:
       - name: Install build and lint tooling
@@ -42,18 +52,44 @@ jobs:
           set -euo pipefail
           pacman -Sy --noconfirm --needed base-devel namcap git curl jq
 
+      # The tree to build, lint and (in the publish job) publish. inputs.tag
+      # is empty unless a dispatch names a tag, and an empty ref checks out
+      # the event's ref.
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.tag }}
+
+      # The gate scripts, from this workflow's own revision. The second path
+      # is for the publish gate's test, which discovers the real workflows
+      # relative to the script.
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          path: gate-src
+          sparse-checkout: |
+            packaging/aur
+            .github/workflows
+
+      - name: Record the commit being linted
+        id: linted
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          SHA=$(git -C "$GITHUB_WORKSPACE" rev-parse 'HEAD^{commit}')
+          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+          echo "Linting ${SHA} (${INPUT_TAG:-$GITHUB_REF})"
 
       - name: Test the publish gate
         # Fixture tests for the script the publish job below waits with. They
         # run here, on every trigger, so a change to the gate is exercised
         # before a release tag depends on it.
-        run: bash packaging/aur/test-await-package-runs.sh
+        run: bash gate-src/packaging/aur/test-await-package-runs.sh
 
       - name: Test the namcap gate
         # Fixture tests, with canned namcap output, for the script the lint
         # below runs namcap through.
-        run: bash packaging/aur/test-namcap-gate.sh
+        run: bash gate-src/packaging/aur/test-namcap-gate.sh
 
       - name: Resolve package version
         id: ver
@@ -99,7 +135,7 @@ jobs:
         # dependency, and checks the gate passes the first and fails the others
         # with this run's namcap. Runs as the build user because makepkg
         # refuses root and because that is how the lint below runs.
-        run: sudo -u builder bash packaging/aur/test-namcap-gate.sh --live
+        run: sudo -u builder bash gate-src/packaging/aur/test-namcap-gate.sh --live
 
       - name: Build a local source tarball of the checkout
         env:
@@ -132,10 +168,13 @@ jobs:
       - name: makepkg build and namcap lint (as build user)
         run: |
           set -euo pipefail
+          # The gate comes from gate-src (see the checkouts above). sudo resets
+          # the environment, so the path is relative to packaging/aur.
           sudo -u builder bash -euo pipefail -c '
             cd packaging/aur
+            gate=../../gate-src/packaging/aur/namcap-gate.sh
             echo "::group::namcap PKGBUILD"
-            bash namcap-gate.sh PKGBUILD
+            bash "$gate" PKGBUILD
             echo "::endgroup::"
             echo "::group::makepkg build"
             # No --nocheck. makepkg runs check() by default, so every AUR user
@@ -145,7 +184,7 @@ jobs:
             makepkg -s --noconfirm
             echo "::endgroup::"
             echo "::group::namcap built package"
-            bash namcap-gate.sh ./*.pkg.tar.*
+            bash "$gate" ./*.pkg.tar.*
             echo "::endgroup::"
           '
 
@@ -158,6 +197,10 @@ jobs:
   # pushes: the AUR must not point at a tag whose release assets are still
   # uploading or failed, and once it does, withdrawing the tag breaks the AUR
   # package (its b2sum pins the tag's source archive).
+  #
+  # Before anything else it checks that the tag resolves to the commit
+  # aur-build built and linted, so a tag moved between the two jobs, or an
+  # edit that makes the two checkouts diverge, stops the publish.
   # ───────────────────────────────────────────────────────────────────────────
   aur-publish-fips:
     name: Publish fips to AUR
@@ -207,6 +250,22 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ steps.tag.outputs.tag }}
+
+      - name: Refuse a commit aur-build did not lint
+        env:
+          LINTED: ${{ needs.aur-build.outputs.linted }}
+        run: |
+          set -euo pipefail
+          SHA=$(git rev-parse 'HEAD^{commit}')
+          if [ -z "${LINTED:-}" ]; then
+            echo "::error::aur-build reported no linted commit; refusing to publish ${SHA}"
+            exit 1
+          fi
+          if [ "$SHA" != "$LINTED" ]; then
+            echo "::error::aur-build linted ${LINTED}, but the tag resolves to ${SHA}; refusing to publish"
+            exit 1
+          fi
+          echo "Publishing ${SHA}, the commit aur-build linted"
 
       # The gate script comes from this workflow's own revision, not the tag:
       # a dispatch republishing a tag cut before the gate existed would not
