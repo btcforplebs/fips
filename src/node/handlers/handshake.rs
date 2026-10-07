@@ -940,8 +940,17 @@ impl Node {
             };
 
             // Process peer's FMP negotiation payload from msg2
-            if let Some(neg_bytes) = &received_negotiation {
-                match process_fmp_negotiation(our_profile, machine, neg_bytes) {
+            // The payload carries the peer's profile; without it the peer would
+            // be promoted as Full and skip `validate_profiles`, so a missing
+            // payload fails the same way an invalid one does.
+            {
+                let negotiated = match &received_negotiation {
+                    Some(neg_bytes) => process_fmp_negotiation(our_profile, machine, neg_bytes),
+                    None => Err(crate::proto::Error::Malformed(
+                        "missing FMP negotiation payload",
+                    )),
+                };
+                match negotiated {
                     Ok(()) => {}
                     Err(e) => {
                         warn!(link_id = %link_id, our_profile = %our_profile, error = %e, "FMP negotiation failed");
@@ -1606,8 +1615,17 @@ impl Node {
                 };
 
             // Process peer's FMP negotiation payload from msg3
-            if let Some(neg_bytes) = &received_negotiation {
-                match process_fmp_negotiation(our_profile, machine, neg_bytes) {
+            // The payload carries the peer's profile; without it the peer would
+            // be promoted as Full and skip `validate_profiles`, so a missing
+            // payload fails the same way an invalid one does.
+            {
+                let negotiated = match &received_negotiation {
+                    Some(neg_bytes) => process_fmp_negotiation(our_profile, machine, neg_bytes),
+                    None => Err(crate::proto::Error::Malformed(
+                        "missing FMP negotiation payload",
+                    )),
+                };
+                match negotiated {
                     Ok(()) => {}
                     Err(e) => {
                         warn!(link_id = %link_id, our_profile = %our_profile, error = %e, "FMP negotiation failed");
