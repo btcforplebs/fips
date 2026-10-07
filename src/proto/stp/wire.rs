@@ -46,7 +46,26 @@ impl TreeAnnounce {
     /// - for a non-root declaration, the second ancestry entry matches `parent_id`
     /// - the final ancestry entry is the advertised root
     /// - the advertised root is the smallest `node_addr` in the ancestry
+    ///
+    /// This is the strict rule. See
+    /// [`validate_semantics_for`](Self::validate_semantics_for) for the leaf
+    /// child exemption.
     pub fn validate_semantics(&self) -> Result<(), TreeError> {
+        self.validate_semantics_for(None)
+    }
+
+    /// [`validate_semantics`](Self::validate_semantics) as seen by `receiver`,
+    /// with the root-min rule relaxed for a child's own entry.
+    ///
+    /// A leaf-only node never self-elects as root, even when it is the
+    /// smallest node it can see, so its coordinate may carry itself below the
+    /// root at entry 0. It announces only to its parent, so when the
+    /// declaration names `receiver` as the parent, entry 0 is exempt. The
+    /// advertised root must still be the smallest of the remaining entries.
+    /// The exemption is safe because the stored path contains `receiver`, so
+    /// `evaluate_parent` never adopts it, and a path that breaks the strict
+    /// rule is never counted toward the smallest visible root.
+    pub fn validate_semantics_for(&self, receiver: Option<&NodeAddr>) -> Result<(), TreeError> {
         let entries = self.ancestry.entries();
         let declared_node = *self.declaration.node_addr();
         let declared_parent = *self.declaration.parent_id();
@@ -73,7 +92,13 @@ impl TreeAnnounce {
         }
 
         let advertised_root = *self.ancestry.root_id();
-        let minimum = entries
+        // A non-root declaration has at least two entries (checked above), so
+        // skipping entry 0 for a child of `receiver` leaves one to take the
+        // min of.
+        let relaxed = !self.declaration.is_root()
+            && receiver.is_some_and(|r| r == self.declaration.parent_id());
+        let checked = if relaxed { &entries[1..] } else { entries };
+        let minimum = checked
             .iter()
             .map(|entry| entry.node_addr)
             .min()
