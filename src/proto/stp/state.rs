@@ -329,10 +329,17 @@ impl TreeState {
     /// itself root (a stale boot declaration, or a false one: the profile is
     /// self-declared) hide every real candidate from `evaluate_parent` and
     /// stop `should_be_root_skipping` from ever firing.
+    ///
+    /// A stored path that breaks the strict root-min rule is left out for the
+    /// same reason: `evaluate_parent` never adopts it, so its root is not
+    /// reachable either. That covers a peer that came back Full while its old
+    /// relaxed NonRouting path is still stored.
     fn smallest_root_excluding(&self, skip_peers: &BTreeSet<NodeAddr>) -> Option<NodeAddr> {
         self.peer_ancestry
             .iter()
-            .filter(|(peer_id, _)| !skip_peers.contains(peer_id))
+            .filter(|(peer_id, c)| {
+                !skip_peers.contains(peer_id) && c.node_addrs().min() == Some(c.root_id())
+            })
             .map(|(_, c)| *c.root_id())
             .min()
     }
@@ -558,7 +565,8 @@ impl TreeState {
             // (`validate_semantics_from`), and adopting such a peer would put
             // it below the root in our own path, which every peer rejects.
             // `skip_peers` already excludes non-Full peers; this catches a
-            // relaxed path however it got here.
+            // relaxed path however it got here. Such a path never sets
+            // `smallest_root` either, so this check is a backstop.
             if coords.node_addrs().min() != Some(coords.root_id()) {
                 continue;
             }

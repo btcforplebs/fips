@@ -619,6 +619,31 @@ fn test_skipped_peer_root_does_not_hide_real_candidates() {
 }
 
 #[test]
+fn test_relaxed_path_root_does_not_hide_real_candidates() {
+    // A peer that came back Full can still hold its old relaxed path until it
+    // next announces. That path's root is not reachable through it, so it
+    // must not count toward the smallest root. Self (5) has Full C [4, 2] and
+    // the unskipped stale path [0, 3, 1] (entry 0 below root 1).
+    let my_node = make_node_addr(5);
+    let mut state = TreeState::new(my_node, 1000);
+    let c = make_node_addr(4);
+    let stale = make_node_addr(0);
+    state.update_peer(
+        ParentDeclaration::new(c, make_node_addr(2), 1, 1000),
+        make_coords(&[4, 2]),
+    );
+    state.update_peer(
+        ParentDeclaration::new(stale, make_node_addr(3), 1, 1000),
+        make_coords(&[0, 3, 1]),
+    );
+    assert!(matches!(
+        state.evaluate_parent(&BTreeMap::new(), &BTreeSet::new()),
+        ParentEval::Mandatory(p) if p == c
+    ));
+    assert_eq!(state.smallest_visible_root(), Some(make_node_addr(2)));
+}
+
+#[test]
 fn test_should_be_root_skipping_ignores_skipped_roots() {
     let my_node = make_node_addr(2);
     let mut state = TreeState::new(my_node, 1000);
