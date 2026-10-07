@@ -161,6 +161,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a typo'd interface name were previously the same flat
   `StartFailed(String)`; nothing downstream could branch on absence.
 
+#### Native datagram API
+
+- `show_routing` reports `pending_native_destinations` and
+  `pending_native_datagrams`: the native API datagrams held for destinations
+  whose session is not yet up, and how many destinations hold any, beside
+  `pending_tun_destinations` and `pending_tun_packets`. The queue is bounded
+  per destination and by the number of destinations, and nothing previously
+  showed a client filling it toward that cap. These count outbound datagrams,
+  unlike `show_native_flows`' per-flow queued count, which covers inbound
+  ones.
+
 #### Packaging
 
 - An RPM package for Fedora and RHEL (`packaging/rpm/`,
@@ -352,9 +363,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   check) read it live. A node could therefore report one effective IPv6 MTU
   and clamp to another. The ceiling is now shared with those threads and
   recomputed whenever the bound set changes, in both directions: a narrow
-  interface appearing tightens it, and its departure releases it. MSS is
-  negotiated per connection, so a change applies to connections opened after
-  it; existing ones are not disturbed.
+  interface appearing tightens it, and its departure releases it. Adopting a
+  NAT-traversal transport, and dropping a bootstrap transport nothing uses any
+  more, count as such changes, so the clamp agrees with the Packet Too Big
+  threshold through hole punching as well. MSS is negotiated per connection,
+  so a change applies to connections opened after it; existing ones are not
+  disturbed.
 
 - Rebinds that keep succeeding into a socket that dies moments later are
   damped: consecutive bindings shorter than ten seconds back off on the
@@ -437,6 +451,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   old target still parses and simply stops matching, so the symptom is missing
   log lines rather than an error. Update `RUST_LOG` filters, journal-watch
   recipes and any log-scraping alert accordingly.
+
+- Runtime peer updates (`update_peers`) and `fipsctl connect` no longer dial a
+  new address for a peer whose link is live, matching discovery. Such a dial
+  did not move the link: it re-keyed it, or left the peer holding a session the
+  dialer never adopted, which blocked the dialer's own rekeys until that
+  session was retired. A peer quiet for longer than
+  `node.heartbeat_interval_secs` is still dialled on the new address, so
+  failover is unchanged. `fipsctl connect` to a live peer succeeds with
+  `refreshed: false` and a new `detail: "peer live, not dialled"` field.
 
 #### Packaging
 
@@ -571,10 +594,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   path, alternate included. **One behaviour goes with it.** A peer held on an
   adopted NAT-traversal transport that is *also* reachable by Ethernet or BLE
   beacon used to drift onto the local path on the next discovery tick, and now
-  stays on the traversed path for as long as that path answers. Migrating it is
-  still done by the configured-peer refresh (a config reload, a runtime peer
-  update, or `fipsctl connect`), and a traversed link that goes quiet still
-  releases the peer to every path.
+  stays on the traversed path for as long as that path answers. A runtime peer
+  update or `fipsctl connect` does not move it either (see Changed), and a
+  traversed link that goes quiet still releases the peer to every path.
 
 - A peer that rotates its address no longer keeps sending from a socket
   aimed where it used to be. The authenticated-frame path updated the
@@ -967,9 +989,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   indefinitely. The bound follows `node.heartbeat_interval_secs`,
   `node.link_dead_timeout_secs`, `node.tick_interval_secs` and the handshake
   resend settings.
+- Inbound TCP connections are now also limited per source, so one host can no
+  longer take every inbound slot. By default a single IPv4 address, or a
+  single IPv6 /64, may hold 8 at once (`transports.tcp.max_inbound_per_source`;
+  a value at or above the transport's inbound cap turns the limit off). A
+  refused connection is closed at once and counted in `connections_rejected`
+  and in the new `source_rejected` statistic. A node that receives inbound TCP
+  through a local proxy (sslh, stunnel, a userland port forwarder) sees every
+  peer arrive from the proxy's address and should raise the limit.
+- A peer that completes msg1 and then never sends an authenticated frame can
+  no longer make the node set up a new link for it on every msg1. Each such
+  link cost a msg2, a tree announce and a stale peer entry until the link-dead
+  timeout removed it. After three links in a row from one identity end without
+  an authenticated frame, at one startup epoch, the node drops that identity's
+  msg1s at that epoch unanswered for 30 seconds, doubling with each further
+  silent link up to 10 minutes. Any authenticated frame from the identity
+  clears the record. A msg1 at a new epoch (a restart) is never refused, a
+  resend of the msg1 an existing link was set up from is still answered, and
+  the node's own dials to the peer are unaffected. Refused msg1s are counted
+  as a new `silent_backoff` handshake reject, apart from `bad_state`, and
+  `HandshakeStats` and `HandshakeStatsSnapshot` gain a public `silent_backoff`
+  field.
 
 #### Routing and discovery
 
+- A tree child's bloom filter that returns most of the filter this node sent
+  it is now rejected, and the child's previous filter kept. A child's filter
+  is merged into every filter the node sends, including the one to its parent,
+  so a child announcing back what it was sent made the node's upward filter
+  claim the whole mesh, which the false-positive cap cannot tell apart from an
+  honest whole-mesh view. The check compares each announce from a tree child
+  with the filter last sent to it, and leaves room for a subtree already
+  present in what was sent. It applies only when the filter sent has at least
+  128 set bits and the child already has a stored filter, so a false rejection
+  never drops a child's subtree outright; parents and non-tree peers are not
+  checked. Rejections are counted as `child_role_rejected` in `show_bloom`
+  and logged at WARN. The threshold is `node.bloom.child_echo_threshold`
+  (default 0.8; 1.0 or above turns the check off).
 - A single forged or reflected `PathBroken` signal no longer deletes
   coordinates a node verified by lookup. A verified entry is kept while a
   fresh lookup re-validates it. It is demoted to an unverified hint only when
