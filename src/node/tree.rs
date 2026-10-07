@@ -827,28 +827,48 @@ impl Node {
     /// it by restarting, which changes its startup epoch. A different profile
     /// on the epoch we already hold is refused (the old profile is kept);
     /// otherwise a connected peer could flip it on every re-dial and churn our
-    /// bloom filter and parent choice. When applied, the new epoch is recorded
-    /// so the same change cannot be replayed on it.
+    /// bloom filter and parent choice. Any new epoch is recorded, changed
+    /// profile or not, so a change can never be replayed on it, and the
+    /// peer's now-stale end-to-end session is dropped.
     pub(in crate::node) fn refresh_peer_profile(
         &mut self,
         node_addr: &NodeAddr,
         profile: Option<NodeProfile>,
         remote_epoch: Option<[u8; 8]>,
     ) {
-        let Some(profile) = profile else {
+        let Some(peer) = self.peers.get_mut(node_addr) else {
             return;
         };
+        // Record a new epoch whether or not the profile changed, as the rekey
+        // install does; otherwise a restart with an unchanged profile would
+        // leave the old epoch stored and let one later same-epoch flip through.
+        let restarted = matches!(
+            (peer.remote_epoch(), remote_epoch),
+            (Some(stored), Some(new)) if stored != new
+        );
+        if restarted {
+            peer.set_remote_epoch(remote_epoch);
+            // The peer restarted, so its end-to-end session is stale, as on
+            // the restart arm of `promote_connection`. With the new epoch now
+            // stored, a later inbound dial from it no longer reads as a
+            // restart, so this is the only place left to clear it.
+            if self.sessions.remove(node_addr).is_some() {
+                debug!(
+                    peer = %self.peer_display_name(node_addr),
+                    "Cleared stale FSP session after peer restart on cross-connection"
+                );
+            }
+        }
         let Some(peer) = self.peers.get_mut(node_addr) else {
+            return;
+        };
+        let Some(profile) = profile else {
             return;
         };
         let old = peer.peer_profile();
         if old == profile {
             return;
         }
-        let restarted = matches!(
-            (peer.remote_epoch(), remote_epoch),
-            (Some(stored), Some(new)) if stored != new
-        );
         if !restarted {
             warn!(
                 peer = %self.peer_display_name(node_addr),
@@ -858,7 +878,6 @@ impl Node {
             );
             return;
         }
-        peer.set_remote_epoch(remote_epoch);
         peer.set_peer_profile(profile);
         info!(
             peer = %self.peer_display_name(node_addr),
