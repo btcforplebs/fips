@@ -463,6 +463,73 @@ fn test_skipped_parent_forces_mandatory_switch() {
 }
 
 #[test]
+fn test_relaxed_path_is_never_a_parent_candidate() {
+    // A stored path whose entry 0 sits below the root (a non-Full sender's
+    // relaxed announce) must never be adopted, even if the peer is missing
+    // from `skip_peers`: our own path would then carry it below the root.
+    // Self (5) is root; peer 1 holds the relaxed path [1, 3, 2].
+    let my_node = make_node_addr(5);
+    let mut state = TreeState::new(my_node, 1000);
+    let relaxed = make_node_addr(1);
+    state.update_peer(
+        ParentDeclaration::new(relaxed, make_node_addr(3), 1, 1000),
+        make_coords(&[1, 3, 2]),
+    );
+    assert!(matches!(
+        state.evaluate_parent(&BTreeMap::new(), &BTreeSet::new()),
+        ParentEval::None
+    ));
+
+    // Control: a strictly valid path to the same root is adopted.
+    let full = make_node_addr(4);
+    state.update_peer(
+        ParentDeclaration::new(full, make_node_addr(3), 1, 1000),
+        make_coords(&[4, 3, 2]),
+    );
+    assert!(matches!(
+        state.evaluate_parent(&BTreeMap::new(), &BTreeSet::new()),
+        ParentEval::Mandatory(p) if p == full
+    ));
+}
+
+#[test]
+fn test_non_full_self_attaches_below_root() {
+    // A non-Full node that is the smallest it can see must not self-elect: it
+    // attaches under its Full peer and keeps the relaxed `[self, …, root]`
+    // coordinate, which receivers accept for a non-Full sender only.
+    let my_node = make_node_addr(1);
+    let mut state = TreeState::new(my_node, 1000);
+    state.set_self_non_full(true);
+    let full = make_node_addr(3);
+    state.update_peer(
+        ParentDeclaration::new(full, make_node_addr(2), 1, 1000),
+        make_coords(&[3, 2]),
+    );
+    assert!(!state.should_be_root());
+    let ParentEval::Mandatory(p) = state.evaluate_parent(&BTreeMap::new(), &BTreeSet::new()) else {
+        panic!("non-Full self must attach under its Full peer");
+    };
+    assert_eq!(p, full);
+    state.set_parent(full, 1, 1000, 1000);
+    state.recompute_coords();
+    let path: Vec<_> = state.my_coords().node_addrs().copied().collect();
+    assert_eq!(
+        path,
+        [1, 3, 2].map(make_node_addr).to_vec(),
+        "non-Full self keeps the relaxed coordinate"
+    );
+    assert_eq!(state.root(), &make_node_addr(2));
+
+    // Control: the same position as Full demotes to a self-root.
+    let mut full_self = TreeState::new(my_node, 1000);
+    full_self.update_peer(
+        ParentDeclaration::new(full, make_node_addr(2), 1, 1000),
+        make_coords(&[3, 2]),
+    );
+    assert!(full_self.should_be_root());
+}
+
+#[test]
 fn test_recover_skips_non_full_peers() {
     // Parent-loss recovery must honour the same parent-candidacy skip as the
     // announce and periodic paths. Self (5) loses its Full parent (1); the
@@ -600,7 +667,7 @@ fn test_leaf_does_not_self_elect_and_selects_full_upstream() {
     let real_root = make_node_addr(2); // the upstream is rooted here
 
     let mut state = TreeState::new(leaf, 1000);
-    state.set_self_is_leaf(true);
+    state.set_self_non_full(true);
     state.update_peer(
         ParentDeclaration::new(upstream, real_root, 1, 1000),
         make_coords(&[3, 2]),
@@ -645,13 +712,13 @@ fn test_leaf_keeps_coord_under_larger_rooted_parent() {
     // only via the coords carried on its session frames, which are not
     // root-min validated). Contrast with
     // test_recompute_coords_demotes_when_self_smaller_than_parent_root, where a
-    // Full self in the same position (default self_is_leaf=false) demotes.
+    // Full self in the same position (default self_non_full=false) demotes.
     let leaf = make_node_addr(1);
     let upstream = make_node_addr(3);
     let real_root = make_node_addr(2);
 
     let mut state = TreeState::new(leaf, 1000);
-    state.set_self_is_leaf(true);
+    state.set_self_non_full(true);
     state.update_peer(
         ParentDeclaration::new(upstream, real_root, 1, 1000),
         make_coords(&[3, 2]),

@@ -334,3 +334,59 @@ fn test_tree_announce_validate_semantics_rejects_root_with_ancestors() {
         Err(TreeError::RootDeclarationMismatch)
     ));
 }
+
+/// A non-Full sender's own entry may sit below the root; nothing else may.
+#[test]
+fn test_validate_semantics_from_relaxes_non_full_entry0_only() {
+    // Sender 1 is below root 2; its parent is 3.
+    let sender = make_node_addr(1);
+    let parent = make_node_addr(3);
+    let root = make_node_addr(2);
+    let relaxed = TreeAnnounce::new(
+        ParentDeclaration::new(sender, parent, 5, 1000),
+        make_coords(&[1, 3, 2]),
+    );
+
+    // A non-Full sender may carry itself below the root at entry 0.
+    assert!(relaxed.validate_semantics_from(false).is_ok());
+    // A Full sender sending the same shape is still rejected.
+    assert!(matches!(
+        relaxed.validate_semantics_from(true),
+        Err(TreeError::AncestryRootNotMinimum {
+            advertised,
+            minimum,
+        }) if advertised == root && minimum == sender
+    ));
+    assert!(relaxed.validate_semantics().is_err());
+
+    // Relaxed entry 0 plus an ancestor below the root: rejected for anyone.
+    let deep = TreeAnnounce::new(
+        ParentDeclaration::new(sender, make_node_addr(4), 5, 1000),
+        make_coords(&[1, 4, 0, 2]),
+    );
+    assert!(matches!(
+        deep.validate_semantics_from(false),
+        Err(TreeError::AncestryRootNotMinimum {
+            advertised,
+            minimum,
+        }) if advertised == root && minimum == make_node_addr(0)
+    ));
+
+    // The other structural checks still apply to a non-Full sender.
+    let wrong_parent = TreeAnnounce::new(
+        ParentDeclaration::new(sender, make_node_addr(4), 5, 1000),
+        make_coords(&[1, 3, 2]),
+    );
+    assert!(matches!(
+        wrong_parent.validate_semantics_from(false),
+        Err(TreeError::AncestryParentMismatch { .. })
+    ));
+    let root_with_ancestors = TreeAnnounce::new(
+        ParentDeclaration::self_root(sender, 5, 1000),
+        make_coords(&[1, 3, 2]),
+    );
+    assert!(matches!(
+        root_with_ancestors.validate_semantics_from(false),
+        Err(TreeError::RootDeclarationMismatch)
+    ));
+}
