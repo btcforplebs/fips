@@ -884,23 +884,103 @@ async fn same_epoch_profile_change_on_cross_connection_is_refused() {
     cleanup_nodes(&mut nodes).await;
 }
 
+/// A restart with an unchanged profile still records the new epoch, so a
+/// later same-epoch profile change is refused, and drops the restarted peer's
+/// stale end-to-end session.
+///
+/// Chain A(Full, pinned smallest, root) — P(Full) — B(Full), with a B->P
+/// session. P restarts Full (new epoch E2) and B re-dials it: only the epoch
+/// changes. P is then rebuilt as NonRouting keeping E2, and B re-dials again.
+/// B must still hold P as Full, because E2 is already stored.
+#[tokio::test]
+async fn unchanged_profile_restart_records_epoch_for_later_refusal() {
+    use crate::proto::fmp::NodeProfile;
+
+    let profiles = [NodeProfile::Full, NodeProfile::Full, NodeProfile::Full];
+    let edges = [(0, 1), (1, 2)];
+    let mut nodes = run_tree_test_with_profiles_leaf_smallest(&profiles, 0, &edges).await;
+    let p_addr = *nodes[1].node.node_addr();
+    populate_all_coord_caches(&mut nodes);
+    let p_pubkey = nodes[1].node.identity().pubkey_full();
+    nodes[2]
+        .node
+        .initiate_session(p_addr, p_pubkey)
+        .await
+        .expect("B->P session");
+    drain_all_packets(&mut nodes, false).await;
+    assert!(
+        nodes[2].node.sessions.contains_key(&p_addr),
+        "precondition: B holds an end-to-end session with P"
+    );
+
+    restart_with_profile_and_redial(&mut nodes, 1, NodeProfile::Full, 2).await;
+    let e2 = nodes[1].node.startup_epoch();
+    assert!(
+        !nodes[2].node.sessions.contains_key(&p_addr),
+        "the restarted P's stale session is dropped along with the epoch update"
+    );
+    assert_eq!(
+        nodes[2]
+            .node
+            .get_peer(&p_addr)
+            .and_then(|p| p.remote_epoch()),
+        Some(e2),
+        "B records P's new epoch even though its profile did not change"
+    );
+
+    let mut config = Config::new();
+    config.node.disable_routing = true;
+    let mut rebuilt = restarted_node(&nodes[1], config);
+    rebuilt.node.replace_context(|ctx| ctx.startup_epoch = e2);
+    drop(std::mem::replace(&mut nodes[1], rebuilt));
+    initiate_handshake(&mut nodes, 2, 1).await;
+    drain_all_packets(&mut nodes, false).await;
+
+    assert_eq!(
+        nodes[2].node.get_peer(&p_addr).map(|p| p.peer_profile()),
+        Some(NodeProfile::Full),
+        "a same-epoch flip after an unchanged-profile restart is refused"
+    );
+    assert!(
+        !nodes[2]
+            .node
+            .bloom_state
+            .leaf_dependents()
+            .contains(&p_addr)
+    );
+
+    cleanup_nodes(&mut nodes).await;
+}
+
 /// A peer that comes back Full becomes a parent candidate again, with no
 /// leftover leaf-dependent entry.
 ///
-/// Chain A(Full, pinned smallest, root) — P(NonRouting) — B(Full). B cannot
-/// use P, so it is its own root. P restarts Full and B re-dials it; after P's
+/// Chain A(Full, root) — P(NonRouting) — B(Full), addresses pinned A < B < P.
+/// B cannot use P, so it is its own root. P restarts Full and B re-dials it; after P's
 /// fresh announce B attaches under P toward A.
 #[tokio::test]
 async fn peer_back_as_full_on_cross_connection_becomes_candidate() {
     use crate::proto::fmp::NodeProfile;
 
-    let profiles = [
-        NodeProfile::Full,
-        NodeProfile::NonRouting,
-        NodeProfile::Full,
-    ];
+    // Pin A < B < P. B must win the cross-connection tie-break (smaller
+    // outbound wins) so it swaps to the new session: on a loss it keeps its
+    // inbound session from P's previous run, which the restarted P cannot
+    // read, a separate outbound-restart gap in upstream.
+    let mut ids: Vec<crate::Identity> = (0..3).map(|_| crate::Identity::generate()).collect();
+    ids.sort_by(|x, y| x.node_addr().cmp(y.node_addr()));
+    let mut non_routing = Config::new();
+    non_routing.node.disable_routing = true;
+    // 0=A Full, 1=P NonRouting, 2=B Full.
     let edges = [(0, 1), (1, 2)];
-    let mut nodes = run_tree_test_with_profiles_leaf_smallest(&profiles, 0, &edges).await;
+    let mut nodes = pinned_tree(
+        vec![
+            (Config::new(), ids[0].clone()),
+            (non_routing, ids[2].clone()),
+            (Config::new(), ids[1].clone()),
+        ],
+        &edges,
+    )
+    .await;
     let a_addr = *nodes[0].node.node_addr();
     let p_addr = *nodes[1].node.node_addr();
     assert!(
@@ -915,10 +995,12 @@ async fn peer_back_as_full_on_cross_connection_becomes_candidate() {
             .contains(&p_addr)
     );
 
-    restart_with_profile_and_redial(&mut nodes, 1, NodeProfile::Full, 2).await;
-    // A re-dials P too (the same cross-connection path), so P regains a path
-    // to A and its announce to B carries it.
-    initiate_handshake(&mut nodes, 0, 1).await;
+    // P restarts Full. A re-dials it first so P already has its path to A
+    // when B re-dials, and announces that path on the new link (a second
+    // announce could be held by the rate limit until a tick this test does
+    // not run).
+    restart_with_profile_and_redial(&mut nodes, 1, NodeProfile::Full, 0).await;
+    initiate_handshake(&mut nodes, 2, 1).await;
     drain_all_packets(&mut nodes, false).await;
 
     assert_eq!(
