@@ -477,14 +477,19 @@ ci_teardown() {
 
     # 2. Remove all compose projects + direct-run resources + per-run images
     #    for this run, plus any host veth interface a chaos scenario was
-    #    killed part-way through creating. Host interfaces carry no docker
-    #    label, so hand over the suffixes this run's scenarios used and let
-    #    the reap derive their names — a blind sweep would take a concurrent
-    #    run's live interfaces with it. ci-cleanup.sh wraps each docker op in
-    #    `timeout`; bound the whole sweep too so the trap can never wedge.
-    #    Its stdout is routine progress and goes nowhere, but stderr carries
-    #    only a skipped sweep or a bad option, and a sweep that quietly stops
-    #    reaping is how interfaces would accumulate unnoticed. Let it through.
+    #    killed part-way through creating. The images are the two built
+    #    above, which --images names, and the fipsci_<run>_<suite>-<service>
+    #    images compose builds, which the reap finds by run label and project
+    #    prefix. They go on a red run too: an image is reproducible from the
+    #    commit, so it is never the evidence of a failure. Host interfaces
+    #    carry no docker label, so hand over the suffixes this run's scenarios
+    #    used and let the reap derive their names — a blind sweep would take a
+    #    concurrent run's live interfaces with it. ci-cleanup.sh wraps each
+    #    docker op in `timeout`; bound the whole sweep too so the trap can
+    #    never wedge. Its stdout is routine progress and goes nowhere, but
+    #    stderr carries only a skipped sweep, an image it failed to remove, or
+    #    a bad option, and a sweep that quietly stops reaping is how
+    #    interfaces and images would accumulate unnoticed. Let it through.
     local _suffixes=() _entry
     for _entry in "${CHAOS_SUITES[@]}"; do
         _suffixes+=("$(ci_chaos_suffix "${_entry%% *}")")

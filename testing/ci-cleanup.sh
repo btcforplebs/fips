@@ -12,7 +12,14 @@
 #   2. The compose project-name prefix  fipsci_  (every compose project ci-local
 #      starts is named  fipsci_<run-id>_<suite>, so its containers/networks/
 #      volumes all carry  com.docker.compose.project=fipsci_...  and are named
-#      with that prefix).
+#      with that prefix, and every image compose builds for a service with no
+#      image: key is named  <project>-<service>).
+#
+# For images, "everything" means the run's labelled images and its compose-built
+# fipsci_ images, which is what a run killed with SIGKILL leaves behind. The
+# suites that build under a fixed tag (fips-deb-test, fips-dns-test,
+# fips-tarball-test, fips-interop) are outside it by design: each overwrites one
+# tag rather than adding an image per run.
 #
 # The generic CI label is shared by every run on the host, so an unscoped label
 # sweep would tear down a CONCURRENT run's resources. So would an unscoped
@@ -56,7 +63,9 @@
 #                                       concurrent run regardless of P
 #   ci-cleanup.sh --label L             Override the CI label (default above)
 #   ci-cleanup.sh --images "a b,c"      Also `docker rmi -f` these image tags
-#                                       (space- or comma-separated)
+#                                       (space- or comma-separated), in
+#                                       addition to the images the label and
+#                                       project sweeps find
 #   ci-cleanup.sh --veth-suffixes "a b" Restrict the host veth sweep to the
 #                                       name suffixes a single run used
 #                                       (space- or comma-separated). Without
@@ -299,12 +308,62 @@ reap_veths() {
     sed 's/^/link delete /' <<< "$names" | veth_ip_batch
 }
 
-reap_images() {
-    [[ -z "$IMAGES" ]] && return 0
-    local imgs
+image_warn() { echo "ci-cleanup: $*" >&2; }
+
+# Tagged images as repository:tag, optionally narrowed by `docker image ls`
+# arguments. Untagged entries are dropped: removal goes by name and never by
+# ID, because removing an ID takes every tag it carries, including one that
+# somebody else gave the same image. Fails only when the listing itself does.
+image_names() {
+    local out
+    out="$(timeout "$TMO" docker image ls "$@" --format '{{.Repository}}:{{.Tag}}' 2>/dev/null)" \
+        || return 1
+    grep -v -e '<none>' -e '^$' <<< "$out" || true
+}
+
+# Every image name this reap owns, one per line: the --images list, every image
+# carrying the sweep label, and every compose-built image of a matched project.
+# Compose names an image it builds <project>-<service>, and `docker image ls
+# --format` cannot read image labels, so the project images are matched by name
+# the way reap_networks matches networks. The prefix is anchored on the `_` that
+# ends the run id: run abc-12 must not reach run abc-123's images, and run ids
+# vary in length, so concurrent runs on one commit can stand in that relation.
+image_targets() {
+    local anchor all labelled img imgs=()
+    anchor="$PROJECT_PREFIX"
+    [[ "$anchor" == *_ ]] || anchor="${anchor}_"
     read -ra imgs <<< "${IMAGES//,/ }"
-    [[ ${#imgs[@]} -eq 0 ]] && return 0
-    timeout "$TMO" docker rmi -f "${imgs[@]}" >/dev/null 2>&1 || true
+    labelled="$(image_names --filter "label=${SWEEP_LABEL}")" \
+        || image_warn "image listing by label failed, label sweep skipped"
+    all="$(image_names)" \
+        || image_warn "image listing failed, compose image sweep skipped"
+    {
+        for img in "${imgs[@]}"; do
+            # A bare name means :latest, which is how the listing spells it.
+            [[ "${img##*/}" == *:* ]] || img="${img}:latest"
+            printf '%s\n' "$img"
+        done
+        printf '%s\n' "$labelled"
+        grep -E "^${anchor}" <<< "$all" || true
+    } | grep -v '^$' | sort -u
+}
+
+# Remove this reap's images, then list again and report on stderr whatever is
+# still there. The reap stays best-effort and exits 0 regardless, so without
+# the report a teardown that stopped removing images would look exactly like
+# one that had nothing to remove.
+reap_images() {
+    local targets left
+    targets="$(image_targets)"
+    [[ -z "$targets" ]] && return 0
+    xargs -r timeout "$TMO" docker rmi -f <<< "$targets" >/dev/null 2>&1 || true
+    if ! left="$(image_names)"; then
+        image_warn "image listing failed, cannot confirm image removal"
+        return 0
+    fi
+    left="$(grep -Fx -f <(printf '%s\n' "$targets") <<< "$left" || true)"
+    [[ -z "$left" ]] && return 0
+    image_warn "$(grep -c . <<< "$left") image(s) not removed: $(paste -sd' ' <<< "$left")"
 }
 
 # Per-run build contexts left in the working tree. ci-local.sh removes its own
