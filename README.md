@@ -12,6 +12,13 @@ infrastructure.
 > FIPS is under active development. The protocol and APIs are not
 > yet stable. See [Status & roadmap](#status--roadmap) below.
 
+> **Fork branch `nostr-vault`:** a v0.5.2 stopgap for the Nostr Vault
+> app (leaf-only nodes, offer re-send, leaf never self-roots). Its
+> tree-validation relaxation is keyed on the declared parent, unlike
+> upstream `next`'s profile-keyed rule. Retire this branch as a whole
+> when the app moves to v1.0; do not merge it forward or reconcile it
+> with `next`.
+
 ## What FIPS does
 
 A machine running FIPS becomes a node in the mesh with a self-generated
