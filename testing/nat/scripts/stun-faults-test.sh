@@ -268,14 +268,28 @@ preflight_assert_stun_active() {
 # ran otherwise leaves a clean "passed" standing for work not done.
 SKIPPED_PHASES=()
 
+# Start the lab. The step is checked here because this runs under
+# relay_lab_start's caller's `||`, where `set -e` does not stop on a failure.
+start_lab() {
+    "${COMPOSE[@]}" --profile "$PROFILE" up -d --no-build --force-recreate || return 1
+    return 0
+}
+
 run_test() {
     echo "=== stun-faults-test: setup ==="
     cleanup
     "$GENERATE_SCRIPT" "$SCENARIO"
     # Build first, with retries, because the build pulls from registries that
-    # time out now and then; the start is not retried, since it is the test.
+    # time out now and then. The start is retried only when the relay faulted
+    # in its start window, a strfry crash at the nodes' first connects that
+    # reproduces with upstream's own image and config (relay-verdict.sh). A
+    # start that fails for any other reason is not retried, and a relay fault
+    # after the window still fails the run through assert_relay.
     retry_build "compose build ($PROFILE)" "${COMPOSE[@]}" --profile "$PROFILE" build
-    "${COMPOSE[@]}" --profile "$PROFILE" up -d --no-build --force-recreate
+    relay_lab_start "$RELAY_CONTAINER" 2 45 start_lab cleanup || {
+        dump_diagnostics
+        return 1
+    }
 
     # Give the daemons time to come up. Both fault-node and fault-peer
     # need to start, publish their adverts to the relay, and discover

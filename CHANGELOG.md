@@ -913,6 +913,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that covers most of the mesh turned every lookup between it and the parent
   into a two-way echo, multiplying duplicate traffic and dedup-cache evictions.
 
+- A node whose tree parent moves to a worse root, for example after losing its
+  own uplink, now switches at once to a peer still on the better root. It used
+  to follow the parent to the worse root and stay there until its next
+  periodic parent check, up to a minute later, so the mesh could briefly hold
+  two roots.
+
 #### Sessions and rekey
 
 - A link rekey whose msg2 is lost now completes on the initiator's next msg1

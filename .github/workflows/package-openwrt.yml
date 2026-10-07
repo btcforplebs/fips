@@ -516,8 +516,11 @@ jobs:
           path: dist/${{ env.PACKAGE_FILENAME }}
           retention-days: 30
 
+      # Blossom and NIP-94 publication is for release tags only; branch, PR and
+      # dispatch-from-branch runs build and verify packages but announce nothing.
       - name: Upload to Blossom
         id: blossom_upload
+        if: startsWith(github.ref, 'refs/tags/')
         continue-on-error: true
         shell: bash
         env:
@@ -560,7 +563,7 @@ jobs:
 
       - name: Publish NIP-94 release event
         id: publish
-        if: steps.blossom_upload.outcome == 'success'
+        if: startsWith(github.ref, 'refs/tags/') && steps.blossom_upload.outcome == 'success'
         shell: bash
         env:
           RELAYS: "wss://relay.damus.io wss://nos.lol wss://nostr.mom wss://offchain.pub"
@@ -609,7 +612,7 @@ jobs:
           echo "Published NIP-94 event: $EVENT_ID"
 
       - name: Verify NIP-94 event on relays
-        if: ${{ steps.publish.outputs.eventId != '' }}
+        if: ${{ startsWith(github.ref, 'refs/tags/') && steps.publish.outputs.eventId != '' }}
         env:
           EVENT_ID: ${{ steps.publish.outputs.eventId }}
           RELAYS: "wss://relay.damus.io wss://nos.lol wss://nostr.mom wss://offchain.pub"
@@ -891,6 +894,7 @@ jobs:
 
       - name: Upload to Blossom
         id: blossom_upload
+        if: startsWith(github.ref, 'refs/tags/')
         continue-on-error: true
         shell: bash
         env:
@@ -933,7 +937,7 @@ jobs:
 
       - name: Publish NIP-94 release event
         id: publish
-        if: steps.blossom_upload.outcome == 'success'
+        if: startsWith(github.ref, 'refs/tags/') && steps.blossom_upload.outcome == 'success'
         shell: bash
         env:
           RELAYS: "wss://relay.damus.io wss://nos.lol wss://nostr.mom wss://offchain.pub"

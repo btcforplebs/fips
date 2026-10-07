@@ -486,14 +486,19 @@ ci_teardown() {
 
     # 2. Remove all compose projects + direct-run resources + per-run images
     #    for this run, plus any host veth interface a chaos scenario was
-    #    killed part-way through creating. Host interfaces carry no docker
-    #    label, so hand over the suffixes this run's scenarios used and let
-    #    the reap derive their names — a blind sweep would take a concurrent
-    #    run's live interfaces with it. ci-cleanup.sh wraps each docker op in
-    #    `timeout`; bound the whole sweep too so the trap can never wedge.
-    #    Its stdout is routine progress and goes nowhere, but stderr carries
-    #    only a skipped sweep or a bad option, and a sweep that quietly stops
-    #    reaping is how interfaces would accumulate unnoticed. Let it through.
+    #    killed part-way through creating. The images are the two built
+    #    above, which --images names, and the fipsci_<run>_<suite>-<service>
+    #    images compose builds, which the reap finds by run label and project
+    #    prefix. They go on a red run too: an image is reproducible from the
+    #    commit, so it is never the evidence of a failure. Host interfaces
+    #    carry no docker label, so hand over the suffixes this run's scenarios
+    #    used and let the reap derive their names — a blind sweep would take a
+    #    concurrent run's live interfaces with it. ci-cleanup.sh wraps each
+    #    docker op in `timeout`; bound the whole sweep too so the trap can
+    #    never wedge. Its stdout is routine progress and goes nowhere, but
+    #    stderr carries only a skipped sweep, an image it failed to remove, or
+    #    a bad option, and a sweep that quietly stops reaping is how
+    #    interfaces and images would accumulate unnoticed. Let it through.
     local _suffixes=() _entry
     for _entry in "${CHAOS_SUITES[@]}"; do
         _suffixes+=("$(ci_chaos_suffix "${_entry%% *}")")
@@ -1770,8 +1775,8 @@ run_portable_atomics() {
 # No bare mktemp result may become a docker bind-mount source. Under a private
 # /tmp, which the builder's CI worker has, the daemon cannot see that path and
 # mounts an empty directory instead, which no GitHub runner shows. Static, plus
-# a self-test of the shared_tmpdir helper; about a second. Not yet mirrored in
-# ci.yml's ci-parity job.
+# a self-test of the shared_tmpdir helper; about a second. Mirrored in ci.yml's
+# ci-parity job by hand.
 run_mount_tmpdir() {
     local rc=0
     info "[mount-tmpdir] Checking that no bind-mount source comes from a bare mktemp"
@@ -1827,6 +1832,19 @@ run_wait_converge() {
     info "[wait-converge] Running convergence-gate unit tests"
     bash "$SCRIPT_DIR/lib/wait-converge-test.sh" || rc=$?
     record "wait-converge" $rc
+}
+
+# Unit tests for the NAT lab's start retry and relay guard. Hermetic: docker
+# and sleep are stubbed, no containers, about a second. The NAT suites decide
+# through relay_lab_start whether a relay fault at start is retried, and a
+# regression there either hides a relay crash or reds a suite on strfry's own
+# start fault, so it is gated here, before anything is built.
+run_relay_verdict_test() {
+    local rc=0
+    info "[relay-verdict] Running the NAT lab relay start and guard unit tests"
+    bash "$SCRIPT_DIR/lib/relay-verdict-test.sh" || rc=$?
+    record "relay-verdict" $rc
+    return 0
 }
 
 # The package versions the packaging workflows derive for a release tag, a
@@ -1888,6 +1906,7 @@ main() {
     run_mount_tmpdir
     run_shellcheck
     run_wait_converge
+    run_relay_verdict_test
     run_package_versions
     run_nextest_flaky
     run_glibc_floor
