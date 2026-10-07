@@ -103,6 +103,14 @@ impl Node {
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
 
+        if !self.may_send_tree_announce(peer_addr) {
+            trace!(
+                peer = %self.peer_display_name(peer_addr),
+                "Leaf-only: not announcing tree position to a non-parent peer"
+            );
+            return Ok(());
+        }
+
         // Check rate limit
         let peer = match self.peers.get_mut(peer_addr) {
             Some(p) => p,

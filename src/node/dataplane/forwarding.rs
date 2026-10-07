@@ -61,11 +61,15 @@ impl Node {
         // LRU-touch side effect scoped to genuine forwards, as it was when the
         // TTL test ran inline ahead of it. Warming above has already run, so
         // the resolution observes freshly cached coords.
-        let next_hop = if datagram_ref.dest_addr != my_addr && datagram_ref.ttl > 1 {
-            self.resolve_next_hop(&datagram_ref.dest_addr)
-        } else {
-            None
-        };
+        //
+        // A leaf-only node never forwards: transit datagrams resolve no next
+        // hop and take the NoRoute path, which signals the source as usual.
+        let next_hop =
+            if datagram_ref.dest_addr != my_addr && datagram_ref.ttl > 1 && !self.is_leaf_only() {
+                self.resolve_next_hop(&datagram_ref.dest_addr)
+            } else {
+                None
+            };
 
         // Read local congestion once and reuse it for both the CE decision
         // (via the view) and the congestion metric/log below, keeping
