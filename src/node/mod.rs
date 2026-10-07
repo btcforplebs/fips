@@ -2274,6 +2274,8 @@ impl Node {
             .collect();
         let routing_view = snap::RoutingView {
             pending_lookups,
+            pending_native_destinations: self.pending_native_destinations(),
+            pending_native_datagrams: self.pending_native_datagrams(),
             pending_tun_destinations: self.pending_tun_destinations(),
             pending_tun_packets: self.pending_tun_total_packets(),
             recent_requests: self.recent_request_count(),
@@ -3479,6 +3481,31 @@ impl Node {
     /// Total TUN packets queued across all destinations.
     pub fn pending_tun_total_packets(&self) -> usize {
         self.pending_tun_packets.values().map(|q| q.len()).sum()
+    }
+
+    /// Count of destinations with native datagrams held awaiting session setup.
+    pub(crate) fn pending_native_destinations(&self) -> usize {
+        self.pending_native.len()
+    }
+
+    /// Total native datagrams held across all destinations.
+    pub(crate) fn pending_native_datagrams(&self) -> usize {
+        self.pending_native.values().map(|q| q.len()).sum()
+    }
+
+    /// Queue a native datagram for a destination directly (for tests that need
+    /// a held native queue without driving a native API client).
+    #[cfg(test)]
+    pub(crate) fn queue_pending_native_for_test(&mut self, dest: NodeAddr, payload: Vec<u8>) {
+        let key = crate::native::registry::FlowKey {
+            peer: dest,
+            remote: 1,
+            local: 1,
+        };
+        self.pending_native
+            .entry(dest)
+            .or_default()
+            .push_back(crate::node::handlers::PendingNative { key, payload });
     }
 
     /// Iterate over retry state for diagnostics.

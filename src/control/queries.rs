@@ -1528,6 +1528,8 @@ pub fn show_routing(node: &Node) -> Value {
         "coord_cache_entries": cache_stats.entries,
         "identity_cache_entries": node.identity_cache_len(),
         "pending_lookups": lookups,
+        "pending_native_destinations": node.pending_native_destinations(),
+        "pending_native_datagrams": node.pending_native_datagrams(),
         "pending_tun_destinations": node.pending_tun_destinations(),
         "pending_tun_packets": node.pending_tun_total_packets(),
         "recent_requests": node.recent_request_count(),
@@ -1586,6 +1588,8 @@ pub(crate) fn show_routing_from_handle(handle: &super::read_handle::ControlReadH
         "coord_cache_entries": routing.cache.count,
         "identity_cache_entries": routing.identity.entries.len(),
         "pending_lookups": lookups,
+        "pending_native_destinations": view.pending_native_destinations,
+        "pending_native_datagrams": view.pending_native_datagrams,
         "pending_tun_destinations": view.pending_tun_destinations,
         "pending_tun_packets": view.pending_tun_packets,
         "recent_requests": view.recent_requests,
@@ -3367,6 +3371,42 @@ mod tests {
                 "{cmd} must fall through to the rx_loop command path"
             );
         }
+    }
+
+    /// Native datagrams held for a destination whose session is not up are
+    /// reported by both `show_routing` renderers, and the two agree when the
+    /// queue is non-empty (`routing_snapshot_matches_on_loop_after_tick` runs
+    /// with it empty, where a missed publish and a correct one both render 0).
+    #[test]
+    fn show_routing_reports_held_native_datagrams_from_the_live_node_and_from_the_tick_snapshot_identically()
+     {
+        let mut node = build_test_node();
+        let dest_a = NodeAddr::from_bytes([0xa1; 16]);
+        let dest_b = NodeAddr::from_bytes([0xb2; 16]);
+        node.queue_pending_native_for_test(dest_a, vec![1, 2, 3]);
+        node.queue_pending_native_for_test(dest_a, vec![4, 5]);
+        node.queue_pending_native_for_test(dest_b, vec![6]);
+
+        node.record_stats_history();
+        let handle = node.control_read_handle();
+
+        let on_loop = show_routing(&node);
+        let off_loop = show_routing_from_handle(&handle);
+        for (label, value) in [("on-loop", &on_loop), ("off-loop", &off_loop)] {
+            assert_eq!(
+                value["pending_native_destinations"], 2,
+                "{label} show_routing counts destinations with held native datagrams"
+            );
+            assert_eq!(
+                value["pending_native_datagrams"], 3,
+                "{label} show_routing counts held native datagrams across destinations"
+            );
+        }
+        assert_eq!(
+            render(on_loop),
+            render(off_loop),
+            "off-loop show_routing must match on-loop output with native datagrams held"
+        );
     }
 
     /// The tick-published `RoutingSnapshot` reflects node state, and each

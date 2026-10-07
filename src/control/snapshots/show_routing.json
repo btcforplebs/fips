@@ -117,6 +117,8 @@
       "resp_unsolicited": 0
     },
     "pending_lookups": [],
+    "pending_native_datagrams": 0,
+    "pending_native_destinations": 0,
     "pending_tun_destinations": 0,
     "pending_tun_packets": 0,
     "recent_requests": 0,

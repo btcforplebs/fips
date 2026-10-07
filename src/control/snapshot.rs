@@ -358,6 +358,8 @@ pub(crate) struct CacheEntryRow {
 #[derive(Clone, Default)]
 pub(crate) struct RoutingView {
     pub pending_lookups: Vec<PendingLookupRow>,
+    pub pending_native_destinations: usize,
+    pub pending_native_datagrams: usize,
     pub pending_tun_destinations: usize,
     pub pending_tun_packets: usize,
     pub recent_requests: usize,

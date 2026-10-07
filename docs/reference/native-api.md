@@ -475,7 +475,9 @@ handshake. What holds it is bounded twice: at
 which a further datagram evicts the oldest one held, and at
 `node.session.pending_max_destinations` destinations, past which a new
 destination's datagram is dropped outright. The defaults are 16 and 256.
-Neither eviction reaches the caller.
+Neither eviction reaches the caller. The node reports what it holds in
+`show_routing`, as `pending_native_destinations` (destinations with a datagram
+held) and `pending_native_datagrams` (datagrams held across all of them).
 
 **An outbound datagram after the MTU has fallen.** `max_payload()` is a
 snapshot taken at setup. The daemon re-checks each outbound datagram against
