@@ -811,12 +811,6 @@ impl Node {
         }
     }
 
-    /// Handle tree state cleanup when a peer is removed.
-    ///
-    /// Called from `remove_active_peer`. If the removed peer was our parent,
-    /// attempts to find an alternative or becomes root.
-    ///
-    /// Returns `true` if our tree state changed (caller should announce).
     /// Apply a peer profile learned on a cross-connection handshake to an
     /// already-active peer.
     ///
@@ -828,10 +822,18 @@ impl Node {
     /// in the skip set). Its next announce re-enters the tree view under the
     /// new profile, so an ancestry accepted under the old profile is never
     /// used under the new one.
+    ///
+    /// A node's profile is fixed at startup, so an honest peer can only change
+    /// it by restarting, which changes its startup epoch. A different profile
+    /// on the epoch we already hold is refused (the old profile is kept);
+    /// otherwise a connected peer could flip it on every re-dial and churn our
+    /// bloom filter and parent choice. When applied, the new epoch is recorded
+    /// so the same change cannot be replayed on it.
     pub(in crate::node) fn refresh_peer_profile(
         &mut self,
         node_addr: &NodeAddr,
         profile: Option<NodeProfile>,
+        remote_epoch: Option<[u8; 8]>,
     ) {
         let Some(profile) = profile else {
             return;
@@ -843,6 +845,20 @@ impl Node {
         if old == profile {
             return;
         }
+        let restarted = matches!(
+            (peer.remote_epoch(), remote_epoch),
+            (Some(stored), Some(new)) if stored != new
+        );
+        if !restarted {
+            warn!(
+                peer = %self.peer_display_name(node_addr),
+                old = %old,
+                declared = %profile,
+                "Peer declared a different profile without restarting; keeping the old one"
+            );
+            return;
+        }
+        peer.set_remote_epoch(remote_epoch);
         peer.set_peer_profile(profile);
         info!(
             peer = %self.peer_display_name(node_addr),
@@ -867,6 +883,12 @@ impl Node {
         }
     }
 
+    /// Handle tree state cleanup when a peer is removed.
+    ///
+    /// Called from `remove_active_peer`. If the removed peer was our parent,
+    /// attempts to find an alternative or becomes root.
+    ///
+    /// Returns `true` if our tree state changed (caller should announce).
     pub(super) fn handle_peer_removal_tree_cleanup(&mut self, node_addr: &NodeAddr) -> bool {
         let was_parent =
             !self.tree_state.is_root() && self.tree_state.my_declaration().parent_id() == node_addr;

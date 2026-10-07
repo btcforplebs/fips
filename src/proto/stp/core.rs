@@ -133,7 +133,7 @@ impl Stp {
                 new_parent,
                 new_seq,
             }
-        } else if !tree.is_root() && tree.should_be_root() {
+        } else if !tree.is_root() && (tree.should_be_root() || tree.parent_is_skipped(skip)) {
             TreeDecision::SelfRoot
         } else if !tree.is_root() && *tree.my_declaration().parent_id() == from {
             // Same parent: loop if parent's ancestry now contains us, else the
@@ -184,7 +184,7 @@ impl Stp {
                 new_parent,
                 new_seq,
             }
-        } else if !tree.is_root() && tree.should_be_root() {
+        } else if !tree.is_root() && (tree.should_be_root() || tree.parent_is_skipped(skip)) {
             TreeDecision::SelfRoot
         } else {
             TreeDecision::PeriodicRebroadcast

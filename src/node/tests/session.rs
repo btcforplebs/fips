@@ -829,6 +829,61 @@ async fn parent_back_as_non_full_on_cross_connection_is_dropped() {
     cleanup_nodes(&mut nodes).await;
 }
 
+/// A profile change without a restart is refused.
+///
+/// Chain A(Full, pinned smallest, root) — P(Full) — B(Full); B's parent is P.
+/// P is rebuilt as NonRouting but keeps its startup epoch (an honest node
+/// cannot do this; its profile is fixed until it restarts), and B re-dials it.
+/// B must keep P's profile, its dependents and its parent unchanged.
+#[tokio::test]
+async fn same_epoch_profile_change_on_cross_connection_is_refused() {
+    use crate::proto::fmp::NodeProfile;
+
+    let profiles = [NodeProfile::Full, NodeProfile::Full, NodeProfile::Full];
+    let edges = [(0, 1), (1, 2)];
+    let mut nodes = run_tree_test_with_profiles_leaf_smallest(&profiles, 0, &edges).await;
+    let p_addr = *nodes[1].node.node_addr();
+    let old_epoch = nodes[1].node.startup_epoch();
+    assert_eq!(
+        nodes[2].node.tree_state().my_declaration().parent_id(),
+        &p_addr
+    );
+
+    let mut config = Config::new();
+    config.node.disable_routing = true;
+    let mut rebuilt = restarted_node(&nodes[1], config);
+    rebuilt
+        .node
+        .replace_context(|ctx| ctx.startup_epoch = old_epoch);
+    drop(std::mem::replace(&mut nodes[1], rebuilt));
+    initiate_handshake(&mut nodes, 2, 1).await;
+    drain_all_packets(&mut nodes, false).await;
+
+    assert_eq!(
+        nodes[1].node.node_profile(),
+        NodeProfile::NonRouting,
+        "precondition: P now declares NonRouting"
+    );
+    assert_eq!(
+        nodes[2].node.get_peer(&p_addr).map(|p| p.peer_profile()),
+        Some(NodeProfile::Full),
+        "B must keep P's profile when the epoch did not change"
+    );
+    assert!(
+        !nodes[2]
+            .node
+            .bloom_state
+            .leaf_dependents()
+            .contains(&p_addr)
+    );
+    assert_eq!(
+        nodes[2].node.tree_state().my_declaration().parent_id(),
+        &p_addr
+    );
+
+    cleanup_nodes(&mut nodes).await;
+}
+
 /// A peer that comes back Full becomes a parent candidate again, with no
 /// leftover leaf-dependent entry.
 ///
