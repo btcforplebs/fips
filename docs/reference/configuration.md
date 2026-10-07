@@ -797,6 +797,7 @@ overhead.
 | `transports.tcp.recv_buf_size` | usize | `2097152` | Socket receive buffer size in bytes (2 MB) |
 | `transports.tcp.send_buf_size` | usize | `2097152` | Socket send buffer size in bytes (2 MB) |
 | `transports.tcp.max_inbound_connections` | usize | `256` | Maximum simultaneous inbound connections |
+| `transports.tcp.max_inbound_per_source` | usize | `8` | Maximum simultaneous inbound connections from one source: one IPv4 address, or one IPv6 /64. Refusals are counted in the `source_rejected` statistic. To turn the limit off, set it at or above the transport's inbound cap (`max_inbound_connections`, or `node.limits.max_connections` when that is unset). If inbound TCP reaches FIPS through a local proxy (sslh, stunnel, a userland port forwarder), every peer arrives from the proxy's address and shares this limit; raise it. |
 | `transports.tcp.advertise_on_nostr` | bool | `false` | Include this TCP transport in Nostr endpoint adverts |
 | `transports.tcp.external_addr` | string | *(none)* | Explicit advertise-as override. Bare IP or full `host:port`. **Required** when `bind_addr` is wildcard (e.g. `"0.0.0.0:443"`) and `advertise_on_nostr: true`, since TCP has no STUN equivalent for autodiscovery. Common on cloud 1:1 NAT / EIP setups where the public IP isn't bindable on the host. |
 
@@ -1420,6 +1421,7 @@ transports:
   #   recv_buf_size: 2097152         # 2 MB
   #   send_buf_size: 2097152         # 2 MB
   #   max_inbound_connections: 256   # resource protection limit
+  #   max_inbound_per_source: 8      # per IPv4 address or IPv6 /64
   # tor:                             # uncomment to enable Tor transport
   #   mode: "socks5"                 # "socks5", "control_port", or "directory"
   #   socks5_addr: "127.0.0.1:9050" # SOCKS5 proxy address

@@ -21,6 +21,10 @@ pub struct TcpStats {
     pub connections_established: AtomicU64,
     pub connections_accepted: AtomicU64,
     pub connections_rejected: AtomicU64,
+    /// Inbound connections refused because their source (one IPv4 address
+    /// or one IPv6 /64) already held `max_inbound_per_source` connections.
+    /// Each is also counted in `connections_rejected`.
+    pub source_rejected: AtomicU64,
     /// Outbound connects, inline or in the background, that did not complete
     /// within `connect_timeout_ms`.
     pub connect_timeouts: AtomicU64,
@@ -49,6 +53,7 @@ impl TcpStats {
             connections_established: AtomicU64::new(0),
             connections_accepted: AtomicU64::new(0),
             connections_rejected: AtomicU64::new(0),
+            source_rejected: AtomicU64::new(0),
             connect_timeouts: AtomicU64::new(0),
             connect_refused: AtomicU64::new(0),
             pool: PoolCounters::new(),
@@ -95,6 +100,12 @@ impl TcpStats {
     /// Record a rejected inbound connection.
     pub fn record_connection_rejected(&self) {
         self.connections_rejected.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record an inbound connection refused by the per-source limit. The
+    /// caller records it in `connections_rejected` as well.
+    pub fn record_source_rejected(&self) {
+        self.source_rejected.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record a connect timeout.
@@ -146,6 +157,7 @@ impl TcpStats {
             connections_established: self.connections_established.load(Ordering::Relaxed),
             connections_accepted: self.connections_accepted.load(Ordering::Relaxed),
             connections_rejected: self.connections_rejected.load(Ordering::Relaxed),
+            source_rejected: self.source_rejected.load(Ordering::Relaxed),
             connect_timeouts: self.connect_timeouts.load(Ordering::Relaxed),
             connect_refused: self.connect_refused.load(Ordering::Relaxed),
             pool_inbound: self.pool.inbound_count(),
@@ -173,6 +185,7 @@ pub struct TcpStatsSnapshot {
     pub connections_established: u64,
     pub connections_accepted: u64,
     pub connections_rejected: u64,
+    pub source_rejected: u64,
     pub connect_timeouts: u64,
     pub connect_refused: u64,
     pub pool_inbound: u64,

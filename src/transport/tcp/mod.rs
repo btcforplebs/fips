@@ -234,6 +234,7 @@ impl TcpTransport {
             let cfg = AcceptConfig {
                 mtu: self.config.mtu(),
                 max_inbound: self.effective_max_inbound(),
+                source_cap: self.config.max_inbound_per_source(),
                 nodelay: self.config.nodelay(),
                 keepalive_secs: self.config.keepalive_secs(),
                 recv_buf: self.config.recv_buf_size(),
@@ -1007,6 +1008,9 @@ impl InboundDeadline {
 struct AcceptConfig {
     mtu: u16,
     max_inbound: usize,
+    /// Most inbound connections one source (IPv4 address or IPv6 /64) may
+    /// hold at once.
+    source_cap: usize,
     nodelay: bool,
     keepalive_secs: u64,
     recv_buf: usize,
@@ -1027,6 +1031,7 @@ async fn accept_loop(
     let AcceptConfig {
         mtu,
         max_inbound,
+        source_cap,
         nodelay,
         keepalive_secs,
         recv_buf,
@@ -1068,6 +1073,25 @@ async fn accept_loop(
                         peer_addr = %peer_addr,
                         max = max_inbound,
                         "Rejecting inbound TCP connection (max_inbound_connections reached)"
+                    );
+                    continue;
+                }
+
+                // Per-source cap: one address (or IPv6 /64) may not take
+                // every inbound slot. Counted from the pool rather than a
+                // separate per-source counter so it cannot drift from it.
+                // This loop is the only inserter of inbound entries, so
+                // between here and the insert below the count can only fall.
+                let from_source = inbound_from_source(&*pool.lock().await, peer_addr.ip());
+                if from_source >= source_cap {
+                    stats.record_connection_rejected();
+                    stats.record_source_rejected();
+                    debug!(
+                        transport_id = %transport_id,
+                        peer_addr = %peer_addr,
+                        open_from_source = from_source,
+                        max = source_cap,
+                        "Rejecting inbound TCP connection (max_inbound_per_source reached)"
                     );
                     continue;
                 }
@@ -1178,16 +1202,11 @@ async fn accept_loop(
                     id,
                 };
 
-                let mut pool_guard = pool.lock().await;
-                pool_guard.insert(key, conn);
-                // Counted under the lock already held for the insert, and
-                // only when the line below will be logged.
-                let open_from_source = if tracing::enabled!(tracing::Level::DEBUG) {
-                    inbound_from_source(&pool_guard, peer_addr.ip())
-                } else {
-                    0
-                };
-                drop(pool_guard);
+                pool.lock().await.insert(key, conn);
+                // The count taken at the gate plus this connection. It can
+                // read one high if a connection from the same source closed
+                // since the gate.
+                let open_from_source = from_source + 1;
 
                 stats.record_connection_accepted();
                 stats.record_pool_inbound_added();
@@ -4106,6 +4125,134 @@ mod tests {
         transport.stop_async().await.unwrap();
     }
 
+    fn source_capped_config(source_cap: usize) -> TcpConfig {
+        TcpConfig {
+            max_inbound_per_source: Some(source_cap),
+            ..capped_config(16)
+        }
+    }
+
+    /// Open a connection to `listen` that sends one msg1 frame, and wait
+    /// for the frame to be delivered.
+    async fn admitted_peer(listen: SocketAddr, rx: &mut crate::transport::PacketRx) -> TcpStream {
+        let mut peer = TcpStream::connect(listen).await.unwrap();
+        peer.write_all(&build_msg1_frame()).await.unwrap();
+        let packet = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timeout waiting for an admitted peer's frame")
+            .expect("packet channel closed");
+        assert_eq!(packet.data, build_msg1_frame());
+        peer
+    }
+
+    /// With a per-source bound below the global cap, the connection past
+    /// the bound from one address is closed and counted, while a connection
+    /// from another address is still admitted.
+    ///
+    /// Break-check: without the per-source gate the fourth connection's
+    /// frame is delivered and `source_rejected` stays 0.
+    #[tokio::test]
+    async fn inbound_connections_beyond_the_per_source_bound_are_refused_and_counted_while_another_source_is_admitted()
+     {
+        use tokio::io::AsyncReadExt;
+
+        const N: usize = 3;
+        let (tx, mut rx) = packet_channel(100);
+        let mut transport =
+            TcpTransport::new(TransportId::new(1), None, source_capped_config(N), tx);
+        transport.start_async().await.unwrap();
+        let listen = transport.local_addr().unwrap();
+
+        let mut held = Vec::new();
+        for _ in 0..N {
+            held.push(admitted_peer(listen, &mut rx).await);
+        }
+        assert_eq!(transport.stats().pool_inbound_count(), N as u64);
+
+        let mut over = TcpStream::connect(listen).await.unwrap();
+        let _ = over.write_all(&build_msg1_frame()).await;
+        assert!(
+            timeout(Duration::from_millis(250), rx.recv())
+                .await
+                .is_err(),
+            "a connection past the per-source bound must not be admitted"
+        );
+        let mut buf = [0u8; 16];
+        match timeout(Duration::from_secs(2), over.read(&mut buf)).await {
+            Ok(Ok(0)) | Ok(Err(_)) => {}
+            Ok(Ok(n)) => panic!("the refused connection received {n} bytes"),
+            Err(_) => panic!("the refused connection was left open"),
+        }
+        let stats = transport.stats().clone();
+        assert!(
+            wait_until(
+                || stats.snapshot().source_rejected == 1,
+                Duration::from_secs(2)
+            )
+            .await,
+            "the refusal should be counted as per-source"
+        );
+        assert_eq!(stats.snapshot().connections_rejected, 1);
+        assert_eq!(stats.pool_inbound_count(), N as u64);
+
+        // Another address of the same host is a different source.
+        #[cfg(target_os = "linux")]
+        {
+            let socket = tokio::net::TcpSocket::new_v4().unwrap();
+            socket.bind("127.0.0.2:0".parse().unwrap()).unwrap();
+            let mut other = socket.connect(listen).await.unwrap();
+            other.write_all(&build_msg1_frame()).await.unwrap();
+            let packet = timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("a connection from another source should be admitted")
+                .expect("packet channel closed");
+            assert_eq!(packet.data, build_msg1_frame());
+            assert_eq!(stats.snapshot().source_rejected, 1);
+            held.push(other);
+        }
+
+        drop(held);
+        drop(over);
+        transport.stop_async().await.unwrap();
+    }
+
+    /// The per-source count follows the pool, so a source at its bound is
+    /// admitted again once one of its connections closes.
+    ///
+    /// Break-check: a per-source count that is never released on close
+    /// refuses the new connection.
+    #[tokio::test]
+    async fn a_source_at_its_per_source_bound_is_admitted_again_after_one_of_its_connections_closes()
+     {
+        const N: usize = 3;
+        let (tx, mut rx) = packet_channel(100);
+        let mut transport =
+            TcpTransport::new(TransportId::new(1), None, source_capped_config(N), tx);
+        transport.start_async().await.unwrap();
+        let listen = transport.local_addr().unwrap();
+
+        let mut held = Vec::new();
+        for _ in 0..N {
+            held.push(admitted_peer(listen, &mut rx).await);
+        }
+        drop(held.pop());
+        assert!(
+            wait_until(
+                || transport.stats().pool_inbound_count() == (N - 1) as u64,
+                Duration::from_secs(2)
+            )
+            .await,
+            "the closed connection should leave the pool"
+        );
+
+        held.push(admitted_peer(listen, &mut rx).await);
+        assert_eq!(transport.stats().snapshot().source_rejected, 0);
+        assert_eq!(transport.stats().pool_inbound_count(), N as u64);
+
+        drop(held);
+        transport.stop_async().await.unwrap();
+    }
+
     #[tokio::test]
     async fn a_silent_inbound_connection_logs_its_close_at_the_first_frame_deadline() {
         let (tx, _rx) = packet_channel(100);
@@ -4332,5 +4479,42 @@ mod tests {
             "neighbouring /64s are different sources"
         );
         assert_eq!(source_of(ip("2001:db8:1:2::1")), ip("2001:db8:1:2::"));
+    }
+
+    /// The per-source count reads IPv6 pool keys back and groups them by
+    /// /64, counting only inbound entries.
+    #[tokio::test]
+    async fn inbound_from_source_counts_inbound_ipv6_entries_by_slash_64() {
+        let local: SocketAddr = "[2001:db8:ffff::1]:443".parse().unwrap();
+        let entry = |direction| TcpConnection {
+            send_tx: mpsc::channel(1).0,
+            send_task: tokio::spawn(async {}),
+            recv_task: tokio::spawn(async {}),
+            mtu: 1400,
+            established_at: Instant::now(),
+            direction,
+            id: next_conn_id(),
+        };
+        let remote = |s: &str| TransportAddr::from_string(s);
+        let mut pool = PoolMap::new();
+        for addr in ["[2001:db8:1:2::1]:5000", "[2001:db8:1:2::abcd]:5001"] {
+            pool.insert(
+                PoolKey::inbound(remote(addr), local),
+                entry(Direction::Inbound),
+            );
+        }
+        pool.insert(
+            PoolKey::inbound(remote("[2001:db8:1:3::1]:5000"), local),
+            entry(Direction::Inbound),
+        );
+        pool.insert(
+            PoolKey::outbound(remote("[2001:db8:1:2::2]:8443")),
+            entry(Direction::Outbound),
+        );
+
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        assert_eq!(inbound_from_source(&pool, ip("2001:db8:1:2::ffff")), 2);
+        assert_eq!(inbound_from_source(&pool, ip("2001:db8:1:3::9")), 1);
+        assert_eq!(inbound_from_source(&pool, ip("2001:db8:1:4::1")), 0);
     }
 }
