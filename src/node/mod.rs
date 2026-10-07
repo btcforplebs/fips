@@ -1597,8 +1597,10 @@ impl Node {
     /// transports, and log it if it moved.
     ///
     /// Called wherever the bound set can change — the presence edges that
-    /// bind and unbind an interface-bound transport, and a child exiting —
-    /// so the clamp the TUN threads apply keeps agreeing with the
+    /// bind and unbind an interface-bound transport, a child exiting, a NAT
+    /// traversal transport being adopted (and removed again when its
+    /// handshake cannot start), and an unused bootstrap transport being
+    /// dropped — so the clamp the TUN threads apply keeps agreeing with the
     /// `effective_ipv6_mtu` this node reports in `show_status`.
     ///
     /// Moves in **both** directions, deliberately. A narrow interface
@@ -3027,6 +3029,7 @@ impl Node {
             .remove_bootstrap_transport(&transport_id);
         self.transport_drops.remove(&transport_id);
         self.transports.remove(&transport_id);
+        self.refresh_tun_mss_ceiling();
     }
 
     /// Iterate over all links.

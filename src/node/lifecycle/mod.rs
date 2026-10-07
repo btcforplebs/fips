@@ -3340,6 +3340,9 @@ impl Node {
         self.supervisor
             .nostr_rendezvous
             .insert_bootstrap_transport(transport_id, traversal.peer_npub.clone());
+        // The adopted transport is bound from here on, so it already counts
+        // toward `transport_mtu()`; the SYN clamp has to follow it now.
+        self.refresh_tun_mss_ceiling();
 
         let remote_addr = TransportAddr::from_string(&traversal.remote_addr.to_string());
         if let Err(err) = self
@@ -3352,6 +3355,7 @@ impl Node {
             if let Some(mut handle) = self.transports.remove(&transport_id) {
                 let _ = handle.stop().await;
             }
+            self.refresh_tun_mss_ceiling();
             return Err(err);
         }
 

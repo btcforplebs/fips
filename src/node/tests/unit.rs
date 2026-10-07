@@ -1998,6 +1998,146 @@ async fn a_presence_edge_refreshes_the_tun_mss_ceiling_without_being_asked() {
     }
 }
 
+/// Set up a running node with one wide (1452) UDP transport and a seeded
+/// ceiling, plus a traversal handoff whose transport is narrower (1280).
+///
+/// The wide transport's id comes from the node's allocator: the counter does
+/// not consult the transport map, so a hand-picked id would collide with the
+/// one the adoption allocates and silently replace the wide transport.
+async fn make_node_with_wide_transport_and_narrow_handoff() -> (Node, crate::EstablishedTraversal) {
+    let mut node = make_node();
+    let (packet_tx, packet_rx) = packet_channel(64);
+    node.supervisor.packet_tx = Some(packet_tx);
+    node.packet_rx = Some(packet_rx);
+    node.supervisor.state = NodeState::Running;
+
+    let wide_id = node.allocate_transport_id();
+    let wide = make_udp_transport_with_mtu(wide_id.as_u32(), 1452).await;
+    node.transports.insert(wide_id, wide);
+    node.refresh_tun_mss_ceiling();
+    assert_eq!(
+        node.tun_mss_ceiling(),
+        crate::ipv6tun::icmp::mss_ceiling(1452),
+        "the seeded ceiling must match the only bound transport"
+    );
+
+    let peer = make_node();
+    let handoff = crate::EstablishedTraversal::new(
+        "sess-mss",
+        peer.npub(),
+        "127.0.0.1:9".parse().unwrap(),
+        std::net::UdpSocket::bind("127.0.0.1:0").unwrap(),
+    )
+    .with_transport_name("nostr-punched")
+    .with_transport_config(crate::config::UdpConfig {
+        mtu: Some(1280),
+        ..Default::default()
+    });
+    (node, handoff)
+}
+
+#[tokio::test]
+async fn adopting_a_narrower_traversal_transport_tightens_the_tun_mss_ceiling() {
+    // An adopted traversal transport is bound the moment it is inserted, so
+    // it enters the node's minimum transport MTU at once. Packet Too Big
+    // reads that minimum live; the SYN clamp reads the shared ceiling. The
+    // adoption itself has to refresh the ceiling or the two disagree until
+    // some unrelated event happens to refresh it.
+    let (mut node, handoff) = make_node_with_wide_transport_and_narrow_handoff().await;
+
+    node.adopt_established_traversal(handoff)
+        .await
+        .expect("adoption succeeds");
+
+    assert_eq!(
+        node.transport_mtu(),
+        1280,
+        "precondition: the adopted transport must lower the node's transport MTU"
+    );
+    assert_eq!(
+        node.tun_mss_ceiling(),
+        crate::ipv6tun::icmp::mss_ceiling(1280),
+        "adopting a narrower transport must tighten the clamp on its own"
+    );
+    assert_eq!(
+        node.tun_mss_ceiling(),
+        crate::ipv6tun::icmp::mss_ceiling(node.transport_mtu()),
+        "the clamp and the Packet Too Big threshold must not disagree"
+    );
+
+    for transport in node.transports.values_mut() {
+        transport.stop().await.ok();
+    }
+}
+
+#[tokio::test]
+async fn dropping_an_unused_bootstrap_transport_restores_the_tun_mss_ceiling() {
+    // The reverse: once the adopted transport's handshake is reaped and
+    // nothing references it, the drop has to release the ceiling, or the
+    // node stays over-clamped for every new TCP flow.
+    let (mut node, handoff) = make_node_with_wide_transport_and_narrow_handoff().await;
+
+    let result = node
+        .adopt_established_traversal(handoff)
+        .await
+        .expect("adoption succeeds");
+    assert_eq!(
+        node.tun_mss_ceiling(),
+        crate::ipv6tun::icmp::mss_ceiling(1280)
+    );
+
+    let link_id = node
+        .links()
+        .find(|link| link.transport_id() == result.transport_id)
+        .map(|link| link.link_id())
+        .expect("the adoption opened a link on the adopted transport");
+    node.cleanup_stale_connection(link_id, 0).await;
+
+    assert!(
+        node.get_transport(&result.transport_id).is_none(),
+        "precondition: reaping the handshake must drop the unused bootstrap transport"
+    );
+    assert_eq!(node.transport_mtu(), 1452);
+    assert_eq!(
+        node.tun_mss_ceiling(),
+        crate::ipv6tun::icmp::mss_ceiling(1452),
+        "dropping the narrow transport must release the clamp on its own"
+    );
+
+    for transport in node.transports.values_mut() {
+        transport.stop().await.ok();
+    }
+}
+
+#[tokio::test]
+async fn a_failed_traversal_adoption_leaves_the_tun_mss_ceiling_where_it_was() {
+    // When the handshake cannot be started the adoption undoes its insert.
+    // The ceiling has to follow the undo back, not stay at the narrow value
+    // the insert set.
+    let (mut node, handoff) = make_node_with_wide_transport_and_narrow_handoff().await;
+    node.index_allocator = crate::utils::index::IndexAllocator::with_max_attempts(0);
+
+    let result = node.adopt_established_traversal(handoff).await;
+    assert!(
+        result.is_err(),
+        "the adoption must fail when no session index can be allocated"
+    );
+    assert_eq!(
+        node.transports.len(),
+        1,
+        "the failed adoption must remove its transport, leaving only the wide one"
+    );
+    assert_eq!(
+        node.tun_mss_ceiling(),
+        crate::ipv6tun::icmp::mss_ceiling(1452),
+        "a failed adoption must leave the clamp where it was"
+    );
+
+    for transport in node.transports.values_mut() {
+        transport.stop().await.ok();
+    }
+}
+
 #[tokio::test]
 async fn test_transport_mtu_fallback_when_no_operational_transports() {
     // No transports configured at all → falls back to 1280 (IPv6 minimum).
