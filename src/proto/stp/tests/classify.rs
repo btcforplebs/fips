@@ -173,3 +173,34 @@ fn parent_ancestry_change_on_same_root_leaves_better_peer_to_the_hold_down_veto(
     assert!(matches!(evaluate(&tree), ParentEval::Discretionary(p) if p == q));
     assert_ancestry_update(classify(&tree, true), 3);
 }
+
+/// A parent that has joined `skip` with no other candidate left: both
+/// classifiers must self-root rather than keep a parent that cannot forward.
+#[test]
+fn skipped_parent_with_no_alternative_self_roots() {
+    let root = make_node_addr(0);
+    let p = make_node_addr(P);
+    let mut tree = TreeState::new(make_node_addr(X), 1000);
+    tree.update_peer(
+        ParentDeclaration::new(p, root, 1, 1000),
+        make_coords(&[P, 0]),
+    );
+    tree.set_parent(p, 1, 1000, 1000);
+    tree.recompute_coords();
+    assert!(!tree.is_root());
+
+    let skip: BTreeSet<NodeAddr> = [p].into_iter().collect();
+    assert!(matches!(
+        Stp::classify_periodic(&tree, &BTreeMap::new(), &skip, false),
+        TreeDecision::SelfRoot
+    ));
+    assert!(matches!(
+        Stp::classify_announce(&tree, p, &BTreeMap::new(), &skip, false),
+        TreeDecision::SelfRoot
+    ));
+    // Control: unskipped, the same state keeps its parent.
+    assert!(!matches!(
+        Stp::classify_periodic(&tree, &BTreeMap::new(), &BTreeSet::new(), false),
+        TreeDecision::SelfRoot
+    ));
+}

@@ -611,10 +611,15 @@ impl Node {
                     let their_index = ambient
                         .their_index
                         .expect("cross-connection swap carries the peer session index");
-                    let negotiated_profile = self
+                    // `establish_inbound` only cross-connects on an unchanged
+                    // epoch, so `refresh_peer_profile` refuses any profile
+                    // change here; it is still routed through it so the rule
+                    // lives in one place.
+                    let (negotiated_profile, negotiated_epoch) = self
                         .peer_machines
                         .get(&link)
-                        .and_then(|m| m.conn_peer_profile());
+                        .map(|m| (m.conn_peer_profile(), m.conn_remote_epoch()))
+                        .unwrap_or((None, None));
                     if our_inbound_wins {
                         // Larger node side: swap to the inbound session so it pairs
                         // with the peer's kept outbound session.
@@ -689,7 +694,7 @@ impl Node {
 
                     // Either branch keeps the existing `ActivePeer`; carry over
                     // the profile this handshake negotiated.
-                    self.refresh_peer_profile(&peer, negotiated_profile);
+                    self.refresh_peer_profile(&peer, negotiated_profile, negotiated_epoch);
 
                     // Both branches tear down the temporary inbound link via
                     // `remove_link`, which hands its `addr_to_link` key back to

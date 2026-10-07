@@ -337,6 +337,13 @@ impl TreeState {
         }
     }
 
+    /// Whether our current parent is in `skip_peers` (it can no longer forward
+    /// transit). With no other candidate, `evaluate_parent` returns `None`; the
+    /// classifiers then self-root on this, as they do on `should_be_root`.
+    pub(crate) fn parent_is_skipped(&self, skip_peers: &BTreeSet<NodeAddr>) -> bool {
+        !self.is_root() && skip_peers.contains(self.my_declaration.parent_id())
+    }
+
     /// Promote self to root with an incremented sequence number.
     ///
     /// `now_secs` is the injected wall-clock Unix time in seconds stamped onto
