@@ -574,6 +574,78 @@ fn test_recover_skips_non_full_peers() {
 }
 
 #[test]
+fn test_skipped_peer_root_does_not_hide_real_candidates() {
+    // A skipped (non-Full) peer that declares itself root must not steer
+    // parent choice. Self (5) has Full peers B [3, 2] (parent) and C [4, 2],
+    // and a skipped N declaring the self-root [1]. When B goes, C still
+    // reaches the real root 2 and must be adopted, not dropped for being off
+    // N's unreachable root.
+    let my_node = make_node_addr(5);
+    let mut state = TreeState::new(my_node, 1000);
+    let b = make_node_addr(3);
+    let c = make_node_addr(4);
+    let n = make_node_addr(1);
+    let root = make_node_addr(2);
+    state.update_peer(
+        ParentDeclaration::new(b, root, 1, 1000),
+        make_coords(&[3, 2]),
+    );
+    state.update_peer(
+        ParentDeclaration::new(c, root, 1, 1000),
+        make_coords(&[4, 2]),
+    );
+    state.update_peer(ParentDeclaration::self_root(n, 1, 1000), make_coords(&[1]));
+    state.set_parent(b, 1, 1000, 1000);
+    state.recompute_coords();
+
+    let skip: BTreeSet<_> = [n].into_iter().collect();
+    state.remove_peer(&b);
+    let outcome = state.recover(&BTreeMap::new(), &skip, 2000, 2000);
+    assert!(outcome.changed);
+    assert_eq!(
+        state.my_declaration().parent_id(),
+        &c,
+        "a skipped peer's root must not hide the real one"
+    );
+    assert_eq!(state.root(), &root);
+    assert!(!state.should_be_root_skipping(&skip));
+
+    // Control: unskipped, N is a candidate on root 1, so C is off-root and
+    // evaluate_parent picks N.
+    assert!(matches!(
+        state.evaluate_parent(&BTreeMap::new(), &BTreeSet::new()),
+        ParentEval::Mandatory(p) if p == n
+    ));
+}
+
+#[test]
+fn test_should_be_root_skipping_ignores_skipped_roots() {
+    let my_node = make_node_addr(2);
+    let mut state = TreeState::new(my_node, 1000);
+    let n = make_node_addr(1);
+    state.update_peer(ParentDeclaration::self_root(n, 1, 1000), make_coords(&[1]));
+    let skip: BTreeSet<_> = [n].into_iter().collect();
+    // Only a skipped peer: nothing to attach under.
+    assert!(state.should_be_root_skipping(&skip));
+    assert!(!state.should_be_root(), "unskipped, N's root 1 is smaller");
+
+    // A Full peer on a larger root: self is the smallest it can use.
+    let p = make_node_addr(6);
+    state.update_peer(
+        ParentDeclaration::new(p, make_node_addr(5), 1, 1000),
+        make_coords(&[6, 5]),
+    );
+    assert!(state.should_be_root_skipping(&skip));
+    // A Full peer on a smaller root takes over.
+    let q = make_node_addr(7);
+    state.update_peer(
+        ParentDeclaration::new(q, make_node_addr(0), 1, 1000),
+        make_coords(&[7, 0]),
+    );
+    assert!(!state.should_be_root_skipping(&skip));
+}
+
+#[test]
 fn test_handle_parent_lost_becomes_root_when_self_smaller_than_remaining() {
     // Regression: self (NodeAddr 1) had peer 0 as parent. Peer 0 disappears,
     // leaving only peers with bigger NodeAddrs (and bigger roots). The old

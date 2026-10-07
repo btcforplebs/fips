@@ -319,7 +319,22 @@ impl TreeState {
 
     /// Smallest root_id visible across known peers.
     pub fn smallest_visible_root(&self) -> Option<NodeAddr> {
-        self.peer_ancestry.values().map(|c| *c.root_id()).min()
+        self.smallest_root_excluding(&BTreeSet::new())
+    }
+
+    /// Smallest root_id visible across known peers outside `skip_peers`.
+    ///
+    /// A skipped peer cannot be a parent, so the root it advertises cannot be
+    /// reached through it. Counting it would let a non-Full peer that declares
+    /// itself root (a stale boot declaration, or a false one: the profile is
+    /// self-declared) hide every real candidate from `evaluate_parent` and
+    /// stop `should_be_root_skipping` from ever firing.
+    fn smallest_root_excluding(&self, skip_peers: &BTreeSet<NodeAddr>) -> Option<NodeAddr> {
+        self.peer_ancestry
+            .iter()
+            .filter(|(peer_id, _)| !skip_peers.contains(peer_id))
+            .map(|(_, c)| *c.root_id())
+            .min()
     }
 
     /// Whether this node should be the tree root: either there are no peers,
@@ -330,7 +345,15 @@ impl TreeState {
     /// non-Full root would partition the mesh. An isolated non-Full node (no
     /// visible root) is still its own root, which is harmless.
     pub fn should_be_root(&self) -> bool {
-        match self.smallest_visible_root() {
+        self.should_be_root_skipping(&BTreeSet::new())
+    }
+
+    /// [`should_be_root`](Self::should_be_root), counting only roots advertised
+    /// by peers outside `skip_peers` (the parent-candidacy exclusion the node
+    /// passes to [`evaluate_parent`](Self::evaluate_parent)). With no
+    /// non-skipped peer there is nothing to attach under, so this is `true`.
+    pub(crate) fn should_be_root_skipping(&self, skip_peers: &BTreeSet<NodeAddr>) -> bool {
+        match self.smallest_root_excluding(skip_peers) {
             Some(sr) => !self.self_non_full && self.my_node_addr <= sr,
             None => true,
         }
@@ -488,23 +511,10 @@ impl TreeState {
             return ParentEval::None;
         }
 
-        // Find the smallest root visible across all peers
-        let mut smallest_root: Option<NodeAddr> = None;
-        for coords in self.peer_ancestry.values() {
-            let peer_root = coords.root_id();
-            smallest_root = Some(match smallest_root {
-                None => *peer_root,
-                Some(current) => {
-                    if *peer_root < current {
-                        *peer_root
-                    } else {
-                        current
-                    }
-                }
-            });
-        }
-
-        let smallest_root = match smallest_root {
+        // Find the smallest root visible across peers that could be a parent.
+        // A skipped peer's root is left out: it is not reachable through that
+        // peer, and counting it would discard every candidate on the real root.
+        let smallest_root = match self.smallest_root_excluding(skip_peers) {
             Some(r) => r,
             None => return ParentEval::None,
         };

@@ -204,3 +204,36 @@ fn skipped_parent_with_no_alternative_self_roots() {
         TreeDecision::SelfRoot
     ));
 }
+
+/// A skipped peer declaring a smaller root must not keep us off the root. X
+/// (2) sits under P on root 0, and a skipped N declares the self-root [1].
+/// P re-announces on root 5: the smallest root X can use is now 5, so both
+/// classifiers self-root rather than read N's root 1 as "someone smaller".
+#[test]
+fn skipped_peer_root_does_not_block_self_root() {
+    let p = make_node_addr(6);
+    let n = make_node_addr(1);
+    let mut tree = TreeState::new(make_node_addr(2), 1000);
+    tree.update_peer(
+        ParentDeclaration::new(p, make_node_addr(0), 1, 1000),
+        make_coords(&[6, 0]),
+    );
+    tree.set_parent(p, 1, 1000, 1000);
+    tree.recompute_coords();
+    tree.update_peer(ParentDeclaration::self_root(n, 1, 1000), make_coords(&[1]));
+    tree.update_peer(
+        ParentDeclaration::new(p, make_node_addr(5), 2, 1000),
+        make_coords(&[6, 5]),
+    );
+    assert!(!tree.is_root());
+
+    let skip: BTreeSet<NodeAddr> = [n].into_iter().collect();
+    assert!(matches!(
+        Stp::classify_announce(&tree, p, &BTreeMap::new(), &skip, false),
+        TreeDecision::SelfRoot
+    ));
+    assert!(matches!(
+        Stp::classify_periodic(&tree, &BTreeMap::new(), &skip, false),
+        TreeDecision::SelfRoot
+    ));
+}
