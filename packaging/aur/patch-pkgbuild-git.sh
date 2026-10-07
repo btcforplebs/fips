@@ -2,8 +2,9 @@
 # Patch packaging/aur/PKGBUILD-git in place with the b2sums of the local
 # assets it ships (fips.sysusers and fips.tmpfiles).
 #
-# Used by the fips-git AUR workflow, so the file it publishes carries sums
-# that match the assets published beside it.
+# Used by both jobs of the fips-git AUR workflow, the lint and the publish,
+# so the file it publishes is the file it linted, with sums that match the
+# assets published beside it. Exits nonzero if the sums did not land.
 #
 # Run from the repository root.
 
@@ -25,5 +26,19 @@ awk -v s1="$SYSUSERS_SUM" -v s2="$TMPFILES_SUM" '
   { print }
 ' packaging/aur/PKGBUILD-git > packaging/aur/PKGBUILD-git.new
 mv packaging/aur/PKGBUILD-git.new packaging/aur/PKGBUILD-git
+
+# The lint job and the publish job run this under different awks. One that
+# does not honour the {128} interval above would leave the sums unpatched and
+# still exit 0, so confirm the file now carries the computed sums.
+block=$(sed -n '/^b2sums=(/,/)/p' packaging/aur/PKGBUILD-git)
+for entry in "2 fips.sysusers $SYSUSERS_SUM" "3 fips.tmpfiles $TMPFILES_SUM"; do
+  read -r n name sum <<<"$entry"
+  case "$(printf '%s\n' "$block" | sed -n "${n}p")" in
+    *"'$sum'"*) ;;
+    *) echo "PKGBUILD-git b2sums entry $n is not the $name sum after patching" >&2
+       exit 1 ;;
+  esac
+done
+
 echo "Patched PKGBUILD-git b2sums:"
 awk '/^b2sums=\(/,/\)$/' packaging/aur/PKGBUILD-git

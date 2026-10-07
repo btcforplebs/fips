@@ -10,10 +10,55 @@ on:
       - 'packaging/aur/fips.sysusers'
       - 'packaging/aur/fips.tmpfiles'
       - 'packaging/aur/fips.install'
+  pull_request:
+    paths:
+      - 'packaging/aur/PKGBUILD-git'
+      - 'packaging/aur/fips.sysusers'
+      - 'packaging/aur/fips.tmpfiles'
+      - 'packaging/aur/fips.install'
+      - 'packaging/aur/namcap-gate.sh'
+      - 'packaging/aur/patch-pkgbuild-git.sh'
+      - '.github/workflows/aur-publish-git.yml'
 
 jobs:
+  # ───────────────────────────────────────────────────────────────────────────
+  # Lint the PKGBUILD-git this workflow publishes, patched by the same script
+  # the publish job uses, and fail on namcap error-level (E:) findings. Runs
+  # before every publish and, without publishing, on pull requests that touch
+  # the package's files.
+  #
+  # It lints the PKGBUILD only and does not build fips-git: PKGBUILD-git's
+  # source= is the GitHub repository, so a build here would compile GitHub's
+  # master rather than the tree under review. The built-package lint is the
+  # release package's, in aur-publish.yml, which declares the same depends,
+  # optdepends and package() body and is built and linted on every push and
+  # pull request.
+  # ───────────────────────────────────────────────────────────────────────────
+  aur-lint-fips-git:
+    name: Lint fips-git AUR PKGBUILD
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+
+    steps:
+      - name: Install lint tooling
+        run: |
+          set -euo pipefail
+          pacman -Sy --noconfirm --needed namcap
+
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Patch PKGBUILD-git b2sums for local assets
+        run: bash packaging/aur/patch-pkgbuild-git.sh
+
+      - name: namcap PKGBUILD-git
+        run: bash packaging/aur/namcap-gate.sh packaging/aur/PKGBUILD-git
+
+  # Publish to the AUR on a dispatch or a master push, never on a pull
+  # request, and only after the lint above has passed on the same commit.
   aur-publish-fips-git:
     name: Publish fips-git to AUR
+    needs: aur-lint-fips-git
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
 
     steps:

@@ -272,9 +272,9 @@ Then run the same verification commands above.
 ## GitHub Secrets for CI
 
 AUR publication is automated: `.github/workflows/aur-publish.yml` pushes the
-release package, and `aur-publish-git.yml` pushes `fips-git`. The manual steps
-above are the fallback for when the workflow cannot be used. The automation
-needs a separate SSH key.
+release package, and `aur-publish-git.yml` lints and pushes `fips-git`. The
+manual steps above are the fallback for when the workflow cannot be used. The
+automation needs a separate SSH key.
 
 ### Step 1: Generate a CI-Specific Key
 
