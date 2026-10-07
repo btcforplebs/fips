@@ -500,6 +500,9 @@ jobs:
           - suite: static-chain
             type: static
             topology: chain
+          - suite: static-leaf
+            type: static
+            topology: leaf
           # ── Firewall baseline (fips0 nftables default-deny) ────────────
           - suite: firewall
             type: firewall

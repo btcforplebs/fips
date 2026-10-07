@@ -1,6 +1,6 @@
 #!/bin/bash
 # End-to-end ping test between FIPS nodes via DNS resolution.
-# Usage: ./ping-test.sh [mesh|chain]
+# Usage: ./ping-test.sh [mesh|chain|leaf]
 #
 # Requires containers to be running:
 #   docker compose --profile mesh up -d
@@ -46,6 +46,21 @@ ping_test() {
         else
             echo "OK"
         fi
+        PASSED=$((PASSED + 1))
+    else
+        echo "FAIL"
+        FAILED=$((FAILED + 1))
+    fi
+}
+
+# Assert a Python expression over `fipsctl show <what>` JSON (bound to `d`)
+# on one node. Counted with the pings.
+leaf_check() {
+    local label="$1" node="$2" what="$3" expr="$4"
+    echo -n "  $label ... "
+    if docker exec "fips-${node}${FIPS_CI_NAME_SUFFIX:-}" fipsctl show "$what" 2>/dev/null \
+        | python3 -c "import json, sys; d = json.load(sys.stdin); sys.exit(0 if ($expr) else 1)"; then
+        echo "OK"
         PASSED=$((PASSED + 1))
     else
         echo "FAIL"
@@ -100,12 +115,17 @@ elif [ "$PROFILE" = "mesh" ]; then
     wait_for_peers fips-node-c${FIPS_CI_NAME_SUFFIX:-} 3 20 || true
     wait_for_peers fips-node-d${FIPS_CI_NAME_SUFFIX:-} 3 20 || true
     wait_for_peers fips-node-e${FIPS_CI_NAME_SUFFIX:-} 3 20 || true
+elif [ "$PROFILE" = "leaf" ]; then
+    # Leaf: ring A-B-C-D-E-A, every node has 2 peers
+    for n in a b c d e; do
+        wait_for_peers fips-node-${n}${FIPS_CI_NAME_SUFFIX:-} 2 20 || true
+    done
 else
     # An unrecognised profile used to fall straight through, and every
     # section below is guarded by these same profile names, so the script
     # ran no assertion at all and exited 0. A typo in the caller's profile
     # argument produced a green run that tested nothing.
-    echo "ERROR: unknown profile '$PROFILE' (expected: chain, mesh)" >&2
+    echo "ERROR: unknown profile '$PROFILE' (expected: chain, mesh, leaf)" >&2
     exit 2
 fi
 # Wait for full pairwise connectivity, progress-aware: the actual pings
@@ -156,6 +176,33 @@ if [ "$PROFILE" = "mesh" ]; then
     ping_test node-e "$NPUB_B" "E → B"
     ping_test node-e "$NPUB_C" "E → C"
     ping_test node-e "$NPUB_D" "E → D"
+
+elif [ "$PROFILE" = "leaf" ]; then
+    # Every directed pair, including to and from the leaf E. Pairs that
+    # would take the short way through E (A <-> D, B <-> D, A <-> C) must
+    # go round through B and C instead.
+    n=${#LABELS[@]}
+    for ((i=0; i<n; i++)); do
+        echo ""
+        echo "From node-${LABELS[$i],,}:"
+        for ((j=0; j<n; j++)); do
+            [ "$i" -eq "$j" ] && continue
+            ping_test "node-${LABELS[$i],,}" "${NPUBS[$j]}" "${LABELS[$i]} → ${LABELS[$j]}"
+        done
+    done
+
+    echo ""
+    echo "Leaf checks:"
+    leaf_check "E forwarded no transit datagrams" node-e status \
+        "d['forwarding']['forwarded_packets'] == 0"
+    for n in a b c d; do
+        leaf_check "node-$n does not have E as parent" "node-$n" peers \
+            "not any(p['npub'] == '$NPUB_E' and p['is_parent'] for p in d['peers'])"
+    done
+    leaf_check "D's parent is C, not E" node-d peers \
+        "any(p['npub'] == '$NPUB_C' and p['is_parent'] for p in d['peers'])"
+    leaf_check "E's parent is A" node-e peers \
+        "any(p['npub'] == '$NPUB_A' and p['is_parent'] for p in d['peers'])"
 
 elif [ "$PROFILE" = "chain" ]; then
     echo ""

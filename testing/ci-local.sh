@@ -26,7 +26,7 @@
 #   -h, --help           Show this help
 #
 # Integration suites (default coverage):
-#   static-mesh, static-chain, gateway,
+#   static-mesh, static-chain, static-leaf, gateway,
 #   firewall, nat-cone, nat-symmetric,
 #   nat-lan, nostr-publish-consume, stun-faults,
 #   chaos-churn-mixed-10, chaos-ethernet-mesh,
@@ -158,7 +158,7 @@ WITH_TOR=false
 ONLY_SUITE=""
 
 # All integration suites matching ci.yml
-STATIC_SUITES=(static-mesh static-chain)
+STATIC_SUITES=(static-mesh static-chain static-leaf)
 # Each entry: "display-name scenario [--flag value ...]"
 CHAOS_SUITES=(
     "churn-mixed-10 churn-mixed --nodes 10 --duration 120"
@@ -1364,7 +1364,7 @@ run_integration() {
 run_suite() {
     local suite="$1"
     case "$suite" in
-        static-mesh|static-chain)
+        static-mesh|static-chain|static-leaf)
             run_static "${suite#static-}" ;;
         gateway)
             run_gateway ;;

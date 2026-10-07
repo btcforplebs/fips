@@ -16,6 +16,7 @@ configurations.
 | ----------- | ----- | --------- | -------------------------------- |
 | mesh        | 5     | UDP       | Sparse mesh, 6 links, multi-hop  |
 | chain       | 5     | UDP       | Linear chain, max 4-hop paths    |
+| leaf        | 5     | UDP       | Ring with one leaf-only node; asserts it carries no transit |
 | rekey       | 5     | UDP       | Rekey integration test topology  |
 
 ### [tor/](tor/) -- Tor Transport Integration

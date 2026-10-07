@@ -154,6 +154,62 @@ services:
     networks:
       fips-net:
 
+  # ── Leaf topology (ring A-B-C-D-E-A, E leaf-only) ─────────────
+  leaf-a:
+    <<: *fips-common
+    profiles: ["leaf"]
+    container_name: fips-node-a${FIPS_CI_NAME_SUFFIX:-}
+    hostname: node-a
+    volumes:
+      - ../docker/resolv.conf:/etc/resolv.conf:ro
+      - ./generated-configs${FIPS_CI_NAME_SUFFIX:-}/leaf/node-a.yaml:/etc/fips/fips.yaml:ro
+    networks:
+      fips-net:
+
+  leaf-b:
+    <<: *fips-common
+    profiles: ["leaf"]
+    container_name: fips-node-b${FIPS_CI_NAME_SUFFIX:-}
+    hostname: node-b
+    volumes:
+      - ../docker/resolv.conf:/etc/resolv.conf:ro
+      - ./generated-configs${FIPS_CI_NAME_SUFFIX:-}/leaf/node-b.yaml:/etc/fips/fips.yaml:ro
+    networks:
+      fips-net:
+
+  leaf-c:
+    <<: *fips-common
+    profiles: ["leaf"]
+    container_name: fips-node-c${FIPS_CI_NAME_SUFFIX:-}
+    hostname: node-c
+    volumes:
+      - ../docker/resolv.conf:/etc/resolv.conf:ro
+      - ./generated-configs${FIPS_CI_NAME_SUFFIX:-}/leaf/node-c.yaml:/etc/fips/fips.yaml:ro
+    networks:
+      fips-net:
+
+  leaf-d:
+    <<: *fips-common
+    profiles: ["leaf"]
+    container_name: fips-node-d${FIPS_CI_NAME_SUFFIX:-}
+    hostname: node-d
+    volumes:
+      - ../docker/resolv.conf:/etc/resolv.conf:ro
+      - ./generated-configs${FIPS_CI_NAME_SUFFIX:-}/leaf/node-d.yaml:/etc/fips/fips.yaml:ro
+    networks:
+      fips-net:
+
+  leaf-e:
+    <<: *fips-common
+    profiles: ["leaf"]
+    container_name: fips-node-e${FIPS_CI_NAME_SUFFIX:-}
+    hostname: node-e
+    volumes:
+      - ../docker/resolv.conf:/etc/resolv.conf:ro
+      - ./generated-configs${FIPS_CI_NAME_SUFFIX:-}/leaf/node-e.yaml:/etc/fips/fips.yaml:ro
+    networks:
+      fips-net:
+
   # ── Rekey integration test (mesh + aggressive rekey timers) ──
   rekey-a:
     <<: *fips-common
