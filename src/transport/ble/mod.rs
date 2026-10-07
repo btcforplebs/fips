@@ -4039,6 +4039,15 @@ mod tests {
     /// The orders where the two sides admit different links first are the
     /// ones "first link wins" got wrong: each side kept the link the other
     /// had just dropped, and both went down.
+    ///
+    /// Both tests run on the paused clock. The tie window, the probe retry
+    /// tick, the pubkey-exchange timeout and the waits' deadline are then
+    /// all virtual time, which moves only when the runtime is idle, and
+    /// inside a wait the next timer due is always the wait's own 1 ms poll.
+    /// A test thread that the host deschedules for seconds therefore cannot
+    /// age an incumbent out of the tie window, expire an exchange, fire a
+    /// retry mid-case, or run out a wait: the outcome no longer depends on
+    /// how promptly the thread runs.
     async fn every_simultaneous_dial(dial: Dial) {
         for t1_is_smaller in [true, false] {
             for first_at_t1 in [Link::L1, Link::L2] {
@@ -4052,14 +4061,14 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_a_simultaneous_dial_leaves_both_sides_on_the_same_link() {
         every_simultaneous_dial(Dial::Probe).await;
     }
 
     /// The same race when the node layer starts both dials, which reach the
     /// pool through `connect_async` rather than the scan loop's probe.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_a_simultaneous_node_dial_leaves_both_sides_on_the_same_link() {
         every_simultaneous_dial(Dial::Node).await;
     }
