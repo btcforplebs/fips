@@ -763,6 +763,48 @@ async fn leaf_smallest_addr_does_not_partition_multihop() {
     cleanup_nodes(&mut nodes).await;
 }
 
+/// Losing a parent must not adopt a non-Full peer, on the real node path.
+///
+/// A(Full, pinned smallest, so root) — B(Full), with N(NonRouting) linked to
+/// both. B's only Full upstream is A. When B removes A, recovery must skip N
+/// (which still reaches root A) and self-root. Without the skip in
+/// `handle_peer_removal_tree_cleanup`'s `recover` call, B adopts N as parent.
+#[tokio::test]
+async fn parent_loss_does_not_adopt_non_full_peer() {
+    use crate::proto::fmp::NodeProfile;
+
+    // 0=A Full (smallest), 1=B Full, 2=N NonRouting.
+    let profiles = [
+        NodeProfile::Full,
+        NodeProfile::Full,
+        NodeProfile::NonRouting,
+    ];
+    let edges = [(0, 1), (0, 2), (1, 2)];
+    let mut nodes = run_tree_test_with_profiles_leaf_smallest(&profiles, 0, &edges).await;
+
+    let a_addr = *nodes[0].node.node_addr();
+    let n_addr = *nodes[2].node.node_addr();
+    assert_eq!(
+        nodes[1].node.tree_state().my_declaration().parent_id(),
+        &a_addr
+    );
+    assert_eq!(nodes[1].node.tree_state().root(), &a_addr);
+
+    nodes[1].node.remove_active_peer(&a_addr);
+
+    assert_ne!(
+        nodes[1].node.tree_state().my_declaration().parent_id(),
+        &n_addr,
+        "B must not adopt the NonRouting peer as parent after losing A"
+    );
+    assert!(
+        nodes[1].node.tree_state().is_root(),
+        "B self-roots when its only remaining peer is non-Full"
+    );
+
+    cleanup_nodes(&mut nodes).await;
+}
+
 #[tokio::test]
 async fn test_session_100_nodes() {
     let _guard = lock_large_network_test().await;
