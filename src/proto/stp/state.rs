@@ -569,11 +569,14 @@ impl TreeState {
 
         // --- Mandatory switches (bypass the shell's hold-down / flap veto) ---
 
-        // If our current parent is gone from peer_ancestry, our path is broken — always switch
+        // If our current parent is gone from peer_ancestry, our path is broken — always switch.
+        // Likewise if it is now in `skip_peers`: a parent that can no longer
+        // forward transit must be left even when nothing else changed.
         if !self.is_root()
-            && !self
+            && (!self
                 .peer_ancestry
                 .contains_key(self.my_declaration.parent_id())
+                || skip_peers.contains(self.my_declaration.parent_id()))
         {
             return ParentEval::Mandatory(best_peer_id);
         }

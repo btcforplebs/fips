@@ -5,9 +5,9 @@ use crate::node::session::EndToEndState;
 use crate::node::tests::spanning_tree::{
     TestNode, cleanup_nodes, drain_all_packets, generate_random_edges, initiate_handshake,
     lock_large_network_test, make_test_node_with_config, pinned_tree, populate_all_coord_caches,
-    process_available_packets, run_tree_test, run_tree_test_with_configs, run_tree_test_with_mtus,
-    run_tree_test_with_profiles, run_tree_test_with_profiles_leaf_smallest,
-    verify_tree_convergence,
+    process_available_packets, restarted_node, run_tree_test, run_tree_test_with_configs,
+    run_tree_test_with_mtus, run_tree_test_with_profiles,
+    run_tree_test_with_profiles_leaf_smallest, verify_tree_convergence,
 };
 use crate::proto::fsp::{SessionAck, SessionMsg3};
 use crate::proto::link::SessionDatagram;
@@ -759,6 +759,131 @@ async fn leaf_smallest_addr_does_not_partition_multihop() {
         found,
         "D->B multi-hop datagram must be delivered to B's TUN"
     );
+
+    cleanup_nodes(&mut nodes).await;
+}
+
+/// Restart node `idx` with `profile` and have node `dialer` dial it. The dialer
+/// still holds the old `ActivePeer`, so its msg2 resolves as a cross-connection
+/// onto that peer rather than a fresh promotion.
+async fn restart_with_profile_and_redial(
+    nodes: &mut [TestNode],
+    idx: usize,
+    profile: crate::proto::fmp::NodeProfile,
+    dialer: usize,
+) {
+    use crate::proto::fmp::NodeProfile;
+    let mut config = Config::new();
+    match profile {
+        NodeProfile::Leaf => config.node.leaf_only = true,
+        NodeProfile::NonRouting => config.node.disable_routing = true,
+        NodeProfile::Full => {}
+    }
+    let restarted = restarted_node(&nodes[idx], config);
+    drop(std::mem::replace(&mut nodes[idx], restarted));
+    initiate_handshake(nodes, dialer, idx).await;
+    drain_all_packets(nodes, false).await;
+}
+
+/// A parent that comes back non-Full must stop being our parent.
+///
+/// Chain A(Full, pinned smallest, root) — P(Full) — B(Full); B's parent is P.
+/// P restarts with `disable_routing` and B re-dials it. B's cross-connection
+/// keeps its existing `ActivePeer`, so the profile must be refreshed there,
+/// and B must leave P (no other peer, so it self-roots).
+#[tokio::test]
+async fn parent_back_as_non_full_on_cross_connection_is_dropped() {
+    use crate::proto::fmp::NodeProfile;
+
+    let profiles = [NodeProfile::Full, NodeProfile::Full, NodeProfile::Full];
+    let edges = [(0, 1), (1, 2)];
+    let mut nodes = run_tree_test_with_profiles_leaf_smallest(&profiles, 0, &edges).await;
+    let p_addr = *nodes[1].node.node_addr();
+    assert_eq!(
+        nodes[2].node.tree_state().my_declaration().parent_id(),
+        &p_addr
+    );
+
+    restart_with_profile_and_redial(&mut nodes, 1, NodeProfile::NonRouting, 2).await;
+
+    assert_eq!(
+        nodes[2].node.get_peer(&p_addr).map(|p| p.peer_profile()),
+        Some(NodeProfile::NonRouting),
+        "B must carry over the profile P negotiated on the new handshake"
+    );
+    assert!(
+        nodes[2]
+            .node
+            .bloom_state
+            .leaf_dependents()
+            .contains(&p_addr),
+        "a non-Full peer is advertised as a leaf dependent"
+    );
+    assert_ne!(
+        nodes[2].node.tree_state().my_declaration().parent_id(),
+        &p_addr,
+        "B must not keep a parent that is now non-Full"
+    );
+    assert!(nodes[2].node.tree_state().is_root());
+
+    cleanup_nodes(&mut nodes).await;
+}
+
+/// A peer that comes back Full becomes a parent candidate again, with no
+/// leftover leaf-dependent entry.
+///
+/// Chain A(Full, pinned smallest, root) — P(NonRouting) — B(Full). B cannot
+/// use P, so it is its own root. P restarts Full and B re-dials it; after P's
+/// fresh announce B attaches under P toward A.
+#[tokio::test]
+async fn peer_back_as_full_on_cross_connection_becomes_candidate() {
+    use crate::proto::fmp::NodeProfile;
+
+    let profiles = [
+        NodeProfile::Full,
+        NodeProfile::NonRouting,
+        NodeProfile::Full,
+    ];
+    let edges = [(0, 1), (1, 2)];
+    let mut nodes = run_tree_test_with_profiles_leaf_smallest(&profiles, 0, &edges).await;
+    let a_addr = *nodes[0].node.node_addr();
+    let p_addr = *nodes[1].node.node_addr();
+    assert!(
+        nodes[2].node.tree_state().is_root(),
+        "precondition: B cannot use P"
+    );
+    assert!(
+        nodes[2]
+            .node
+            .bloom_state
+            .leaf_dependents()
+            .contains(&p_addr)
+    );
+
+    restart_with_profile_and_redial(&mut nodes, 1, NodeProfile::Full, 2).await;
+    // A re-dials P too (the same cross-connection path), so P regains a path
+    // to A and its announce to B carries it.
+    initiate_handshake(&mut nodes, 0, 1).await;
+    drain_all_packets(&mut nodes, false).await;
+
+    assert_eq!(
+        nodes[2].node.get_peer(&p_addr).map(|p| p.peer_profile()),
+        Some(NodeProfile::Full)
+    );
+    assert!(
+        !nodes[2]
+            .node
+            .bloom_state
+            .leaf_dependents()
+            .contains(&p_addr),
+        "no stale leaf-dependent entry once P is Full"
+    );
+    assert_eq!(
+        nodes[2].node.tree_state().my_declaration().parent_id(),
+        &p_addr,
+        "P is a parent candidate again once Full"
+    );
+    assert_eq!(nodes[2].node.tree_state().root(), &a_addr);
 
     cleanup_nodes(&mut nodes).await;
 }

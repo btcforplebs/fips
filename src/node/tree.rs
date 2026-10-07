@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use secp256k1::XOnlyPublicKey;
 use secp256k1::schnorr::Signature;
 
+use crate::proto::fmp::NodeProfile;
 use crate::proto::stp::{ParentDeclaration, Stp, TreeAnnounce, TreeDecision, TreeError};
 use crate::{Identity, NodeAddr};
 
@@ -816,6 +817,56 @@ impl Node {
     /// attempts to find an alternative or becomes root.
     ///
     /// Returns `true` if our tree state changed (caller should announce).
+    /// Apply a peer profile learned on a cross-connection handshake to an
+    /// already-active peer.
+    ///
+    /// A cross-connection resolves onto the existing `ActivePeer`, so without
+    /// this its profile stays whatever the first handshake negotiated. On a
+    /// change in either direction: update the profile, fix the leaf-dependent
+    /// entry in our bloom filter, and drop the peer's stored tree declaration
+    /// and ancestry (recovering if it was our parent, now with the new profile
+    /// in the skip set). Its next announce re-enters the tree view under the
+    /// new profile, so an ancestry accepted under the old profile is never
+    /// used under the new one.
+    pub(in crate::node) fn refresh_peer_profile(
+        &mut self,
+        node_addr: &NodeAddr,
+        profile: Option<NodeProfile>,
+    ) {
+        let Some(profile) = profile else {
+            return;
+        };
+        let Some(peer) = self.peers.get_mut(node_addr) else {
+            return;
+        };
+        let old = peer.peer_profile();
+        if old == profile {
+            return;
+        }
+        peer.set_peer_profile(profile);
+        info!(
+            peer = %self.peer_display_name(node_addr),
+            old = %old,
+            new = %profile,
+            "Peer profile changed on cross-connection"
+        );
+
+        if profile == NodeProfile::Full {
+            self.bloom_state.remove_leaf_dependent(node_addr);
+        } else {
+            self.bloom_state.add_leaf_dependent(*node_addr);
+        }
+        self.bloom_state.remove_peer_state(node_addr);
+        let all_peers: Vec<NodeAddr> = self.peers.keys().copied().collect();
+        self.bloom_state.mark_all_updates_needed(all_peers);
+
+        if self.handle_peer_removal_tree_cleanup(node_addr) {
+            for peer in self.peers.values_mut() {
+                peer.mark_tree_announce_pending();
+            }
+        }
+    }
+
     pub(super) fn handle_peer_removal_tree_cleanup(&mut self, node_addr: &NodeAddr) -> bool {
         let was_parent =
             !self.tree_state.is_root() && self.tree_state.my_declaration().parent_id() == node_addr;
