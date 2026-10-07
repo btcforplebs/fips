@@ -655,6 +655,10 @@ impl TreeState {
     /// `now_secs` is the injected wall-clock Unix seconds stamped onto the new
     /// declaration; `now_ms` is the monotonic milliseconds driving the parent
     /// re-evaluation's flap timers (the two clock bases must not be crossed).
+    ///
+    /// Applies no parent-candidacy skip: any remaining peer may be chosen. The
+    /// node uses [`recover`](Self::recover) with `non_full_peers()` instead;
+    /// this signature is kept stable for the published API.
     pub fn handle_parent_lost(
         &mut self,
         peer_costs: &BTreeMap<NodeAddr, f64>,
