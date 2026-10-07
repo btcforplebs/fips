@@ -18,7 +18,7 @@ This directory contains Arch Linux packaging files for two AUR packages:
 | `fips.tmpfiles` | tmpfiles.d fragment (creates `/run/fips/`) |
 | `fips.service` | Symlink to `../debian/fips.service` |
 | `fips-dns.service` | Symlink to `../debian/fips-dns.service` |
-| `build-aur.sh` | Local `fips-git` build plus namcap validation (run by `make aur`) |
+| `build-aur.sh` | Local `fips-git` build plus the namcap gate (run by `make aur`) |
 | `patch-pkgbuild.sh` | Rewrites `pkgver`, `pkgrel`, `conflicts`, `options`, and `b2sums` in the PKGBUILD at publish time |
 | `patch-pkgbuild-git.sh` | Rewrites the asset `b2sums` in `PKGBUILD-git` at publish time |
 | `await-package-runs.sh` | Holds the AUR publish until every `package-*.yml` run for the release tag has succeeded |
@@ -61,7 +61,10 @@ Build and validate the `-git` package locally using the Makefile target:
 make -C packaging aur
 ```
 
-This runs `makepkg -sf` followed by `namcap` on the resulting package.
+This runs `makepkg -sf` followed by the namcap gate (`namcap-gate.sh`) on
+`PKGBUILD-git` and the resulting package, and fails on an error-level finding.
+The gate lints every `fips-git-*.pkg.tar.zst` in the directory, so remove
+packages left by earlier builds first.
 
 For manual testing of individual steps:
 
