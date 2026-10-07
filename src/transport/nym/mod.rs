@@ -24,7 +24,7 @@ use crate::transport::socks5::{
     Socks5Auth, Socks5Dialer, SocksTarget, existing_sender, is_pooled, poll_connecting,
     proxied_receive_loop, proxied_send_loop,
 };
-use crate::transport::stream::{ConnId, WRITER_DRAIN_TIMEOUT, drain_writer, next_conn_id};
+use crate::transport::stream::{ConnId, DrainingWriters, WRITER_DRAIN_TIMEOUT, next_conn_id};
 use stats::NymStats;
 
 use std::collections::HashMap;
@@ -62,6 +62,9 @@ pub struct NymTransport {
     packet_tx: PacketTx,
     /// Transport statistics.
     stats: Arc<NymStats>,
+    /// Writers of deliberately closed connections still finishing their
+    /// queues, which `stop_async` must also stop.
+    draining: DrainingWriters,
 }
 
 impl NymTransport {
@@ -81,6 +84,7 @@ impl NymTransport {
             connecting: Arc::new(Mutex::new(HashMap::new())),
             packet_tx,
             stats: Arc::new(NymStats::new()),
+            draining: DrainingWriters::default(),
         }
     }
 
@@ -223,6 +227,10 @@ impl NymTransport {
             );
         }
         drop(pool);
+
+        // Writers of connections closed before the stop are out of the pool,
+        // so the loop above does not reach them.
+        self.draining.stop().await;
 
         self.state = TransportState::Down;
 
@@ -656,8 +664,9 @@ impl NymTransport {
     /// Close a specific connection asynchronously.
     ///
     /// Aborts the receive task and lets the writer finish the frames already
-    /// queued, within [`WRITER_DRAIN_TIMEOUT`], without waiting for it. This
-    /// mirrors `TcpTransport::close_connection_async`.
+    /// queued, within [`WRITER_DRAIN_TIMEOUT`], without waiting for it.
+    /// Stopping the transport ends a writer still draining. This mirrors
+    /// `TcpTransport::close_connection_async`.
     pub async fn close_connection_async(&self, addr: &TransportAddr) {
         let mut pool = self.pool.lock().await;
         if let Some(conn) = pool.remove(addr) {
@@ -669,7 +678,7 @@ impl NymTransport {
             } = conn;
             drop(send_tx);
             recv_task.abort();
-            drain_writer(send_task, WRITER_DRAIN_TIMEOUT);
+            self.draining.drain(send_task, WRITER_DRAIN_TIMEOUT);
             debug!(
                 transport_id = %self.transport_id,
                 remote_addr = %addr,
@@ -1294,6 +1303,49 @@ mod tests {
 
         nym.stop_async().await.unwrap();
         dest.stop_async().await.unwrap();
+    }
+
+    /// Stopping the transport must stop a writer that is still draining after
+    /// a deliberate close, rather than leave it to its drain timer.
+    ///
+    /// The writer holds a oneshot sender and never finishes, so the sender is
+    /// dropped only once the task has been aborted.
+    #[tokio::test]
+    async fn nym_stop_ends_a_writer_still_draining_after_a_close() {
+        let (tx, _rx) = packet_channel(32);
+        let mut nym = NymTransport::new(TransportId::new(1), None, make_config(), tx);
+        nym.start_async().await.unwrap();
+        let remote = TransportAddr::from_string("192.0.2.1:2121");
+        let (guard_tx, mut guard_rx) = tokio::sync::oneshot::channel::<()>();
+        nym.pool.lock().await.insert(
+            remote.clone(),
+            ProxiedConnection {
+                send_tx: tokio::sync::mpsc::channel(1).0,
+                send_task: tokio::spawn(async move {
+                    let _guard = guard_tx;
+                    std::future::pending::<()>().await
+                }),
+                recv_task: tokio::spawn(std::future::pending::<()>()),
+                mtu: 1400,
+                established_at: Instant::now(),
+                meta: (),
+                id: next_conn_id(),
+            },
+        );
+
+        nym.close_connection_async(&remote).await;
+        tokio::time::timeout(Duration::from_secs(2), nym.stop_async())
+            .await
+            .expect("stop waited on a draining writer")
+            .unwrap();
+
+        assert!(
+            matches!(
+                guard_rx.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+            ),
+            "a writer still draining after a close outlived the transport's stop"
+        );
     }
 
     /// With no pooled connection and no connect under way, `send_existing`

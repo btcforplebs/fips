@@ -34,7 +34,7 @@ use crate::config::TcpConfig;
 use crate::proto::fmp::wire::{FMP_VERSION, PHASE_MSG2};
 use crate::transport::framing::{StreamError, read_fmp_packet};
 use crate::transport::stream::{
-    ConnId, WRITER_DRAIN_TIMEOUT, drain_writer, next_conn_id, remove_own,
+    ConnId, DrainingWriters, WRITER_DRAIN_TIMEOUT, next_conn_id, remove_own,
 };
 use pool::{
     ConnectingEntry, ConnectingPool, ConnectionPool, Direction, PoolKey, TcpConnection,
@@ -94,6 +94,9 @@ pub struct TcpTransport {
     /// Longest wait for each later complete inbound frame. Defaults to
     /// `INBOUND_IDLE_TIMEOUT`; the node sets it from its liveness timers.
     idle_timeout: Duration,
+    /// Writers of deliberately closed connections still finishing their
+    /// queues, which `stop_async` must also stop.
+    draining: DrainingWriters,
     /// Transport statistics.
     stats: Arc<TcpStats>,
 }
@@ -119,6 +122,7 @@ impl TcpTransport {
             node_max_connections: None,
             first_frame_timeout: INBOUND_FIRST_FRAME_TIMEOUT,
             idle_timeout: INBOUND_IDLE_TIMEOUT,
+            draining: DrainingWriters::default(),
             stats: Arc::new(TcpStats::new()),
         }
     }
@@ -316,6 +320,10 @@ impl TcpTransport {
             );
         }
         drop(pool);
+
+        // Writers of connections closed before the stop are out of the pool,
+        // so the loop above does not reach them.
+        self.draining.stop().await;
 
         self.local_addr = None;
         self.state = TransportState::Down;
@@ -612,7 +620,8 @@ impl TcpTransport {
     /// timer aborts it if it is still writing after [`WRITER_DRAIN_TIMEOUT`],
     /// so this call never waits on the peer. Stopping the transport, and every
     /// teardown after a connection has failed, abort the writer instead and
-    /// discard what it had queued.
+    /// discard what it had queued; stopping also ends a writer still draining
+    /// from an earlier close.
     pub async fn close_connection_async(&self, addr: &TransportAddr) {
         let mut pool = self.pool.lock().await;
         let key = key_for_remote(&pool, addr);
@@ -626,7 +635,7 @@ impl TcpTransport {
             } = conn;
             drop(send_tx);
             recv_task.abort();
-            drain_writer(send_task, WRITER_DRAIN_TIMEOUT);
+            self.draining.drain(send_task, WRITER_DRAIN_TIMEOUT);
             match direction {
                 Direction::Inbound => self.stats.record_pool_inbound_removed(),
                 Direction::Outbound => self.stats.record_pool_outbound_removed(),
@@ -3625,6 +3634,86 @@ mod tests {
         );
 
         t1.stop_async().await.unwrap();
+    }
+
+    /// Stopping the transport must stop a writer that is still draining after
+    /// a deliberate close, rather than leave it to its drain timer.
+    ///
+    /// The writer holds a oneshot sender and never finishes, so the sender is
+    /// dropped only once the task has been aborted. A stop that left it
+    /// draining returns with the sender still held.
+    #[tokio::test]
+    async fn stopping_the_transport_ends_a_writer_still_draining_after_a_close() {
+        let (tx1, _rx1) = packet_channel(100);
+        let mut t1 = TcpTransport::new(TransportId::new(1), None, make_outbound_config(), tx1);
+        t1.start_async().await.unwrap();
+        let remote = TransportAddr::from_string("127.0.0.1:9");
+        let (guard_tx, mut guard_rx) = tokio::sync::oneshot::channel::<()>();
+        t1.pool.lock().await.insert(
+            PoolKey::outbound(remote.clone()),
+            TcpConnection {
+                send_tx: mpsc::channel(1).0,
+                send_task: tokio::spawn(async move {
+                    let _guard = guard_tx;
+                    std::future::pending::<()>().await
+                }),
+                recv_task: tokio::spawn(std::future::pending::<()>()),
+                mtu: 1400,
+                established_at: Instant::now(),
+                direction: Direction::Outbound,
+                id: next_conn_id(),
+            },
+        );
+        t1.stats.record_pool_outbound_added();
+
+        t1.close_connection_async(&remote).await;
+        timeout(Duration::from_secs(2), t1.stop_async())
+            .await
+            .expect("stop waited on a draining writer")
+            .unwrap();
+
+        assert!(
+            matches!(
+                guard_rx.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+            ),
+            "a writer still draining after a close outlived the transport's stop"
+        );
+    }
+
+    /// No frame a deliberate close left queued may reach the peer after the
+    /// transport has stopped.
+    ///
+    /// The writer is parked on a peer that does not read, with a full queue,
+    /// and the connection is closed and the transport stopped before the peer
+    /// reads anything. A writer left draining delivers every frame it had
+    /// queued once the peer reads; a stopped one delivers fewer, since the
+    /// queue alone holds more frames than the kernel buffers leave unread.
+    #[tokio::test]
+    async fn no_queued_frame_reaches_the_peer_after_the_transport_stops() {
+        let (tx1, _rx1) = packet_channel(100);
+        let mut t1 = TcpTransport::new(TransportId::new(1), None, make_outbound_config(), tx1);
+        t1.start_async().await.unwrap();
+        let listener = capped_deaf_listener();
+        let remote = TransportAddr::from_string(&listener.local_addr().unwrap().to_string());
+        let frame = vec![0xAB; 1400];
+
+        let queued = park_tcp_writer(&t1, &remote, &frame).await;
+        let (mut peer, _) = listener.accept().await.unwrap();
+
+        t1.close_connection_async(&remote).await;
+        t1.stop_async().await.unwrap();
+
+        let read = read_to_eof(&mut peer, Duration::from_secs(10))
+            .await
+            .expect("the connection was never closed toward the peer");
+        assert!(read > 0, "the kernel buffers held written frames");
+        assert!(
+            read < queued * frame.len(),
+            "the writer kept writing after the transport stopped: \
+             read={read} queued_bytes={}",
+            queued * frame.len()
+        );
     }
 
     // ========================================================================
