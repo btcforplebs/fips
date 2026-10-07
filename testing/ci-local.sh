@@ -1580,8 +1580,8 @@ run_portable_atomics() {
 # No bare mktemp result may become a docker bind-mount source. Under a private
 # /tmp, which the builder's CI worker has, the daemon cannot see that path and
 # mounts an empty directory instead, which no GitHub runner shows. Static, plus
-# a self-test of the shared_tmpdir helper; about a second. Not yet mirrored in
-# ci.yml's ci-parity job.
+# a self-test of the shared_tmpdir helper; about a second. Mirrored in ci.yml's
+# ci-parity job by hand.
 run_mount_tmpdir() {
     local rc=0
     info "[mount-tmpdir] Checking that no bind-mount source comes from a bare mktemp"

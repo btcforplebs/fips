@@ -79,6 +79,8 @@ jobs:
         run: bash testing/check-comment-refs.sh
       - name: Check no non-test code uses std 64-bit atomics
         run: python3 testing/check-portable-atomics.py
+      - name: Check no bind-mount source comes from a bare mktemp
+        run: python3 testing/check-mount-tmpdir.py
       # The OpenWrt Package workflow runs this too, but only on trunk pushes,
       # tags and pull requests; here a branch push sees a finding first.
       # Kept in step with ci-local.sh's run_shellcheck by hand.
