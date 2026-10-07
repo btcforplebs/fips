@@ -867,7 +867,7 @@ impl Node {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let mut tree_state = TreeState::new(node_addr, tree_now_secs);
-        tree_state.set_self_is_leaf(node_profile == NodeProfile::Leaf);
+        tree_state.set_self_non_full(node_profile != NodeProfile::Full);
         tree_state.set_parent_hysteresis(config.node.tree.parent_hysteresis);
         tree_state.set_hold_down(config.node.tree.hold_down_secs);
         tree_state.set_flap_dampening(
@@ -1044,7 +1044,7 @@ impl Node {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let mut tree_state = TreeState::new(node_addr, tree_now_secs);
-        tree_state.set_self_is_leaf(config.node_profile() == NodeProfile::Leaf);
+        tree_state.set_self_non_full(config.node_profile() != NodeProfile::Full);
         tree_state.set_parent_hysteresis(config.node.tree.parent_hysteresis);
         tree_state.set_hold_down(config.node.tree.hold_down_secs);
         tree_state.set_flap_dampening(
@@ -1207,7 +1207,7 @@ impl Node {
             ctx.is_leaf_only = true;
             ctx.node_profile = NodeProfile::Leaf;
         });
-        node.tree_state.set_self_is_leaf(true);
+        node.tree_state.set_self_non_full(true);
         Ok(node)
     }
 

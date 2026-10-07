@@ -62,7 +62,7 @@ pub struct TreeState {
     /// nodes keep `false` — they announce, so the same relaxation would emit a
     /// wire-invalid coordinate; a global-min NonRouting node is a separate open
     /// problem for the leaf/non-routing tree-participation model.
-    self_is_leaf: bool,
+    self_non_full: bool,
 }
 
 impl TreeState {
@@ -87,7 +87,7 @@ impl TreeState {
             announced: BTreeMap::new(),
             parent_hysteresis: 0.0,
             flap: FlapDampener::new(),
-            self_is_leaf: false,
+            self_non_full: false,
         }
     }
 
@@ -286,7 +286,7 @@ impl TreeState {
         let parent_id = self.my_declaration.parent_id();
         if let Some(parent_coords) = self.peer_ancestry.get(parent_id) {
             let parent_root = *parent_coords.root_id();
-            if !self.self_is_leaf && self.my_node_addr <= parent_root {
+            if !self.self_non_full && self.my_node_addr <= parent_root {
                 // Prepending self would put a smaller-or-equal node at depth 0,
                 // breaking the "advertised root = min path entry" invariant.
                 // Demote to self-root rather than emit a path peers will reject.
@@ -332,7 +332,7 @@ impl TreeState {
     /// own root, which is harmless.
     pub fn should_be_root(&self) -> bool {
         match self.smallest_visible_root() {
-            Some(sr) => !self.self_is_leaf && self.my_node_addr <= sr,
+            Some(sr) => !self.self_non_full && self.my_node_addr <= sr,
             None => true,
         }
     }
@@ -410,9 +410,9 @@ impl TreeState {
     /// Mark this node as a Leaf (or not), gating it out of root self-election.
     ///
     /// A Leaf attaches under its upstream Full peer and never becomes root; see
-    /// the `self_is_leaf` field docs. Set from the node profile at construction.
-    pub fn set_self_is_leaf(&mut self, is_leaf: bool) {
-        self.self_is_leaf = is_leaf;
+    /// the `self_non_full` field docs. Set from the node profile at construction.
+    pub fn set_self_non_full(&mut self, is_leaf: bool) {
+        self.self_non_full = is_leaf;
     }
 
     /// Set the parent hysteresis factor (0.0-1.0).
@@ -518,7 +518,7 @@ impl TreeState {
         // announces it (`send_tree_announce_to_peer` is Leaf-gated); it is used
         // only for the Leaf's own routing and propagates to peers via the
         // coords carried on its session frames, which are not root-validated.
-        if !self.self_is_leaf && self.my_node_addr <= smallest_root {
+        if !self.self_non_full && self.my_node_addr <= smallest_root {
             return ParentEval::None;
         }
 

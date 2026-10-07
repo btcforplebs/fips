@@ -568,7 +568,7 @@ fn test_leaf_does_not_self_elect_and_selects_full_upstream() {
     let real_root = make_node_addr(2); // the upstream is rooted here
 
     let mut state = TreeState::new(leaf, 1000);
-    state.set_self_is_leaf(true);
+    state.set_self_non_full(true);
     state.update_peer(
         ParentDeclaration::new(upstream, real_root, 1, 1000),
         make_coords(&[3, 2]),
@@ -613,13 +613,13 @@ fn test_leaf_keeps_coord_under_larger_rooted_parent() {
     // only via the coords carried on its session frames, which are not
     // root-min validated). Contrast with
     // test_recompute_coords_demotes_when_self_smaller_than_parent_root, where a
-    // Full self in the same position (default self_is_leaf=false) demotes.
+    // Full self in the same position (default self_non_full=false) demotes.
     let leaf = make_node_addr(1);
     let upstream = make_node_addr(3);
     let real_root = make_node_addr(2);
 
     let mut state = TreeState::new(leaf, 1000);
-    state.set_self_is_leaf(true);
+    state.set_self_non_full(true);
     state.update_peer(
         ParentDeclaration::new(upstream, real_root, 1, 1000),
         make_coords(&[3, 2]),
