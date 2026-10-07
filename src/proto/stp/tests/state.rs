@@ -431,6 +431,50 @@ fn test_handle_parent_lost_finds_alternative() {
 }
 
 #[test]
+fn test_recover_skips_non_full_peers() {
+    // Parent-loss recovery must honour the same parent-candidacy skip as the
+    // announce and periodic paths. Self (5) loses its Full parent (1); the
+    // only remaining peer (2) is non-Full and reaches the same root. It must
+    // self-root rather than adopt a peer that cannot forward transit.
+    let my_node = make_node_addr(5);
+    let mut state = TreeState::new(my_node, 1000);
+
+    let full_parent = make_node_addr(1);
+    let non_full = make_node_addr(2);
+    let root = make_node_addr(0);
+
+    state.update_peer(
+        ParentDeclaration::new(full_parent, root, 1, 1000),
+        make_coords(&[1, 0]),
+    );
+    state.update_peer(
+        ParentDeclaration::new(non_full, root, 1, 1000),
+        make_coords(&[2, 0]),
+    );
+    state.set_parent(full_parent, 1, 1000, 1000);
+    state.recompute_coords();
+
+    state.remove_peer(&full_parent);
+    let skip: BTreeSet<_> = [non_full].into_iter().collect();
+    let outcome = state.recover(&BTreeMap::new(), &skip, 2000, 2000);
+
+    assert!(outcome.changed);
+    assert!(
+        state.is_root(),
+        "must not adopt a skipped (non-Full) peer as parent on recovery"
+    );
+
+    // Control: without the skip, the same state adopts the peer.
+    let mut control = TreeState::new(my_node, 1000);
+    control.update_peer(
+        ParentDeclaration::new(non_full, root, 1, 1000),
+        make_coords(&[2, 0]),
+    );
+    control.recover(&BTreeMap::new(), &BTreeSet::new(), 2000, 2000);
+    assert_eq!(control.my_declaration().parent_id(), &non_full);
+}
+
+#[test]
 fn test_handle_parent_lost_becomes_root_when_self_smaller_than_remaining() {
     // Regression: self (NodeAddr 1) had peer 0 as parent. Peer 0 disappears,
     // leaving only peers with bigger NodeAddrs (and bigger roots). The old

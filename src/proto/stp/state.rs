@@ -661,7 +661,8 @@ impl TreeState {
         now_secs: u64,
         now_ms: u64,
     ) -> bool {
-        self.recover(peer_costs, now_secs, now_ms).changed
+        self.recover(peer_costs, &BTreeSet::new(), now_secs, now_ms)
+            .changed
     }
 
     /// Handle loss of current parent, reporting whether the recovery switch
@@ -671,16 +672,22 @@ impl TreeState {
     /// here. A caller holding a metrics handle uses this one so the
     /// engagement can be counted and logged; the published signature stays
     /// `bool`.
+    ///
+    /// `skip_peers` is the same parent-candidacy exclusion the announce and
+    /// periodic paths pass to [`evaluate_parent`](Self::evaluate_parent)
+    /// (`non_full_peers()` on the node). Without it, losing a parent could
+    /// adopt a non-routing or leaf peer that cannot forward transit.
     pub(crate) fn recover(
         &mut self,
         peer_costs: &BTreeMap<NodeAddr, f64>,
+        skip_peers: &BTreeSet<NodeAddr>,
         now_secs: u64,
         now_ms: u64,
     ) -> ParentLoss {
         // Try to find an alternative parent. The veto is computed at the edge and
         // applied only to a discretionary result; a mandatory switch bypasses it.
         let suppressed = self.is_switch_suppressed(now_ms);
-        let alt = match self.evaluate_parent(peer_costs, &BTreeSet::new()) {
+        let alt = match self.evaluate_parent(peer_costs, skip_peers) {
             ParentEval::Mandatory(p) => Some(p),
             ParentEval::Discretionary(p) if !suppressed => Some(p),
             ParentEval::Discretionary(_) | ParentEval::None => None,
