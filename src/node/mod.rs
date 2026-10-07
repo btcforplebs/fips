@@ -3247,6 +3247,21 @@ impl Node {
         false
     }
 
+    /// Whether this node may send its TreeAnnounce to `peer_addr`.
+    ///
+    /// Always true for a normal node. A leaf-only node announces only to its
+    /// own parent: a peer that never receives our TreeAnnounce has no
+    /// ancestry for us, so it cannot pick us as its parent and its greedy
+    /// tree routing never selects us as a next hop. The parent still learns
+    /// we are its child and routes our own traffic down to us. A leaf that is
+    /// its own root announces to nobody and stays reachable by direct peers.
+    pub(crate) fn may_send_tree_announce(&self, peer_addr: &NodeAddr) -> bool {
+        if !self.is_leaf_only() {
+            return true;
+        }
+        !self.tree_state.is_root() && self.tree_state.my_declaration().parent_id() == peer_addr
+    }
+
     /// Find next hop for a destination node address.
     ///
     /// Routing priority:

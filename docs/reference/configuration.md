@@ -117,7 +117,7 @@ ephemeral mode a `fips.key` found at startup is moved aside to
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `node.leaf_only` | bool | `false` | Leaf-only mode: node does not forward traffic or participate in routing |
+| `node.leaf_only` | bool | `false` | Leaf-only mode: the node is reachable but never carries other nodes' traffic. It announces its tree position only to its parent, advertises only itself in bloom filters, drops transit datagrams as no-route, and does not forward lookups for other targets. See [Leaf-Only Operation](../design/fips-mesh-operation.md#leaf-only-operation) |
 | `node.tick_interval_secs` | u64 | `1` | Periodic maintenance tick interval (retry checks, timeout cleanup, tree refresh) |
 | `node.base_rtt_ms` | u64 | `100` | Initial RTT estimate for new links before measurements converge |
 | `node.heartbeat_interval_secs` | u64 | `10` | Heartbeat send interval per peer for liveness detection |

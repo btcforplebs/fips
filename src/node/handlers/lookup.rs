@@ -183,6 +183,13 @@ impl Node {
                 );
                 self.send_lookup_response(&request).await;
             }
+            RequestOutcome::Forward if self.is_leaf_only() => {
+                debug!(
+                    request_id = request.request_id,
+                    target = %self.peer_display_name(&request.target),
+                    "Leaf-only: not forwarding LookupRequest for another node"
+                );
+            }
             RequestOutcome::Forward => {
                 self.metrics().lookup.req_forwarded.inc();
                 self.forward_lookup_request(request).await;

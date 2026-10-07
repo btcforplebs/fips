@@ -20,6 +20,7 @@ mod establish_chartests;
 mod forwarding;
 mod handshake;
 mod heartbeat;
+mod leaf_only;
 mod mmp_chartests;
 mod probe;
 mod routing;

@@ -485,44 +485,56 @@ When traffic resumes:
 3. Coordinates: discovery may be needed if cache has expired
 4. SessionSetup re-warms transit caches on the new path
 
-## Leaf-Only Operation *(under development)*
+## Leaf-Only Operation
 
-Leaf-only operation is an optimization for resource-constrained nodes
-(sensors, battery-powered devices). The core infrastructure exists (config
-flag, node constructor, bloom filter support) but is not yet enabled in
-normal operation.
+A node with `node.leaf_only: true` takes part in the mesh as a destination
+only. It is meant for nodes that should be reachable but must not spend
+battery, bandwidth or address exposure on other nodes' traffic, such as a
+phone. No wire format changes: a leaf works against unmodified peers.
 
-### Concept
+A leaf-only node:
 
-A leaf-only node connects to a single upstream peer that handles all routing
-on its behalf:
+- **Announces its tree position only to its parent.** It still chooses a
+  parent the usual way, and sends its TreeAnnounce to that peer alone. Its
+  other peers hold no ancestry for it, so it is never a parent candidate for
+  them and their greedy tree routing never picks it as a next hop. Its
+  parent sees it as a child and routes traffic for it down to it. A leaf
+  that is its own root announces to nobody.
+- **Advertises only itself.** Its outbound bloom filters contain its own
+  node_addr and nothing merged from peers, so no peer learns to reach
+  another destination through it.
+- **Refuses transit.** A SessionDatagram addressed to another node resolves
+  no next hop and takes the NoRoute path: it is dropped, counted as
+  `drop_no_route`, and the source receives the usual error signal.
+- **Does not forward lookups.** A LookupRequest for another target is
+  dropped. A LookupRequest for the leaf itself is answered as usual.
+
+Traffic the leaf originates, and traffic addressed to it, route normally.
+Direct peers always reach it.
+
+When a leaf switches parent, its previous parent keeps the old
+TreeAnnounce while that link stays up. That declaration
+names the previous parent as the leaf's parent, so loop rejection keeps it
+from ever selecting the leaf.
+
+### Limitation
+
+If the leaf has the smallest node_addr among the nodes it can see, it is
+the root of a tree containing only itself, and peers stay in their own
+trees. It is then reachable by direct peers only, not across the mesh.
+
+### Leaf Dependents *(under development)*
+
+A further mode, for very constrained devices, would have a leaf delegate
+its routing state to a single upstream peer:
 
 - **No bloom filter storage or processing**: The upstream peer includes the
   leaf's identity in its own outbound bloom filters
-- **No spanning tree participation**: The leaf does not offer itself as a
-  potential parent to other nodes
 - **Simplified routing**: All traffic tunnels through the upstream peer
 - **Minimal resource usage**: Suitable for ESP32-class devices (~500KB RAM)
 
-### Upstream Peer Responsibilities
-
-The upstream peer:
-
-- Includes the leaf's identity in its outbound bloom filters
-- Forwards all traffic addressed to the leaf
-- Handles discovery responses on behalf of the leaf
-- Maintains the link session with the leaf
-
-### What the Leaf Retains
-
-Even as a leaf-only node, it still:
-
-- Maintains its own Noise IK link session with the upstream peer (FMP layer)
-- Can establish end-to-end FSP sessions with arbitrary destinations
-- Has its own identity (npub, node_addr)
-
-The optimization is purely at the routing/mesh layer — the leaf delegates
-routing decisions but retains its own end-to-end encryption and identity.
+The bloom state already carries a leaf-dependents set for this; nothing
+populates it yet.
 
 ## Packet Type Summary
 
@@ -577,7 +589,8 @@ recovery).
 | Discovery originator backoff | **Implemented** |
 | Discovery transit-side rate limiting | **Implemented** |
 | Discovery response-forwarded dedup | **Implemented** |
-| Leaf-only operation | Under development |
+| Leaf-only operation (non-transit) | **Implemented** |
+| Leaf dependents (upstream delegation) | Under development |
 | Link cost in parent selection (ETX) | **Implemented** |
 | Link cost in candidate ranking | **Implemented** |
 
