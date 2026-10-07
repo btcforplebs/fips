@@ -259,7 +259,13 @@ impl Node {
             return;
         }
 
-        if let Err(e) = announce.validate_semantics() {
+        // The relaxed entry-0 rule keys on the profile negotiated in the
+        // authenticated handshake for `from`, never on the announce itself.
+        let sender_is_full = self
+            .peers
+            .get(from)
+            .is_none_or(|peer| peer.peer_profile() == NodeProfile::Full);
+        if let Err(e) = announce.validate_semantics_from(sender_is_full) {
             self.metrics()
                 .tree
                 .record_reject(TreeReject::AncestryInvalid);

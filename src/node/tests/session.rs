@@ -7,7 +7,8 @@ use crate::node::tests::spanning_tree::{
     lock_large_network_test, make_test_node_with_config, pinned_tree, populate_all_coord_caches,
     process_available_packets, restarted_node, run_tree_test, run_tree_test_with_configs,
     run_tree_test_with_mtus, run_tree_test_with_profiles,
-    run_tree_test_with_profiles_leaf_smallest, verify_tree_convergence,
+    run_tree_test_with_profiles_leaf_smallest, run_tree_test_with_profiles_ordered,
+    verify_tree_convergence,
 };
 use crate::proto::fsp::{SessionAck, SessionMsg3};
 use crate::proto::link::SessionDatagram;
@@ -759,6 +760,220 @@ async fn leaf_smallest_addr_does_not_partition_multihop() {
         found,
         "D->B multi-hop datagram must be delivered to B's TUN"
     );
+
+    cleanup_nodes(&mut nodes).await;
+}
+
+/// A NonRouting node holding the smallest NodeAddr must not partition the mesh
+/// either. Unlike a Leaf it announces, so its Full peers must accept its
+/// `self < root` entry 0 while still never choosing it as a parent.
+///
+/// Topology A — B — C (Full), with N (NonRouting, pinned smallest) linked to
+/// both A and C. Without the non-Full root gate N self-roots and the mesh
+/// splits; without the receive-side exemption A and C reject N's announces.
+#[tokio::test]
+async fn non_routing_smallest_addr_does_not_partition_multihop() {
+    use crate::proto::fmp::NodeProfile;
+
+    // 0=A, 1=B, 2=C Full; 3=N NonRouting (pinned smallest).
+    let profiles = [
+        NodeProfile::Full,
+        NodeProfile::Full,
+        NodeProfile::Full,
+        NodeProfile::NonRouting,
+    ];
+    let edges = [(0, 1), (1, 2), (3, 0), (3, 2)];
+    let mut nodes = run_tree_test_with_profiles_leaf_smallest(&profiles, 3, &edges).await;
+    let n_addr = *nodes[3].node.node_addr();
+    let full_min = (0..3).map(|i| *nodes[i].node.node_addr()).min().unwrap();
+
+    assert!(
+        !nodes[3].node.tree_state().is_root(),
+        "the NonRouting node (smallest addr) must not self-elect as root"
+    );
+    for (i, n) in nodes.iter().enumerate() {
+        assert_eq!(
+            n.node.tree_state().root(),
+            &full_min,
+            "node {i} must share the one Full-rooted tree; {}",
+            mesh_state(&nodes)
+        );
+        assert_eq!(
+            n.node.metrics().tree.ancestry_invalid.get(),
+            0,
+            "node {i} must not reject any announce"
+        );
+    }
+    for (i, full) in nodes.iter().enumerate().take(3) {
+        assert_ne!(
+            full.node.tree_state().my_declaration().parent_id(),
+            &n_addr,
+            "Full node {i} must not adopt the NonRouting node as parent"
+        );
+    }
+    // N's own coordinate carries it below the root at entry 0, and its Full
+    // peers stored that announce rather than rejecting it.
+    assert_eq!(nodes[3].node.tree_state().my_coords().node_addr(), &n_addr);
+    for i in [0, 2] {
+        assert!(
+            nodes[i].node.tree_state().peer_coords(&n_addr).is_some(),
+            "Full peer {i} must have accepted N's relaxed announce"
+        );
+    }
+
+    populate_all_coord_caches(&mut nodes);
+
+    let (tx, b_rx) = std::sync::mpsc::channel();
+    nodes[1].node.install_tun(tx);
+    let (b_addr, b_pubkey) = (
+        *nodes[1].node.node_addr(),
+        nodes[1].node.identity().pubkey_full(),
+    );
+
+    // N -> B: multi-hop, through A or C.
+    nodes[3]
+        .node
+        .initiate_session(b_addr, b_pubkey)
+        .await
+        .expect("N->B initiate_session must succeed (no partition)");
+    drain_to_quiescence(&mut nodes).await;
+
+    let payload = b"non-routing-multihop".to_vec();
+    let n_fips = crate::FipsAddress::from_node_addr(&n_addr);
+    let b_fips = crate::FipsAddress::from_node_addr(&b_addr);
+    let ipv6 = build_ipv6_packet(&n_fips, &b_fips, &payload);
+    nodes[3]
+        .node
+        .send_ipv6_packet(&b_addr, &ipv6)
+        .await
+        .expect("N->B send must succeed");
+    drain_to_quiescence(&mut nodes).await;
+
+    let found = std::iter::from_fn(|| b_rx.try_recv().ok())
+        .any(|pkt| pkt.len() >= 40 && pkt[40..] == payload[..]);
+    assert!(
+        found,
+        "N->B multi-hop datagram must be delivered to B's TUN"
+    );
+
+    cleanup_nodes(&mut nodes).await;
+}
+
+/// A Full node whose parent drops while its only other tree peer is a
+/// NonRouting node below the root must not adopt it, and the announce it then
+/// sends must pass strict validation at a third node.
+///
+/// N(NonRouting) < R < F < X (all Full), pinned. R — F — X in a line, and N
+/// linked to R and F. F's parent is R; X hangs off F, so X's path runs through
+/// F and is no alternative.
+#[tokio::test]
+async fn parent_loss_with_relaxed_non_full_peer_self_roots_cleanly() {
+    use crate::proto::fmp::NodeProfile;
+
+    // 0=N NonRouting; 1=R, 2=F, 3=X Full.
+    let profiles = [
+        NodeProfile::NonRouting,
+        NodeProfile::Full,
+        NodeProfile::Full,
+        NodeProfile::Full,
+    ];
+    let edges = [(1, 2), (2, 3), (0, 1), (0, 2)];
+    let mut nodes = run_tree_test_with_profiles_ordered(&profiles, &edges).await;
+    let n_addr = *nodes[0].node.node_addr();
+    let r_addr = *nodes[1].node.node_addr();
+    let f_addr = *nodes[2].node.node_addr();
+    assert_eq!(
+        nodes[2].node.tree_state().my_declaration().parent_id(),
+        &r_addr,
+        "F sits under R; {}",
+        mesh_state(&nodes)
+    );
+    assert!(
+        nodes[2].node.tree_state().peer_coords(&n_addr).is_some(),
+        "F holds N's relaxed path"
+    );
+
+    nodes[2].node.remove_active_peer(&r_addr);
+    assert_ne!(
+        nodes[2].node.tree_state().my_declaration().parent_id(),
+        &n_addr,
+        "F must not adopt the NonRouting peer after losing R"
+    );
+    assert!(nodes[2].node.tree_state().is_root(), "F self-roots");
+
+    let rejected_before = nodes[3].node.metrics().tree.ancestry_invalid.get();
+    let x_addr = *nodes[3].node.node_addr();
+    nodes[2]
+        .node
+        .send_tree_announce_to_peer(&x_addr)
+        .await
+        .expect("F announces to X");
+    drain_all_packets(&mut nodes, false).await;
+    assert_eq!(
+        nodes[3].node.metrics().tree.ancestry_invalid.get(),
+        rejected_before,
+        "X must accept F's announce under the strict rule"
+    );
+    assert_eq!(
+        nodes[3]
+            .node
+            .tree_state()
+            .peer_coords(&f_addr)
+            .map(|c| *c.root_id()),
+        Some(f_addr),
+        "X stored F's self-root announce"
+    );
+
+    cleanup_nodes(&mut nodes).await;
+}
+
+/// A NonRouting node whose Full parent drops, leaving only a link to another
+/// phone, must fall back to a clean self-root rather than hold its old parent
+/// or attach under the other phone.
+///
+/// A(Full) with phones N (NonRouting, pinned smallest) and M (NonRouting),
+/// both under A and linked to each other.
+#[tokio::test]
+async fn non_routing_parent_loss_with_only_phone_peer_self_roots() {
+    use crate::proto::fmp::NodeProfile;
+
+    // 0=A Full; 1=N NonRouting (pinned smallest); 2=M NonRouting.
+    let profiles = [
+        NodeProfile::Full,
+        NodeProfile::NonRouting,
+        NodeProfile::NonRouting,
+    ];
+    let edges = [(0, 1), (0, 2), (1, 2)];
+    let mut nodes = run_tree_test_with_profiles_leaf_smallest(&profiles, 1, &edges).await;
+    let a_addr = *nodes[0].node.node_addr();
+    let m_addr = *nodes[2].node.node_addr();
+    assert_eq!(
+        nodes[1].node.tree_state().my_declaration().parent_id(),
+        &a_addr,
+        "N attaches under A while A is up"
+    );
+    assert_eq!(nodes[2].node.tree_state().root(), &a_addr);
+
+    nodes[1].node.remove_active_peer(&a_addr);
+    assert!(
+        nodes[1].node.tree_state().is_root(),
+        "N self-roots once its only Full peer is gone"
+    );
+    assert_ne!(
+        nodes[1].node.tree_state().my_declaration().parent_id(),
+        &m_addr
+    );
+    drain_all_packets(&mut nodes, false).await;
+    assert!(
+        nodes[1].node.tree_state().is_root(),
+        "N stays a clean self-root with only a phone peer left"
+    );
+    // M still sits under A and accepted N's self-root announce.
+    assert_eq!(
+        nodes[2].node.tree_state().my_declaration().parent_id(),
+        &a_addr
+    );
+    assert_eq!(nodes[2].node.metrics().tree.ancestry_invalid.get(), 0);
 
     cleanup_nodes(&mut nodes).await;
 }

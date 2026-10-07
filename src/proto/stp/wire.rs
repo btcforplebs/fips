@@ -46,7 +46,28 @@ impl TreeAnnounce {
     /// - for a non-root declaration, the second ancestry entry matches `parent_id`
     /// - the final ancestry entry is the advertised root
     /// - the advertised root is the smallest `node_addr` in the ancestry
+    ///
+    /// This is the strict rule, for a Full sender. See
+    /// [`validate_semantics_from`](Self::validate_semantics_from) for the
+    /// non-Full exemption.
     pub fn validate_semantics(&self) -> Result<(), TreeError> {
+        self.validate_semantics_from(true)
+    }
+
+    /// [`validate_semantics`](Self::validate_semantics), with the root-min rule
+    /// relaxed for a non-Full sender's own entry.
+    ///
+    /// A non-Full (Leaf or NonRouting) node never self-elects as root, even
+    /// when it is the smallest node it can see, so its coordinate may carry
+    /// itself below the root at entry 0. When `sender_is_full` is `false`, only
+    /// that entry is exempt: the advertised root must still be the smallest of
+    /// the remaining entries, so no ancestor may sit below the root. The
+    /// exemption is safe because no node adopts a non-Full peer as its parent,
+    /// so a relaxed entry is never prepended to anyone else's path.
+    ///
+    /// `sender_is_full` must come from the sender's authenticated handshake
+    /// profile, not from the announce.
+    pub fn validate_semantics_from(&self, sender_is_full: bool) -> Result<(), TreeError> {
         let entries = self.ancestry.entries();
         let declared_node = *self.declaration.node_addr();
         let declared_parent = *self.declaration.parent_id();
@@ -73,7 +94,14 @@ impl TreeAnnounce {
         }
 
         let advertised_root = *self.ancestry.root_id();
-        let minimum = entries
+        // A non-root declaration has at least two entries (checked above), so
+        // skipping entry 0 for a non-Full sender leaves one to take the min of.
+        let checked = if sender_is_full || self.declaration.is_root() {
+            entries
+        } else {
+            &entries[1..]
+        };
+        let minimum = checked
             .iter()
             .map(|entry| entry.node_addr)
             .min()

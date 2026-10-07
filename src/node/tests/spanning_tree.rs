@@ -940,6 +940,28 @@ pub(super) async fn run_tree_test_with_profiles_leaf_smallest(
     nodes
 }
 
+/// Like [`run_tree_test_with_profiles_leaf_smallest`], but every NodeAddr is
+/// pinned: node `i` gets the `i`-th smallest, so the tree's shape is fixed.
+pub(super) async fn run_tree_test_with_profiles_ordered(
+    profiles: &[crate::proto::fmp::NodeProfile],
+    edges: &[(usize, usize)],
+) -> Vec<TestNode> {
+    let mut ids: Vec<Identity> = (0..profiles.len()).map(|_| Identity::generate()).collect();
+    ids.sort_by(|a, b| a.node_addr().cmp(b.node_addr()));
+
+    let mut nodes = Vec::with_capacity(profiles.len());
+    for (i, &profile) in profiles.iter().enumerate() {
+        nodes.push(make_test_node_with_profile_and_identity(profile, ids[i].clone()).await);
+    }
+    for &(i, j) in edges {
+        initiate_handshake(&mut nodes, i, j).await;
+    }
+    let total = drain_all_packets(&mut nodes, false).await;
+    assert!(total > 0, "Should have processed at least some packets");
+    repair_missing_edge_handshakes(&mut nodes, edges, false).await;
+    nodes
+}
+
 /// Like `run_tree_test` but with per-node transport MTUs.
 ///
 /// `mtus` must have one entry per node. Used for heterogeneous-MTU tests
