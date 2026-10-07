@@ -51,10 +51,6 @@ fn short_npub(npub: &str) -> String {
         .unwrap_or_else(|| npub.to_string())
 }
 
-/// Whether an inbound-offer rejection belongs to a class that cannot be
-/// explained by ordinary relay delivery lag, and therefore warrants a warning
-/// on a node running at the default log level. A stale offer is benign and is
-/// deliberately excluded.
 /// An offer we sent and are still waiting on, with what is needed to send it
 /// again. `resent` caps the re-send at once per offer.
 struct InflightOffer {
@@ -64,6 +60,10 @@ struct InflightOffer {
     resent: bool,
 }
 
+/// Whether an inbound-offer rejection belongs to a class that cannot be
+/// explained by ordinary relay delivery lag, and therefore warrants a warning
+/// on a node running at the default log level. A stale offer is benign and is
+/// deliberately excluded.
 pub(super) fn adversarial_offer_reject(err: &BootstrapError) -> bool {
     matches!(
         err,
