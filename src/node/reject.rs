@@ -192,7 +192,8 @@ pub enum DiscoveryReject {
 /// `UnknownConnection` covers lookup-miss sites where an inbound message
 /// arrived for a connection identifier we don't recognise (no pending
 /// outbound for the receiver_idx in msg2; duplicate msg1 with no stored
-/// msg2 to resend).
+/// msg2 to resend). `SilentBackoff` covers a msg1 refused because the
+/// identity's recent sessions ended without an authenticated frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum HandshakeReject {
@@ -210,6 +211,12 @@ pub enum HandshakeReject {
     /// no rekey-responder state). Tracked via
     /// [`HandshakeStats::unknown_connection`](crate::node::stats::HandshakeStats).
     UnknownConnection,
+    /// Inbound msg1 refused, without an answer, because the identity's last
+    /// sessions at that startup epoch (three or more in a row) ended without
+    /// one authenticated frame and the back-off they started is running. Not
+    /// counted in `bad_state`. Tracked via
+    /// [`HandshakeStats::silent_backoff`](crate::node::stats::HandshakeStats).
+    SilentBackoff,
 }
 
 /// FSP session rejection reasons.

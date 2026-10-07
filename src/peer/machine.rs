@@ -1947,6 +1947,7 @@ mod tests {
             has_pending_outbound_to_peer: false,
             rekey_enabled: true,
             our_node_addr: our,
+            silent_backoff: None,
         }
     }
 

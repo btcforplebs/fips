@@ -2,6 +2,8 @@
 
 use crate::NodeAddr;
 use crate::node::Node;
+use crate::node::diag::OrNone;
+use crate::peer::ActivePeer;
 use std::time::Instant;
 use tracing::{debug, info, trace};
 
@@ -106,6 +108,28 @@ impl Node {
         self.note_link_dead(addr, now_ms);
     }
 
+    /// Count `peer`'s session, removed without having carried one
+    /// authenticated frame, toward its identity's silent-session back-off,
+    /// and log the refusal this starts or extends.
+    fn note_silent_session(&mut self, node_addr: &NodeAddr, peer: &ActivePeer) {
+        let epoch = peer.remote_epoch();
+        let refusal = self.silent_sessions.ended(
+            *node_addr,
+            epoch,
+            peer.setup_msg1(),
+            crate::time::mono_ms(),
+        );
+        if let Some(refusal) = refusal {
+            debug!(
+                peer = %self.peer_display_name(node_addr),
+                startup_epoch = %OrNone(epoch.map(hex::encode)),
+                silent = refusal.silent,
+                refuse_s = refusal.remaining_ms / 1000,
+                "Session ended without a frame, refusing the peer's msg1s at this epoch"
+            );
+        }
+    }
+
     /// Remove an active peer and clean up all associated state.
     ///
     /// Frees session index, removes link and address mappings. Used for
@@ -122,6 +146,10 @@ impl Node {
                 return;
             }
         };
+
+        if !peer.heard() {
+            self.note_silent_session(node_addr, &peer);
+        }
 
         // Log suppressed replay detection summary before teardown
         let suppressed = peer.replay_suppressed_count();

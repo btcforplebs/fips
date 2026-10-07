@@ -55,11 +55,11 @@ use crate::node::session::SessionEntry;
 use crate::peer::machine::{PeerMachine, TimerKind};
 use crate::peer::{ActivePeer, ConnectivityState};
 use crate::proto::bloom::{BloomFilter, BloomState};
-use crate::proto::fmp::Fmp;
 use crate::proto::fmp::wire::{
     ESTABLISHED_HEADER_SIZE, FLAG_CE, FLAG_KEY_EPOCH, FLAG_SP, build_encrypted,
     build_established_header, prepend_inner_header,
 };
+use crate::proto::fmp::{Fmp, SilentSessions};
 use crate::proto::fsp::Fsp;
 use crate::proto::fsp::quorum::LinkQuorum;
 use crate::proto::lookup::{Lookup, LookupBackoff, LookupForwardRateLimiter};
@@ -649,6 +649,11 @@ pub struct Node {
     /// the peer entry itself. Pruned on insert; see
     /// `EPOCH_RESTART_MIN_INTERVAL_SECS`.
     restart_dampener: HashMap<NodeAddr, std::time::Instant>,
+    /// Each identity's recent link sessions that ended without one
+    /// authenticated frame, and the msg1 refusal they drive. Held here, not
+    /// on `ActivePeer`, for the same reason as `restart_dampener`: the
+    /// removal it counts destroys the peer entry.
+    silent_sessions: SilentSessions,
 
     // === Rate Limiting ===
     /// Rate limiter for msg1 processing (DoS protection).
@@ -938,6 +943,7 @@ impl Node {
             msgtype_budget: diag::LogBudget::new(std::time::Instant::now()),
             pending_outbound: HashMap::new(),
             restart_dampener: HashMap::new(),
+            silent_sessions: SilentSessions::new(),
             msg1_rate_limiter,
             setup_rate_limiter,
             icmp_rate_limiter: IcmpRateLimiter::new(),
@@ -1111,6 +1117,7 @@ impl Node {
             msgtype_budget: diag::LogBudget::new(std::time::Instant::now()),
             pending_outbound: HashMap::new(),
             restart_dampener: HashMap::new(),
+            silent_sessions: SilentSessions::new(),
             msg1_rate_limiter,
             setup_rate_limiter,
             icmp_rate_limiter: IcmpRateLimiter::new(),

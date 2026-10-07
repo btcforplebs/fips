@@ -119,6 +119,9 @@ impl EstablishView for Node {
             }),
             rekey_enabled: self.config().node.rekey.enabled,
             our_node_addr: *self.identity().node_addr(),
+            silent_backoff: self
+                .silent_sessions
+                .refusing(peer_addr, crate::time::mono_ms()),
         }
     }
 
@@ -702,6 +705,7 @@ impl Node {
         // out before the classification consumes it, and the established
         // link is read before any arm can change it.
         let age_s = est.existing_session_age_secs;
+        let silent_backoff = est.silent_backoff;
         let held_dg = OrNone(est.held_answer.as_ref().map(|a| diag::msg1_tag(&a.msg1)));
         // The receiver index of the stored msg2 a duplicate is answered with
         // is the sender index of the msg1 it answers.
@@ -765,6 +769,27 @@ impl Node {
                     .record_reject(RejectReason::Handshake(HandshakeReject::BadState));
             }
             InboundDecision::Reject {
+                reason: InboundReject::SilentBackoff,
+            } => {
+                // The identity's last sessions at this epoch carried no
+                // frame and its back-off is running. The classification
+                // failed the fresh leg with no actions, and `conn`/`link_id`
+                // were never registered, so dropping the msg1 unanswered is
+                // the whole effect.
+                debug_assert!(actions.is_empty());
+                debug!(
+                    peer = %self.peer_display_name(&peer_node_addr),
+                    transport_id = %packet.transport_id,
+                    remote_addr = %packet.remote_addr,
+                    msg1_dg = %msg1_dg,
+                    silent = %OrNone(silent_backoff.map(|b| b.silent)),
+                    remaining_s = %OrNone(silent_backoff.map(|b| b.remaining_ms.div_ceil(1000))),
+                    "Msg1 from a peer whose recent sessions carried no frame, refusing during its back-off"
+                );
+                self.stats_mut()
+                    .record_reject(RejectReason::Handshake(HandshakeReject::SilentBackoff));
+            }
+            InboundDecision::Reject {
                 reason:
                     reason @ (InboundReject::PendingSession
                     | InboundReject::DualRekeyWon
@@ -810,7 +835,7 @@ impl Node {
                         msg1_dg = %msg1_dg,
                         "Same-epoch msg1 off the established link while that link is up, dropping"
                     ),
-                    InboundReject::AtMaxPeers => unreachable!(),
+                    InboundReject::AtMaxPeers | InboundReject::SilentBackoff => unreachable!(),
                 }
                 // `conn`/`link_id` were never inserted into the registry, so the
                 // local drop suffices — no cleanup needed.

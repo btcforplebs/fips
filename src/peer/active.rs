@@ -894,6 +894,13 @@ impl ActivePeer {
         self.send.heard = true;
     }
 
+    /// Set the last-seen time without marking the peer heard, as for a
+    /// session that has carried no authenticated frame and gone idle.
+    #[cfg(test)]
+    pub(crate) fn test_set_last_seen(&mut self, current_time_ms: u64) {
+        self.send.last_seen = current_time_ms;
+    }
+
     /// Update the link ID (e.g., on reconnect).
     pub fn set_link_id(&mut self, link_id: LinkId) {
         self.send.link_id = link_id;
@@ -1174,6 +1181,12 @@ impl ActivePeer {
     /// the one the stored msg2 answers.
     pub(crate) fn is_setup(&self, msg1: &Msg1Digest) -> bool {
         self.setup_msg1.as_ref() == Some(msg1)
+    }
+
+    /// The digest of the link-setup msg1 this peering was promoted from, or
+    /// `None` for a peering this node dialled.
+    pub(crate) fn setup_msg1(&self) -> Option<Msg1Digest> {
+        self.setup_msg1
     }
 
     /// Record `msg1`, the link-setup msg1 this peering was promoted from, so

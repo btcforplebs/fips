@@ -94,6 +94,7 @@ pub(super) fn establish_snapshot() -> EstablishSnapshot {
         has_pending_outbound_to_peer: false,
         rekey_enabled: true,
         our_node_addr: make_node_addr(0x10),
+        silent_backoff: None,
     }
 }
 

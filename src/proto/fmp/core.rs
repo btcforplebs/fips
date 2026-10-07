@@ -17,6 +17,7 @@
 //! (`handle_msg2`) classification and the born-on-next `handle_msg3` leaf remain
 //! shell-side.
 
+use super::silent::{ActiveBackoff, epochs_differ};
 use super::state::Fmp;
 use crate::transport::{LinkId, TransportAddr, TransportId};
 use crate::utils::index::SessionIndex;
@@ -397,6 +398,10 @@ pub(crate) struct EstablishSnapshot {
     pub rekey_enabled: bool,
     /// This node's own address, for the dual-initiation tie-break.
     pub our_node_addr: NodeAddr,
+    /// The refusal in force for this identity after its sessions ended
+    /// without an authenticated frame, read shell-side from its
+    /// [`SilentSessions`](super::SilentSessions) record. `None` when none is.
+    pub silent_backoff: Option<ActiveBackoff>,
 }
 
 /// Where an inbound msg1 arrived, and the shell's answer to whether the
@@ -557,15 +562,19 @@ pub(crate) enum InboundDecision {
     /// opaque stored bytes, always present when the setup digest matched,
     /// since the two are stored and cleared together.
     ResendMsg2 { msg2: Option<Vec<u8>> },
-    /// Drop this msg1 with a handshake reject (`HandshakeReject::BadState`) and
-    /// no promotion. `reason` selects only the diagnostic log line — every reject
-    /// records the same stat and completes the rate-limiter identically.
+    /// Drop this msg1 with a handshake reject and no promotion. Every reject
+    /// but [`InboundReject::SilentBackoff`] records `HandshakeReject::BadState`;
+    /// that one records its own reason. `reason` otherwise selects only the
+    /// diagnostic log line, and every reject completes the rate-limiter
+    /// identically.
     Reject { reason: InboundReject },
 }
 
-/// Why an inbound msg1 was rejected. Distinguishes only the diagnostic log
-/// message; every variant rejects identically (BadState stat, rate-limiter
-/// complete, the local not-yet-registered connection dropped).
+/// Why an inbound msg1 was rejected. Every variant rejects identically
+/// (rate-limiter complete, the local not-yet-registered connection dropped)
+/// and records `HandshakeReject::BadState`, except
+/// [`SilentBackoff`](InboundReject::SilentBackoff), which records its own
+/// reason.
 #[derive(Debug)]
 pub(crate) enum InboundReject {
     /// At `max_peers` and this is a net-new identity with no pending outbound to
@@ -587,6 +596,12 @@ pub(crate) enum InboundReject {
     /// peer's established link while that link works: a second path, not a
     /// rekey of this link.
     OffLink,
+    /// The identity's last sessions at this msg1's epoch, at least
+    /// [`SILENT_SESSION_LIMIT`](super::silent::SILENT_SESSION_LIMIT) in a
+    /// row, ended without one authenticated frame, and the back-off they
+    /// started is still running. Checked only where the msg1 would promote a
+    /// new session.
+    SilentBackoff,
 }
 
 /// The classification outcome for one outbound `handle_msg2` completion, decided
@@ -856,6 +871,11 @@ impl Fmp {
                                 reason: InboundReject::AnsweredBefore,
                             };
                         }
+                        if silent_refusal(snap, wire) {
+                            return InboundDecision::Reject {
+                                reason: InboundReject::SilentBackoff,
+                            };
+                        }
                         return InboundDecision::ReplaceThenPromote { peer: peer_addr };
                     }
                     if !snap.msg1_on_link && snap.link_reachable {
@@ -918,6 +938,10 @@ impl Fmp {
                     }
                 }
             }
+        } else if silent_refusal(snap, wire) {
+            InboundDecision::Reject {
+                reason: InboundReject::SilentBackoff,
+            }
         } else {
             // No existing peer for this identity → net-new promote.
             InboundDecision::Promote
@@ -948,4 +972,13 @@ impl Fmp {
 fn next_resend_at_ms(now_ms: u64, interval_ms: u64, backoff: f64, prior_count: u32) -> u64 {
     let count = prior_count + 1;
     now_ms + (interval_ms as f64 * crate::proto::math::powi(backoff, count)) as u64
+}
+
+/// Whether a refusal for silent sessions covers this msg1: one is in force
+/// for the identity and the msg1 is at the epoch it counted. A msg1 at another
+/// epoch is a restart and is left to the restart guard.
+fn silent_refusal(snap: &EstablishSnapshot, wire: &WireOutcome) -> bool {
+    snap.silent_backoff
+        .as_ref()
+        .is_some_and(|b| !epochs_differ(b.epoch, wire.remote_epoch))
 }

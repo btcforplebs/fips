@@ -162,6 +162,10 @@ pub struct HandshakeStats {
     /// resend, msg3 for an unknown pending-inbound index without a
     /// matching rekey-responder slot.
     pub unknown_connection: u64,
+    /// Inbound msg1 refused because the identity's recent sessions at that
+    /// startup epoch ended without an authenticated frame and its back-off
+    /// is running. Not part of `bad_state`.
+    pub silent_backoff: u64,
 }
 
 impl HandshakeStats {
@@ -169,6 +173,7 @@ impl HandshakeStats {
         HandshakeStatsSnapshot {
             bad_state: self.bad_state,
             unknown_connection: self.unknown_connection,
+            silent_backoff: self.silent_backoff,
         }
     }
 
@@ -176,6 +181,7 @@ impl HandshakeStats {
         match reason {
             HandshakeReject::BadState => self.bad_state += 1,
             HandshakeReject::UnknownConnection => self.unknown_connection += 1,
+            HandshakeReject::SilentBackoff => self.silent_backoff += 1,
         }
     }
 }
@@ -435,6 +441,7 @@ pub struct SessionStatsSnapshot {
 pub struct HandshakeStatsSnapshot {
     pub bad_state: u64,
     pub unknown_connection: u64,
+    pub silent_backoff: u64,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -612,6 +619,17 @@ mod tests {
         stats.record_reject(HandshakeReject::BadState);
         assert_eq!(stats.bad_state, 3);
         assert_eq!(stats.unknown_connection, 0);
+    }
+
+    #[test]
+    fn handshake_stats_record_reject_silent_backoff() {
+        let mut stats = HandshakeStats::default();
+        stats.record_reject(HandshakeReject::SilentBackoff);
+        stats.record_reject(HandshakeReject::SilentBackoff);
+        assert_eq!(stats.silent_backoff, 2);
+        assert_eq!(stats.bad_state, 0);
+        assert_eq!(stats.unknown_connection, 0);
+        assert_eq!(stats.snapshot().silent_backoff, 2);
     }
 
     #[test]
