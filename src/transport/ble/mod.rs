@@ -3731,7 +3731,8 @@ mod tests {
         )
     }
 
-    /// Make `dialler`'s dials land on `acceptor` through a gated relay.
+    /// Make `dialler`'s dials land on `acceptor` through a gated relay, and
+    /// return a count of the dials made.
     ///
     /// The first dial uses `first`; any later one — a retry after the race —
     /// is relayed ungated. `seen_as` is the link address the acceptor sees
@@ -3742,10 +3743,13 @@ mod tests {
         acceptor: &BleTransport<MockBleIo>,
         seen_as: BleAddr,
         first: GateRx,
-    ) {
+    ) -> Arc<std::sync::atomic::AtomicUsize> {
         let acceptor_io = Arc::clone(acceptor.io());
         let first = std::sync::Mutex::new(Some(first));
+        let dials = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&dials);
         dialler.io().set_connect_handler(move |addr, _psm| {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let (to_dialler, to_acceptor) = first.lock().unwrap().take().unwrap_or_else(|| {
                 (
                     tokio::sync::watch::channel(true).1,
@@ -3759,6 +3763,117 @@ mod tests {
             tokio::spawn(async move { acceptor_io.inject_inbound(acceptor_end).await });
             Ok(dialler_end)
         });
+        dials
+    }
+
+    /// One side of a simultaneous dial, read in a single pass.
+    struct Side {
+        dials: usize,
+        stats: stats::BleStatsSnapshot,
+        /// Each pooled link: its key, whether this side dialled it, and how
+        /// long ago it was admitted.
+        links: Vec<(TransportAddr, bool, Duration)>,
+    }
+
+    impl Side {
+        /// Read a side's dial count, stats and pool. The pool is read under
+        /// its lock, so a link being admitted or dropped is seen before or
+        /// after, never as a missed read.
+        async fn read(t: &BleTransport<MockBleIo>, dials: &std::sync::atomic::AtomicUsize) -> Self {
+            let pool = t.pool.lock().await;
+            let links = pool
+                .addrs()
+                .into_iter()
+                .map(|a| {
+                    let c = pool.get(&a).unwrap();
+                    (a, c.outbound, c.established_at.elapsed())
+                })
+                .collect();
+            Self {
+                dials: dials.load(std::sync::atomic::Ordering::SeqCst),
+                stats: t.stats.snapshot(),
+                links,
+            }
+        }
+
+        /// Links this side admitted, as dialler or acceptor.
+        fn admitted(&self) -> u64 {
+            self.stats.connections_established + self.stats.connections_accepted
+        }
+
+        /// Conclusions this side reached. Each link reaches one per side:
+        /// admitted, declined, or closed by the far end before its exchange
+        /// finished. A replaced link was admitted first, and the peer can
+        /// close a side's incumbent before that side's second exchange
+        /// completes, so counting outcomes is the only wait that fits every
+        /// order.
+        fn concluded(&self) -> u64 {
+            self.admitted()
+                + self.stats.duplicate_node_declines
+                + self.stats.pubkey_exchange_failures
+        }
+
+        /// Everything a timed-out wait needs to say which way the race went.
+        fn describe(&self) -> String {
+            let s = &self.stats;
+            let links: Vec<String> = self
+                .links
+                .iter()
+                .map(|(a, out, age)| {
+                    let dir = if *out { "out" } else { "in" };
+                    format!("{a} {dir} age={}ms", age.as_millis())
+                })
+                .collect();
+            format!(
+                "dials={} established={} accepted={} declined={} replaced={} \
+                 exchange_failures={} connect_errors={} connect_timeouts={} \
+                 rejected={} aborted={} links=[{}]",
+                self.dials,
+                s.connections_established,
+                s.connections_accepted,
+                s.duplicate_node_declines,
+                s.duplicate_link_replacements,
+                s.pubkey_exchange_failures,
+                s.connect_errors,
+                s.connect_timeouts,
+                s.connections_rejected,
+                s.handshakes_aborted,
+                links.join(", ")
+            )
+        }
+    }
+
+    /// The two sides of a simultaneous dial and their dial counters.
+    struct Race<'a> {
+        case: &'a str,
+        t1: &'a BleTransport<MockBleIo>,
+        t2: &'a BleTransport<MockBleIo>,
+        dials1: Arc<std::sync::atomic::AtomicUsize>,
+        dials2: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Race<'_> {
+        /// Wait until `cond` holds for both sides, or fail naming the case,
+        /// the step, and both sides' state. Polls as [`wait_for`] does.
+        async fn wait(&self, what: &str, cond: impl Fn(&Side, &Side) -> bool) {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                settle().await;
+                let s1 = Side::read(self.t1, &self.dials1).await;
+                let s2 = Side::read(self.t2, &self.dials2).await;
+                if cond(&s1, &s2) {
+                    return;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "{}: timed out waiting for {what}\n  T1: {}\n  T2: {}",
+                    self.case,
+                    s1.describe(),
+                    s2.describe()
+                );
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }
     }
 
     /// The one link a side holds once the race settles.
@@ -3782,6 +3897,10 @@ mod tests {
         rotated: bool,
     ) {
         let (smaller, larger) = pubkeys_ordered_by_node_addr();
+        let case = format!(
+            "dial={dial:?} t1_smaller={t1_is_smaller} first_at_t1={first_at_t1:?} \
+             first_at_t2={first_at_t2:?} rotated={rotated}"
+        );
         let (pk1, pk2) = if t1_is_smaller {
             (smaller, larger)
         } else {
@@ -3815,8 +3934,8 @@ mod tests {
         let offset = if rotated { 10 } else { 0 };
         let (l1, l1_rx) = gates();
         let (l2, l2_rx) = gates();
-        cross_wire(&t1, &t2, test_addr(1 + offset), l1_rx);
-        cross_wire(&t2, &t1, test_addr(2 + offset), l2_rx);
+        let dials1 = cross_wire(&t1, &t2, test_addr(1 + offset), l1_rx);
+        let dials2 = cross_wire(&t2, &t1, test_addr(2 + offset), l2_rx);
         t1.start_async().await.unwrap();
         t2.start_async().await.unwrap();
 
@@ -3837,50 +3956,46 @@ mod tests {
         settle().await;
 
         // T1 completes L1 as its dialler and L2 as its acceptor; T2 the
-        // reverse.
+        // reverse. A gate on a link that has already closed has no reader;
+        // opening it is then a no-op, and the next wait reports the state.
         let open_at_t1 = |link: Link| match link {
-            Link::L1 => l1.to_dialler.send(true).unwrap(),
-            Link::L2 => l2.to_acceptor.send(true).unwrap(),
+            Link::L1 => l1.to_dialler.send_replace(true),
+            Link::L2 => l2.to_acceptor.send_replace(true),
         };
         let open_at_t2 = |link: Link| match link {
-            Link::L1 => l1.to_acceptor.send(true).unwrap(),
-            Link::L2 => l2.to_dialler.send(true).unwrap(),
+            Link::L1 => l1.to_acceptor.send_replace(true),
+            Link::L2 => l2.to_dialler.send_replace(true),
         };
         let other = |link: Link| match link {
             Link::L1 => Link::L2,
             Link::L2 => Link::L1,
         };
-        let admitted = |t: &BleTransport<MockBleIo>| {
-            let s = t.stats.snapshot();
-            s.connections_established + s.connections_accepted
+        let race = Race {
+            case: &case,
+            t1: &t1,
+            t2: &t2,
+            dials1,
+            dials2,
         };
-        // Each link reaches one conclusion per side: admitted, declined, or
-        // closed by the far end before its exchange finished. A replaced
-        // link was admitted first, and the peer can close a side's
-        // incumbent before that side's second exchange completes, so
-        // counting outcomes is the only wait that fits every order.
-        let concluded = |t: &BleTransport<MockBleIo>| {
-            let s = t.stats.snapshot();
-            admitted(t) + s.duplicate_node_declines + s.pubkey_exchange_failures
-        };
-        let one_link = |t: &BleTransport<MockBleIo>| t.pool.try_lock().is_ok_and(|p| p.len() == 1);
 
         open_at_t1(first_at_t1);
-        wait_for("T1 to admit its first link", || admitted(&t1) == 1).await;
+        race.wait("T1 to admit its first link", |s1, _| s1.admitted() == 1)
+            .await;
         open_at_t2(first_at_t2);
-        wait_for("T2 to admit its first link", || admitted(&t2) == 1).await;
+        race.wait("T2 to admit its first link", |_, s2| s2.admitted() == 1)
+            .await;
         open_at_t1(other(first_at_t1));
         open_at_t2(other(first_at_t2));
-        wait_for("both sides to settle on one link", || {
-            concluded(&t1) == 2 && concluded(&t2) == 2 && one_link(&t1) && one_link(&t2)
+        // Exactly two conclusions from exactly one dial each: the race
+        // settled by itself, not through a retry after both links died.
+        race.wait("both sides to settle on one link", |s1, s2| {
+            [s1, s2]
+                .iter()
+                .all(|s| s.dials == 1 && s.concluded() == 2 && s.links.len() == 1)
         })
         .await;
         settle().await;
 
-        let case = format!(
-            "dial={dial:?} t1_smaller={t1_is_smaller} first_at_t1={first_at_t1:?} \
-             first_at_t2={first_at_t2:?} rotated={rotated}"
-        );
         let (key1, out1) = sole_link(&t1).await;
         let (key2, out2) = sole_link(&t2).await;
         assert_eq!(
