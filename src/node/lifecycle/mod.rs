@@ -104,6 +104,17 @@ impl Node {
         &mut self,
         new_peers: Vec<PeerConfig>,
     ) -> Result<crate::node::UpdatePeersOutcome, NodeError> {
+        self.update_peers_with(new_peers, true).await
+    }
+
+    /// [`Self::update_peers`], with the refresh of kept peers optional.
+    /// `add_peer` turns it off: it changes one peer, and refreshing would
+    /// re-dial every unconnected auto-connect peer on each add.
+    pub(crate) async fn update_peers_with(
+        &mut self,
+        new_peers: Vec<PeerConfig>,
+        refresh_kept: bool,
+    ) -> Result<crate::node::UpdatePeersOutcome, NodeError> {
         let mut new_by_addr: HashMap<NodeAddr, PeerConfig> =
             HashMap::with_capacity(new_peers.len());
         for peer in new_peers {
@@ -186,7 +197,9 @@ impl Node {
                 outcome.unchanged += 1;
             }
 
-            if new_peer.is_auto_connect() && (!new_peer.addresses.is_empty() || new_peer.via_nostr)
+            if refresh_kept
+                && new_peer.is_auto_connect()
+                && (!new_peer.addresses.is_empty() || new_peer.via_nostr)
             {
                 refresh_configs.push(new_peer.clone());
             }
@@ -3329,15 +3342,12 @@ impl Node {
                 .expect("position is in range");
             let redial = self.get_peer(&addr).is_none()
                 && now_ms.saturating_sub(last_dial_ms) >= RUNTIME_REDIAL_MS;
-            if redial {
-                // Out and back in: update_peers dials a newly added peer.
-                let entry = peers.iter().find(|p| is(p, addr)).cloned();
-                peers.retain(|p| !is(p, addr));
-                self.update_peers(peers.clone())
-                    .await
-                    .map_err(|e| e.to_string())?;
-                peers.extend(entry);
-                self.update_peers(peers).await.map_err(|e| e.to_string())?;
+            if redial && let Some(config) = peers.iter().find(|p| is(p, addr)) {
+                // Dial this one peer only; never a refresh of the whole list.
+                if let Err(err) = self.initiate_peer_connection(config).await {
+                    debug!(npub = %config.npub, error = %err, "Runtime peer redial did not start");
+                    self.note_handshake_timeout(addr, now_ms);
+                }
             }
             let dialed_ms = if redial { now_ms } else { last_dial_ms };
             self.runtime_peers.push_back((addr, dialed_ms));
@@ -3362,7 +3372,10 @@ impl Node {
             auto_reconnect: false,
             via_nostr: true,
         });
-        let outcome = self.update_peers(peers).await.map_err(|e| e.to_string())?;
+        let outcome = self
+            .update_peers_with(peers, false)
+            .await
+            .map_err(|e| e.to_string())?;
         self.runtime_peers.push_back((addr, now_ms));
         Ok(serde_json::json!({ "added": outcome.added == 1, "evicted": evicted }))
     }
