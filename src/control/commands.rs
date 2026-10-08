@@ -13,6 +13,7 @@ pub async fn dispatch(node: &mut Node, command: &str, params: Option<&Value>) ->
     match command {
         "connect" => connect(node, params).await,
         "disconnect" => disconnect(node, params).await,
+        "add_peer" => add_peer(node, params).await,
         "probe_start" => probe_start(node, params).await,
         "probe_poll" => probe_poll(node, params),
         "probe_cancel" => probe_cancel(node, params).await,
@@ -65,6 +66,23 @@ async fn disconnect(node: &mut Node, params: Option<&Value>) -> Response {
     debug!(npub = %npub, "API disconnect requested");
 
     match node.api_disconnect(npub).await {
+        Ok(data) => Response::ok(data),
+        Err(msg) => Response::error(msg),
+    }
+}
+
+/// Add a peer reached through its Nostr advert, keeping the rest of the
+/// runtime peer list. Adding a peer already in the list changes nothing.
+///
+/// Params: `{"npub": "npub1..."}`
+async fn add_peer(node: &mut Node, params: Option<&Value>) -> Response {
+    let Some(npub) = params.and_then(|p| p.get("npub")).and_then(|v| v.as_str()) else {
+        return Response::error("missing 'npub' parameter");
+    };
+
+    debug!(npub = %npub, "API add_peer requested");
+
+    match node.api_add_nostr_peer(npub).await {
         Ok(data) => Response::ok(data),
         Err(msg) => Response::error(msg),
     }
