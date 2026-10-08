@@ -417,6 +417,13 @@ pub struct Node {
     /// Receiver half of the runtime child-liveness channel, `take()`-en by the
     /// rx_loop select arm that feeds `Event::ChildExited` to the supervisor FSM.
     child_exit_rx: Option<tokio::sync::mpsc::Receiver<crate::node::lifecycle::supervisor::Child>>,
+    /// In-process control channel set up by [`Node::enable_embedded_control`],
+    /// `take()`-en by the rx_loop in place of the channel it would otherwise
+    /// create for the control socket.
+    embedded_control: Option<(
+        tokio::sync::mpsc::Sender<crate::control::ControlMessage>,
+        tokio::sync::mpsc::Receiver<crate::control::ControlMessage>,
+    )>,
 
     // === Per-Peer Control Machines ===
     /// Per-peer lifecycle control FSMs, keyed by the stable `LinkId` that spans
@@ -810,6 +817,7 @@ impl Node {
             packet_rx: None,
             child_exit_tx: None,
             child_exit_rx: None,
+            embedded_control: None,
             peer_machines: HashMap::new(),
             peer_timers: HashMap::new(),
             peers: HashMap::new(),
@@ -975,6 +983,7 @@ impl Node {
             packet_rx: None,
             child_exit_tx: None,
             child_exit_rx: None,
+            embedded_control: None,
             peer_machines: HashMap::new(),
             peer_timers: HashMap::new(),
             peers: HashMap::new(),
@@ -3392,6 +3401,19 @@ impl Node {
     /// Returns None if TUN is not active or the node hasn't been started.
     pub fn tun_tx(&self) -> Option<&TunTx> {
         self.supervisor.tun_tx.as_ref()
+    }
+
+    /// Set up an **in-process control channel**: the embedder sends the same
+    /// mutating commands the control socket carries (`connect`, `add_peer`,
+    /// ...) without a socket. An app sandbox cannot bind the socket's default
+    /// path, so this is how an embedded node changes its peers at runtime.
+    /// Call before [`Self::run_rx_loop`]; the commands are served by it.
+    pub fn enable_embedded_control(
+        &mut self,
+    ) -> tokio::sync::mpsc::Sender<crate::control::ControlMessage> {
+        let (tx, rx) = tokio::sync::mpsc::channel(32);
+        self.embedded_control = Some((tx.clone(), rx));
+        tx
     }
 
     /// Set up an **app-owned TUN**: rather than FIPS creating a system TUN

@@ -3291,6 +3291,36 @@ impl Node {
 
     // === Control API methods ===
 
+    /// Append `npub` to the runtime peer list as an auto-connect peer whose
+    /// endpoints come from its Nostr advert, so an embedder can reach a node
+    /// it did not start with. A peer already in the list is left as it is.
+    pub(crate) async fn api_add_nostr_peer(
+        &mut self,
+        npub: &str,
+    ) -> Result<serde_json::Value, String> {
+        let identity = PeerIdentity::from_npub(npub).map_err(|e| format!("invalid npub: {e}"))?;
+        if identity.node_addr() == self.identity().node_addr() {
+            return Err("cannot add self as a peer".into());
+        }
+        let mut peers = self.config().peers().to_vec();
+        let known = peers.iter().any(|p| {
+            PeerIdentity::from_npub(&p.npub).is_ok_and(|id| id.node_addr() == identity.node_addr())
+        });
+        if known {
+            return Ok(serde_json::json!({ "added": false }));
+        }
+        peers.push(PeerConfig {
+            npub: identity.npub(),
+            alias: None,
+            addresses: vec![PeerAddress::new("udp", "nat")],
+            connect_policy: ConnectPolicy::AutoConnect,
+            auto_reconnect: true,
+            via_nostr: true,
+        });
+        let outcome = self.update_peers(peers).await.map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({ "added": outcome.added == 1 }))
+    }
+
     /// Connect to a peer via the control API.
     ///
     /// Creates an ephemeral peer connection (not persisted to config, no

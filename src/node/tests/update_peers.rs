@@ -395,3 +395,48 @@ async fn update_peers_republishes_aliases_to_the_running_dns_responder() {
 
     node.stop().await.unwrap();
 }
+
+/// `add_peer` appends a Nostr-resolved auto-connect peer and keeps the list it
+/// was given; a repeat, the node itself and a bad npub change nothing.
+#[tokio::test]
+async fn add_peer_command_appends_a_nostr_peer() {
+    let a = Identity::generate();
+    let b = Identity::generate();
+    let mut node = make_node();
+    node.update_peers(vec![peer(&a, None)]).await.unwrap();
+
+    let add = |npub: String| serde_json::json!({ "npub": npub });
+    let response =
+        crate::control::commands::dispatch(&mut node, "add_peer", Some(&add(b.npub()))).await;
+    assert_eq!(response.status, "ok", "{:?}", response.message);
+    assert_eq!(response.data, Some(serde_json::json!({ "added": true })));
+
+    let peers = node.config().peers();
+    assert_eq!(peers.len(), 2, "existing peer kept");
+    assert!(
+        peers.iter().any(|p| p.npub == a.npub()),
+        "existing peer kept"
+    );
+    let added = peers
+        .iter()
+        .find(|p| p.npub == b.npub())
+        .expect("added peer");
+    assert!(added.via_nostr, "endpoints come from the advert");
+    assert_eq!(added.connect_policy, ConnectPolicy::AutoConnect);
+
+    let response =
+        crate::control::commands::dispatch(&mut node, "add_peer", Some(&add(b.npub()))).await;
+    assert_eq!(response.data, Some(serde_json::json!({ "added": false })));
+    assert_eq!(node.config().peers().len(), 2);
+
+    let own = node.identity().npub();
+    let response = crate::control::commands::dispatch(&mut node, "add_peer", Some(&add(own))).await;
+    assert_eq!(response.status, "error", "self is refused");
+    let response =
+        crate::control::commands::dispatch(&mut node, "add_peer", Some(&add("npub1nope".into())))
+            .await;
+    assert_eq!(response.status, "error", "bad npub is refused");
+    let response = crate::control::commands::dispatch(&mut node, "add_peer", None).await;
+    assert_eq!(response.status, "error", "missing npub is refused");
+    assert_eq!(node.config().peers().len(), 2);
+}
