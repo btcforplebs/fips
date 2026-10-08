@@ -1345,7 +1345,7 @@ pub use windows_tun::{TunDevice, TunWriter, run_tun_reader, shutdown_tun_interfa
 // Android uses an app-owned TUN (the embedder owns the fd, e.g. an Android
 // VpnService); FIPS never creates or configures a system TUN here. These no-op
 // stubs stand in for the platform ops so the shared TunDevice code compiles.
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_os = "ios"))]
 mod platform {
     use super::TunError;
     use std::net::Ipv6Addr;
