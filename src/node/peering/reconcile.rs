@@ -828,9 +828,13 @@ impl PeeringReconciler {
         else {
             return Vec::new();
         };
+        // A peer that opted out of auto-reconnect (e.g. one added at runtime
+        // by `add_peer`) stays subject to `max_retries`; others are unlimited
+        // as before.
+        let reconnect = peer_config.auto_reconnect;
         let mut state = RetryState::new(peer_config);
         state.retry_count = 1;
-        state.reconnect = true;
+        state.reconnect = reconnect;
         let delay = backoff_ms(state.retry_count, base, cap);
         state.retry_after_ms = now + delay;
         self.retry_pending.insert(addr, state);

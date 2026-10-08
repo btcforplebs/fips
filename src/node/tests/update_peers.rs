@@ -530,5 +530,48 @@ async fn add_peer_dials_only_the_added_peer() {
 
     let list = node.config().peers().to_vec();
     node.update_peers(list).await.unwrap();
-    assert_ne!(probe(&node), before, "control: a full refresh does re-dial a");
+    assert_ne!(
+        probe(&node),
+        before,
+        "control: a full refresh does re-dial a"
+    );
+}
+
+/// A runtime peer that never connects is given up after `max_retries`
+/// failures; a start-time peer (auto-reconnect) keeps retrying. Both reach
+/// the retry state through the handshake-timeout reflex, the path a failed
+/// advert dial takes.
+#[tokio::test]
+async fn a_runtime_peer_is_given_up_after_max_retries() {
+    let start = Identity::generate();
+    let added = Identity::generate();
+    let mut node = make_node();
+    let mut start_peer = peer(&start, None);
+    start_peer.connect_policy = ConnectPolicy::AutoConnect;
+    start_peer.auto_reconnect = true;
+    node.update_peers(vec![start_peer]).await.unwrap();
+    node.api_add_nostr_peer(&added.npub()).await.unwrap();
+
+    let max_retries = node.config().node.retry.max_retries;
+    assert!(max_retries > 0);
+    let mut given_up = false;
+    for _ in 0..=max_retries {
+        node.note_handshake_timeout(addr(&start), Node::now_ms());
+        node.note_handshake_timeout(addr(&added), Node::now_ms());
+        let pending = &node.peering.reconciler.retry_pending;
+        assert!(
+            pending.contains_key(&addr(&start)),
+            "control: start-time peer still retried"
+        );
+        if !pending.contains_key(&addr(&added)) {
+            given_up = true;
+            break;
+        }
+    }
+    // Once given up, nothing schedules another dial, so no further timeout
+    // can re-create the entry.
+    assert!(
+        given_up,
+        "runtime peer given up within max_retries failures"
+    );
 }
