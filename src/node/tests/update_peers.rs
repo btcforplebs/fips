@@ -409,7 +409,10 @@ async fn add_peer_command_appends_a_nostr_peer() {
     let response =
         crate::control::commands::dispatch(&mut node, "add_peer", Some(&add(b.npub()))).await;
     assert_eq!(response.status, "ok", "{:?}", response.message);
-    assert_eq!(response.data, Some(serde_json::json!({ "added": true })));
+    assert_eq!(
+        response.data,
+        Some(serde_json::json!({ "added": true, "evicted": 0 }))
+    );
 
     let peers = node.config().peers();
     assert_eq!(peers.len(), 2, "existing peer kept");
@@ -423,10 +426,18 @@ async fn add_peer_command_appends_a_nostr_peer() {
         .expect("added peer");
     assert!(added.via_nostr, "endpoints come from the advert");
     assert_eq!(added.connect_policy, ConnectPolicy::AutoConnect);
+    assert!(
+        !added.auto_reconnect,
+        "a runtime peer is not redialed forever"
+    );
 
     let response =
         crate::control::commands::dispatch(&mut node, "add_peer", Some(&add(b.npub()))).await;
-    assert_eq!(response.data, Some(serde_json::json!({ "added": false })));
+    assert_eq!(
+        response.data,
+        Some(serde_json::json!({ "added": false, "redialed": false })),
+        "just dialed, so no redial yet"
+    );
     assert_eq!(node.config().peers().len(), 2);
 
     let own = node.identity().npub();
@@ -439,4 +450,57 @@ async fn add_peer_command_appends_a_nostr_peer() {
     let response = crate::control::commands::dispatch(&mut node, "add_peer", None).await;
     assert_eq!(response.status, "error", "missing npub is refused");
     assert_eq!(node.config().peers().len(), 2);
+}
+
+/// Runtime peers are capped: one past the cap drops the least recently
+/// added, a re-added peer counts as fresh, and a start-time peer is never
+/// dropped.
+#[tokio::test]
+async fn add_peer_evicts_the_stalest_runtime_peer_past_the_cap() {
+    use crate::node::lifecycle::MAX_RUNTIME_PEERS;
+    let start = Identity::generate();
+    let mut node = make_node();
+    node.update_peers(vec![peer(&start, None)]).await.unwrap();
+
+    let added: Vec<Identity> = (0..MAX_RUNTIME_PEERS)
+        .map(|_| Identity::generate())
+        .collect();
+    for id in &added {
+        node.api_add_nostr_peer(&id.npub()).await.unwrap();
+    }
+    assert_eq!(node.config().peers().len(), MAX_RUNTIME_PEERS + 1);
+
+    // Touch the oldest, so the second oldest is now the stalest.
+    node.api_add_nostr_peer(&added[0].npub()).await.unwrap();
+    let extra = Identity::generate();
+    let data = node.api_add_nostr_peer(&extra.npub()).await.unwrap();
+    assert_eq!(data["evicted"], 1);
+
+    let has =
+        |node: &Node, id: &Identity| node.config().peers().iter().any(|p| p.npub == id.npub());
+    assert_eq!(node.config().peers().len(), MAX_RUNTIME_PEERS + 1);
+    assert!(has(&node, &start), "start-time peer kept");
+    assert!(has(&node, &added[0]), "recently touched peer kept");
+    assert!(!has(&node, &added[1]), "stalest runtime peer dropped");
+    assert!(has(&node, &extra));
+}
+
+/// Adding an unconnected runtime peer again redials it once the redial gap
+/// has passed, and keeps it on the list.
+#[tokio::test]
+async fn add_peer_redials_an_unconnected_runtime_peer_after_the_gap() {
+    let b = Identity::generate();
+    let mut node = make_node();
+    node.api_add_nostr_peer(&b.npub()).await.unwrap();
+
+    let data = node.api_add_nostr_peer(&b.npub()).await.unwrap();
+    assert_eq!(data["redialed"], false, "inside the gap");
+
+    node.runtime_peers.back_mut().unwrap().1 = 0;
+    let data = node.api_add_nostr_peer(&b.npub()).await.unwrap();
+    assert_eq!(data["redialed"], true, "gap passed and not connected");
+    assert_eq!(node.config().peers().len(), 1);
+    assert_eq!(node.config().peers()[0].npub, b.npub());
+    assert_eq!(node.runtime_peers.len(), 1);
+    assert!(node.runtime_peers[0].1 > 0, "dial time refreshed");
 }

@@ -27,6 +27,12 @@ use std::thread;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
+/// Most peers `add_peer` keeps at once.
+pub(crate) const MAX_RUNTIME_PEERS: usize = 32;
+
+/// How soon `add_peer` may dial an unconnected runtime peer again.
+pub(crate) const RUNTIME_REDIAL_MS: u64 = 30_000;
+
 const OPEN_DISCOVERY_RETRY_LIFETIME_MULTIPLIER: u64 = 2;
 const MAX_PARALLEL_PATH_CANDIDATES_PER_PEER: usize = 4;
 const MAX_DISCOVERY_CONNECTS_PER_TICK: usize = 16;
@@ -3293,32 +3299,72 @@ impl Node {
 
     /// Append `npub` to the runtime peer list as an auto-connect peer whose
     /// endpoints come from its Nostr advert, so an embedder can reach a node
-    /// it did not start with. A peer already in the list is left as it is.
+    /// it did not start with. A start-time peer is left as it is.
+    ///
+    /// Added peers are not redialed by the retry loop after a link dies.
+    /// Adding one again redials it if it is not connected and was last
+    /// dialed more than [`RUNTIME_REDIAL_MS`] ago, so an app that keeps
+    /// reading a vault keeps it reachable without a dial per request. At
+    /// most [`MAX_RUNTIME_PEERS`] are kept: adding one more drops the least
+    /// recently used, never a start-time peer.
     pub(crate) async fn api_add_nostr_peer(
         &mut self,
         npub: &str,
     ) -> Result<serde_json::Value, String> {
         let identity = PeerIdentity::from_npub(npub).map_err(|e| format!("invalid npub: {e}"))?;
-        if identity.node_addr() == self.identity().node_addr() {
+        let addr = *identity.node_addr();
+        if addr == *self.identity().node_addr() {
             return Err("cannot add self as a peer".into());
         }
+        let now_ms = Self::now_ms();
+        let is = |p: &PeerConfig, a: NodeAddr| {
+            PeerIdentity::from_npub(&p.npub).is_ok_and(|id| *id.node_addr() == a)
+        };
         let mut peers = self.config().peers().to_vec();
-        let known = peers.iter().any(|p| {
-            PeerIdentity::from_npub(&p.npub).is_ok_and(|id| id.node_addr() == identity.node_addr())
-        });
-        if known {
-            return Ok(serde_json::json!({ "added": false }));
+        if let Some(pos) = self.runtime_peers.iter().position(|(a, _)| *a == addr) {
+            // Most recently used goes last, so eviction takes the stalest.
+            let (_, last_dial_ms) = self
+                .runtime_peers
+                .remove(pos)
+                .expect("position is in range");
+            let redial = self.get_peer(&addr).is_none()
+                && now_ms.saturating_sub(last_dial_ms) >= RUNTIME_REDIAL_MS;
+            if redial {
+                // Out and back in: update_peers dials a newly added peer.
+                let entry = peers.iter().find(|p| is(p, addr)).cloned();
+                peers.retain(|p| !is(p, addr));
+                self.update_peers(peers.clone())
+                    .await
+                    .map_err(|e| e.to_string())?;
+                peers.extend(entry);
+                self.update_peers(peers).await.map_err(|e| e.to_string())?;
+            }
+            let dialed_ms = if redial { now_ms } else { last_dial_ms };
+            self.runtime_peers.push_back((addr, dialed_ms));
+            return Ok(serde_json::json!({ "added": false, "redialed": redial }));
+        }
+        if peers.iter().any(|p| is(p, addr)) {
+            return Ok(serde_json::json!({ "added": false, "redialed": false }));
+        }
+        let mut evicted = 0;
+        while self.runtime_peers.len() >= MAX_RUNTIME_PEERS {
+            let Some((old, _)) = self.runtime_peers.pop_front() else {
+                break;
+            };
+            peers.retain(|p| !is(p, old));
+            evicted += 1;
         }
         peers.push(PeerConfig {
             npub: identity.npub(),
             alias: None,
             addresses: vec![PeerAddress::new("udp", "nat")],
             connect_policy: ConnectPolicy::AutoConnect,
-            auto_reconnect: true,
+            auto_reconnect: false,
             via_nostr: true,
         });
         let outcome = self.update_peers(peers).await.map_err(|e| e.to_string())?;
-        Ok(serde_json::json!({ "added": outcome.added == 1 }))
+        self.runtime_peers.push_back((addr, now_ms));
+        Ok(serde_json::json!({ "added": outcome.added == 1, "evicted": evicted }))
     }
 
     /// Connect to a peer via the control API.

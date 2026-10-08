@@ -424,6 +424,10 @@ pub struct Node {
         tokio::sync::mpsc::Sender<crate::control::ControlMessage>,
         tokio::sync::mpsc::Receiver<crate::control::ControlMessage>,
     )>,
+    /// Peers added by `add_peer`, least recently used first, each with when
+    /// it was last dialed (ms). Capped at `MAX_RUNTIME_PEERS`; start-time
+    /// peers are never on it.
+    runtime_peers: std::collections::VecDeque<(NodeAddr, u64)>,
 
     // === Per-Peer Control Machines ===
     /// Per-peer lifecycle control FSMs, keyed by the stable `LinkId` that spans
@@ -818,6 +822,7 @@ impl Node {
             child_exit_tx: None,
             child_exit_rx: None,
             embedded_control: None,
+            runtime_peers: std::collections::VecDeque::new(),
             peer_machines: HashMap::new(),
             peer_timers: HashMap::new(),
             peers: HashMap::new(),
@@ -984,6 +989,7 @@ impl Node {
             child_exit_tx: None,
             child_exit_rx: None,
             embedded_control: None,
+            runtime_peers: std::collections::VecDeque::new(),
             peer_machines: HashMap::new(),
             peer_timers: HashMap::new(),
             peers: HashMap::new(),
