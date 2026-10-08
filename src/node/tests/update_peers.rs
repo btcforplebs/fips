@@ -504,3 +504,31 @@ async fn add_peer_redials_an_unconnected_runtime_peer_after_the_gap() {
     assert_eq!(node.runtime_peers.len(), 1);
     assert!(node.runtime_peers[0].1 > 0, "dial time refreshed");
 }
+
+/// Adding a peer dials only that peer: an earlier, unconnected runtime peer
+/// is not re-dialed. A full `update_peers` does re-dial it, which is the
+/// control that the probe below can see a dial at all.
+#[tokio::test]
+async fn add_peer_dials_only_the_added_peer() {
+    let a = Identity::generate();
+    let b = Identity::generate();
+    let mut node = make_node();
+    node.api_add_nostr_peer(&a.npub()).await.unwrap();
+
+    let probe = |node: &Node| {
+        node.peering
+            .reconciler
+            .retry_pending
+            .get(&addr(&a))
+            .map(|s| (s.retry_count, s.retry_after_ms))
+    };
+    let before = probe(&node);
+
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    node.api_add_nostr_peer(&b.npub()).await.unwrap();
+    assert_eq!(probe(&node), before, "adding b must not re-dial a");
+
+    let list = node.config().peers().to_vec();
+    node.update_peers(list).await.unwrap();
+    assert_ne!(probe(&node), before, "control: a full refresh does re-dial a");
+}
