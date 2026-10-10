@@ -3,7 +3,9 @@ use super::*;
 use crate::node::tests::session::{
     expect_single_endpoint_data_event, run_large_stack_async_test, send_endpoint_data_via_dataplane,
 };
-use crate::node::tests::spanning_tree::{TestNode, initiate_handshake, make_test_node};
+use crate::node::tests::spanning_tree::{
+    TestNode, initiate_handshake, make_test_node, poll_available_packets,
+};
 use futures::FutureExt;
 use std::panic::AssertUnwindSafe;
 use tokio::time::Instant;
@@ -63,7 +65,9 @@ async fn turn(nodes: &mut [TestNode]) {
         test.node.resend_pending_session_msg3(now).await;
         test.node.check_discovery_work(now).await;
     }
-    process_available_packets(nodes).await;
+    // Crypto readiness can coalesce with the preceding turn. Keep revisiting
+    // every peer instead of spending another peer's deadline awaiting it.
+    poll_available_packets(nodes).await;
     tokio::time::sleep(Duration::from_millis(5)).await;
 }
 
