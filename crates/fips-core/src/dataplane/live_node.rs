@@ -678,6 +678,10 @@ impl DataplaneLiveNode {
         Ok(())
     }
 
+    pub(crate) fn has_deferred_application_ingress(&self) -> bool {
+        !self.deferred_endpoint_data_batches.is_empty() || !self.deferred_tun_packets.is_empty()
+    }
+
     pub(crate) fn take_deferred_endpoint_data_batches(
         &mut self,
     ) -> Vec<NodeEndpointDataBatch> {

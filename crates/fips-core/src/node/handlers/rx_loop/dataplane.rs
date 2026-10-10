@@ -106,6 +106,19 @@ impl Node {
         &mut self,
         turn: &mut crate::dataplane::DataplaneLiveNodeTurn,
     ) -> usize {
+        if !turn.has_activity()
+            && self.deferred_session_forwards.is_empty()
+            && !self.dataplane.has_deferred_application_ingress()
+        {
+            return 0;
+        }
+        Box::pin(self.process_active_dataplane_control_ingress(turn)).await
+    }
+
+    async fn process_active_dataplane_control_ingress(
+        &mut self,
+        turn: &mut crate::dataplane::DataplaneLiveNodeTurn,
+    ) -> usize {
         let mut processed = 0usize;
         self.collect_deferred_session_forward_terminals(turn);
         processed = processed.saturating_add(self.finish_completed_session_forwards().await);

@@ -627,7 +627,7 @@ impl Node {
             )
             .await;
         let drained_packets = Self::dataplane_packet_activity(&turn);
-        let control_drained = Box::pin(self.process_dataplane_control_ingress(&mut turn)).await;
+        let control_drained = self.process_dataplane_control_ingress(&mut turn).await;
         RxLoopDataDrainStats::new(
             drained_packets,
             turn.tun_source_drained(),
@@ -813,7 +813,7 @@ impl Node {
         control_query_budget: usize,
     ) -> usize {
         let had_activity = turn.has_activity();
-        let mut control_drained = Box::pin(self.process_dataplane_control_ingress(turn)).await;
+        let mut control_drained = self.process_dataplane_control_ingress(turn).await;
         // Deferred control can nest a second ingress turn. Keep that future off
         // the ordinary turn's stack, and allocate only when it has work to do.
         if !self.deferred_dataplane_control_turns.is_empty() || self.pending_root_traffic.is_some()

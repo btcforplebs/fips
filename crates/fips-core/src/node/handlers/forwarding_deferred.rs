@@ -133,6 +133,10 @@ pub(in crate::node) struct DeferredSessionForwards {
 }
 
 impl DeferredSessionForwards {
+    pub(in crate::node) fn is_empty(&self) -> bool {
+        self.pending.is_empty() && self.completed.is_empty()
+    }
+
     pub(in crate::node) fn has_demand_for(&self, peer: &NodeAddr) -> bool {
         self.pending
             .values()
