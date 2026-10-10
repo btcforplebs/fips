@@ -328,7 +328,7 @@ async fn order_competing_requests(
     while witness.requests.lock().unwrap().is_empty() {
         // B's local query reaches C first. Keep D's response queued briefly so
         // it cannot warm B's coordinate cache before A's request crosses B.
-        process_available_packets(&mut nodes[INGRESS..TARGET]).await;
+        poll_available_packets(&mut nodes[INGRESS..TARGET]).await;
         assert!(Instant::now() < until, "ordinary B query reaches C");
         tokio::time::sleep(Duration::from_millis(2)).await;
     }
