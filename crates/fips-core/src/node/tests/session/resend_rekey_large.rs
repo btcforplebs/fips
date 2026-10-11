@@ -770,11 +770,14 @@ async fn rekey_msg1_exhaustion_allows_peer_msg1_to_converge() {
             .await,
         "larger side should be able to start its own fresh rekey"
     );
-    let count = wait_process_packets_for_node(&mut nodes, smaller).await;
-    assert!(
-        count > 0,
-        "smaller side should process peer msg1 after abandoning stale local rekey"
-    );
+    wait_for_session_state_for_node(
+        &mut nodes,
+        smaller,
+        &larger_addr,
+        "peer msg1 after abandoning stale local rekey",
+        |entry| entry.has_rekey_in_progress(),
+    )
+    .await;
     let entry = nodes[smaller].node.get_session(&larger_addr).unwrap();
     assert!(
         entry.has_rekey_in_progress(),
