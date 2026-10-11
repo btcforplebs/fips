@@ -1,6 +1,7 @@
 #[cfg(feature = "sim-transport")]
 mod bloom_cancellation;
 mod cooperative_progress;
+mod discovery_wakeup;
 
 use super::budget::{
     ENDPOINT_DRAIN_BUDGET, LATENCY_PACKET_DRAIN_BUDGET, PACKET_DRAIN_BUDGET,

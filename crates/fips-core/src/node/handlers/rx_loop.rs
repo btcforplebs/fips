@@ -935,13 +935,6 @@ impl Node {
     }
 }
 
-async fn wait_for_optional_notify(notify: Option<&Arc<Notify>>) {
-    match notify {
-        Some(notify) => notify.notified().await,
-        None => std::future::pending().await,
-    }
-}
-
 async fn wait_for_optional_deadline(deadline: Option<Instant>, not_before: Instant) {
     match deadline {
         Some(due) => {
@@ -968,8 +961,15 @@ async fn wait_for_optional_epoch_deadline(deadline_ms: Option<u64>) {
 }
 
 async fn wait_for_optional_notify_after(notify: Option<&Arc<Notify>>, not_before: Instant) {
-    tokio::time::sleep(not_before.saturating_duration_since(Instant::now())).await;
-    wait_for_optional_notify(notify).await;
+    let Some(notify) = notify else {
+        return std::future::pending().await;
+    };
+    // A zero-duration sleep can still arm the next millisecond timer tick.
+    // Once the rate limit has elapsed, wait directly for actual discovery work.
+    if not_before > Instant::now() {
+        tokio::time::sleep_until(tokio::time::Instant::from_std(not_before)).await;
+    }
+    notify.notified().await;
 }
 
 async fn rx_loop_fast_maintenance_within_budget<F>(maintenance: F) -> bool
