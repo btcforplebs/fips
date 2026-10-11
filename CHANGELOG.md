@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.97] - 2026-10-11
+
+### Fixed
+
+- Reuse the shared cryptographic context while deriving handshake keys.
+- Avoid allocating control-processing futures when an idle dataplane turn has
+  no queued work, while retaining deferred forwarding and application traffic.
+- Build endpoint failure snapshots only for relevant peers and pending retries,
+  avoiding repeated public-key reconstruction for unrelated discovery records.
+- Keep the wire protocol, routing semantics, and compatibility unchanged.
+
 ## [0.4.96] - 2026-10-10
 
 ### Fixed
