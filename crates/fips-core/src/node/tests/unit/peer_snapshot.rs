@@ -104,7 +104,18 @@ async fn endpoint_peer_snapshot_preserves_failures_with_unrelated_discovery_hist
         },
     ));
     for _ in 0..256 {
-        discovery.record_traversal_failure(&Identity::generate().npub(), 1_000);
+        let unrelated = Identity::generate();
+        discovery.record_traversal_failure(&unrelated.npub(), 1_000);
+        // Discovered retries are not configured status rows. They must neither
+        // appear in the snapshot nor affect the configured peer's failure state.
+        node.retry_pending.insert(
+            *unrelated.node_addr(),
+            super::super::retry::RetryState::new(PeerConfig::new(
+                unrelated.npub(),
+                "udp",
+                "127.0.0.1:9",
+            )),
+        );
     }
     for npub in [node.peers.get(&addrs[0]).unwrap().npub(), pending.npub()] {
         for _ in 0..3 {

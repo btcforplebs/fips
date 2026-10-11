@@ -774,10 +774,10 @@ impl NostrDiscovery {
 
     pub(crate) fn failure_state_snapshot_for(
         &self,
-        peers: impl Iterator<Item = PeerIdentity>,
+        peers: impl Iterator<Item = PublicKey>,
     ) -> Vec<NostrPeerFailureView> {
         self.failure_state
-            .snapshot_for(peers.map(NostrPeerKey::from_peer_identity))
+            .snapshot_for(peers.map(NostrPeerKey::from_public_key))
             .into_iter()
             .map(peer_failure_view)
             .collect()

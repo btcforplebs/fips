@@ -222,14 +222,29 @@ impl Node {
             }
             NodeEndpointControlCommand::PeerSnapshot { response_tx } => {
                 let snapshot_now = Instant::now();
+                let pending_peers = self
+                    .retry_pending
+                    .iter()
+                    .filter(|(node_addr, retry)| {
+                        !self.peers.contains_key(node_addr)
+                            && self
+                                .config
+                                .peers
+                                .iter()
+                                .any(|peer| peer.npub == retry.peer_config.npub)
+                    })
+                    .collect::<Vec<_>>();
                 let nostr_failure_state: std::collections::HashMap<String, _> = self
                     .nostr_discovery_handle()
                     .map(|discovery| {
-                        let peers = self.peers().map(|peer| *peer.identity()).chain(
-                            self.retry_pending.iter().filter_map(|(_, retry)| {
-                                PeerIdentity::from_npub(&retry.peer_config.npub).ok()
-                            }),
-                        );
+                        let peers = self
+                            .peers()
+                            .map(|peer| {
+                                nostr::PublicKey::from_byte_array(peer.identity().pubkey().serialize())
+                            })
+                            .chain(pending_peers.iter().filter_map(|(_, retry)| {
+                                nostr::PublicKey::parse(&retry.peer_config.npub).ok()
+                            }));
                         discovery
                             .failure_state_snapshot_for(peers)
                             .into_iter()
@@ -320,17 +335,7 @@ impl Node {
                     })
                     .collect::<Vec<_>>();
 
-                for (node_addr, retry_state) in self.retry_pending.iter() {
-                    if self.peers.contains_key(node_addr)
-                        || !self
-                            .config
-                            .peers
-                            .iter()
-                            .any(|peer| peer.npub == retry_state.peer_config.npub)
-                    {
-                        continue;
-                    }
-
+                for (node_addr, retry_state) in pending_peers {
                     let npub = retry_state.peer_config.npub.clone();
                     let nostr_state = nostr_failure_state.get(&npub);
                     let nostr_traversal_cooldown_until_ms =
