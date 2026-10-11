@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.98] - 2026-10-12
+
+### Fixed
+
+- Wait directly for discovery events after the existing rate limit expires,
+  avoiding timer wakeups when no discovery work is available.
+- Preserve discovery rate limits, wire formats, routing, and peer compatibility.
+
 ## [0.4.97] - 2026-10-11
 
 ### Fixed
