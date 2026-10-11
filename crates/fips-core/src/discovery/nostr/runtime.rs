@@ -14,7 +14,7 @@ use tokio::sync::{Mutex, Notify, RwLock, broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, trace, warn};
 
-use super::failure_state::{FailureDecision, FailureState, NostrPeerKey};
+use super::failure_state::{FailureDecision, FailureState, NostrPeerKey, PeerFailureRecord};
 use super::offer_admission::OfferAdmission;
 use super::signal::{
     FRESHNESS_SKEW_TOLERANCE_MS, FreshnessOutcome, SignalEnvelope, TraversalSignalTiming,
@@ -768,13 +768,28 @@ impl NostrDiscovery {
         self.failure_state
             .snapshot()
             .into_iter()
-            .map(|(peer, rec)| NostrPeerFailureView {
-                npub: peer.npub(),
-                consecutive_failures: rec.consecutive_failures,
-                cooldown_until_ms: rec.cooldown_until_ms,
-                last_observed_skew_ms: rec.last_observed_skew_ms,
-            })
+            .map(peer_failure_view)
             .collect()
+    }
+
+    pub(crate) fn failure_state_snapshot_for(
+        &self,
+        peers: impl Iterator<Item = PeerIdentity>,
+    ) -> Vec<NostrPeerFailureView> {
+        self.failure_state
+            .snapshot_for(peers.map(NostrPeerKey::from_peer_identity))
+            .into_iter()
+            .map(peer_failure_view)
+            .collect()
+    }
+}
+
+fn peer_failure_view((peer, rec): (NostrPeerKey, PeerFailureRecord)) -> NostrPeerFailureView {
+    NostrPeerFailureView {
+        npub: peer.npub(),
+        consecutive_failures: rec.consecutive_failures,
+        cooldown_until_ms: rec.cooldown_until_ms,
+        last_observed_skew_ms: rec.last_observed_skew_ms,
     }
 }
 

@@ -315,6 +315,16 @@ impl FailureState {
         let map = self.inner.lock().expect("failure-state mutex poisoned");
         map.iter().map(|(peer, rec)| (*peer, rec.clone())).collect()
     }
+
+    pub(super) fn snapshot_for(
+        &self,
+        peers: impl Iterator<Item = NostrPeerKey>,
+    ) -> Vec<(NostrPeerKey, PeerFailureRecord)> {
+        let map = self.inner.lock().expect("failure-state mutex poisoned");
+        peers
+            .filter_map(|peer| map.get(&peer).map(|rec| (peer, rec.clone())))
+            .collect()
+    }
 }
 
 fn evict_oldest(map: &mut HashMap<NostrPeerKey, PeerFailureRecord>, target: usize) {

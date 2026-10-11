@@ -225,8 +225,13 @@ impl Node {
                 let nostr_failure_state: std::collections::HashMap<String, _> = self
                     .nostr_discovery_handle()
                     .map(|discovery| {
+                        let peers = self.peers().map(|peer| *peer.identity()).chain(
+                            self.retry_pending.iter().filter_map(|(_, retry)| {
+                                PeerIdentity::from_npub(&retry.peer_config.npub).ok()
+                            }),
+                        );
                         discovery
-                            .failure_state_snapshot()
+                            .failure_state_snapshot_for(peers)
                             .into_iter()
                             .map(|state| (state.npub.clone(), state))
                             .collect()

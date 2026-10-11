@@ -86,6 +86,57 @@ async fn endpoint_peer_snapshot_preserves_route_selection_and_missing_activity()
 }
 
 #[tokio::test]
+async fn endpoint_peer_snapshot_preserves_failures_with_unrelated_discovery_history() {
+    use crate::discovery::nostr::NostrDiscovery;
+
+    let (mut node, addrs) = snapshot_node(2);
+    let pending = Identity::generate();
+    let pending_config = PeerConfig::new(pending.npub(), "udp", "127.0.0.1:9");
+    node.config.peers.push(pending_config.clone());
+    node.retry_pending.insert(
+        *pending.node_addr(),
+        super::super::retry::RetryState::new(pending_config),
+    );
+    let discovery = std::sync::Arc::new(NostrDiscovery::new_for_test_with_config(
+        crate::config::NostrDiscoveryConfig {
+            failure_streak_threshold: 3,
+            ..Default::default()
+        },
+    ));
+    for _ in 0..256 {
+        discovery.record_traversal_failure(&Identity::generate().npub(), 1_000);
+    }
+    for npub in [node.peers.get(&addrs[0]).unwrap().npub(), pending.npub()] {
+        for _ in 0..3 {
+            discovery.record_traversal_failure(&npub, 1_000);
+        }
+    }
+    node.nostr_discovery = Some(discovery);
+    let start = std::time::Instant::now();
+    for _ in 0..100 {
+        let peers = snapshot(&mut node).await;
+        assert_eq!(peers.len(), 3);
+        for peer in peers {
+            let failed = peer.node_addr == addrs[0] || peer.node_addr == *pending.node_addr();
+            assert_eq!(
+                peer.nostr_traversal_consecutive_failures,
+                if failed { 3 } else { 0 }
+            );
+            assert_eq!(peer.nostr_traversal_in_cooldown, failed);
+            assert_eq!(peer.nostr_traversal_cooldown_until_ms.is_some(), failed);
+            assert_eq!(
+                peer.direct_probe_pending,
+                peer.node_addr == *pending.node_addr()
+            );
+        }
+    }
+    println!(
+        "peer_snapshot_history_100_elapsed_us={}",
+        start.elapsed().as_micros()
+    );
+}
+
+#[tokio::test]
 #[ignore = "bounded production-handler benchmark; run separately from timing-sensitive tests"]
 async fn endpoint_peer_snapshot_425_peer_benchmark() {
     let (mut node, _) = snapshot_node(425);
