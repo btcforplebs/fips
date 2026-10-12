@@ -1,7 +1,8 @@
 #!/bin/sh
 # FIPS first-boot setup — runs once after package installation.
-# Loads the kernel modules, creates the fips firewall zone for fips0 and
-# registers the .fips forwarding with dnsmasq. The UCI defaults mechanism runs
+# Loads the kernel modules, creates the fips firewall zone for fips0, adds
+# existing 802.11s mesh interfaces to the fips_mesh zone and registers the
+# .fips forwarding with dnsmasq. The UCI defaults mechanism runs
 # it once and deletes it when it ends with status 0.
 #
 # It is executed by the package's postinst, but sourced, not executed, by
@@ -387,6 +388,27 @@ fwzone_setup() {
 
 fwzone_setup
 fwstatus=$?
+
+# ---------------------------------------------------------------------------
+# 2b. Firewall: the fips_mesh zone for existing mesh interfaces
+# ---------------------------------------------------------------------------
+# fips-mesh-setup in packages up to 0.5.2 put the open 802.11s mesh
+# interfaces it created in no firewall zone, where they meet the default input
+# policy, ACCEPT on OpenWrt 22.03. Its zone subcommand adds them to the
+# fips_mesh zone, saves and reloads, and does nothing when there is no mesh.
+# When the save above failed, /etc/config/firewall may be damaged or still
+# hold that section's staged changes, so nothing here saves or reloads:
+# close only drops IP traffic arriving on the mesh interfaces in the loaded
+# ruleset, until the firewall next reloads. A failed save here also ends the
+# setup with status 1, so it runs again at the next boot.
+
+if [ -x /usr/bin/fips-mesh-setup ]; then
+	if [ "$fwstatus" = 0 ]; then
+		/usr/bin/fips-mesh-setup zone || fwstatus=1
+	else
+		/usr/bin/fips-mesh-setup close
+	fi
+fi
 
 # ---------------------------------------------------------------------------
 # 3. dnsmasq UCI registration

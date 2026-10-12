@@ -8,7 +8,8 @@
 #
 # Then runs testing/openwrt/firewall-scenarios.sh in four pinned OpenWrt
 # rootfs images, which carry the real uci, fw4 and nft, so 90-fips-setup's
-# firewall zone and upgrade migration run against the firewall they configure.
+# firewall zone and upgrade migration, and fips-mesh-setup's mesh zone, run
+# against the firewall they configure.
 # Those containers get NET_ADMIN so fw4 can load its table, into the
 # container's own network namespace; they have no network otherwise. Each also
 # gets a small tmpfs, where the cases that save onto a full overlay put
@@ -38,8 +39,10 @@ IMAGE="${OPENWRT_ASH_IMAGE:-busybox:1.37.0@sha256:bdf57e528e45e4433820e045b29b45
 # cases to keep the job's time: an upgrade, a fresh install, port-forward
 # scoping, a failed reload and its recovery, an unloaded firewall, and a save
 # onto a full overlay, which matters most on 22.03, whose default input policy
-# is ACCEPT.
-FW_OLDER_CASES="fw_upgrade_moves_fips0_into_its_own_zone fw_fresh_install_creates_live_zone fw_operator_scoping_renders_before_port_forwards fw_failed_reload_blocks_new_fips0_connections fw_recovery_after_failed_reload_clears_block fw_unloaded_firewall_is_reported fw_full_overlay_save_blocks_and_keeps_setup"
+# is ACCEPT; and for the mesh zone an add, a two-radio remove, a firewall
+# reload during a remove, a failed reload, an upgrade, and a failed reload
+# during an upgrade.
+FW_OLDER_CASES="fw_upgrade_moves_fips0_into_its_own_zone fw_fresh_install_creates_live_zone fw_operator_scoping_renders_before_port_forwards fw_failed_reload_blocks_new_fips0_connections fw_recovery_after_failed_reload_clears_block fw_unloaded_firewall_is_reported fw_full_overlay_save_blocks_and_keeps_setup mesh_add_puts_interface_in_reject_zone mesh_two_radios_share_one_zone_and_remove_cleans_up mesh_remove_keeps_zone_until_interface_is_gone mesh_failed_reload_drops_mesh_input mesh_upgrade_zones_existing_interfaces mesh_hook_failed_reload_drops_mesh_input"
 FW_IMAGES=(
     "openwrt/rootfs:x86-64-25.12.5@sha256:c5d5f05bab4ce06a4e840b3573671a06ec8ae9842273188ffc53f7021836b8e2|"
     "openwrt/rootfs:x86-64-24.10.8@sha256:9972a4b4747cd136abd597475d7b88c51a49fd849d0d53f069a2f4bf446061b9|"
@@ -118,12 +121,13 @@ if [[ $rc -ne 0 && $rc -ne 1 ]]; then
 fi
 worst=$rc
 
-# FW_SETUP and FW_SNIPPETS pass through from the caller when set, to run the
-# firewall scenarios against another setup script or without the snippets.
+# FW_SETUP, FW_MESH_SETUP and FW_SNIPPETS pass through from the caller when
+# set, to run the firewall scenarios against another setup script or mesh
+# helper, or without the snippets.
 for spec in "${FW_IMAGES[@]}"; do
     image="${spec%%|*}"
     cases="${spec#*|}"
-    fw_env=(-e FW_SETUP -e FW_SNIPPETS)
+    fw_env=(-e FW_SETUP -e FW_MESH_SETUP -e FW_SNIPPETS)
     if [[ -n "$cases" ]]; then
         fw_env+=(-e "FW_CASES=$cases")
     else

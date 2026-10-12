@@ -28,7 +28,10 @@ Two deliberate choices distinguish this from a stock 802.11s setup:
   open up to the daemon's max-peers cap. What you concede: any nearby
   radio can peer and reach the FIPS overlay surface; L2 metadata (MAC
   addresses, frame sizes) is visible in the air; a hostile radio can
-  burn airtime — all inherent to an open radio link.
+  burn airtime — all inherent to an open radio link. Router services
+  (LuCI, SSH, DNS) and the daemon's UDP and mDNS ports are not reachable
+  over the mesh: the helper puts the mesh interface in the `fips_mesh`
+  firewall zone, which rejects all IP input and forwarding.
 - **`mesh_fwding 0`** — disables 802.11s's own HWMP routing so each
   mesh link is a plain neighbor link. FIPS is the routing layer; two
   routing layers would fight, and broadcast discovery beacons would
@@ -72,9 +75,11 @@ fips-mesh-setup radio1
 
 This creates an open 802.11s interface with mesh ID `fips-mesh` and
 HWMP forwarding off, attaches it to an unmanaged netifd interface (no
-IP configuration — none is needed), uncomments the matching `meshN`
+IP configuration — none is needed), puts it in the `fips_mesh` firewall
+zone, which rejects all IP input and forwarding (the Ethernet transport
+is not IP and is not affected), uncomments the matching `meshN`
 transport entry in `/etc/fips/fips.yaml` (see Step 2), and reloads the
-radio. Interfaces are named by radio index: `radio0` → `fips-mesh0`,
+firewall and then the radio. Interfaces are named by radio index: `radio0` → `fips-mesh0`,
 `radio1` → `fips-mesh1`. Pass a second argument to use a different
 mesh ID.
 
@@ -125,8 +130,16 @@ set wireless.fips_mesh_radio1.ifname='fips-mesh1'
 set wireless.fips_mesh_radio1.network='fips_mesh_radio1'
 set network.fips_mesh_radio1=interface
 set network.fips_mesh_radio1.proto='none'
+set firewall.fips_mesh=zone
+set firewall.fips_mesh.name='fips_mesh'
+set firewall.fips_mesh.input='REJECT'
+set firewall.fips_mesh.output='ACCEPT'
+set firewall.fips_mesh.forward='REJECT'
+set firewall.fips_mesh.auto_helper='0'
+add_list firewall.fips_mesh.device='fips-mesh1'
 EOF
 uci commit
+/etc/init.d/firewall reload
 wifi reload
 ```
 

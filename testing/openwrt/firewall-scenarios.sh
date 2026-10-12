@@ -1,6 +1,6 @@
 #!/bin/sh
-# OpenWrt firewall scenarios for 90-fips-setup, run inside an openwrt/rootfs
-# image so the real uci, fw4 and nft are exercised under ash.
+# OpenWrt firewall scenarios for 90-fips-setup and fips-mesh-setup, run inside
+# an openwrt/rootfs image so the real uci, fw4 and nft are exercised under ash.
 #
 # Driven by testing/openwrt/maintainer-scripts-test.sh, once per pinned image,
 # with the container started with --cap-add NET_ADMIN so fw4 can load its
@@ -15,7 +15,13 @@
 #                .ipk, as package-test.sh --keep extracts it under /apk.
 #   FW_SNIPPETS  a directory laid out like /usr/share/nftables.d, copied there
 #                before each case; default the .ipk's. "none" installs none.
+#   FW_MESH_SETUP  the mesh helper under test; default the one built into the
+#                .ipk.
 #   FW_CASES     case function names to run, separated by spaces; default all.
+#
+# The mesh cases have no radio: the zone holds each interface by device name,
+# which fw4 renders without netifd, and wifi is a stub that logs its call to
+# the same file as the firewall reloads, so the log gives their order.
 #
 # Assertions do not stop a case. A failed precondition records a failure and
 # the case skips to its end. Every case that reaches its end is counted, and a
@@ -29,6 +35,7 @@ set -u
 REPO="${REPO:-/src}"
 FW_SETUP="${FW_SETUP:-/apk/ipk-root/etc/uci-defaults/90-fips-setup}"
 FW_SNIPPETS="${FW_SNIPPETS:-/apk/ipk-root/usr/share/nftables.d}"
+FW_MESH_SETUP="${FW_MESH_SETUP:-/apk/ipk-root/usr/bin/fips-mesh-setup}"
 FW_CASES="${FW_CASES:-}"
 FIXTURES="$REPO/testing/openwrt/fixtures"
 
@@ -40,12 +47,14 @@ FLUSHONLY=/tmp/fw-flush-only
 FLUSHLIST=/tmp/fw-flush-listing
 SMALL=/fw-small
 COPY=/tmp/fips-firewall.uci
+MCOPY=/tmp/fips-mesh-firewall.uci
+STUB=/tmp/fw-wrap/stub
 OUT="$WORK/out"
 SYSPATH=/usr/sbin:/usr/bin:/sbin:/bin
 
 # The number of cases in the full run, counted by hand from the list at the
 # end of this file. A run that completes fewer exits 2.
-ALL_CASES=44
+ALL_CASES=74
 
 FAILURES=0
 CASES=0
@@ -328,7 +337,11 @@ fw_clean() {
 	rm -rf /tmp/.uci "$WRAP" "$WORK"
 	rm -f /etc/nftables.d/zz-*.nft "$FLUSHONLY" "$FLUSHLIST" "$RELOADLOG"
 	rm -f /etc/fips/firewall.sh /etc/hotplug.d/net/99-fips /etc/uci-defaults/90-fips-setup
-	rm -f "$COPY" "$COPY.staged" "$COPY.now"
+	rm -f "$COPY" "$COPY.staged" "$COPY.now" "$MCOPY" "$MCOPY.staged" "$MCOPY.now"
+	rm -f /usr/bin/fips-mesh-setup
+	for l in /sys/class/net/fips-mesh*; do
+		[ -e "$l" ] && ip link del "${l##*/}" >/dev/null 2>&1
+	done
 	# A symbolic link when the case before put /etc/config on the small tmpfs.
 	rm -rf /etc/config /usr/share/nftables.d
 	[ -d "$SMALL" ] && rm -rf "$SMALL/config" "$SMALL/fill"
@@ -404,11 +417,22 @@ run_setup() {
 	return 0
 }
 
+# hook_path [wrap]: the PATH the setup runs with. The wifi stub comes first,
+# so a wifi reload the mesh hook makes is logged; outside the mesh cases the
+# stub does not exist. wrap puts the uci and nft wrappers next.
+hook_path() {
+	if [ "${1:-}" = wrap ]; then
+		printf '%s' "$STUB:$WRAP:$PATH"
+	else
+		printf '%s' "$STUB:$PATH"
+	fi
+}
+
 # run_postinst [wrap]: install the setup in /etc/uci-defaults and run it as the
 # package's postinst does, deleting it only when it ends with status 0.
 run_postinst() {
-	local p="$PATH"
-	[ "${1:-}" = wrap ] && p="$WRAP:$PATH"
+	local p
+	p="$(hook_path "${1:-}")"
 	cp "$FW_SETUP" /etc/uci-defaults/90-fips-setup && chmod 0755 /etc/uci-defaults/90-fips-setup ||
 		harness_fail "cannot install the setup in /etc/uci-defaults"
 	: > "$RELOADLOG"
@@ -421,7 +445,7 @@ run_postinst() {
 # Run the kept setup as the uci-defaults loop at boot does.
 run_boot() {
 	: > "$RELOADLOG"
-	sh -c '( cd /etc/uci-defaults && . ./90-fips-setup ) && rm -f /etc/uci-defaults/90-fips-setup' > "$OUT" 2>&1
+	PATH="$(hook_path)" sh -c '( cd /etc/uci-defaults && . ./90-fips-setup ) && rm -f /etc/uci-defaults/90-fips-setup' > "$OUT" 2>&1
 	RC=$?
 	sed 's/^/    | /' "$OUT"
 	return 0
@@ -1477,9 +1501,843 @@ fw_flush_only_load_blocks_fips0() {
 	fw_end
 }
 
+# ── The 802.11s mesh zone ───────────────────────────────────────────────────
+# fips-mesh-setup puts the mesh interfaces it creates in the fips_mesh zone,
+# and 90-fips-setup adds those made by earlier packages to it.
+
+MESHDROP='drop comment "fips-mesh-reload-failed"'
+
+# mesh_begin <name> <what it shows> [nostart]: reset, start fw4, and give the
+# container two radios, an empty network configuration and the wifi stub.
+mesh_begin() {
+	fw_begin "$@"
+	touch /etc/config/network
+	cat > /etc/config/wireless <<'EOF'
+config wifi-device 'radio0'
+	option type 'mac80211'
+	option channel '36'
+	option band '5g'
+
+config wifi-device 'radio1'
+	option type 'mac80211'
+	option channel '1'
+	option band '2g'
+EOF
+	mkdir -p "$STUB" && printf '#!/bin/sh\necho "wifi $*" >> %s\n' "$RELOADLOG" > "$STUB/wifi" &&
+		chmod 0755 "$STUB/wifi" || harness_fail "cannot install the wifi stub"
+}
+
+# run_mesh [wrap] <args>: run the mesh helper under test, keeping its output in
+# $OUT and its status in RC. wrap puts the uci and nft wrappers first.
+run_mesh() {
+	local p="$STUB:$PATH"
+	if [ "${1:-}" = wrap ]; then
+		p="$STUB:$WRAP:$PATH"
+		shift
+	fi
+	: > "$RELOADLOG"
+	PATH="$p" sh "$FW_MESH_SETUP" "$@" > "$OUT" 2>&1
+	RC=$?
+	sed 's/^/    | /' "$OUT"
+	return 0
+}
+
+# The helper as 0.5.2 shipped it, which put the interface in no zone.
+run_released_mesh() {
+	PATH="$STUB:$PATH" sh "$FIXTURES/released-fips-mesh-setup" "$@" >/dev/null 2>&1
+}
+
+# Install the helper under test where 90-fips-setup looks for it.
+mesh_install() {
+	cp "$FW_MESH_SETUP" /usr/bin/fips-mesh-setup && chmod 0755 /usr/bin/fips-mesh-setup ||
+		harness_fail "cannot install the mesh helper"
+}
+
+# The hooks' PATH finds the wifi stub, so a wifi reload they make is logged.
+stub_first() { [ "$(PATH="$(hook_path)" sh -c 'command -v wifi')" = "$STUB/wifi" ]; }
+
+# In input, forward and output, a rule naming <dev> jumps to the chain of
+# zone <zone>, fips_mesh unless given.
+mesh_jumps() {
+	local c dir z="${2:-fips_mesh}"
+	for c in input forward output; do
+		dir=iifname
+		[ "$c" = output ] && dir=oifname
+		listing "$c" || return 1
+		printf '%s\n' "$LIST" | grep -F "\"$1\"" | grep -F "$dir " | grep -qF "jump ${c}_$z " || return 1
+	done
+	return 0
+}
+
+# No rule names a mesh interface or jumps to a fips_mesh chain. The empty
+# chains a reload leaves after the zone is deleted are allowed.
+mesh_named_nowhere() {
+	local t
+	t="$(nft list table inet fw4 2>/dev/null)" || return 1
+	! printf '%s\n' "$t" | grep -q '"fips-mesh[0-9]*"' &&
+		! printf '%s\n' "$t" | grep -qE 'jump [A-Za-z_]*_fips_mesh( |$)'
+}
+
+# mesh_zone_made <device list>: the zone is exactly what the helper creates.
+mesh_zone_made() {
+	local want
+	want="$(printf '%s\n' "=zone" ".name='fips_mesh'" ".input='REJECT'" ".output='ACCEPT'" \
+		".forward='REJECT'" ".auto_helper='0'" ".device=$1")"
+	[ "$(dump firewall.fips_mesh)" = "$want" ]
+}
+
+# The drop for <dev> is in <chain> once, and only failsafe rules precede it.
+mesh_drop_heads() {
+	local r n
+	r="$(rules_of "$1" | grep -v '^type ')" || return 1
+	[ "$(printf '%s\n' "$r" | grep -cxF "iifname \"$2\" $MESHDROP")" = 1 ] || return 1
+	n="$(printf '%s\n' "$r" | grep -nxF "iifname \"$2\" $MESHDROP" | sed 's/:.*//')"
+	[ "$(printf '%s\n' "$r" | sed -n "1,${n}p" | grep -vc 'reload-failed"$')" = 0 ]
+}
+
+mesh_failsafe() { mesh_drop_heads input "$1" && mesh_drop_heads forward "$1"; }
+
+no_mesh_drop() { table_lacks fips-mesh-reload-failed; }
+
+# mesh_wireless_made <radio> <ifname>: the sections the helper has always made.
+mesh_wireless_made() {
+	local s="fips_mesh_$1"
+	[ "$(uget "wireless.$s")" = wifi-iface ] &&
+		[ "$(uget "wireless.$s.device")" = "$1" ] &&
+		[ "$(uget "wireless.$s.mode")" = mesh ] &&
+		[ "$(uget "wireless.$s.encryption")" = none ] &&
+		[ "$(uget "wireless.$s.mesh_fwding")" = 0 ] &&
+		[ "$(uget "wireless.$s.ifname")" = "$2" ] &&
+		[ "$(uget "wireless.$s.network")" = "$s" ] &&
+		[ "$(uget "network.$s")" = interface ] &&
+		[ "$(uget "network.$s.proto")" = none ]
+}
+
+mesh_exports_save() {
+	uci export wireless > "$WORK/wireless.before"
+	uci export network > "$WORK/network.before"
+}
+
+mesh_exports_same() {
+	uci export wireless > "$WORK/wireless.after"
+	uci export network > "$WORK/network.after"
+	cmp -s "$WORK/wireless.before" "$WORK/wireless.after" &&
+		cmp -s "$WORK/network.before" "$WORK/network.after"
+}
+
+log_is() { [ "$(cat "$RELOADLOG" 2>/dev/null)" = "$1" ]; }
+
+no_wifi() { [ -f "$RELOADLOG" ] && ! grep -q '^wifi' "$RELOADLOG"; }
+
+# The log holds a wifi reload, and a firewall reload after it.
+wifi_then_reload() {
+	local w r
+	w="$(grep -nx 'wifi reload' "$RELOADLOG" | sed -n '1s/:.*//p')"
+	r="$(grep -nx reload "$RELOADLOG" | sed -n '$s/:.*//p')"
+	[ -n "$w" ] && [ -n "$r" ] && [ "$w" -lt "$r" ]
+}
+
+ZONED='is in firewall zone fips_mesh, which rejects all IP input'
+MESHCLOSED='closed to IP traffic until the firewall next reloads'
+
+mesh_add_puts_interface_in_reject_zone() {
+	mesh_begin mesh_add_puts_interface_in_reject_zone "adding a mesh puts its interface in the fips_mesh zone before the radio comes up"
+	note "defaults input $(uget firewall.@defaults[0].input); loaded input chain $(nft list chain inet fw4 input 2>/dev/null | sed -n 's/.*\(policy [a-z]*\);.*/\1/p'); rules naming fips-mesh0: $(nft list chain inet fw4 input 2>/dev/null | grep -c '"fips-mesh0"')"
+	run_mesh radio0
+	check "the helper exits 0" same "$RC" 0
+	check "the fips_mesh zone is REJECT/ACCEPT/REJECT on fips-mesh0 with auto_helper 0" mesh_zone_made "'fips-mesh0'"
+	check "input, forward and output jump fips-mesh0 into the zone" mesh_jumps fips-mesh0
+	check "input_fips_mesh only rejects" same "$(rules_of input_fips_mesh | grep -v '^type ')" 'jump reject_from_fips_mesh'
+	check "forward_fips_mesh only rejects" same "$(rules_of forward_fips_mesh | grep -v '^type ')" 'jump reject_to_fips_mesh'
+	if table_has 'jump helper_lan'; then
+		check "no helper chain for the fips_mesh zone" table_lacks helper_fips_mesh
+	else
+		note "helper assertion not exercised on this host"
+	fi
+	check "the firewall reloads, then the radio" log_is "$(printf 'reload\nwifi reload')"
+	check "the wireless and network sections are as before" mesh_wireless_made radio0 fips-mesh0
+	check "no failsafe rule" no_mesh_drop
+	check "the closing message names the zone" said "fips-mesh0 $ZONED"
+	fw_end
+}
+
+mesh_second_add_changes_nothing() {
+	mesh_begin mesh_second_add_changes_nothing "adding the same mesh again changes no firewall configuration and does not reload"
+	run_mesh radio0
+	uci export firewall > "$WORK/first.uci"
+	run_mesh radio0
+	uci export firewall > "$WORK/second.uci"
+	check "the second add exits 0" same "$RC" 0
+	check "uci export firewall is byte-identical" cmp -s "$WORK/first.uci" "$WORK/second.uci"
+	check "the second add does not reload the firewall" no_reload
+	check "fips-mesh0 is in the zone" mesh_jumps fips-mesh0
+	check "no failsafe rule" no_mesh_drop
+	fw_end
+}
+
+mesh_two_radios_share_one_zone_and_remove_cleans_up() {
+	mesh_begin mesh_two_radios_share_one_zone_and_remove_cleans_up "two radios share the zone; remove takes each out and the last deletes it"
+	run_mesh radio0
+	run_mesh radio1
+	check "the zone lists both interfaces" same "$(uget firewall.fips_mesh.device)" "fips-mesh0 fips-mesh1"
+	check "input sends both to the zone in one rule" \
+		eval 'listing input && printf "%s\n" "$LIST" | grep -F "\"fips-mesh0\"" | grep -F "\"fips-mesh1\"" | grep -qF "jump input_fips_mesh "'
+	run_mesh remove radio1
+	check "remove radio1: the zone lists fips-mesh0" same "$(uget firewall.fips_mesh.device)" fips-mesh0
+	check "remove radio1: no rule names fips-mesh1" table_lacks '"fips-mesh1"'
+	check "remove radio1: fips-mesh0 is still in the zone" mesh_jumps fips-mesh0
+	check "remove radio1: the radio reloads before the firewall" wifi_then_reload
+	run_mesh remove
+	check "remove: the helper exits 0" same "$RC" 0
+	check "remove: no firewall.fips_mesh" same "$(uget firewall.fips_mesh)" ""
+	check "remove: nothing loaded names a mesh interface or jumps to the zone" mesh_named_nowhere
+	check "remove: no mesh section in wireless or network" \
+		eval '! uci -q show wireless | grep -q fips_mesh_ && ! uci -q show network | grep -q fips_mesh_'
+	fw_end
+}
+
+# mesh_veth_remove <deleted> [window]: the helper adds radio0, a veth stands in
+# for its interface, and the wifi stub deletes it two seconds after the reload
+# when <deleted> is 1. The stub logs the deletion just before making it, so a
+# firewall reload logged after that line came after a two-second wait at
+# least, and one that did not wait is logged before it. With window, the stub
+# first reloads the firewall through fw4, not the logged init script, as
+# OpenWrt's firewall hotplug script does when a zoned interface comes up
+# during a radio reload, and writes to $WORK/window how many loaded rules then
+# name fips-mesh0.
+mesh_veth_remove() {
+	run_mesh radio0
+	ip link add fips-mesh0 type veth peer name fmpeer0 >/dev/null 2>&1
+	if precond "ip is found and fips-mesh0 exists" eval 'command -v ip >/dev/null && [ -e /sys/class/net/fips-mesh0 ]'; then
+		{
+			echo '#!/bin/sh'
+			echo "echo \"wifi \$*\" >> $RELOADLOG"
+			[ "${2:-}" = window ] &&
+				echo "fw4 -q reload >/dev/null 2>&1; nft list table inet fw4 | grep -c '\"fips-mesh0\"' > $WORK/window"
+			[ "$1" = 1 ] &&
+				echo "( sleep 2; echo 'gone fips-mesh0' >> $RELOADLOG; ip link del fips-mesh0 ) >/dev/null 2>&1 &"
+		} > "$STUB/wifi"
+		run_mesh remove
+		return 0
+	fi
+	return 1
+}
+
+mesh_remove_waits_for_interface_before_reload() {
+	mesh_begin mesh_remove_waits_for_interface_before_reload "remove reloads the firewall only once the interface is gone"
+	if mesh_veth_remove 1; then
+		check "remove exits 0" same "$RC" 0
+		check "the radio reloads, the interface goes, then the firewall reloads" \
+			log_is "$(printf 'wifi reload\ngone fips-mesh0\nreload')"
+		refute "no still-present line" said 'is still present after the wifi reload'
+	fi
+	fw_end
+}
+
+mesh_remove_waits_for_interface_before_reload_and_reports_one_that_stays() {
+	mesh_begin mesh_remove_waits_for_interface_before_reload_and_reports_one_that_stays "an interface still present after the wait is named, and the firewall reloads"
+	if mesh_veth_remove 0; then
+		check "remove exits 0" same "$RC" 0
+		check "the line names fips-mesh0" said 'fips-mesh0 is still present after the wifi reload'
+		check "the firewall reloads after the radio" log_is "$(printf 'wifi reload\nreload')"
+	fi
+	fw_end
+}
+
+mesh_remove_keeps_zone_until_interface_is_gone() {
+	mesh_begin mesh_remove_keeps_zone_until_interface_is_gone "a firewall reload while the radio reloads leaves the interface in the zone"
+	if mesh_veth_remove 1 window; then
+		check "remove exits 0" same "$RC" 0
+		check "the reload during the radio reload still loads rules naming fips-mesh0" \
+			eval '[ "$(cat "$WORK/window" 2>/dev/null || echo 0)" -gt 0 ]'
+		check "remove: no firewall.fips_mesh" same "$(uget firewall.fips_mesh)" ""
+		check "remove: nothing loaded names a mesh interface or jumps to the zone" mesh_named_nowhere
+	fi
+	fw_end
+}
+
+mesh_add_then_remove_restores_firewall_config() {
+	mesh_begin mesh_add_then_remove_restores_firewall_config "add then remove leaves the firewall configuration as it was, with the fips and fips_ap zones"
+	run_setup
+	uci set firewall.fips_ap=zone &&
+		uci set firewall.fips_ap.name=fips_ap &&
+		uci set firewall.fips_ap.input=REJECT &&
+		uci set firewall.fips_ap.output=ACCEPT &&
+		uci set firewall.fips_ap.forward=REJECT &&
+		uci add_list firewall.fips_ap.network=fips_ap_radio1 &&
+		uci set firewall.fips_ap_icmpv6=rule && uci set firewall.fips_ap_icmpv6.src=fips_ap &&
+		uci set firewall.fips_ap_icmpv6.proto=icmp && uci set firewall.fips_ap_icmpv6.target=ACCEPT &&
+		uci set firewall.fips_ap_dhcpv4=rule && uci set firewall.fips_ap_dhcpv4.src=fips_ap &&
+		uci set firewall.fips_ap_dhcpv4.proto=udp && uci set firewall.fips_ap_dhcpv4.dest_port=67 &&
+		uci set firewall.fips_ap_dhcpv4.target=ACCEPT &&
+		uci set firewall.fips_ap_mdns=rule && uci set firewall.fips_ap_mdns.src=fips_ap &&
+		uci set firewall.fips_ap_mdns.proto=udp && uci set firewall.fips_ap_mdns.dest_port=5353 &&
+		uci set firewall.fips_ap_mdns.target=ACCEPT &&
+		uci set firewall.fips_ap_fips_udp=rule && uci set firewall.fips_ap_fips_udp.src=fips_ap &&
+		uci set firewall.fips_ap_fips_udp.proto=udp && uci set firewall.fips_ap_fips_udp.dest_port=2121 &&
+		uci set firewall.fips_ap_fips_udp.target=ACCEPT &&
+		uci set firewall.fips_ap_fips_tcp=rule && uci set firewall.fips_ap_fips_tcp.src=fips_ap &&
+		uci set firewall.fips_ap_fips_tcp.proto=tcp && uci set firewall.fips_ap_fips_tcp.dest_port=8443 &&
+		uci set firewall.fips_ap_fips_tcp.target=ACCEPT &&
+		uci commit firewall || harness_fail "cannot add the fips_ap zone"
+	/etc/init.d/firewall reload >/dev/null 2>&1
+	uci export firewall > "$WORK/before.uci"
+	run_mesh radio0
+	run_mesh remove
+	uci export firewall > "$WORK/after.uci"
+	check "remove exits 0" same "$RC" 0
+	check "uci export firewall is byte-identical to before the add" cmp -s "$WORK/before.uci" "$WORK/after.uci"
+	check "fips0 is still in the fips zone" has input 'iifname "fips0" jump input_fips '
+	fw_end
+}
+
+mesh_existing_zone_options_are_kept() {
+	mesh_begin mesh_existing_zone_options_are_kept "an existing fips_mesh zone keeps its options; an ACCEPT input is reported"
+	uci set firewall.fips_mesh=zone &&
+		uci set firewall.fips_mesh.name=fips_mesh &&
+		uci set firewall.fips_mesh.input=ACCEPT &&
+		uci set firewall.fips_mesh.output=ACCEPT &&
+		uci set firewall.fips_mesh.forward=REJECT &&
+		uci add_list firewall.fips_mesh.device=op-dev0 &&
+		uci commit firewall || harness_fail "cannot add the operator's fips_mesh zone"
+	/etc/init.d/firewall reload >/dev/null 2>&1
+	dump firewall.fips_mesh | sed "s/^\.device='op-dev0'\$/.device='op-dev0' 'fips-mesh0'/" > "$WORK/zone.want"
+	run_mesh radio0
+	dump firewall.fips_mesh > "$WORK/zone.after"
+	check "the helper exits 0" same "$RC" 0
+	check "the zone's options are unchanged but for fips-mesh0 appended" cmp -s "$WORK/zone.want" "$WORK/zone.after"
+	check "one line reports the ACCEPT input" said_once 'has input policy ACCEPT, so router services are reachable from anyone in radio range'
+	refute "the closing message does not say the zone rejects all input" said "$ZONED"
+	run_mesh remove
+	check "remove keeps the zone with the operator's device" same "$(uget firewall.fips_mesh.device)" op-dev0
+	fw_end
+}
+
+mesh_remove_keeps_empty_zone_it_took_nothing_from() {
+	mesh_begin mesh_remove_keeps_empty_zone_it_took_nothing_from "remove on a radio with no mesh leaves an empty fips_mesh zone alone"
+	uci set firewall.fips_mesh=zone &&
+		uci set firewall.fips_mesh.name=fips_mesh &&
+		uci set firewall.fips_mesh.input=REJECT &&
+		uci set firewall.fips_mesh.output=ACCEPT &&
+		uci set firewall.fips_mesh.forward=REJECT &&
+		uci set firewall.fips_mesh.log=1 &&
+		uci commit firewall || harness_fail "cannot add the empty fips_mesh zone"
+	/etc/init.d/firewall reload >/dev/null 2>&1
+	uci export firewall > "$WORK/before.uci"
+	run_mesh remove radio1
+	uci export firewall > "$WORK/after.uci"
+	check "remove exits 0" same "$RC" 0
+	check "the zone is still there" same "$(uget firewall.fips_mesh)" zone
+	check "uci export firewall is byte-identical to before" cmp -s "$WORK/before.uci" "$WORK/after.uci"
+	check "no firewall reload" no_reload
+	fw_end
+}
+
+mesh_disabled_zone_is_reported_not_failed() {
+	mesh_begin mesh_disabled_zone_is_reported_not_failed "a disabled fips_mesh zone is reported as such, not as a failed reload"
+	uci set firewall.fips_mesh=zone &&
+		uci set firewall.fips_mesh.name=fips_mesh &&
+		uci set firewall.fips_mesh.input=REJECT &&
+		uci set firewall.fips_mesh.enabled=0 &&
+		uci commit firewall || harness_fail "cannot add the disabled zone"
+	run_mesh radio0
+	check "the helper exits 0" same "$RC" 0
+	check "the zone is still disabled" same "$(uget firewall.fips_mesh.enabled)" 0
+	check "fips-mesh0 is listed" same "$(uget firewall.fips_mesh.device)" fips-mesh0
+	check "the disabled zone is reported" said 'the fips_mesh firewall zone is disabled, so fips-mesh0 is in no firewall zone'
+	refute "no reload-failure line" said 'firewall reload failed'
+	check "no failsafe rule" no_mesh_drop
+	check "the mesh is created" mesh_wireless_made radio0 fips-mesh0
+	fw_end
+}
+
+mesh_renamed_zone_is_checked_by_its_name() {
+	mesh_begin mesh_renamed_zone_is_checked_by_its_name "a fips_mesh zone named mesh is checked by that name"
+	uci set firewall.fips_mesh=zone &&
+		uci set firewall.fips_mesh.name=mesh &&
+		uci set firewall.fips_mesh.input=REJECT &&
+		uci set firewall.fips_mesh.output=ACCEPT &&
+		uci set firewall.fips_mesh.forward=REJECT &&
+		uci set firewall.fips_mesh.auto_helper=0 &&
+		uci commit firewall || harness_fail "cannot add the renamed zone"
+	/etc/init.d/firewall reload >/dev/null 2>&1
+	run_mesh radio0
+	check "the helper exits 0" same "$RC" 0
+	check "fips-mesh0 is listed" same "$(uget firewall.fips_mesh.device)" fips-mesh0
+	check "input sends fips-mesh0 to input_mesh" mesh_jumps fips-mesh0 mesh
+	check "no failsafe rule" no_mesh_drop
+	refute "no reload-failure line" said 'firewall reload failed'
+	refute "no stays-in-zone line" said 'stays in that zone'
+	run_mesh radio0
+	check "second add: exits 0" same "$RC" 0
+	check "second add: no firewall reload" no_reload
+	refute "second add: no stays-in-zone line" said 'stays in that zone'
+	fw_end
+}
+
+mesh_conflicting_firewall_section_is_refused() {
+	local v
+	for v in rule zone; do
+		mesh_begin mesh_conflicting_firewall_section_is_refused "a fips_mesh section that is a $v the helper cannot use stops the add"
+		if [ "$v" = rule ]; then
+			uci set firewall.fips_mesh=rule &&
+				uci set firewall.fips_mesh.src=lan &&
+				uci set firewall.fips_mesh.target=ACCEPT &&
+				uci commit firewall || harness_fail "cannot add the fips_mesh rule"
+		else
+			uci add firewall zone >/dev/null &&
+				uci set firewall.@zone[-1].name=fips_mesh &&
+				uci set firewall.@zone[-1].input=REJECT &&
+				uci commit firewall || harness_fail "cannot add the anonymous fips_mesh zone"
+		fi
+		cp /etc/config/firewall "$WORK/firewall.before"
+		run_mesh radio0
+		check "$v: the helper exits 1" same "$RC" 1
+		check "$v: /etc/config/firewall is unchanged" cmp -s "$WORK/firewall.before" /etc/config/firewall
+		check "$v: no wireless section" same "$(uget wireless.fips_mesh_radio0)" ""
+		check "$v: no reload of either kind" eval '[ -f "$RELOADLOG" ] && [ ! -s "$RELOADLOG" ]'
+		if [ "$v" = rule ]; then
+			check "rule: the line names the section" said 'firewall section fips_mesh exists and is not a zone'
+		else
+			check "zone: the line names the zone" said 'a firewall zone named fips_mesh already exists (firewall.cfg'
+		fi
+	done
+	fw_end
+}
+
+mesh_conflicting_firewall_section_is_refused_unless_it_holds_the_interface() {
+	mesh_begin mesh_conflicting_firewall_section_is_refused_unless_it_holds_the_interface "an anonymous zone named fips_mesh that holds the interface keeps it"
+	uci add firewall zone >/dev/null &&
+		uci set firewall.@zone[-1].name=fips_mesh &&
+		uci set firewall.@zone[-1].input=REJECT &&
+		uci set firewall.@zone[-1].output=ACCEPT &&
+		uci set firewall.@zone[-1].forward=REJECT &&
+		uci add_list firewall.@zone[-1].device=fips-mesh0 &&
+		uci commit firewall || harness_fail "cannot add the anonymous fips_mesh zone"
+	/etc/init.d/firewall reload >/dev/null 2>&1
+	cp /etc/config/firewall "$WORK/firewall.before"
+	run_mesh radio0
+	check "the helper exits 0" same "$RC" 0
+	check "no section firewall.fips_mesh" same "$(uget firewall.fips_mesh)" ""
+	check "/etc/config/firewall is unchanged" cmp -s "$WORK/firewall.before" /etc/config/firewall
+	check "no firewall reload" no_reload
+	check "the line names the anonymous zone" said 'fips-mesh0 is in firewall zone fips_mesh (firewall.cfg'
+	refute "no conflict line" said 'already exists'
+	check "input sends fips-mesh0 to that zone" has input 'iifname "fips-mesh0" jump input_fips_mesh '
+	check "the mesh is created" mesh_wireless_made radio0 fips-mesh0
+	fw_end
+}
+
+mesh_failed_reload_start() {
+	echo 'this is not nft;' > /etc/nftables.d/zz-invalid.nft
+	precond "fw4 check fails on the invalid include" eval '! fw4 check >/dev/null 2>&1'
+}
+
+mesh_failed_reload_drops_mesh_input() {
+	mesh_begin mesh_failed_reload_drops_mesh_input "a reload that fails to load drops IP traffic arriving on the mesh"
+	if mesh_failed_reload_start; then
+		run_mesh radio0
+		check "the helper exits 0" same "$RC" 0
+		check "the zone is in /etc/config/firewall" grep -qF "config zone 'fips_mesh'" /etc/config/firewall
+		check "the drop heads input and forward" mesh_failsafe fips-mesh0
+		check "the old ruleset is still loaded" lacks input 'jump input_fips_mesh'
+		check "the failed reload is reported" said 'the firewall reload failed, so IP traffic arriving on fips-mesh0 is dropped'
+		check "the mesh is created" mesh_wireless_made radio0 fips-mesh0
+		run_mesh radio0
+		check "second add: exits 0" same "$RC" 0
+		check "second add: one firewall reload" one_reload
+		check "second add: still one drop in each chain" mesh_failsafe fips-mesh0
+		rm -f /etc/nftables.d/zz-invalid.nft
+		/etc/init.d/firewall reload >/dev/null 2>&1
+		check "after a clean reload: no failsafe rule" no_mesh_drop
+		check "after a clean reload: fips-mesh0 is in the zone" mesh_jumps fips-mesh0
+	fi
+	fw_end
+}
+
+mesh_missing_state_file_names_restart() {
+	mesh_begin mesh_missing_state_file_names_restart "a loaded table without fw4's state file drops mesh input and names the restart"
+	rm -f /var/run/fw4.state
+	if precond "the table is loaded and the state file is absent" \
+		eval 'nft list table inet fw4 >/dev/null 2>&1 && [ ! -e /var/run/fw4.state ]'; then
+		run_mesh radio0
+		check "the helper exits 0" same "$RC" 0
+		check "the drop heads input and forward" mesh_failsafe fips-mesh0
+		check "the missing state file is reported" said "the firewall reload failed because fw4's state file is missing"
+		check "the remedy is a restart" said "run '/etc/init.d/firewall restart'"
+		refute "no fw4 check remedy" said "run 'fw4 check'"
+		check "the mesh is created" mesh_wireless_made radio0 fips-mesh0
+	fi
+	fw_end
+}
+
+mesh_unloaded_firewall_is_reported() {
+	mesh_begin mesh_unloaded_firewall_is_reported "with fw4 not running the zone is configured, not reloaded, and applies when it starts" nostart
+	if precond "neither state file nor table" \
+		eval '[ ! -e /var/run/fw4.state ] && ! nft list table inet fw4 >/dev/null 2>&1'; then
+		run_mesh radio0
+		check "the helper exits 0" same "$RC" 0
+		check "the zone is configured" mesh_zone_made "'fips-mesh0'"
+		check "no firewall reload" no_reload
+		check "the unloaded firewall is reported" said 'firewall is not loaded'
+		fw4 -q start >/dev/null 2>&1
+		check "after fw4 starts: fips-mesh0 is in the zone" mesh_jumps fips-mesh0
+	fi
+	fw_end
+}
+
+mesh_state_file_without_table_is_reported() {
+	mesh_begin mesh_state_file_without_table_is_reported "a state file with no table loaded is reported, and the mesh is created" nostart
+	echo 'this is not nft;' > /etc/nftables.d/zz-invalid.nft
+	fw4 -q start >/dev/null 2>&1
+	if precond "the state file exists and inet fw4 is not loaded" \
+		eval '[ -e /var/run/fw4.state ] && ! nft list table inet fw4 >/dev/null 2>&1'; then
+		run_mesh radio0
+		check "the helper exits 0" same "$RC" 0
+		check "the zone is configured" mesh_zone_made "'fips-mesh0'"
+		check "the unloaded firewall is reported" said 'firewall is not loaded'
+		refute "no could-not-be-closed line" said 'could not be closed'
+		check "the mesh is created" mesh_wireless_made radio0 fips-mesh0
+		check "the radio is reloaded" grep -qx 'wifi reload' "$RELOADLOG"
+	fi
+	fw_end
+}
+
+# The 0.5.2 helper's two meshes, with no zone.
+mesh_released_two() {
+	run_released_mesh radio0
+	run_released_mesh radio1
+	mesh_exports_save
+	precond "no fips_mesh section, nothing loaded names a mesh interface, and the hooks find the wifi stub" \
+		eval '[ -z "$(uget firewall.fips_mesh)" ] && table_lacks fips-mesh && stub_first && [ "$(uget wireless.fips_mesh_radio1.ifname)" = fips-mesh1 ]'
+}
+
+mesh_upgrade_zones_existing_interfaces() {
+	mesh_begin mesh_upgrade_zones_existing_interfaces "an upgrade adds the interfaces the 0.5.2 helper made to the zone"
+	if mesh_released_two; then
+		mesh_install
+		run_postinst
+		check "the setup exits 0 and is deleted" eval '[ "$RC" = 0 ] && [ ! -e /etc/uci-defaults/90-fips-setup ]'
+		check "the zone holds both interfaces" mesh_zone_made "'fips-mesh0' 'fips-mesh1'"
+		check "fips-mesh0 is in the zone" mesh_jumps fips-mesh0
+		check "fips-mesh1 is in the zone" mesh_jumps fips-mesh1
+		check "no failsafe rule" no_mesh_drop
+		check "no wifi reload" no_wifi
+		check "wireless and network are unchanged" mesh_exports_same
+		check "the fips zone is made as in a fresh install" zone_made
+	fi
+	fw_end
+}
+
+mesh_second_upgrade_changes_nothing() {
+	mesh_begin mesh_second_upgrade_changes_nothing "a later upgrade changes nothing and does not reload"
+	if mesh_released_two; then
+		mesh_install
+		run_postinst
+		if precond "the first upgrade zoned both interfaces" \
+			eval 'mesh_zone_made "'"'fips-mesh0' 'fips-mesh1'"'" && mesh_jumps fips-mesh0 && mesh_jumps fips-mesh1'; then
+			uci export firewall > "$WORK/first.uci"
+			run_postinst
+			uci export firewall > "$WORK/second.uci"
+			check "uci export firewall is byte-identical" cmp -s "$WORK/first.uci" "$WORK/second.uci"
+			check "no firewall reload" no_reload
+		fi
+	fi
+	fw_end
+}
+
+mesh_first_boot_after_sysupgrade_zones_interfaces() {
+	mesh_begin mesh_first_boot_after_sysupgrade_zones_interfaces "the first boot after a sysupgrade zones the mesh before the firewall starts" nostart
+	run_released_mesh radio0
+	if precond "no state file, no table, and the hook finds the wifi stub" \
+		eval '[ ! -e /var/run/fw4.state ] && ! nft list table inet fw4 >/dev/null 2>&1 && stub_first'; then
+		mesh_install
+		cp "$FW_SETUP" /etc/uci-defaults/90-fips-setup || harness_fail "cannot install the setup"
+		run_boot
+		check "the run exits 0" same "$RC" 0
+		check "the setup is removed" eval '[ ! -e /etc/uci-defaults/90-fips-setup ]'
+		check "the zone is made" mesh_zone_made "'fips-mesh0'"
+		check "no firewall reload" no_reload
+		check "no wifi reload" no_wifi
+		fw4 -q start >/dev/null 2>&1
+		check "after fw4 starts: fips-mesh0 is in the zone" mesh_jumps fips-mesh0
+	fi
+	fw_end
+}
+
+# The 0.5.2 helper's two meshes after an upgrade, with the mesh zone deleted
+# again, so only the mesh needs saving.
+mesh_hook_unzoned() {
+	if mesh_released_two; then
+		mesh_install
+		run_postinst
+		# Absent when the setup under test makes no mesh zone.
+		uci -q delete firewall.fips_mesh
+		uci commit firewall || harness_fail "cannot delete the mesh zone"
+		/etc/init.d/firewall reload >/dev/null 2>&1
+		precond "the fips zone holds fips0 and no zone holds the mesh" \
+			eval 'zone_made && table_lacks "\"fips-mesh0\"" && [ -z "$(uci -q changes firewall)" ]'
+		return
+	fi
+	return 1
+}
+
+mesh_hook_failed_save_ok() {
+	check "$1: the setup ends non-zero and is kept" eval '[ "$RC" != 0 ] && [ -f /etc/uci-defaults/90-fips-setup ]'
+	check "$1: no firewall reload" no_reload
+	check "$1: fips-mesh0 is dropped" mesh_failsafe fips-mesh0
+	check "$1: fips-mesh1 is dropped" mesh_failsafe fips-mesh1
+	check "$1: the failed save is reported" said 'the firewall configuration could not be saved'
+	check "$1: the mesh interfaces are reported closed" said "$MESHCLOSED"
+}
+
+mesh_hook_failed_save_closes_and_keeps_setup() {
+	local v
+	for v in full commit; do
+		mesh_begin mesh_hook_failed_save_closes_and_keeps_setup "an upgrade whose mesh save fails ($v) closes the mesh and keeps the setup"
+		if mesh_hook_unzoned; then
+			if [ "$v" = full ]; then
+				small_config
+				if precond "full: no mesh copy is left from before" eval '[ ! -e "$MCOPY" ]' &&
+					precond "full: the small tmpfs has no page free" small_free 0; then
+					run_postinst
+					mesh_hook_failed_save_ok full
+					check "full: the line names the copy to import" said "uci import firewall < $MCOPY"
+					check "full: the copy holds the zone" grep -qF "config zone 'fips_mesh'" "$MCOPY"
+					rm -f "$SMALL/fill"
+					uci import firewall < "$MCOPY" 2>/dev/null
+					/etc/init.d/firewall reload >/dev/null 2>&1
+					check "full: after the import and a reload, fips-mesh0 is in the zone" mesh_jumps fips-mesh0
+					check "full: after the import and a reload, fips-mesh1 is in the zone" mesh_jumps fips-mesh1
+					check "full: after the import and a reload, no failsafe rule" no_mesh_drop
+				fi
+			else
+				wrap_uci_commit_fails
+				run_postinst wrap
+				if precond "commit: the uci wrapper failed a commit firewall" wrap_called uci 'commit firewall'; then
+					mesh_hook_failed_save_ok commit
+				fi
+			fi
+		fi
+	done
+	fw_end
+}
+
+# Continues from mesh_hook_failed_save_closes_and_keeps_setup's last variant:
+# the second run an SDK-feed install makes, with the save still failing.
+mesh_second_sdk_run_after_failed_save_keeps_one_drop() {
+	CUR=mesh_second_sdk_run_after_failed_save_keeps_one_drop
+	note "$CUR: a second run retries the save and stacks no second drop"
+	if precond "the mesh changes are still staged" eval '[ -n "$(uci -q changes firewall)" ]'; then
+		: > "$RELOADLOG"
+		PATH="$(hook_path wrap)" sh -c '( cd /etc/uci-defaults && . ./90-fips-setup ) && rm -f /etc/uci-defaults/90-fips-setup' > "$OUT" 2>&1
+		RC=$?
+		sed 's/^/    | /' "$OUT"
+		check "the run ends non-zero and the setup is kept" eval '[ "$RC" != 0 ] && [ -f /etc/uci-defaults/90-fips-setup ]'
+		check "the save was tried again" eval '[ "$(grep -cx "commit firewall" /tmp/fw-wrap/uci.log)" = 2 ]'
+		check "no firewall reload" no_reload
+		check "fips-mesh0 has one drop in each chain" mesh_failsafe fips-mesh0
+		check "fips-mesh1 has one drop in each chain" mesh_failsafe fips-mesh1
+		check "the mesh interfaces are reported closed" said "$MESHCLOSED"
+	fi
+	fw_end
+}
+
+mesh_hook_without_mesh_does_nothing() {
+	mesh_begin mesh_hook_without_mesh_does_nothing "with no mesh the hook changes nothing and adds no reload"
+	mesh_install
+	run_postinst
+	check "the setup exits 0" same "$RC" 0
+	check "no fips_mesh section" same "$(uget firewall.fips_mesh)" ""
+	check "one firewall reload, as a fresh install makes" one_reload
+	refute "no line from the mesh helper" said 'fips-mesh-setup:'
+	fw_end
+}
+
+mesh_hook_after_damaged_save_closes_without_reload() {
+	local v
+	for v in 1 0; do
+		mesh_begin mesh_hook_after_damaged_save_closes_without_reload "when the fips zone's save leaves the file damaged ($v page free), the mesh is closed and nothing saved"
+		run_released_mesh radio0
+		mesh_install
+		if [ "$v" = 1 ]; then
+			full_save_start 1 pad
+		else
+			full_save_start 0
+		fi
+		if [ "$?" = 0 ]; then
+			check "$v: the setup exits 1 and is kept" eval '[ "$RC" = 1 ] && [ -f /etc/uci-defaults/90-fips-setup ]'
+			check "$v: no firewall reload" no_reload
+			check "$v: the mesh helper saved nothing" eval '! grep -q fips_mesh /etc/config/firewall'
+			check "$v: fips-mesh0 is dropped" mesh_failsafe fips-mesh0
+			check "$v: fips0's pair is in input" pair_once input
+			check "$v: fips0's pair is in forward" pair_once forward
+			check "$v: the damaged save is reported" said "$DAMAGED"
+			check "$v: the mesh interface is reported closed" said "$MESHCLOSED"
+		fi
+	done
+	fw_end
+}
+
+mesh_interface_in_another_zone_is_left_there() {
+	local v
+	for v in device network hook; do
+		mesh_begin mesh_interface_in_another_zone_is_left_there "an interface lan holds by $v is left in lan and reported"
+		case "$v" in
+		device | hook)
+			[ "$v" = hook ] && run_released_mesh radio0
+			uci add_list "firewall.$(zone_of lan).device=fips-mesh0" && uci commit firewall ||
+				harness_fail "cannot add fips-mesh0 to lan"
+			;;
+		network)
+			uci add_list "firewall.$(zone_of lan).network=fips_mesh_radio0" && uci commit firewall ||
+				harness_fail "cannot add the mesh network to lan"
+			;;
+		esac
+		/etc/init.d/firewall reload >/dev/null 2>&1
+		if [ "$v" = hook ]; then
+			mesh_install
+			run_postinst
+		else
+			run_mesh radio0
+		fi
+		check "$v: exits 0" same "$RC" 0
+		check "$v: no fips_mesh section" same "$(uget firewall.fips_mesh)" ""
+		# The stock lan zone is an anonymous section, so the line names it too.
+		check "$v: the line names lan" said 'fips-mesh0 is in firewall zone lan (firewall.'
+		check "$v: the line names the exposure" \
+			said 'whose input policy is ACCEPT, so router services are reachable from anyone in radio range of the mesh; it stays in that zone'
+		check "$v: no failsafe rule" no_mesh_drop
+		if [ "$v" != hook ]; then
+			refute "$v: the closing message does not say fips_mesh rejects all input" said "$ZONED"
+			check "$v: the mesh is created" mesh_wireless_made radio0 fips-mesh0
+		fi
+		[ "$v" = device ] && check "device: no firewall reload" no_reload
+		if [ "$v" != network ]; then
+			check "$v: input sends fips-mesh0 to lan" eval 'naming_dev input fips-mesh0 | grep -qF "jump input_lan "'
+			check "$v: nothing jumps to input_fips_mesh" table_lacks 'jump input_fips_mesh'
+		fi
+	done
+	fw_end
+}
+
+# The rules of <chain> naming <dev>.
+naming_dev() {
+	listing "$1" || return 1
+	printf '%s\n' "$LIST" | grep -F "\"$2\""
+}
+
+mesh_add_failed_save_ok() {
+	check "$1: the helper exits 1" same "$RC" 1
+	check "$1: no reload of either kind" eval '[ -f "$RELOADLOG" ] && [ ! -s "$RELOADLOG" ]'
+	check "$1: no wireless section" same "$(uget wireless.fips_mesh_radio0)" ""
+	check "$1: /etc/config/wireless is unchanged" cmp -s "$WORK/wireless.conf" /etc/config/wireless
+	check "$1: the line says the mesh was not created" said 'so the mesh was not created'
+}
+
+mesh_add_failed_save_does_not_create_mesh() {
+	local v
+	for v in full commit; do
+		mesh_begin mesh_add_failed_save_does_not_create_mesh "an add whose save fails ($v) does not create the mesh"
+		cp /etc/config/wireless "$WORK/wireless.conf"
+		if [ "$v" = full ]; then
+			small_config
+			if precond "full: no mesh copy is left from before" eval '[ ! -e "$MCOPY" ]' &&
+				precond "full: the small tmpfs has no page free" small_free 0; then
+				run_mesh radio0
+				mesh_add_failed_save_ok full
+				check "full: the line names the copy to import" said "uci import firewall < $MCOPY"
+			fi
+		else
+			wrap_uci_commit_fails
+			run_mesh wrap radio0
+			if precond "commit: the uci wrapper failed a commit firewall" wrap_called uci 'commit firewall'; then
+				mesh_add_failed_save_ok commit
+			fi
+		fi
+	done
+	fw_end
+}
+
+# Continues from mesh_add_failed_save_does_not_create_mesh's last variant.
+mesh_readd_after_failed_save_saves_staged_zone() {
+	CUR=mesh_readd_after_failed_save_saves_staged_zone
+	note "$CUR: an add after a failed save saves the zone left staged"
+	rm -f "$WRAP/uci"
+	if precond "the zone is staged, reads back as listed, and is not in the file" \
+		eval '[ -n "$(uci -q changes firewall)" ] && [ "$(uget firewall.fips_mesh.device)" = fips-mesh0 ] && ! grep -q fips_mesh /etc/config/firewall'; then
+		run_mesh radio0
+		check "the helper exits 0" same "$RC" 0
+		check "nothing is left staged" eval '[ -z "$(uci -q changes firewall)" ]'
+		check "/etc/config/firewall holds the zone and fips-mesh0" \
+			eval 'grep -qF "config zone '"'fips_mesh'"'" /etc/config/firewall && grep -qF "fips-mesh0" /etc/config/firewall'
+		check "fips-mesh0 is in the zone" mesh_jumps fips-mesh0
+		check "the firewall reloads, then the radio" log_is "$(printf 'reload\nwifi reload')"
+		check "no failsafe rule" no_mesh_drop
+	fi
+	fw_end
+}
+
+mesh_add_failed_close_does_not_create_mesh() {
+	mesh_begin mesh_add_failed_close_does_not_create_mesh "an add that cannot close the interface after a failed reload does not create the mesh"
+	if mesh_failed_reload_start; then
+		wrap_nft_fails 'insert rule inet fw4 input iifname fips-mesh0 drop comment "fips-mesh-reload-failed"'
+		run_mesh wrap radio0
+		if precond "the nft wrapper failed the insert" \
+			wrap_called nft 'insert rule inet fw4 input iifname fips-mesh0 drop comment "fips-mesh-reload-failed"'; then
+			check "the helper exits 1" same "$RC" 1
+			check "no wifi reload" no_wifi
+			check "no wireless section" same "$(uget wireless.fips_mesh_radio0)" ""
+			check "the line says it could not be closed" said 'could not be closed'
+		fi
+	fi
+	fw_end
+}
+
+mesh_readd_unnumbered_radio_moves_zone_entry() {
+	mesh_begin mesh_readd_unnumbered_radio_moves_zone_entry "a re-add that renames the interface keeps the old name zoned until the rename"
+	uci set wireless.radiox=wifi-device &&
+		uci set wireless.radiox.type=mac80211 &&
+		uci set wireless.radiox.channel=1 &&
+		uci set wireless.radiox.band=2g &&
+		uci commit wireless || harness_fail "cannot add radiox"
+	run_mesh radiox
+	if precond "the first add listed fips-mesh0" same "$(uget firewall.fips_mesh.device)" fips-mesh0; then
+		run_mesh radiox
+		check "the second add exits 0" same "$RC" 0
+		check "the zone lists exactly fips-mesh1" same "$(uget firewall.fips_mesh.device)" fips-mesh1
+		check "the file lists fips-mesh1 and not fips-mesh0" \
+			eval 'grep -qF "fips-mesh1" /etc/config/firewall && ! grep -qF "fips-mesh0" /etc/config/firewall'
+		check "the firewall reloads once, before the radio" log_is "$(printf 'reload\nwifi reload')"
+		check "the loaded input still names both" \
+			eval 'naming_dev input fips-mesh0 >/dev/null && naming_dev input fips-mesh1 >/dev/null'
+		/etc/init.d/firewall reload >/dev/null 2>&1
+		check "after a reload: fips-mesh1 is in the zone" mesh_jumps fips-mesh1
+		check "after a reload: nothing names fips-mesh0" table_lacks '"fips-mesh0"'
+	fi
+	fw_end
+}
+
+mesh_hook_failed_reload_drops_mesh_input() {
+	mesh_begin mesh_hook_failed_reload_drops_mesh_input "an upgrade whose reload fails drops IP traffic arriving on the mesh"
+	if mesh_released_two && mesh_failed_reload_start; then
+		mesh_install
+		run_postinst
+		check "the setup exits 0 and is deleted" eval '[ "$RC" = 0 ] && [ ! -e /etc/uci-defaults/90-fips-setup ]'
+		check "fips-mesh0 is dropped" mesh_failsafe fips-mesh0
+		check "fips-mesh1 is dropped" mesh_failsafe fips-mesh1
+		check "fips0's pair is in input" pair_once input
+		check "fips0's pair is in forward" pair_once forward
+		check "the failed reload is reported" said 'the firewall reload failed, so IP traffic arriving on fips-mesh0 fips-mesh1 is dropped'
+		check "no wifi reload" no_wifi
+	fi
+	fw_end
+}
+
 # ── Harness start ───────────────────────────────────────────────────────────
 
 [ -r "$FW_SETUP" ] || harness_fail "cannot read the setup under test, $FW_SETUP"
+[ -r "$FW_MESH_SETUP" ] || harness_fail "cannot read the mesh helper under test, $FW_MESH_SETUP"
 if [ "$FW_SNIPPETS" != none ] && [ ! -d "$FW_SNIPPETS" ]; then
 	harness_fail "FW_SNIPPETS is neither none nor a directory: $FW_SNIPPETS"
 fi
@@ -1510,7 +2368,7 @@ EOF
 chmod 0755 /etc/init.d/firewall || harness_fail "cannot install the firewall wrapper"
 
 echo "OpenWrt firewall scenarios ($(. /etc/openwrt_release && echo "$DISTRIB_DESCRIPTION"))"
-echo "setup under test: $FW_SETUP; snippets: $FW_SNIPPETS"
+echo "setup under test: $FW_SETUP; mesh helper: $FW_MESH_SETUP; snippets: $FW_SNIPPETS"
 
 ALL="fw_upgrade_moves_fips0_into_its_own_zone
 fw_upgrade_under_apk_environment_moves_fips0
@@ -1555,9 +2413,39 @@ fw_missing_nft_is_reported
 fw_probe_add_failure_blocks_fips0
 fw_unchecked_reload_without_state_file_names_restart
 fw_listing_failure_blocks_fips0
-fw_flush_only_load_blocks_fips0"
+fw_flush_only_load_blocks_fips0
+mesh_add_puts_interface_in_reject_zone
+mesh_second_add_changes_nothing
+mesh_two_radios_share_one_zone_and_remove_cleans_up
+mesh_remove_waits_for_interface_before_reload
+mesh_remove_waits_for_interface_before_reload_and_reports_one_that_stays
+mesh_remove_keeps_zone_until_interface_is_gone
+mesh_add_then_remove_restores_firewall_config
+mesh_existing_zone_options_are_kept
+mesh_remove_keeps_empty_zone_it_took_nothing_from
+mesh_disabled_zone_is_reported_not_failed
+mesh_renamed_zone_is_checked_by_its_name
+mesh_conflicting_firewall_section_is_refused
+mesh_conflicting_firewall_section_is_refused_unless_it_holds_the_interface
+mesh_failed_reload_drops_mesh_input
+mesh_missing_state_file_names_restart
+mesh_unloaded_firewall_is_reported
+mesh_state_file_without_table_is_reported
+mesh_upgrade_zones_existing_interfaces
+mesh_second_upgrade_changes_nothing
+mesh_first_boot_after_sysupgrade_zones_interfaces
+mesh_hook_failed_save_closes_and_keeps_setup
+mesh_second_sdk_run_after_failed_save_keeps_one_drop
+mesh_hook_without_mesh_does_nothing
+mesh_hook_after_damaged_save_closes_without_reload
+mesh_interface_in_another_zone_is_left_there
+mesh_add_failed_save_does_not_create_mesh
+mesh_readd_after_failed_save_saves_staged_zone
+mesh_add_failed_close_does_not_create_mesh
+mesh_readd_unnumbered_radio_moves_zone_entry
+mesh_hook_failed_reload_drops_mesh_input"
 
-# The three continuation cases run only right after the case they continue.
+# The five continuation cases run only right after the case they continue.
 if [ -n "$FW_CASES" ]; then
 	SELECTED="$FW_CASES"
 	EXPECTED=$(echo "$FW_CASES" | wc -w)

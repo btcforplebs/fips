@@ -11,7 +11,7 @@ OpenWrt 22.03+ router via the standard `opkg` package system.
 | `/usr/bin/fipsctl` | CLI control tool (`fipsctl show peers`, `fipsctl show links`, …) |
 | `/usr/bin/fipstop` | Live TUI dashboard |
 | `/usr/bin/fips-gateway` | Outbound LAN gateway service (not started by default) |
-| `/usr/bin/fips-mesh-setup` | Opt-in helper — creates an open 802.11s mesh interface for router↔router backhaul |
+| `/usr/bin/fips-mesh-setup` | Opt-in helper — creates an open 802.11s mesh interface for router↔router backhaul, in the `fips_mesh` firewall zone |
 | `/usr/bin/fips-ap-setup` | Opt-in helper — creates the open `!FIPS` access SSID for client devices |
 | `/etc/init.d/fips` | procd service for the daemon (auto-start, crash respawn) |
 | `/etc/init.d/fips-gateway` | procd service for the gateway (disabled by default) |
@@ -270,6 +270,72 @@ Removing the package leaves the zone. To delete it:
 uci delete firewall.fips
 uci delete firewall.fips_lan
 uci delete firewall.fips_ping
+uci commit firewall
+/etc/init.d/firewall reload
+```
+
+### The 802.11s mesh zone
+
+`fips-mesh-setup` puts each mesh interface it creates in a firewall zone of its
+own, `fips_mesh`, before it brings the radio up:
+
+```text
+config zone 'fips_mesh'
+        option name 'fips_mesh'
+        option input 'REJECT'
+        option output 'ACCEPT'
+        option forward 'REJECT'
+        option auto_helper '0'
+        list device 'fips-mesh0'
+```
+
+The mesh is open at the radio layer, so anyone in radio range can join it. An
+interface in no zone meets the default input policy, which on stock OpenWrt
+22.03 is ACCEPT, and would let them reach router services such as LuCI, SSH
+and DNS at the interface's link-local address. The zone rejects all IP input
+and forwarding on the mesh, including FIPS UDP (port 2121) and mDNS, so FIPS
+peers over the mesh use the Ethernet transport, which is not IP and does not
+pass the firewall.
+
+The zone holds each interface by its name. If you put a mesh interface in a
+zone of your own before running `fips-mesh-setup`, it is left there, and the
+helper prints a warning that names the zone, saying router services are
+reachable over the mesh when that zone's input policy is ACCEPT. The zone is
+created once and is yours from then on: the helper adds and removes
+interfaces but does not rewrite its options, and warns when its input policy
+is ACCEPT or the zone is disabled. If you rename a mesh interface by hand, add
+the new name to the zone (`uci add_list firewall.fips_mesh.device=<name>`, then
+commit and reload).
+
+`fips-mesh-setup remove` takes each interface out of the zone, and deletes the
+zone with the last one. An upgrade adds mesh interfaces made by older packages,
+which put them in no zone, to the zone. A reinstall of the same version with a
+plain `opkg install` does not run the package's setup, so run the helper's
+`zone` subcommand yourself:
+
+```bash
+fips-mesh-setup zone
+```
+
+As with the `fips` zone, the helper and the upgrade check the loaded ruleset
+after the firewall reload. If the reload failed, IP traffic arriving on the mesh
+interfaces is dropped until the firewall reloads cleanly, and a warning says
+so. If the firewall configuration cannot be saved, `fips-mesh-setup` does not
+create the mesh, and an upgrade drops IP traffic arriving on the mesh
+interfaces until the firewall next reloads (`fips-mesh-setup close` does the
+same by hand). When the save left the file damaged, the warning names the
+copy to restore before any reload or reboot:
+
+```bash
+uci import firewall < /tmp/fips-mesh-firewall.uci
+/etc/init.d/firewall reload
+```
+
+Removing the package leaves the zone, because the mesh interfaces stay
+configured. Once you have removed the mesh, delete the zone with:
+
+```bash
+uci delete firewall.fips_mesh
 uci commit firewall
 /etc/init.d/firewall reload
 ```
