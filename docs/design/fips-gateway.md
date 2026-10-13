@@ -86,7 +86,7 @@ probe at startup.
 ### nftables Table Layout
 
 All gateway rules live in a single nftables table, `inet
-fips_gateway`, with five chains and one set:
+fips_gateway`, with six chains and one set:
 
 - `prerouting` — `type nat hook prerouting priority dstnat (-100)`,
   for both LAN→mesh DNAT (per virtual-IP mapping, matching
@@ -108,6 +108,10 @@ fips_gateway`, with five chains and one set:
   addressed to the pool that arrives on neither the LAN interface
   nor loopback, and traffic from a mapped mesh address that arrives
   on neither `fips0` nor loopback.
+- `input` — `type filter hook input priority filter (0)`, which
+  rejects traffic still addressed to the pool when it reaches the
+  input hook, that is, traffic no mapping translated, except a
+  neighbour solicitation.
 
 The set, `fips_mesh_sources`, holds every mapped mesh address.
 
@@ -121,7 +125,8 @@ refuses leaves the previous table in place. Rebuilding the whole
 table avoids reliance on kernel rule-handle tracking, which the
 rustables crate does not expose. The table holds the two masquerades
 into `fips0`, the forward drop, the pool drop, the forged-source drop
-and its set, three rules per live outbound mapping
+and its set, the pool reject and its neighbour-solicitation exception,
+three rules per live outbound mapping
 (at most 1000 mappings), one rule per inbound forward, and one extra
 masquerade when any forward is present.
 
@@ -370,22 +375,24 @@ way an entry counts once toward each distinct IPv6 destination among
 its original and reply tuples, so an entry counts as a session of a
 virtual IP whose address is its original destination.
 
-**Evidence of use.** A mapping counts as having carried traffic once
-a conntrack entry for a flow to its virtual IP has seen a reply whose
+**Evidence of use.** A mapping counts as having carried traffic once a
+conntrack entry for a flow to its virtual IP has seen a reply whose
 source is the mapped mesh address. A reply from anywhere else does not
-count: not from the virtual IP itself (an unmapped pool address is a
-local address of the gateway, so it answers), not from an earlier
-holder of the address, and not from a host forging the mesh address,
-since the `raw_prerouting` chain drops packets from any mapped mesh
-address (the `fips_mesh_sources` set) unless they arrive on `fips0`
-or loopback. An ICMPv6 error is not a reply. The gateway routes its
-whole pool prefix to itself, so a name whose mesh address lies inside
-that prefix is refused with `SERVFAIL`: its traffic could never reach
-the mesh, and the gateway's own replies from the address would read as
-the mapping's traffic. Only a mapping that has
-carried traffic is refreshed by re-queries and answered with the full
-TTL; a name nobody has used expires TTL plus grace after it was
-created however often it is queried, and its answers never outlive
+count: not from the virtual IP itself (an unmapped pool address is
+local to the gateway, so a reply from it comes from the gateway, not
+the mapped node; the input chain's reject of traffic to it is an
+ICMPv6 error sent from the gateway's own address, not from the virtual
+IP), not from an earlier holder of the address, and not from a host
+forging the mesh address, since the `raw_prerouting` chain drops
+packets from any mapped mesh address (the `fips_mesh_sources` set)
+unless they arrive on `fips0` or loopback. An ICMPv6 error is not a
+reply. The gateway routes its whole pool prefix to itself, so a name
+whose mesh address lies inside that prefix is refused with `SERVFAIL`:
+its traffic could never reach the mesh, and the gateway's own replies
+from the address would read as the mapping's traffic. Only a mapping
+that has carried traffic is refreshed by re-queries and answered with
+the full TTL; a name nobody has used expires TTL plus grace after it
+was created however often it is queried, and its answers never outlive
 TTL after creation (TTL 0 if unreplied traffic keeps it mapped past
 that). The flag is never cleared.
 
@@ -406,7 +413,7 @@ is spent (a bucket of 50 that refills at 10 per second), or when it
 already holds 1000 live mappings that have all carried traffic. At
 the ceiling a new name otherwise replaces the oldest mapping that has
 never carried traffic; a client still holding an answer for the
-replaced address then reaches the gateway host itself, as for any
+replaced address then has its connections to it rejected, as for any
 unmapped pool address, until that answer expires. A name that already
 has a mapping keeps resolving while new names are refused. The first
 refusal at a bound logs one warning; later ones are counted and
@@ -522,9 +529,34 @@ LAN flow's addresses and ports could otherwise send in that flow's
 original direction and have it translated and forwarded. The
 gateway host's own connections to a mapped virtual IP are translated
 in `output` and leave on `fips0`, so they never reach this rule.
-Loopback is exempt, which leaves a gap: the gateway host's own
-connections to a pool address with no mapping are delivered to the
-gateway host itself, as a LAN client's are.
+Loopback is exempt so that the gateway host's own connections to a
+pool address with no mapping reach the pool reject below, as a LAN
+client's do.
+
+**Pool reject** keeps traffic to a pool address that has no mapping
+(an expired one, or an address written into a configuration by hand)
+from reaching whatever listens on the gateway host, such as its SSH
+server:
+
+```text
+chain:  input
+match:  nfproto ipv6 && ip6 daddr in <pool>
+        && icmpv6 type == nd-neighbor-solicit
+action: accept
+match:  nfproto ipv6 && ip6 daddr in <pool>
+action: reject (ICMPv6 port unreachable)
+```
+
+Every pool address is local to the gateway, and a mapping's DNAT
+rewrites the destination before the input hook (LAN traffic in
+`prerouting`, the host's own in `output`, and a flow to the gateway's
+own node to its mesh address), so whatever reaches `input` still
+addressed to the pool has no mapping. It covers the LAN and the
+gateway host alike. The one exception is a neighbour solicitation: a
+LAN client that reached a virtual IP by proxy NDP checks the neighbour
+with a unicast solicitation addressed to the virtual IP, connection
+tracking leaves neighbour discovery untracked so no DNAT rewrites it,
+and proxy NDP must still answer it.
 
 **Postrouting SNAT (per mapping)** rewrites the source of a new flow
 sourced from a mapped mesh address to that mapping's virtual IP:
@@ -655,8 +687,9 @@ sequence is:
 
 1. Add the table (which succeeds whether or not it exists), delete
    it, and add it again, so the delete always has a target.
-2. Add the five chains and the mesh-source set with its elements; the
-   pool drop, the forged-source drop and the forward drop; the two
+2. Add the six chains and the mesh-source set with its elements; the
+   pool drop, the forged-source drop and the forward drop; the
+   neighbour-solicitation accept and the pool reject; the two
    `oifname fips0` masquerades, LAN first; the LAN-side masquerade if
    any port-forwards exist; per-mapping prerouting DNAT, output DNAT
    and SNAT rules for every live pool entry; per-port-forward DNAT

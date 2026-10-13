@@ -14,9 +14,9 @@ use tracing::{debug, error, info, warn};
 
 use rustables::expr::{
     Bitwise, Cmp, CmpOp, ConnTrackState, Conntrack, ConntrackKey, Counter, HighLevelPayload,
-    IPv6HeaderField, Immediate, Lookup, Masquerade, Meta, MetaType, Nat, NatType,
-    NetworkHeaderField, Register, TCPHeaderField, TransportHeaderField, UDPHeaderField,
-    VerdictKind,
+    ICMPv6HeaderField, IPv6HeaderField, IcmpCode, Immediate, Lookup, Masquerade, Meta, MetaType,
+    Nat, NatType, NetworkHeaderField, Register, Reject, RejectType, TCPHeaderField,
+    TransportHeaderField, UDPHeaderField, VerdictKind,
 };
 use rustables::set::{SetBuilder, SetElementList};
 use rustables::{
@@ -29,6 +29,7 @@ const TABLE_NAME: &str = "fips_gateway";
 const PREROUTING_CHAIN: &str = "prerouting";
 const POSTROUTING_CHAIN: &str = "postrouting";
 const OUTPUT_CHAIN: &str = "output";
+const INPUT_CHAIN: &str = "input";
 const FORWARD_CHAIN: &str = "forward";
 const RAW_CHAIN: &str = "raw_prerouting";
 
@@ -51,7 +52,11 @@ const LOOPBACK_IFACE: &[u8] = b"lo\0";
 const DSTNAT_PRIORITY: i32 = -100;
 const SRCNAT_PRIORITY: i32 = 100;
 
-/// The standard filter priority, for the forward chain.
+/// ICMPv6 Neighbor Solicitation, the one message addressed to a pool address
+/// that the gateway must still take in: proxy NDP answers it.
+const ND_NEIGHBOR_SOLICIT: u8 = 135;
+
+/// The standard filter priority, for the forward and input chains.
 const FILTER_PRIORITY: i32 = 0;
 
 /// The raw priority, which runs before connection tracking (-200), so a
@@ -208,12 +213,19 @@ enum NatOp {
     OutChain,
     ForwardChain,
     RawChain,
+    InChain,
     /// Drop, before connection tracking, traffic to the pool that arrives on
     /// neither the LAN interface nor loopback.
     NonLanPoolDrop,
     /// Drop traffic into `fips0` from any interface but the LAN unless it
     /// belongs to an established or related flow.
     NonLanForwardDrop,
+    /// Accept a Neighbor Solicitation addressed to a pool address, ahead of
+    /// the reject below, so proxy NDP still answers it.
+    PoolSolicitAccept,
+    /// Reject traffic that is still addressed to the pool when it reaches the
+    /// input hook: no mapping translated it.
+    UnmappedPoolReject,
     /// The set of mapped mesh addresses.
     MeshSourceSet,
     /// Its elements, sent only when at least one mapping exists.
@@ -244,8 +256,10 @@ enum NatOp {
 /// doesn't expose). The table is small, so this is cheap: two masquerades
 /// into `fips0` (LAN traffic, and the gateway host's own traffic to a mapped
 /// node), the forward, pool and forged-source drops in their filter chains
-/// with the mesh-source set, three rules per mapping (at most 1000), one rule
-/// per inbound forward, and one more masquerade when any forward is present.
+/// with the mesh-source set, the reject of unmapped pool traffic and its
+/// neighbour-solicitation exception in the input chain, three rules per
+/// mapping (at most 1000), one rule per inbound forward, and one more
+/// masquerade when any forward is present.
 pub struct NatManager {
     table: Table,
     pre_chain: Chain,
@@ -253,6 +267,7 @@ pub struct NatManager {
     out_chain: Chain,
     forward_chain: Chain,
     raw_chain: Chain,
+    in_chain: Chain,
     /// LAN interface name. Only traffic arriving on it is translated onto
     /// the mesh, and it gates the port-forward LAN-side masquerade.
     lan_interface: String,
@@ -304,6 +319,10 @@ impl NatManager {
             .with_name(RAW_CHAIN)
             .with_type(ChainType::Filter)
             .with_hook(Hook::new(HookClass::PreRouting, RAW_PRIORITY));
+        let in_chain = Chain::new(&table)
+            .with_name(INPUT_CHAIN)
+            .with_type(ChainType::Filter)
+            .with_hook(Hook::new(HookClass::In, FILTER_PRIORITY));
 
         Self {
             table,
@@ -312,6 +331,7 @@ impl NatManager {
             out_chain,
             forward_chain,
             raw_chain,
+            in_chain,
             lan_interface,
             pool,
             mappings: HashMap::new(),
@@ -332,7 +352,8 @@ impl NatManager {
     /// Traffic from any other interface is not translated: the forward chain
     /// drops it on its way into `fips0` unless it is a reply, and the raw
     /// chain drops it before connection tracking when it is addressed to the
-    /// pool.
+    /// pool. The input chain rejects traffic to a pool address that no
+    /// mapping translated, from the LAN or from the gateway host itself.
     ///
     /// `lan_interface` is the gateway's LAN-facing interface name. `pool` is
     /// the virtual IP range as its network address and prefix length.
@@ -467,6 +488,7 @@ impl NatManager {
             NatOp::PostChain,
             NatOp::ForwardChain,
             NatOp::RawChain,
+            NatOp::InChain,
             NatOp::MeshSourceSet,
         ];
         if !self.mappings.is_empty() {
@@ -476,6 +498,8 @@ impl NatManager {
             NatOp::NonLanPoolDrop,
             NatOp::ForgedSourceDrop,
             NatOp::NonLanForwardDrop,
+            NatOp::PoolSolicitAccept,
+            NatOp::UnmappedPoolReject,
             NatOp::FipsMasquerade,
             NatOp::LocalMasquerade,
         ]);
@@ -542,6 +566,7 @@ impl NatManager {
             NatOp::OutChain => Some(&self.out_chain),
             NatOp::ForwardChain => Some(&self.forward_chain),
             NatOp::RawChain => Some(&self.raw_chain),
+            NatOp::InChain => Some(&self.in_chain),
             _ => None,
         }
     }
@@ -555,6 +580,7 @@ impl NatManager {
             | NatOp::OutChain
             | NatOp::ForwardChain
             | NatOp::RawChain
+            | NatOp::InChain
             | NatOp::MeshSourceSet
             | NatOp::MeshSourceElements => Ok(None),
             NatOp::ForgedSourceDrop => {
@@ -589,17 +615,12 @@ impl NatManager {
                 // whatever interface it arrived on. The host's own connections
                 // to a mapped virtual IP are translated in the output chain
                 // and leave on fips0, so they never reach this chain. Loopback
-                // is exempt, which leaves one known gap: the host's own
-                // connections to a virtual IP with no mapping are still
-                // delivered to the host, as LAN clients' are, through
-                // `local <pool> dev lo`. That is the only traffic the
-                // exemption admits: a flow mapped to the gateway's own node
-                // re-enters on lo addressed to its mesh address, outside the
-                // pool.
-                let (network, prefix) = self.pool;
-                let mask = u128::MAX << (128 - u32::from(prefix.min(128)));
-                let network = Ipv6Addr::from(u128::from(network) & mask);
-                let mask = mask.to_be_bytes();
+                // is exempt so that the host's own connections to a pool
+                // address with no mapping reach the input chain's reject, as
+                // LAN clients' do, rather than vanish here; a flow mapped to
+                // the gateway's own node re-enters on lo addressed to its
+                // mesh address, outside the pool.
+                let (network, mask) = self.pool_match();
                 let rule = Rule::new(&self.raw_chain)?
                     .with_expr(Meta::new(MetaType::NfProto))
                     .with_expr(Cmp::new(CmpOp::Eq, [libc::NFPROTO_IPV6 as u8]))
@@ -615,6 +636,63 @@ impl NatManager {
                     .with_expr(Cmp::new(CmpOp::Eq, network.octets()))
                     .with_expr(Counter::default())
                     .with_expr(Immediate::new_verdict(VerdictKind::Drop));
+                Ok(Some(rule))
+            }
+            NatOp::PoolSolicitAccept => {
+                // A LAN client that reached a virtual IP by proxy NDP checks
+                // the neighbour is still there with a unicast solicitation
+                // addressed to the virtual IP itself. Connection tracking
+                // leaves neighbour discovery untracked, so no DNAT rewrites
+                // it, and the reject below would otherwise make the client
+                // drop the neighbour.
+                let (network, mask) = self.pool_match();
+                let rule = Rule::new(&self.in_chain)?
+                    .with_expr(Meta::new(MetaType::NfProto))
+                    .with_expr(Cmp::new(CmpOp::Eq, [libc::NFPROTO_IPV6 as u8]))
+                    .with_expr(
+                        HighLevelPayload::Network(NetworkHeaderField::IPv6(IPv6HeaderField::Daddr))
+                            .build(),
+                    )
+                    .with_expr(Bitwise::new(mask, [0u8; 16])?)
+                    .with_expr(Cmp::new(CmpOp::Eq, network.octets()))
+                    .with_expr(Meta::new(MetaType::L4Proto))
+                    .with_expr(Cmp::new(CmpOp::Eq, [libc::IPPROTO_ICMPV6 as u8]))
+                    .with_expr(
+                        HighLevelPayload::Transport(TransportHeaderField::ICMPv6(
+                            ICMPv6HeaderField::Type,
+                        ))
+                        .build(),
+                    )
+                    .with_expr(Cmp::new(CmpOp::Eq, [ND_NEIGHBOR_SOLICIT]))
+                    .with_expr(Immediate::new_verdict(VerdictKind::Accept));
+                Ok(Some(rule))
+            }
+            NatOp::UnmappedPoolReject => {
+                // Every pool address is local to the gateway
+                // (`local <pool> dev lo`), and a mapping's DNAT rewrites the
+                // destination before input: LAN traffic in prerouting, the
+                // host's own in output, a flow to the gateway's own node to
+                // its mesh address. What arrives here still addressed to the
+                // pool has no mapping, an expired one or a hand-written
+                // address, and would otherwise reach whatever listens on the
+                // gateway itself. Rejected rather than dropped, so the
+                // sender fails at once.
+                let (network, mask) = self.pool_match();
+                let rule = Rule::new(&self.in_chain)?
+                    .with_expr(Meta::new(MetaType::NfProto))
+                    .with_expr(Cmp::new(CmpOp::Eq, [libc::NFPROTO_IPV6 as u8]))
+                    .with_expr(
+                        HighLevelPayload::Network(NetworkHeaderField::IPv6(IPv6HeaderField::Daddr))
+                            .build(),
+                    )
+                    .with_expr(Bitwise::new(mask, [0u8; 16])?)
+                    .with_expr(Cmp::new(CmpOp::Eq, network.octets()))
+                    .with_expr(Counter::default())
+                    .with_expr(
+                        Reject::default()
+                            .with_type(RejectType::IcmpxUnreach)
+                            .with_icmp_code(IcmpCode::PortUnreach),
+                    );
                 Ok(Some(rule))
             }
             NatOp::NonLanForwardDrop => {
@@ -761,6 +839,17 @@ impl NatManager {
                 Ok(Some(rule))
             }
         }
+    }
+
+    /// The pool as a masked destination match: its network address, with any
+    /// host bits cleared, and the mask.
+    fn pool_match(&self) -> (Ipv6Addr, [u8; 16]) {
+        let (network, prefix) = self.pool;
+        let mask = u128::MAX << (128 - u32::from(prefix.min(128)));
+        (
+            Ipv6Addr::from(u128::from(network) & mask),
+            mask.to_be_bytes(),
+        )
     }
 
     /// A DNAT of `virtual_ip` to its mapped mesh address in `chain`, matching
@@ -2568,6 +2657,134 @@ mod tests {
                  the gateway's identity: {:?}",
                 expressions(rule)
             );
+        }
+    }
+
+    /// The masked pool match of `TEST_POOL`: daddr, mask, compare.
+    fn pool_daddr() -> [ExpressionVariant; 3] {
+        let (network, prefix) = TEST_POOL;
+        let mask = (u128::MAX << (128 - u32::from(prefix))).to_be_bytes();
+        [
+            daddr(),
+            ExpressionVariant::from(Bitwise::new(mask, [0u8; 16]).expect("equal lengths")),
+            ExpressionVariant::from(Cmp::new(CmpOp::Eq, network.octets())),
+        ]
+    }
+
+    /// Whether `rule` ends in a reject.
+    fn rejects(rule: &Rule) -> bool {
+        expressions(rule)
+            .iter()
+            .any(|e| matches!(e, ExpressionVariant::Reject(_)))
+    }
+
+    #[test]
+    fn rebuild_adds_an_input_filter_chain() {
+        let mgr = manager_with_mappings(1);
+        let chains = emitted_chains(&mgr);
+        let input: Vec<&&Chain> = chains
+            .iter()
+            .filter(|c| c.get_name().map(String::as_str) == Some("input"))
+            .collect();
+        assert_eq!(input.len(), 1, "one input chain: {chains:?}");
+        assert_eq!(input[0].get_type(), Some(&ChainType::Filter));
+        assert_eq!(
+            input[0].get_hook().cloned(),
+            Some(Hook::new(HookClass::In, 0)),
+            "unmapped pool traffic is rejected at the input hook"
+        );
+    }
+
+    #[test]
+    fn traffic_still_addressed_to_the_pool_at_input_is_rejected() {
+        let mgr = manager_with_mappings(2);
+        let rules = emitted_rules(&mgr);
+        let nfproto = meta_cmp(MetaType::NfProto, CmpOp::Eq, &[libc::NFPROTO_IPV6 as u8]);
+        let [d, mask, net] = pool_daddr();
+        let expected = [nfproto[0].clone(), nfproto[1].clone(), d, mask, net];
+        let found: Vec<&Rule> = rules
+            .iter()
+            .filter(|rule| {
+                rule.get_chain().map(String::as_str) == Some("input")
+                    && rejects(rule)
+                    && has_in_order(rule, &expected)
+            })
+            .collect();
+        assert_eq!(
+            found.len(),
+            1,
+            "no input rule rejects traffic still addressed to the pool, so a \
+             connection to a virtual IP with no mapping reaches whatever listens \
+             on the gateway itself"
+        );
+        assert!(
+            !matches_an_interface(found[0]),
+            "the reject must cover the LAN and the gateway host alike: {:?}",
+            expressions(found[0])
+        );
+        let reject = expressions(found[0]).into_iter().find_map(|e| match e {
+            ExpressionVariant::Reject(r) => Some(r),
+            _ => None,
+        });
+        let reject = reject.expect("the rule rejects");
+        assert_eq!(reject.get_type(), Some(&RejectType::IcmpxUnreach));
+        assert_eq!(reject.get_icmp_code(), Some(&IcmpCode::PortUnreach));
+    }
+
+    #[test]
+    fn a_neighbour_solicitation_to_the_pool_is_accepted_before_the_reject() {
+        let mgr = manager_with_mappings(2);
+        let rules = emitted_rules(&mgr);
+        let input: Vec<&Rule> = rules
+            .iter()
+            .filter(|rule| rule.get_chain().map(String::as_str) == Some("input"))
+            .collect();
+        let [d, mask, net] = pool_daddr();
+        let l4 = meta_cmp(MetaType::L4Proto, CmpOp::Eq, &[libc::IPPROTO_ICMPV6 as u8]);
+        let expected = [
+            d,
+            mask,
+            net,
+            l4[0].clone(),
+            l4[1].clone(),
+            ExpressionVariant::from(
+                HighLevelPayload::Transport(TransportHeaderField::ICMPv6(ICMPv6HeaderField::Type))
+                    .build(),
+            ),
+            ExpressionVariant::from(Cmp::new(CmpOp::Eq, [135u8])),
+            ExpressionVariant::from(Immediate::new_verdict(VerdictKind::Accept)),
+        ];
+        let accept = input
+            .iter()
+            .position(|rule| has_in_order(rule, &expected))
+            .expect(
+                "no input rule accepts a neighbour solicitation to the pool, so a LAN \
+                 client's unicast probe of a proxied virtual IP is rejected and it \
+                 drops the neighbour",
+            );
+        let reject = input
+            .iter()
+            .position(|rule| rejects(rule))
+            .expect("the reject is emitted");
+        assert!(
+            accept < reject,
+            "the solicitation accept at {accept} follows the reject at {reject}"
+        );
+    }
+
+    #[test]
+    fn the_input_rules_are_added_after_their_chain() {
+        let ops = manager_with_mappings(1).rebuild_batches().remove(0);
+        let chain = ops
+            .iter()
+            .position(|op| *op == NatOp::InChain)
+            .expect("the input chain is added");
+        for op in [NatOp::PoolSolicitAccept, NatOp::UnmappedPoolReject] {
+            let index = ops
+                .iter()
+                .position(|o| *o == op)
+                .unwrap_or_else(|| panic!("no {op:?}: {ops:?}"));
+            assert!(chain < index, "{op:?} before its chain: {ops:?}");
         }
     }
 

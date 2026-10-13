@@ -634,6 +634,39 @@ print(tables[0]["handle"], pool, forward, forged)
 '
 }
 
+# The table handle and the packet counter of the input chain's reject of
+# unmapped pool traffic, from `nft -j list table inet fips_gateway`, as
+# "HANDLE PACKETS". Every rebuild recreates the table, resetting the counter
+# and changing the handle, so two readings compare only when their handles
+# agree. Fails when the table or a counted reject in chain input is missing.
+pool_reject() {
+    python3 -c '
+import json, sys
+try:
+    doc = json.load(sys.stdin)
+except ValueError:
+    sys.exit(1)
+entries = [e for e in doc.get("nftables", []) if isinstance(e, dict)]
+tables = [e["table"] for e in entries if "table" in e]
+if len(tables) != 1 or "handle" not in tables[0]:
+    sys.exit(1)
+found = []
+for e in entries:
+    r = e.get("rule")
+    if not isinstance(r, dict) or r.get("chain") != "input":
+        continue
+    exprs = [x for x in r.get("expr", []) if isinstance(x, dict)]
+    if not any("reject" in x for x in exprs):
+        continue
+    for x in exprs:
+        if isinstance(x.get("counter"), dict) and isinstance(x["counter"].get("packets"), int):
+            found.append(x["counter"]["packets"])
+if len(found) != 1:
+    sys.exit(1)
+print(tables[0]["handle"], found[0])
+'
+}
+
 # Succeeds when $1 and $2 are the same IPv6 address in any written form.
 same_addr() {
     python3 -c '
@@ -922,6 +955,15 @@ print(json.dumps(a))
     gw_case "reply_src: empty input" 1 "" "" reply_src tcp 8009 || fails=$((fails + 1))
     gw_case "reply_dst: translated and masqueraded" 0 fd3c:9a51:7e02:4b18::1 "$ct_host" \
         reply_dst tcp 8009 || fails=$((fails + 1))
+    # The input chain's reject, written from the documented `nft -j` format;
+    # json_reject_none has the chain but no reject in it.
+    local json_reject json_reject_none
+    json_reject='{"nftables": [{"table": {"family": "inet", "name": "fips_gateway", "handle": 11}}, {"rule": {"family": "inet", "table": "fips_gateway", "chain": "input", "handle": 4, "expr": [{"match": {"op": "==", "left": {"meta": {"key": "nfproto"}}, "right": "ipv6"}}, {"match": {"op": "==", "left": {"payload": {"protocol": "ip6", "field": "daddr"}}, "right": {"prefix": {"addr": "fd01::", "len": 112}}}}, {"match": {"op": "==", "left": {"meta": {"key": "l4proto"}}, "right": "ipv6-icmp"}}, {"match": {"op": "==", "left": {"payload": {"protocol": "icmpv6", "field": "type"}}, "right": "nd-neighbor-solicit"}}, {"accept": null}]}}, {"rule": {"family": "inet", "table": "fips_gateway", "chain": "input", "handle": 5, "expr": [{"match": {"op": "==", "left": {"meta": {"key": "nfproto"}}, "right": "ipv6"}}, {"match": {"op": "==", "left": {"payload": {"protocol": "ip6", "field": "daddr"}}, "right": {"prefix": {"addr": "fd01::", "len": 112}}}}, {"counter": {"packets": 6, "bytes": 480}}, {"reject": {"type": "icmpx", "expr": "port-unreachable"}}]}}]}'
+    json_reject_none=${json_reject//\{\"reject\": \{\"type\": \"icmpx\", \"expr\": \"port-unreachable\"\}\}/\{\"drop\": null\}}
+    gw_case "pool_reject: the counted reject" 0 "11 6" "$json_reject" pool_reject || fails=$((fails + 1))
+    gw_case "pool_reject: no reject in chain input" 1 "" "$json_reject_none" pool_reject || fails=$((fails + 1))
+    gw_case "pool_reject: a table without the input chain" 1 "" "$json_ok" pool_reject || fails=$((fails + 1))
+    gw_case "pool_reject: empty input" 1 "" "" pool_reject || fails=$((fails + 1))
     gw_case "same_addr: two forms of one address" 0 "" "" same_addr fd02:0:0:0::10 fd02::10 || fails=$((fails + 1))
     gw_case "same_addr: different addresses" 1 "" "" same_addr fd01::1 fd02::10 || fails=$((fails + 1))
 
@@ -1557,6 +1599,7 @@ P6D_GW=$(docker exec "$GATEWAY" bash -c \
     "ip -6 -o addr show fips0 | awk '/inet6 fd/ {print \$4}' | cut -d/ -f1 | head -1" \
     2>/dev/null || echo "")
 P6D_SUM=""
+P6D_READY=false
 if docker exec "$SERVER" sh -c "
     mkdir '$P6D_SRV_DIR' &&
     echo '$P6D_TOKEN' > '$P6D_SRV_DIR/token' &&
@@ -1592,6 +1635,7 @@ if [ -z "$P6D_MESH" ] || [ -z "$P6D_GW" ] || [ -z "$P6D_SUM" ] || [ "$P6D_DECOY"
     || [ "$P6D_LISTENING" != true ]; then
     check "Gateway-host setup (server mesh '$P6D_MESH', gateway mesh '$P6D_GW', checksum '$P6D_SUM', decoy $P6D_DECOY, listening $P6D_LISTENING)" 1
 else
+    P6D_READY=true
     P6D_GATE=false
     for P6D_TRY in 1 2 3; do
         # The gateway's DNS listens on [::]:53, so the gateway host can ask
@@ -1651,6 +1695,140 @@ else
         fi
         if [ "${FIPS_GW_DEBUG:-}" = 1 ]; then
             grep -E "dport=$P6D_PORT\b" <<< "$P6D_CT" | sed 's/^/    /' || true
+        fi
+    fi
+fi
+
+# Phase 6e: a pool address with no mapping is rejected
+#
+# Every pool address is local to the gateway, and a mapping's DNAT rewrites
+# the destination before the input hook, so whatever reaches input still
+# addressed to the pool has no mapping: an expired one, or an address written
+# by hand. The input chain rejects it, from the gateway host and from the LAN
+# alike, rather than let it reach a listener on the gateway, here 6d's decoy.
+# A rejected connection is refused at once (curl exit 7), and the reject's
+# counter rises. A mapped virtual IP still reaches its node from the LAN, and
+# a unicast neighbour solicitation for a proxied virtual IP, which a LAN client
+# sends to check the neighbour and which connection tracking leaves untracked
+# and so untranslated, is still answered. Uses 6d's servers, so it runs only
+# when their setup succeeded, and is a failure, never a skip, otherwise.
+echo ""
+echo "Phase 6e: Pool addresses without a mapping are rejected"
+if [ "$P6D_READY" != true ]; then
+    check "Unmapped pool address setup (Phase 6d's servers are not running)" 1
+else
+    P6E_NFT=$(docker exec "$GATEWAY" nft list table inet fips_gateway 2>/dev/null || true)
+    P6E_ADDR=""
+    for P6E_CAND in fd01::fffe fd01::fffd fd01::fffc; do
+        if [ -n "$P6E_NFT" ] && ! dnat_to "$P6E_CAND" <<< "$P6E_NFT" >/dev/null \
+            && ! dnat_to "$P6E_CAND" output <<< "$P6E_NFT" >/dev/null; then
+            P6E_ADDR="$P6E_CAND"
+            break
+        fi
+    done
+    if [ -z "$P6E_ADDR" ]; then
+        check "An unmapped pool address to probe (none of three candidates, or no listing)" 1
+    else
+        P6E_DONE=false
+        for P6E_TRY in 1 2 3; do
+            P6E_BEFORE=$(docker exec "$GATEWAY" nft -j list table inet fips_gateway 2>/dev/null | pool_reject || echo "")
+            P6E_GW_RC=0
+            P6E_GW_BODY=$(docker exec "$GATEWAY" curl -6 -s --max-time 5 --interface "$GW_DNS" \
+                "http://[$P6E_ADDR]:$P6D_PORT/token" 2>/dev/null) || P6E_GW_RC=$?
+            P6E_LAN_RC=0
+            P6E_LAN_BODY=$(docker exec "$CLIENT" curl -6 -s --max-time 5 \
+                "http://[$P6E_ADDR]:$P6D_PORT/token" 2>/dev/null) || P6E_LAN_RC=$?
+            P6E_AFTER=$(docker exec "$GATEWAY" nft -j list table inet fips_gateway 2>/dev/null | pool_reject || echo "")
+            read -r P6E_H0 P6E_N0 <<< "$P6E_BEFORE"
+            read -r P6E_H1 P6E_N1 <<< "$P6E_AFTER"
+            if [ -n "$P6E_BEFORE" ] && [ -n "$P6E_AFTER" ] && [ "$P6E_H0" != "$P6E_H1" ]; then
+                echo "  try $P6E_TRY: table rebuilt during the probe ('$P6E_BEFORE' then '$P6E_AFTER'), retrying"
+                continue
+            fi
+            P6E_DONE=true
+            break
+        done
+        if [ "$P6E_DONE" != true ]; then
+            check "Unmapped pool address probe (no conclusive try in 3)" 1
+        else
+            for P6E_WHO in "gateway host:$P6E_GW_RC:$P6E_GW_BODY" "LAN client:$P6E_LAN_RC:$P6E_LAN_BODY"; do
+                P6E_LABEL="${P6E_WHO%%:*}"
+                P6E_REST="${P6E_WHO#*:}"
+                P6E_RC="${P6E_REST%%:*}"
+                P6E_BODY="${P6E_REST#*:}"
+                if [ "$P6E_BODY" = gateway-decoy ]; then
+                    check "The $P6E_LABEL's connection to unmapped $P6E_ADDR reached the gateway itself (body 'gateway-decoy')" 1
+                elif [ "$P6E_RC" = 7 ] && [ -z "$P6E_BODY" ]; then
+                    check "The $P6E_LABEL's connection to unmapped $P6E_ADDR is refused" 0
+                else
+                    check "The $P6E_LABEL's connection to unmapped $P6E_ADDR (curl exit $P6E_RC, body '${P6E_BODY:0:40}'; expected refused)" 1
+                fi
+            done
+            if [ -n "$P6E_BEFORE" ] && [ -n "$P6E_AFTER" ] && [ "$P6E_N1" -ge $((P6E_N0 + 2)) ]; then
+                check "The pool reject counted both ($P6E_N0 -> $P6E_N1)" 0
+            else
+                check "The pool reject counted both (read '$P6E_BEFORE' then '$P6E_AFTER')" 1
+            fi
+        fi
+    fi
+
+    # A mapped virtual IP still reaches its node from the LAN.
+    P6E_VIP=""
+    P6E_GATE=false
+    for _ in $(seq 1 10); do
+        P6E_VIP=$(docker exec "$CLIENT" dig +short AAAA "${NPUB_B}.fips" "@$GW_DNS" 2>/dev/null \
+            | grep -m1 "^fd01::" || true)
+        P6E_NFT=$(docker exec "$GATEWAY" nft list table inet fips_gateway 2>/dev/null || true)
+        if [ -n "$P6E_VIP" ] && P6E_TO=$(dnat_to "$P6E_VIP" <<< "$P6E_NFT") && same_addr "$P6E_TO" "$P6D_MESH"; then
+            P6E_GATE=true
+            break
+        fi
+        sleep 0.5
+    done
+    if [ "$P6E_GATE" != true ]; then
+        check "LAN client resolves ${NPUB_B:0:20}...fips to a mapped virtual IP (got '$P6E_VIP')" 1
+    else
+        P6E_MAPPED=$(docker exec "$CLIENT" curl -6 -s --max-time 5 "http://[$P6E_VIP]:$P6D_PORT/token" 2>&1 || true)
+        if [ "$P6E_MAPPED" = "$P6D_TOKEN" ]; then
+            check "A LAN client still reaches $SERVER through mapped $P6E_VIP" 0
+        else
+            check "A LAN client's fetch through mapped $P6E_VIP (body '${P6E_MAPPED:0:40}', expected the token)" 1
+        fi
+
+        # The client sends the solicitation itself, as neighbour
+        # unreachability detection does: to the virtual IP, hop limit 255.
+        # Any advertisement for the virtual IP answers this probe: the
+        # client routes the pool via $GW_DNS, so its kernel resolves only
+        # that next hop and never solicits the virtual IP itself.
+        if [ -n "$LAN_IF" ] && P6E_PROXY=$(docker exec "$GATEWAY" ip -6 neigh show proxy 2>/dev/null \
+            | proxy_dev "$P6E_VIP") && [ "$P6E_PROXY" = "$LAN_IF" ]; then
+            P6E_NS=$(docker exec "$CLIENT" python3 -c '
+import ipaddress, select, socket, struct, sys, time
+vip = sys.argv[1]
+target = ipaddress.IPv6Address(vip).packed
+s = socket.socket(socket.AF_INET6, socket.SOCK_RAW, socket.IPPROTO_ICMPV6)
+s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_UNICAST_HOPS, 255)
+ns = struct.pack("!BBHI", 135, 0, 0, 0) + target
+for _ in range(3):
+    s.sendto(ns, (vip, 0))
+    end = time.time() + 1
+    while time.time() < end:
+        ready, _, _ = select.select([s], [], [], max(0, end - time.time()))
+        if not ready:
+            break
+        data, _ = s.recvfrom(2048)
+        if len(data) >= 24 and data[0] == 136 and data[8:24] == target:
+            print("answered")
+            sys.exit(0)
+print("unanswered")
+' "$P6E_VIP" 2>&1 || true)
+            if [ "$P6E_NS" = answered ]; then
+                check "A unicast neighbour solicitation for $P6E_VIP is answered" 0
+            else
+                check "A unicast neighbour solicitation for $P6E_VIP ('${P6E_NS:0:60}', expected answered)" 1
+            fi
+        else
+            check "Proxy NDP entry for $P6E_VIP on the LAN interface '$LAN_IF' (none found)" 1
         fi
     fi
 fi

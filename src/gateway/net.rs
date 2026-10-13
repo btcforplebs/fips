@@ -67,8 +67,8 @@ impl NetSetup {
     /// interface — the kernel matches on the routing table regardless of
     /// which interface the packet arrives on. LAN traffic to a mapped
     /// address is translated in the NAT table's prerouting chain and the
-    /// gateway host's own in its output chain; a pool address with no
-    /// mapping is delivered to the gateway host itself.
+    /// gateway host's own in its output chain; traffic to a pool address
+    /// with no mapping is rejected in its input chain.
     pub async fn add_pool_route(&mut self) -> Result<(), std::io::Error> {
         let output = tokio::process::Command::new("ip")
             .args(["-6", "route", "add", "local", &self.pool_cidr, "dev", "lo"])
