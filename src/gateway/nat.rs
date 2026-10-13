@@ -28,6 +28,7 @@ use crate::config::{PortForward, Proto};
 const TABLE_NAME: &str = "fips_gateway";
 const PREROUTING_CHAIN: &str = "prerouting";
 const POSTROUTING_CHAIN: &str = "postrouting";
+const OUTPUT_CHAIN: &str = "output";
 const FORWARD_CHAIN: &str = "forward";
 const RAW_CHAIN: &str = "raw_prerouting";
 
@@ -204,6 +205,7 @@ enum NatOp {
     Table(MsgType),
     PreChain,
     PostChain,
+    OutChain,
     ForwardChain,
     RawChain,
     /// Drop, before connection tracking, traffic to the pool that arrives on
@@ -221,8 +223,12 @@ enum NatOp {
     ForgedSourceDrop,
     /// Masquerade for LAN traffic leaving through `fips0`.
     FipsMasquerade,
+    /// Masquerade for the gateway host's own traffic DNATed onto `fips0`.
+    LocalMasquerade,
     /// DNAT for the mapping with this virtual IP.
     Dnat(Ipv6Addr),
+    /// DNAT for the gateway host's own traffic to this virtual IP.
+    OutputDnat(Ipv6Addr),
     /// SNAT for the mapping with this virtual IP.
     Snat(Ipv6Addr),
     /// DNAT for the port forward at this index in `port_forwards`.
@@ -235,15 +241,16 @@ enum NatOp {
 ///
 /// Rebuilds the entire nftables table atomically on every change to
 /// avoid relying on kernel rule handle tracking (which rustables
-/// doesn't expose). The table is small, so this is cheap: the masquerade
-/// of LAN traffic into `fips0`, the forward, pool and forged-source drops
-/// in their filter chains with the mesh-source set, two rules per mapping
-/// (at most 1000), one rule per inbound forward, and one more masquerade
-/// when any forward is present.
+/// doesn't expose). The table is small, so this is cheap: two masquerades
+/// into `fips0` (LAN traffic, and the gateway host's own traffic to a mapped
+/// node), the forward, pool and forged-source drops in their filter chains
+/// with the mesh-source set, three rules per mapping (at most 1000), one rule
+/// per inbound forward, and one more masquerade when any forward is present.
 pub struct NatManager {
     table: Table,
     pre_chain: Chain,
     post_chain: Chain,
+    out_chain: Chain,
     forward_chain: Chain,
     raw_chain: Chain,
     /// LAN interface name. Only traffic arriving on it is translated onto
@@ -285,6 +292,10 @@ impl NatManager {
             .with_name(POSTROUTING_CHAIN)
             .with_type(ChainType::Nat)
             .with_hook(Hook::new(HookClass::PostRouting, SRCNAT_PRIORITY));
+        let out_chain = Chain::new(&table)
+            .with_name(OUTPUT_CHAIN)
+            .with_type(ChainType::Nat)
+            .with_hook(Hook::new(HookClass::Out, DSTNAT_PRIORITY));
         let forward_chain = Chain::new(&table)
             .with_name(FORWARD_CHAIN)
             .with_type(ChainType::Filter)
@@ -298,6 +309,7 @@ impl NatManager {
             table,
             pre_chain,
             post_chain,
+            out_chain,
             forward_chain,
             raw_chain,
             lan_interface,
@@ -315,6 +327,8 @@ impl NatManager {
     /// Installs a masquerade rule for LAN traffic exiting via `fips0` so
     /// that LAN client source addresses are rewritten to the gateway's mesh
     /// address, allowing return traffic to route back through the mesh.
+    /// The gateway host's own traffic to a virtual IP is translated in the
+    /// output chain and masqueraded the same way.
     /// Traffic from any other interface is not translated: the forward chain
     /// drops it on its way into `fips0` unless it is a reply, and the raw
     /// chain drops it before connection tracking when it is addressed to the
@@ -449,6 +463,7 @@ impl NatManager {
             NatOp::Table(MsgType::Del),
             NatOp::Table(MsgType::Add),
             NatOp::PreChain,
+            NatOp::OutChain,
             NatOp::PostChain,
             NatOp::ForwardChain,
             NatOp::RawChain,
@@ -462,6 +477,7 @@ impl NatManager {
             NatOp::ForgedSourceDrop,
             NatOp::NonLanForwardDrop,
             NatOp::FipsMasquerade,
+            NatOp::LocalMasquerade,
         ]);
 
         // When any port forwards are configured, one LAN-side masquerade in
@@ -476,6 +492,7 @@ impl NatManager {
 
         for mapping in self.mappings.values() {
             ops.push(NatOp::Dnat(mapping.virtual_ip));
+            ops.push(NatOp::OutputDnat(mapping.virtual_ip));
             ops.push(NatOp::Snat(mapping.virtual_ip));
         }
 
@@ -522,6 +539,7 @@ impl NatManager {
         match op {
             NatOp::PreChain => Some(&self.pre_chain),
             NatOp::PostChain => Some(&self.post_chain),
+            NatOp::OutChain => Some(&self.out_chain),
             NatOp::ForwardChain => Some(&self.forward_chain),
             NatOp::RawChain => Some(&self.raw_chain),
             _ => None,
@@ -534,6 +552,7 @@ impl NatManager {
             NatOp::Table(_)
             | NatOp::PreChain
             | NatOp::PostChain
+            | NatOp::OutChain
             | NatOp::ForwardChain
             | NatOp::RawChain
             | NatOp::MeshSourceSet
@@ -567,8 +586,16 @@ impl NatManager {
                 // its destination. Dropping it here keeps a host on another
                 // interface from joining a LAN flow by sending in its original
                 // direction, which conntrack would translate and forward
-                // whatever interface it arrived on. Loopback is exempt, so the
-                // gateway's own connections to a pool address still work.
+                // whatever interface it arrived on. The host's own connections
+                // to a mapped virtual IP are translated in the output chain
+                // and leave on fips0, so they never reach this chain. Loopback
+                // is exempt, which leaves one known gap: the host's own
+                // connections to a virtual IP with no mapping are still
+                // delivered to the host, as LAN clients' are, through
+                // `local <pool> dev lo`. That is the only traffic the
+                // exemption admits: a flow mapped to the gateway's own node
+                // re-enters on lo addressed to its mesh address, outside the
+                // pool.
                 let (network, prefix) = self.pool;
                 let mask = u128::MAX << (128 - u32::from(prefix.min(128)));
                 let network = Ipv6Addr::from(u128::from(network) & mask);
@@ -622,28 +649,42 @@ impl NatManager {
                     .with_expr(Masquerade::default());
                 Ok(Some(rule))
             }
-            NatOp::Dnat(virtual_ip) => {
-                let mapping = self.mapping(virtual_ip)?;
-                let rule = Rule::new(&self.pre_chain)?
-                    .with_expr(Meta::new(MetaType::IifName))
-                    .with_expr(Cmp::new(CmpOp::Eq, self.lan_iface_bytes()))
+            NatOp::LocalMasquerade => {
+                // The gateway host's own traffic, DNATed in the output chain,
+                // leaves fips0 with whatever source the host picked before
+                // the reroute, often its LAN address, which the mesh cannot
+                // answer. The only flows new in postrouting with oifname
+                // fips0 and a mapped mesh destination are LAN flows, which
+                // the masquerade above takes first; flows forwarded from any
+                // other interface, which the forward chain drops before
+                // postrouting; and the host's own, which this takes.
+                let (set, _) = self.mesh_sources()?;
+                let rule = Rule::new(&self.post_chain)?
                     .with_expr(Meta::new(MetaType::NfProto))
                     .with_expr(Cmp::new(CmpOp::Eq, [libc::NFPROTO_IPV6 as u8]))
+                    .with_expr(Meta::new(MetaType::OifName))
+                    .with_expr(Cmp::new(CmpOp::Eq, TUN_IFACE.to_vec()))
                     .with_expr(
                         HighLevelPayload::Network(NetworkHeaderField::IPv6(IPv6HeaderField::Daddr))
                             .build(),
                     )
-                    .with_expr(Cmp::new(CmpOp::Eq, mapping.virtual_ip.octets()))
-                    .with_expr(Immediate::new_data(
-                        mapping.mesh_addr.octets().to_vec(),
-                        Register::Reg1,
-                    ))
-                    .with_expr(
-                        Nat::default()
-                            .with_nat_type(NatType::DNat)
-                            .with_family(ProtocolFamily::Ipv6)
-                            .with_ip_register(Register::Reg1),
-                    );
+                    .with_expr(Lookup::new(&set)?)
+                    .with_expr(Masquerade::default());
+                Ok(Some(rule))
+            }
+            NatOp::Dnat(virtual_ip) => {
+                let rule =
+                    self.dnat_rule(&self.pre_chain, Some(self.lan_iface_bytes()), virtual_ip)?;
+                Ok(Some(rule))
+            }
+            NatOp::OutputDnat(virtual_ip) => {
+                // Locally generated packets pass the output hook, not
+                // prerouting, and every pool address is local to the gateway
+                // (`local <pool> dev lo`), so without this the host's own
+                // connections to a virtual IP reach the host itself. Such a
+                // packet has no input interface to match. The table is inet,
+                // so the nfproto match keeps the host's IPv4 traffic out.
+                let rule = self.dnat_rule(&self.out_chain, None, virtual_ip)?;
                 Ok(Some(rule))
             }
             NatOp::Snat(virtual_ip) => {
@@ -720,6 +761,40 @@ impl NatManager {
                 Ok(Some(rule))
             }
         }
+    }
+
+    /// A DNAT of `virtual_ip` to its mapped mesh address in `chain`, matching
+    /// the input interface `iif` when one is given.
+    fn dnat_rule(
+        &self,
+        chain: &Chain,
+        iif: Option<Vec<u8>>,
+        virtual_ip: Ipv6Addr,
+    ) -> Result<Rule, NatError> {
+        let mapping = self.mapping(virtual_ip)?;
+        let mut rule = Rule::new(chain)?;
+        if let Some(iif) = iif {
+            rule = rule
+                .with_expr(Meta::new(MetaType::IifName))
+                .with_expr(Cmp::new(CmpOp::Eq, iif));
+        }
+        Ok(rule
+            .with_expr(Meta::new(MetaType::NfProto))
+            .with_expr(Cmp::new(CmpOp::Eq, [libc::NFPROTO_IPV6 as u8]))
+            .with_expr(
+                HighLevelPayload::Network(NetworkHeaderField::IPv6(IPv6HeaderField::Daddr)).build(),
+            )
+            .with_expr(Cmp::new(CmpOp::Eq, mapping.virtual_ip.octets()))
+            .with_expr(Immediate::new_data(
+                mapping.mesh_addr.octets().to_vec(),
+                Register::Reg1,
+            ))
+            .with_expr(
+                Nat::default()
+                    .with_nat_type(NatType::DNat)
+                    .with_family(ProtocolFamily::Ipv6)
+                    .with_ip_register(Register::Reg1),
+            ))
     }
 
     /// The set of mapped mesh addresses and its element list, each address
@@ -2123,6 +2198,103 @@ mod tests {
     }
 
     #[test]
+    fn rebuild_adds_an_output_nat_chain_at_dstnat_priority() {
+        let mgr = manager_with_mappings(1);
+        let chains = emitted_chains(&mgr);
+        let output: Vec<&&Chain> = chains
+            .iter()
+            .filter(|c| c.get_name().map(String::as_str) == Some(OUTPUT_CHAIN))
+            .collect();
+        assert_eq!(output.len(), 1, "one output chain: {chains:?}");
+        assert_eq!(output[0].get_type(), Some(&ChainType::Nat));
+        assert_eq!(
+            output[0].get_hook().cloned(),
+            Some(Hook::new(HookClass::Out, DSTNAT_PRIORITY)),
+            "the gateway host's own traffic is translated at the output hook"
+        );
+    }
+
+    #[test]
+    fn rebuild_emits_an_output_dnat_for_every_mapping() {
+        let ops = manager_with_mappings(3).rebuild_batches().remove(0);
+        for i in 1..=3u16 {
+            assert_eq!(
+                ops.iter()
+                    .filter(|op| **op == NatOp::OutputDnat(vip(i)))
+                    .count(),
+                1,
+                "no single output DNAT for {}: {ops:?}",
+                vip(i)
+            );
+        }
+        assert_eq!(
+            ops.iter()
+                .filter(|op| matches!(op, NatOp::LocalMasquerade))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn the_host_masquerade_precedes_every_snat() {
+        let mut mgr = manager_with_mappings(3);
+        mgr.port_forwards = vec![PortForward {
+            proto: Proto::Tcp,
+            listen_port: 8080,
+            target: SocketAddrV6::new(Ipv6Addr::LOCALHOST, 80, 0, 0),
+        }];
+        let ops = mgr.rebuild_batches().remove(0);
+        let host = ops
+            .iter()
+            .position(|op| *op == NatOp::LocalMasquerade)
+            .expect("the host masquerade is emitted");
+        let later: Vec<usize> = ops
+            .iter()
+            .enumerate()
+            .filter(|(_, op)| matches!(op, NatOp::Snat(_) | NatOp::LanMasquerade))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            later.len(),
+            4,
+            "three SNATs and the LAN masquerade: {ops:?}"
+        );
+        for index in later {
+            assert!(
+                host < index,
+                "the host masquerade at {host} follows {:?} at {index}, which would \
+                 take the host's DNATed flow first: {ops:?}",
+                ops[index]
+            );
+        }
+    }
+
+    #[test]
+    fn the_output_dnat_is_added_after_the_set_and_chain_it_uses() {
+        let ops = manager_with_mappings(3).rebuild_batches().remove(0);
+        let position = |wanted: NatOp| {
+            ops.iter()
+                .position(|op| *op == wanted)
+                .unwrap_or_else(|| panic!("no {wanted:?}: {ops:?}"))
+        };
+        let chain = position(NatOp::OutChain);
+        let set = position(NatOp::MeshSourceSet);
+        let post = position(NatOp::PostChain);
+        for (index, op) in ops.iter().enumerate() {
+            match op {
+                NatOp::OutputDnat(_) => assert!(chain < index, "{op:?} before its chain"),
+                NatOp::LocalMasquerade => {
+                    assert!(
+                        set < index && post < index,
+                        "{op:?} before its set or chain"
+                    )
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
     fn lan_ingress_rules_keep_their_shape() {
         let mut mgr = manager_with_mappings(1);
         mgr.port_forwards = vec![PortForward {
@@ -2201,8 +2373,17 @@ mod tests {
     fn every_mapping_dnat_matches_only_the_lan_interface() {
         let mgr = manager_with_mappings(2);
         let rules = emitted_rules(&mgr);
-        let dnats: Vec<&Rule> = rules.iter().filter(|r| is_mapping_dnat(r, 2)).collect();
-        assert_eq!(dnats.len(), 2, "one DNAT per mapping must be found first");
+        let dnats: Vec<&Rule> = rules
+            .iter()
+            .filter(|r| {
+                r.get_chain().map(String::as_str) == Some(PREROUTING_CHAIN) && is_mapping_dnat(r, 2)
+            })
+            .collect();
+        assert_eq!(
+            dnats.len(),
+            2,
+            "one prerouting DNAT per mapping must be found first"
+        );
 
         let from_lan = meta_cmp(MetaType::IifName, CmpOp::Eq, b"br-lan\0");
         for rule in dnats {
@@ -2220,16 +2401,18 @@ mod tests {
         let mgr = manager_with_mappings(2);
         let to_tun = meta_cmp(MetaType::OifName, CmpOp::Eq, TUN_IFACE);
         let rules = emitted_rules(&mgr);
+        // The host's masquerade, which matches no input interface, is checked
+        // by its own test.
         let masquerades: Vec<&Rule> = rules
             .iter()
             .filter(|rule| {
                 has_sequence(rule, &to_tun)
+                    && is_masquerade(rule)
                     && expressions(rule)
-                        .iter()
-                        .any(|e| matches!(e, ExpressionVariant::Masquerade(_)))
+                        .contains(&ExpressionVariant::from(Meta::new(MetaType::IifName)))
             })
             .collect();
-        assert_eq!(masquerades.len(), 1, "one fips0 masquerade");
+        assert_eq!(masquerades.len(), 1, "one LAN fips0 masquerade");
         assert!(
             has_sequence(
                 masquerades[0],
@@ -2239,6 +2422,153 @@ mod tests {
              any interface leaves on the mesh under the gateway's identity: {:?}",
             expressions(masquerades[0])
         );
+    }
+
+    /// Whether `rule` ends in a DNAT to an address, not a port forward.
+    fn is_address_dnat(rule: &Rule) -> bool {
+        expressions(rule).iter().any(|e| {
+            matches!(e, ExpressionVariant::Nat(nat)
+                if nat.get_nat_type() == Some(&NatType::DNat) && nat.get_port_register().is_none())
+        })
+    }
+
+    /// Whether `rule` loads an interface name, input or output.
+    fn matches_an_interface(rule: &Rule) -> bool {
+        expressions(rule).iter().any(|e| {
+            *e == ExpressionVariant::from(Meta::new(MetaType::IifName))
+                || *e == ExpressionVariant::from(Meta::new(MetaType::OifName))
+        })
+    }
+
+    /// Whether `rule` ends in a masquerade.
+    fn is_masquerade(rule: &Rule) -> bool {
+        expressions(rule)
+            .iter()
+            .any(|e| matches!(e, ExpressionVariant::Masquerade(_)))
+    }
+
+    /// Whether `rule` looks its destination up in the mesh-source set.
+    fn looks_up_mesh_destination(rule: &Rule) -> bool {
+        expressions(rule).windows(2).any(|pair| {
+            pair[0] == daddr()
+                && matches!(&pair[1], ExpressionVariant::Lookup(lookup)
+                    if lookup.get_set().map(String::as_str) == Some(MESH_SOURCE_SET)
+                        && lookup.get_set_id() == Some(&MESH_SOURCE_SET_ID))
+        })
+    }
+
+    #[test]
+    fn every_output_dnat_matches_no_interface_and_translates_to_the_mapped_node() {
+        let mgr = manager_with_mappings(3);
+        let rules = emitted_rules(&mgr);
+        let output_dnats: Vec<&Rule> = rules
+            .iter()
+            .filter(|rule| {
+                rule.get_chain().map(String::as_str) == Some("output") && is_address_dnat(rule)
+            })
+            .collect();
+
+        let nfproto = meta_cmp(MetaType::NfProto, CmpOp::Eq, &[libc::NFPROTO_IPV6 as u8]);
+        for i in 1..=3u16 {
+            let expected = [
+                nfproto[0].clone(),
+                nfproto[1].clone(),
+                daddr(),
+                ExpressionVariant::from(Cmp::new(CmpOp::Eq, vip(i).octets())),
+                ExpressionVariant::from(Immediate::new_data(
+                    mesh(i).octets().to_vec(),
+                    Register::Reg1,
+                )),
+            ];
+            let found: Vec<&&Rule> = output_dnats
+                .iter()
+                .filter(|rule| has_in_order(rule, &expected))
+                .collect();
+            assert_eq!(
+                found.len(),
+                1,
+                "no output-chain DNAT translates {} to {}, so the gateway host's own \
+                 connections to the virtual IP stay on the gateway: {output_dnats:?}",
+                vip(i),
+                mesh(i)
+            );
+            assert!(
+                !matches_an_interface(found[0]),
+                "the output DNAT for {} matches an interface; locally generated \
+                 traffic has no input interface: {:?}",
+                vip(i),
+                expressions(found[0])
+            );
+        }
+        assert_eq!(output_dnats.len(), 3, "one output DNAT per mapping");
+    }
+
+    #[test]
+    fn the_host_masquerade_matches_mapped_mesh_destinations_on_fips0() {
+        let mgr = manager_with_mappings(2);
+        let to_tun = meta_cmp(MetaType::OifName, CmpOp::Eq, TUN_IFACE);
+        let rules = emitted_rules(&mgr);
+        let host: Vec<&Rule> = rules
+            .iter()
+            .filter(|rule| {
+                is_masquerade(rule)
+                    && has_sequence(rule, &to_tun)
+                    && looks_up_mesh_destination(rule)
+            })
+            .collect();
+        assert_eq!(
+            host.len(),
+            1,
+            "no fips0 masquerade limited to mapped mesh destinations, so the \
+             gateway host's own DNATed traffic leaves fips0 with a LAN source the \
+             mesh cannot answer"
+        );
+        let nfproto = meta_cmp(MetaType::NfProto, CmpOp::Eq, &[libc::NFPROTO_IPV6 as u8]);
+        assert!(
+            has_in_order(
+                host[0],
+                &[
+                    nfproto[0].clone(),
+                    nfproto[1].clone(),
+                    to_tun[0].clone(),
+                    to_tun[1].clone(),
+                    daddr(),
+                ]
+            ),
+            "{:?}",
+            expressions(host[0])
+        );
+        assert!(
+            !expressions(host[0]).contains(&ExpressionVariant::from(Meta::new(MetaType::IifName))),
+            "the host masquerade matches an input interface: {:?}",
+            expressions(host[0])
+        );
+        assert_eq!(host[0].get_chain().map(String::as_str), Some("postrouting"));
+    }
+
+    #[test]
+    fn every_fips0_masquerade_is_limited_to_the_lan_or_mapped_mesh_destinations() {
+        let mgr = manager_with_mappings(2);
+        let to_tun = meta_cmp(MetaType::OifName, CmpOp::Eq, TUN_IFACE);
+        let from_lan = meta_cmp(MetaType::IifName, CmpOp::Eq, b"br-lan\0");
+        let rules = emitted_rules(&mgr);
+        let masquerades: Vec<&Rule> = rules
+            .iter()
+            .filter(|rule| is_masquerade(rule) && has_sequence(rule, &to_tun))
+            .collect();
+        assert!(
+            !masquerades.is_empty(),
+            "the LAN masquerade must be found first"
+        );
+        for rule in masquerades {
+            assert!(
+                has_sequence(rule, &from_lan) || looks_up_mesh_destination(rule),
+                "a fips0 masquerade matches neither iifname br-lan nor a mapped mesh \
+                 destination, so traffic from any interface leaves on the mesh under \
+                 the gateway's identity: {:?}",
+                expressions(rule)
+            );
+        }
     }
 
     #[test]

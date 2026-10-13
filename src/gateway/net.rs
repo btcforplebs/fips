@@ -65,7 +65,10 @@ impl NetSetup {
     /// addresses in the pool as locally-owned, enabling NAT processing.
     /// Uses `dev lo` because local routes don't need to reference the LAN
     /// interface — the kernel matches on the routing table regardless of
-    /// which interface the packet arrives on.
+    /// which interface the packet arrives on. LAN traffic to a mapped
+    /// address is translated in the NAT table's prerouting chain and the
+    /// gateway host's own in its output chain; a pool address with no
+    /// mapping is delivered to the gateway host itself.
     pub async fn add_pool_route(&mut self) -> Result<(), std::io::Error> {
         let output = tokio::process::Command::new("ip")
             .args(["-6", "route", "add", "local", &self.pool_cidr, "dev", "lo"])
