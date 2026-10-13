@@ -107,6 +107,7 @@ while [ \$# -gt 0 ]; do
 done
 [ -n "\$files" ] && [ -n "\$out" ] || { echo "stub apk: --files and --output are required" >&2; exit 64; }
 (cd "\$files" && find . -mindepth 1 | LC_ALL=C sort) > "\$cap/payload"
+cp "\$files/usr/bin/fips" "\$cap/fips-bin" 2>/dev/null || true
 : > "\$out"
 : > "\$cap/called"
 STUB
@@ -510,6 +511,93 @@ if [[ -n "$KEEP" ]]; then
     tar -xzf "$IPK" -O ./data.tar.gz | tar -xzf - -C "$KEEP/ipk-root" \
         || harness_fail "cannot extract the .ipk payload into $KEEP/ipk-root"
 fi
+
+# ── T1 and T2. Without --bin-dir, the builders find cargo's target directory ─
+# CARGO_TARGET_DIR, CARGO_BUILD_TARGET_DIR and build.target-dir move the
+# binaries out of target/. This job has no Rust toolchain, so a cargo stub
+# stands in: for zigbuild it writes placeholders under the directory either
+# variable names, and for metadata it reports that directory as
+# target_directory; anything else exits 64. With neither variable set, the
+# stub takes the directory from STUB_CONFIG_TARGET_DIR, which only it reads.
+# That stands in for build.target-dir in a config.toml, the reported case: a
+# builder that reads the two variables instead of asking cargo fails it.
+# The stub is first on PATH and handles zigbuild itself, since cargo looks
+# for a subcommand in $CARGO_HOME/bin before PATH and would find a real
+# cargo-zigbuild there. The cargo-zigbuild and rustup stubs only satisfy the
+# builders' tool checks. What the stub cannot show, the real cargo
+# metadata's answer, was measured once by hand.
+STUBS="$TMP/stubs"
+mkdir -p "$STUBS" || harness_fail "cannot create $STUBS"
+cat > "$STUBS/cargo" <<'STUB'
+#!/bin/bash
+dir="${CARGO_TARGET_DIR:-${CARGO_BUILD_TARGET_DIR:-${STUB_CONFIG_TARGET_DIR:-}}}"
+[ -n "$dir" ] || { echo "stub cargo: no target directory configured" >&2; exit 64; }
+case "${1-}" in
+    zigbuild)
+        target=""
+        while [ $# -gt 0 ]; do
+            [ "$1" = --target ] && target="${2-}"
+            shift
+        done
+        [ -n "$target" ] || { echo "stub cargo: zigbuild without --target" >&2; exit 64; }
+        mkdir -p "$dir/$target/release" || exit 1
+        for bin in fips fipsctl fipstop fips-gateway; do
+            printf 'stub-%s' "$bin" > "$dir/$target/release/$bin" || exit 1
+        done
+        ;;
+    metadata)
+        printf '{"packages":[],"target_directory":"%s","version":1,"workspace_root":"/x"}\n' "$dir"
+        ;;
+    *) echo "stub cargo: unsupported command '${1-}'" >&2; exit 64 ;;
+esac
+STUB
+printf '#!/bin/sh\nexit 0\n' > "$STUBS/cargo-zigbuild"
+printf '#!/bin/sh\n[ "$*" = "target list --installed" ] || exit 64\necho x86_64-unknown-linux-musl\n' \
+    > "$STUBS/rustup"
+chmod 0755 "$STUBS/cargo" "$STUBS/cargo-zigbuild" "$STUBS/rustup" \
+    || harness_fail "cannot make the cargo stubs executable"
+
+# A version of its own, so these builds never overwrite the package --keep
+# extracted, and the exit trap's pattern still removes what they write.
+TD_VERSION="${PKG_VERSION}~td"
+for var in CARGO_TARGET_DIR CARGO_BUILD_TARGET_DIR STUB_CONFIG_TARGET_DIR; do
+    tdir="$TMP/target-$var"
+    how="$var"
+    [[ "$var" == STUB_CONFIG_TARGET_DIR ]] && how="build.target-dir (neither variable set)"
+    for kind in ipk apk; do
+        log="$TMP/build-$kind-$var.log"
+        rm -f "$CAPTURE/fips-bin"
+        if [[ "$kind" == ipk ]]; then
+            id=T1
+            env -u CARGO_TARGET_DIR -u CARGO_BUILD_TARGET_DIR -u IPK_VERSION \
+                PATH="$STUBS:$PATH" LLVM_STRIP=true PKG_VERSION="$TD_VERSION" "$var=$tdir" \
+                bash "$PROJECT_ROOT/packaging/openwrt-ipk/build-ipk.sh" --arch x86_64 > "$log" 2>&1
+        else
+            id=T2
+            env -u CARGO_TARGET_DIR -u CARGO_BUILD_TARGET_DIR \
+                PATH="$STUBS:$PATH" LLVM_STRIP=true PKG_VERSION="$TD_VERSION" APK_VERSION=0.0.0-r0 \
+                APK_BIN="$TMP/apk" "$var=$tdir" \
+                bash "$PROJECT_ROOT/packaging/openwrt-apk/build-apk.sh" --arch x86_64 > "$log" 2>&1
+        fi
+        rc=$?
+        if [[ $rc -ne 0 ]]; then
+            bad "$id build-$kind.sh with $how and no --bin-dir exited $rc: $(grep -m1 -iE 'error|no such file' "$log")"
+            continue
+        fi
+        if [[ "$kind" == ipk ]]; then
+            got="$(tar -xzf "$PROJECT_ROOT/dist/fips_${TD_VERSION}_x86_64.ipk" -O ./data.tar.gz \
+                | tar -xzOf - ./usr/bin/fips 2>/dev/null)"
+        else
+            got="$(cat "$CAPTURE/fips-bin" 2>/dev/null)"
+        fi
+        if [[ "$got" == stub-fips ]]; then
+            ok "$id build-$kind.sh with $how and no --bin-dir packages the binaries cargo wrote there"
+        else
+            bad "$id build-$kind.sh with $how packaged /usr/bin/fips '${got:0:20}', not the binary cargo wrote under $tdir"
+        fi
+    done
+done
+rm -f "$PROJECT_ROOT/dist/fips_${TD_VERSION}"_*
 
 echo ""
 if [[ $FAILURES -eq 0 ]]; then

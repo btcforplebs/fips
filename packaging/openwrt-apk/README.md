@@ -68,6 +68,33 @@ meson setup build && ninja -C build src/apk
 export APK_BIN="$PWD/build/src/apk"
 ```
 
+#### Or package in an Alpine container
+
+Instead of building apk-tools, cross-compile on the host and package in an
+`alpine:3.23` container, whose own `apk` is apk-tools 3.0.8; OpenWrt 25.12's
+apk-tools 3.0.5 installs what it builds. Run from the repo root:
+
+```bash
+ARCH=aarch64 TRIPLE=aarch64-unknown-linux-musl
+cargo zigbuild --release --target "$TRIPLE" \
+  --bin fips --bin fipsctl --bin fipstop --bin fips-gateway
+TARGET_DIR=$(cargo metadata --format-version 1 --no-deps |
+  sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')
+docker run --rm -w /src -v "$PWD:/src" \
+  -v "$TARGET_DIR/$TRIPLE/release:/bins:ro" \
+  -e PKG_VERSION="$(git describe --tags --always --dirty)" \
+  -e APK_VERSION="$(sh packaging/openwrt-apk/apk-version.sh auto)" \
+  -e APK_BIN=apk -e ARCH="$ARCH" alpine:3.23 \
+  sh -c 'apk add --no-cache bash &&
+    bash packaging/openwrt-apk/build-apk.sh --arch "$ARCH" --bin-dir /bins'
+```
+
+Pass both versions from the host as shown. The container has no `git`, or git
+refuses the bind-mounted checkout as owned by another user, and without them
+the build falls back, without an error, to `PKG_VERSION` `0.1.0` and
+`APK_VERSION` `0.0.0_git0-r0`, which sorts below any installed development
+build. The package is written to `dist/` owned by root.
+
 ### Build the package
 
 ```bash
@@ -89,6 +116,20 @@ scp -O dist/fips_<version>_<arch>.apk root@192.168.1.1:/tmp/
 ssh root@192.168.1.1 apk add --allow-untrusted /tmp/fips_<version>_<arch>.apk
 ```
 
+On a router with no internet access, add `--no-network --repositories-file
+/dev/null`, so apk does not try the package feeds:
+
+```bash
+apk add --allow-untrusted --no-network --repositories-file /dev/null \
+  /tmp/fips_<version>_<arch>.apk
+```
+
+Without them apk prints an error for each feed it cannot fetch, and
+`--no-network` alone still warns once per feed with no cached index. apk then
+cannot fetch the package's dependencies (`kmod-tun`, `kmod-br-netfilter`,
+`kmod-nft-nat`, `kmod-nf-conntrack`, `ip-full`), so they must already be
+installed.
+
 On OpenWrt 25.x, installing from a *signed repository* requires the publisher's
 key; a single `--allow-untrusted` package install does not. If we ever publish an
 apk feed, add ECDSA (prime256v1) signing via `apk mkpkg --sign` and distribute the
@@ -101,6 +142,9 @@ Upgrade with the same command, pointed at the new package:
 ```bash
 ssh root@192.168.1.1 apk add --allow-untrusted /tmp/fips_<new-version>_<arch>.apk
 ```
+
+On a router with no internet access, add `--no-network --repositories-file
+/dev/null`, as for the install.
 
 The new package's upgrade scripts stop `fips` and `fips-gateway` before the
 files are replaced, then start `fips` again and start `fips-gateway` only if it

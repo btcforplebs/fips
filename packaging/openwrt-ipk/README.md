@@ -429,6 +429,9 @@ using the same command that installs it:
 apk add --allow-untrusted /tmp/fips_<new-version>_<arch>.apk
 ```
 
+On a router with no internet access, add `--no-network --repositories-file
+/dev/null` so apk does not try the package feeds.
+
 The `.apk` package's upgrade scripts stop `fips` and `fips-gateway`, start
 `fips` again, and start `fips-gateway` only if it was enabled; see
 [`../openwrt-apk/README.md`](../openwrt-apk/README.md).

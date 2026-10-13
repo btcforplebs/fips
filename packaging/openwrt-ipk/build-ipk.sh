@@ -139,7 +139,18 @@ else
         --bin fipstop \
         --bin fips-gateway
 
-    RELEASE_DIR="$PROJECT_ROOT/target/$RUST_TARGET/release"
+    # cargo writes under its target directory, which CARGO_TARGET_DIR,
+    # CARGO_BUILD_TARGET_DIR or build.target-dir in any config.toml can move
+    # away from target/, so ask cargo where it is. Read with sed, so a build
+    # host needs no jq or Python. Kept in sync with ../openwrt-apk/build-apk.sh.
+    TARGET_DIR="$(cargo metadata --format-version 1 --no-deps 2>/dev/null \
+        | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')" || TARGET_DIR=""
+    if [ -z "$TARGET_DIR" ] || [ ! -d "$TARGET_DIR" ]; then
+        echo "Error: could not read cargo's target directory from 'cargo metadata'" \
+            "(got '$TARGET_DIR')." >&2
+        exit 1
+    fi
+    RELEASE_DIR="$TARGET_DIR/$RUST_TARGET/release"
 
     echo "==> Stripping binaries..."
     STRIP="${LLVM_STRIP:-strip}"
