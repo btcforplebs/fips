@@ -56,6 +56,10 @@ pub struct CoordCache {
     max_entries: usize,
     /// Default TTL for entries (milliseconds).
     default_ttl_ms: u64,
+    /// Entries visited by eviction scans, so tests can measure eviction work
+    /// without timing it.
+    #[cfg(test)]
+    eviction_examined: std::cell::Cell<u64>,
 }
 
 impl CoordCache {
@@ -65,6 +69,8 @@ impl CoordCache {
             entries: HashMap::with_capacity(max_entries.min(1000)),
             max_entries,
             default_ttl_ms,
+            #[cfg(test)]
+            eviction_examined: std::cell::Cell::new(0),
         }
     }
 
@@ -343,6 +349,7 @@ impl CoordCache {
         let expired_key = self
             .entries
             .iter()
+            .inspect(|_| self.note_examined())
             .find(|(_, e)| e.is_expired(current_time_ms))
             .map(|(k, _)| *k);
 
@@ -363,6 +370,7 @@ impl CoordCache {
         let lru_key = self
             .entries
             .iter()
+            .inspect(|_| self.note_examined())
             .filter(|(_, e)| !e.is_verified(current_time_ms))
             .max_by_key(|(_, e)| e.idle_time(current_time_ms))
             .map(|(k, _)| *k);
@@ -370,6 +378,28 @@ impl CoordCache {
         if let Some(key) = lru_key {
             self.entries.remove(&key);
         }
+    }
+
+    /// Count one entry visited by an eviction scan; a no-op outside tests.
+    #[inline(always)]
+    fn note_examined(&self) {
+        #[cfg(test)]
+        self.eviction_examined.set(self.eviction_examined.get() + 1);
+    }
+
+    /// Total entries eviction has visited since the cache was created.
+    #[cfg(test)]
+    pub fn eviction_examined(&self) -> u64 {
+        self.eviction_examined.get()
+    }
+
+    /// Total coordinate addresses stored across all entries, expired or not.
+    #[cfg(test)]
+    pub fn stored_addrs(&self) -> usize {
+        self.entries
+            .values()
+            .map(|e| e.coords().entries().len())
+            .sum()
     }
 
     /// Get cache statistics.
