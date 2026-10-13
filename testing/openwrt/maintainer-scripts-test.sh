@@ -10,7 +10,10 @@
 # rootfs images, which carry the real uci, fw4 and nft, so 90-fips-setup's
 # firewall zone and upgrade migration, and fips-mesh-setup's mesh zone, run
 # against the firewall they configure.
-# Those containers get NET_ADMIN so fw4 can load its table, into the
+# Then runs testing/openwrt/init-scenarios.sh in the same four images, where
+# the fips-gateway init script runs under the image's own rc.common, procd.sh,
+# flock and uci, against a stub gateway, with no network.
+# The firewall containers get NET_ADMIN so fw4 can load its table, into the
 # container's own network namespace; they have no network otherwise. Each also
 # gets a small tmpfs, where the cases that save onto a full overlay put
 # /etc/config.
@@ -55,7 +58,7 @@ if ! command -v docker >/dev/null 2>&1; then
     exit 2
 fi
 
-for f in scenarios.sh firewall-scenarios.sh; do
+for f in scenarios.sh firewall-scenarios.sh init-scenarios.sh; do
     if [[ ! -f "$SCRIPT_DIR/$f" ]]; then
         echo "openwrt-scripts: missing $SCRIPT_DIR/$f" >&2
         exit 2
@@ -143,6 +146,24 @@ for spec in "${FW_IMAGES[@]}"; do
     rc=$?
     if [[ $rc -ne 0 && $rc -ne 1 ]]; then
         echo "openwrt-scripts: the $image container exited $rc, so its firewall scenarios did not report" >&2
+        rc=2
+    fi
+    [[ $rc -gt $worst ]] && worst=$rc
+done
+
+# INIT_GATEWAY and PRERM pass through from the caller when set, as for
+# scenarios.sh; inside the container they name paths under /src or /apk.
+for spec in "${FW_IMAGES[@]}"; do
+    image="${spec%%|*}"
+    echo "==> init script scenarios in $image"
+    docker run --rm --network none \
+        -v "$PROJECT_ROOT:/src:ro" \
+        -v "$APK_DIR:/apk:ro" \
+        -e INIT_GATEWAY -e PRERM -e INIT_CASES \
+        "$image" sh /src/testing/openwrt/init-scenarios.sh
+    rc=$?
+    if [[ $rc -ne 0 && $rc -ne 1 ]]; then
+        echo "openwrt-scripts: the $image container exited $rc, so its init script scenarios did not report" >&2
         rc=2
     fi
     [[ $rc -gt $worst ]] && worst=$rc

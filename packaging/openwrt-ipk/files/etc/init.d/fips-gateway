@@ -117,6 +117,13 @@ reload_service() {
 supervise() {
 	local port pid="" watcher rc stopping="" killer=""
 
+	# rc.common took procd's service lock on fd 1000 when it sourced
+	# procd.sh. Held for the gateway's lifetime, it would make every later
+	# stop, restart and reload of the service wait on it forever. ash takes
+	# descriptors above 9, and procd.sh has used 1000 since at least 22.03.
+	# shellcheck disable=SC3023
+	exec 1000>&-
+
 	port="$(gateway_dns_port)"
 	# Set before the gateway starts, so a stop that arrives first still
 	# reaches it.

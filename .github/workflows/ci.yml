@@ -549,7 +549,8 @@ jobs:
 # init script's gateway.enabled guard. Then runs the firewall scenarios for
 # 90-fips-setup in four OpenWrt rootfs images (22.03 to 25.12), against the
 # real uci, fw4 and nft; fw4 there loads netfilter modules from the runner's
-# kernel.
+# kernel. Then runs the fips-gateway init script in the same four images under
+# their own rc.common, procd.sh and uci (testing/openwrt/init-scenarios.sh).
 #
 # A job of its own rather than a leg of the integration matrix: it needs no
 # FIPS binary and no shared test image, so as an integration leg it would wait
