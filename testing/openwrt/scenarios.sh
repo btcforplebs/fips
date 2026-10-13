@@ -460,6 +460,7 @@ stub_start_service_helpers() {
     }
     procd_close_instance() { return 0; }
     gateway_add_global_prefix() { echo "add_global_prefix" >> "$CALLS"; return 0; }
+    prefix_remove() { echo "prefix_remove" >> "$CALLS"; return 0; }
     gateway_add_ra_route() { echo "add_ra_route" >> "$CALLS"; return 0; }
     procd_open_instance() { echo "procd_open_instance" >> "$CALLS"; return 0; }
     return 0
@@ -480,6 +481,7 @@ scenario_start_service_guard() {
     assert_called "procd_open_instance" "an enabled gateway still starts the daemon"
     assert_called "command /etc/init.d/fips-gateway supervise" \
         "procd runs the gateway through the init script's supervise command"
+    assert_not_called "prefix_remove" "an enabled gateway keeps the LAN prefix"
 
     reset_state
     CONFIG="$WORK/disabled.yaml"
@@ -491,6 +493,7 @@ YAML
     start_service >/dev/null 2>&1
     assert_none_called_with_prefix "dnsmasq_swap " "a disabled gateway does not redirect dnsmasq"
     assert_not_called "add_global_prefix" "a disabled gateway does not add the LAN prefix"
+    assert_called "prefix_remove" "a disabled gateway gives the LAN prefix back"
     assert_not_called "add_ra_route" "a disabled gateway does not advertise the pool route"
     assert_not_called "procd_open_instance" "a disabled gateway does not start the daemon"
     return 0

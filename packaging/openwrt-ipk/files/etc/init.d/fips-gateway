@@ -38,8 +38,16 @@ GW_KILL_AFTER=3
 INSTALL_HOLD=/var/run/fips-gateway-install-hold
 
 # Global-scope IPv6 prefix assigned to br-lan so Android/Chrome clients
-# believe they have full IPv6 and actually send AAAA queries.
-# Uses RFC 5180 (benchmarking) range — not routed on the public internet.
+# believe they have full IPv6 and actually send AAAA queries. An unassigned
+# address in IANA's 2001::/23 IETF protocol assignments block, not routed on
+# the internet. (It is not RFC 5180 benchmarking space, which is 2001:2::/48.)
+#
+# Set by the first start and kept across stops and restarts while the service
+# is enabled: changing it reloads the network, which on OpenWrt 25.12 recreates
+# br-lan and drops the LAN for a few seconds. Turning the gateway off deletes
+# it: disable (below), a stop of a disabled service (stop_service), a start
+# with the gateway turned off in fips.yaml, and package removal, whose prerm
+# runs disable.
 GLOBAL_PREFIX="2001:2:f1b5::1/64"
 
 start_service() {
@@ -60,6 +68,8 @@ start_service() {
 	# upstream away from the daemon and point it at a port nothing listens on.
 	if [ "$(gateway_config_enabled)" != "true" ]; then
 		logger -t fips-gateway "gateway.enabled is not true in $CONFIG; not starting"
+		# A gateway turned off in its config gives the LAN prefix back.
+		prefix_remove
 		return 1
 	fi
 
@@ -98,8 +108,36 @@ stop_service() {
 	# Remove the RA route for the virtual IP pool.
 	gateway_remove_ra_route
 
-	# Remove the global prefix and ra_default override.
-	gateway_remove_global_prefix
+	# The LAN prefix stays; see GLOBAL_PREFIX. The ra_default override goes,
+	# which needs only an odhcpd restart.
+	ra_restore
+
+	# A stop of a disabled service is the gateway being turned off: disable
+	# keeps the prefix while the gateway runs, so in the order disable then
+	# stop it goes here. Only for the stop action itself: rc.common's restart
+	# runs this with action "restart" and its shutdown with "shutdown", and
+	# neither turns the gateway off.
+	if [ "${action:-}" = stop ] && ! enabled; then
+		prefix_remove
+	fi
+	return 0
+}
+
+# rc.common's disable, which this replaces: remove the boot links.
+# Disabling also turns the gateway off, so the LAN prefix is deleted too,
+# except in an image build (IPKG_INSTROOT names the image's root, and the
+# build host's uci must not be touched) and while procd still runs the
+# gateway, which must keep its prefix; its stop deletes it then.
+# shellcheck disable=SC2154 # rc.common sets initscript before sourcing this
+disable() {
+	name="$(basename "${initscript}")"
+	rm -f "$IPKG_INSTROOT"/etc/rc.d/S??"$name"
+	rm -f "$IPKG_INSTROOT"/etc/rc.d/K??"$name"
+
+	[ -n "${IPKG_INSTROOT:-}" ] && return 0
+	procd_running "$name" && return 0
+	prefix_remove
+	return 0
 }
 
 reload_service() {
@@ -318,12 +356,12 @@ gateway_remove_ra_route_uci() {
 
 # Add a global-scope IPv6 prefix to br-lan and enable RA default route.
 gateway_add_global_prefix() {
-	# Add the global prefix via UCI (idempotent — remove first).
-	local current
+	local current changed=""
 	current="$(uci -q get network.lan.ip6addr 2>/dev/null || echo "")"
 	if [ "$current" != "$GLOBAL_PREFIX" ]; then
 		uci set network.lan.ip6addr="$GLOBAL_PREFIX"
 		uci commit network
+		changed=1
 	fi
 
 	# Force odhcpd to advertise a default route even without upstream IPv6.
@@ -334,20 +372,24 @@ gateway_add_global_prefix() {
 		uci commit dhcp
 	fi
 
-	# Apply network change immediately (odhcpd restarted by gateway_add_ra_route).
+	# Apply a changed prefix now. Only when it changed: a reload recreates
+	# br-lan on OpenWrt 25.12. The ra_default change reaches odhcpd through
+	# the restart in gateway_add_ra_route.
+	[ -n "$changed" ] && /etc/init.d/network reload 2>/dev/null
+	return 0
+}
+
+# Delete the LAN prefix when it is the one this script sets, and apply that.
+# An address the operator set is left alone.
+prefix_remove() {
+	[ "$(uci -q get network.lan.ip6addr 2>/dev/null)" = "$GLOBAL_PREFIX" ] || return 0
+	uci delete network.lan.ip6addr
+	uci commit network
 	/etc/init.d/network reload 2>/dev/null || true
 }
 
-# Remove the global prefix and ra_default override.
-gateway_remove_global_prefix() {
-	local current
-	current="$(uci -q get network.lan.ip6addr 2>/dev/null || echo "")"
-	if [ "$current" = "$GLOBAL_PREFIX" ]; then
-		uci delete network.lan.ip6addr
-		uci commit network
-		/etc/init.d/network reload 2>/dev/null || true
-	fi
-
+# Remove the ra_default override.
+ra_restore() {
 	uci -q delete dhcp.lan.ra_default 2>/dev/null || true
 	uci commit dhcp
 	/etc/init.d/odhcpd restart 2>/dev/null || true

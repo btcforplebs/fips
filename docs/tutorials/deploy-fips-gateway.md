@@ -183,8 +183,9 @@ Behind that single command, the init script
 3. **Adds a global-scope IPv6 prefix** to `br-lan`. Without a
    non-ULA address on the local interface, Android and Chrome
    suppress AAAA queries entirely — they assume the LAN has no
-   real IPv6 and don't bother. The init script adds a small
-   benchmarking-range prefix to convince them otherwise.
+   real IPv6 and don't bother. The init script adds an address from
+   an unassigned, unrouted part of IANA's `2001::/23` block to
+   convince them otherwise.
 4. **Adds an RA route for the virtual pool.** A UCI `route6` entry
    under `dhcp` tells `odhcpd` to advertise the pool CIDR via Router
    Advertisement (RFC 4191), so LAN clients learn how to reach pool
@@ -314,7 +315,7 @@ BR_LAN_ADDR=$(ip -6 addr show br-lan \
 echo "$BR_LAN_ADDR"
 ```
 
-Pick from the global-scope benchmarking prefix the init script added
+Pick from the global-scope prefix the init script added
 in Step 3, or your own ULA if `br-lan` has one — anything except a
 link-local `fe80::/10` address.
 
@@ -412,12 +413,18 @@ service fips-gateway stop
 service fips-gateway disable
 ```
 
-The init script's `stop_service` handler reverses the LAN-side
-integration on the way out: dnsmasq's `.fips` forwarder is pointed
-back at the daemon's port 5354, the RA route for the pool is
-withdrawn from `odhcpd`, and the global-scope IPv6 prefix on
-`br-lan` is removed. The LAN reverts to the state it was in before
-you ran `service fips-gateway start` in Step 3.
+The init script's `stop_service` handler reverses most of the
+LAN-side integration on the way out: dnsmasq's `.fips` forwarder is
+pointed back at the daemon's port 5354 and the RA route for the pool
+is withdrawn from `odhcpd`. The global-scope IPv6 prefix on `br-lan`
+stays while the service is enabled, so that a restart does not reload
+the network; `disable` removes it, with one network reload. (In the
+other order, `disable` then `stop`, the `stop` removes it.) The LAN
+then reverts to the state it was in before you ran
+`service fips-gateway start` in Step 3. If you disable a running
+gateway and reboot without stopping it, nothing removes the prefix:
+a disabled service is neither stopped at shutdown nor started at boot.
+Run `service fips-gateway stop` once after the reboot to remove it.
 
 The daemon and the rest of `/etc/fips/` are untouched. Existing mesh
 peering on the AP itself continues to work.
