@@ -2401,28 +2401,48 @@ pub(crate) fn show_stats_history_all_peers_from_handle(
 /// [`crate::control::listening`] and [`crate::control::firewall_state`]
 /// for the per-half implementations.
 pub fn show_listening_sockets(node: &Node) -> Value {
-    render_listening_sockets(node.identity().node_addr())
+    let tun = node
+        .tun_name()
+        .unwrap_or_else(|| node.config().tun.name())
+        .to_string();
+    render_listening_sockets(node.identity().node_addr(), &tun)
 }
 
 /// Off-loop variant of [`show_listening_sockets`]: renders from the
 /// [`ControlReadHandle`](super::read_handle::ControlReadHandle) in the control
-/// task. Reads only the node identity (from `NodeContext`) plus host-OS facts
-/// (`/proc` socket enumeration, nftables firewall classification) — no `Node`
-/// state — so it never round-trips the rx_loop.
+/// task. Reads only the node identity (from `NodeContext`), the TUN name (from
+/// the published stats snapshot, falling back to the configured name), plus
+/// host-OS facts (`/proc` socket enumeration, nftables firewall
+/// classification) — no `Node` state — so it never round-trips the rx_loop.
 pub(crate) fn show_listening_sockets_from_handle(
     handle: &super::read_handle::ControlReadHandle,
 ) -> Value {
-    render_listening_sockets(handle.context().identity.node_addr())
+    let tun = handle
+        .stats()
+        .tun_name
+        .clone()
+        .unwrap_or_else(|| handle.context().config.tun.name().to_string());
+    render_listening_sockets(handle.context().identity.node_addr(), &tun)
 }
 
-/// Shared renderer for the listening-sockets panel. Given the node's
-/// `NodeAddr` it derives the fips0 address, enumerates listening sockets, and
-/// classifies each against the shipped firewall baseline.
-fn render_listening_sockets(node_addr: &NodeAddr) -> Value {
+/// Shell for the listening-sockets panel. Given the node's `NodeAddr` and
+/// TUN name it derives the fips0 address, enumerates listening sockets,
+/// queries the loaded firewall, and hands all three to [`render`].
+fn render_listening_sockets(node_addr: &NodeAddr, tun: &str) -> Value {
     let fips0 = crate::FipsAddress::from_node_addr(node_addr).to_ipv6();
     let sockets = super::listening::enumerate(fips0);
     let classifier = super::firewall_state::FilterClassifier::query();
+    render(&classifier, tun, fips0, &sockets)
+}
 
+/// Pure renderer for the listening-sockets panel: classifies each socket
+/// against the loaded firewall baseline and builds the JSON reply.
+pub(super) fn render(
+    classifier: &super::firewall_state::FilterClassifier,
+    _tun: &str,
+    fips0: std::net::Ipv6Addr,
+    sockets: &[super::listening::ListeningSocket],
+) -> Value {
     let rows: Vec<Value> = sockets
         .iter()
         .map(|s| {
