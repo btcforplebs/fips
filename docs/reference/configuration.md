@@ -503,7 +503,7 @@ hides the line protocol; see
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `tun.enabled` | bool | `false` | Enable TUN virtual interface |
-| `tun.name` | string | `"fips0"` | Interface name |
+| `tun.name` | string | `"fips0"` | Interface name. The mesh firewall baseline `/etc/fips/fips.nft` polices only the interface its `fips_if` define names (`"fips0"` as shipped); if you change this, change the define to match, or the firewall polices nothing on the TUN (see [Enable the mesh-interface firewall](../how-to/enable-mesh-firewall.md#if-you-rename-the-tun)). |
 | `tun.mtu` | u16 | `1280` | Interface MTU (IPv6 minimum) |
 
 ## DNS Responder (`dns.*`)

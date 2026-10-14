@@ -40,6 +40,34 @@ Equivalently:
 sudo nft -f /etc/fips/fips.nft
 ```
 
+## If you rename the TUN
+
+The baseline polices one interface, named by the `define fips_if` line
+near the top of `/etc/fips/fips.nft`:
+
+```nft
+define fips_if = "fips0"
+```
+
+Traffic arriving on any other interface returns from the chain
+unfiltered. The shipped value matches the default `tun.name`. If you set
+`tun.name` in `fips.yaml` to another name, change `fips_if` to the same
+name and reload:
+
+```sh
+sudo systemctl reload-or-restart fips-firewall.service
+```
+
+Until you do, the baseline filters nothing on the TUN and every listener
+on it is reachable from the mesh. The daemon checks this when it brings
+the TUN up and logs a warning naming both interfaces, and `fipstop`'s
+listening panel shows the "all listeners exposed" banner.
+
+Because `/etc/fips/fips.nft` is a configuration file, an upgrade that
+changes it while you have edited it asks whether to keep your version
+(dpkg) or installs the new one beside yours (`.pacnew` on Arch). Keep
+your file and carry over any change you want from the new one.
+
 ## Folding the baseline into the host's main nftables
 
 If you prefer to load the baseline from your existing
@@ -128,7 +156,7 @@ parsing `nft list table inet fips`.
 | Service row in **default White** with `OPEN` in the State column | The chain has a canonical, unrestricted accept rule for this (proto, port). The service is reachable from any mesh node. |
 | Service row in **DarkGray** with `filt` | No matching accept rule; the chain falls through to `counter drop`. The service is not reachable from the mesh. |
 | Service row in **DarkGray** with `filt?` | A rule references the port but uses matchers the panel cannot fully decompose (saddr filter, jump, daddr filter). The intent is operator-defined; inspect with `sudo nft list table inet fips` to see the actual rule. |
-| **Yellow banner** above the panel: "fips-firewall.service inactive — all listeners exposed" | The `inet fips` table is not loaded. Every listener is mesh-reachable (subject only to whatever ACL you have at the peer layer). |
+| **Yellow banner** above the panel: "fips-firewall.service inactive — all listeners exposed" | The `inet fips` table is not loaded, or it is loaded but does not police the TUN (its `fips_if` names another interface, or its scoping rule has a shape the panel cannot read; see [If you rename the TUN](#if-you-rename-the-tun)). Every listener is mesh-reachable (subject only to whatever ACL you have at the peer layer). |
 
 A common workflow when extending the baseline is to keep `fipstop`
 open on the Node tab in one terminal while editing

@@ -6,6 +6,10 @@
 #   (b) outbound-initiated reply    → conntrack established/related ACCEPT
 #   (c) ICMPv6 echo-request         → ACCEPT
 #   (d) drop-in allowlisted port    → ACCEPT
+# and one about the TUN name the file is scoped to:
+#   (e) table scoped to an interface that is not the TUN → the TUN is
+#       not policed, and the daemon's listener report says so; reloading
+#       the real file restores (a)
 #
 # fips-firewall.service activation: the unit's ExecStart is
 # `/usr/sbin/nft -f /etc/fips/fips.nft`. The test image does not run
@@ -140,6 +144,39 @@ activate_firewall() {
     if ! docker exec "$container" nft list table inet fips >/dev/null 2>&1; then
         fail "$container: inet fips table not present after nft -f"
     fi
+}
+
+# Print the `firewall_active` field of the daemon's show_listening_sockets
+# reply ("true" or "false"), or the empty string when the control socket
+# did not answer. Empty is distinct from both answers, so a caller expecting
+# either value cannot be satisfied by an unreachable daemon.
+read_firewall_active() {
+    local container="$1"
+    docker exec "$container" python3 -c '
+import glob, json, socket, sys
+paths = ["/run/fips/control.sock", "/var/run/fips/control.sock"] \
+    + glob.glob("/run/user/*/fips/control.sock") + ["/tmp/fips-control.sock"]
+for path in paths:
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(5)
+        s.connect(path)
+    except OSError:
+        continue
+    s.sendall(b"{\"command\":\"show_listening_sockets\"}\n")
+    s.shutdown(socket.SHUT_WR)
+    buf = b""
+    while True:
+        chunk = s.recv(65536)
+        if not chunk:
+            break
+        buf += chunk
+    reply = json.loads(buf.decode().splitlines()[0])
+    active = reply.get("data", {}).get("firewall_active")
+    if isinstance(active, bool):
+        print("true" if active else "false")
+    sys.exit(0)
+' 2>/dev/null || true
 }
 
 # Verify default-policy and key chain rules look right.
@@ -327,5 +364,63 @@ if [ -z "${DROP_PKTS:-}" ] || [ "$DROP_PKTS" -lt 1 ]; then
     fail "drop counter is $DROP_PKTS — case (a) should have produced drops"
 fi
 pass "drop counter = $DROP_PKTS (case a was actually dropped, not just unrouted)"
+
+# ── (e) Table scoped to an interface that is not the TUN ───────────────
+# fips.nft scopes its chain with `iifname != $fips_if return`, so a table
+# whose interface name differs from tun.name polices nothing on the TUN.
+# Load the production file with its interface name rewritten (the sed
+# matches the quoted literal on the define line and on the older inline
+# form alike), and assert both halves: mesh traffic reaches the case-(a)
+# port, and the daemon's listener report no longer claims an active
+# firewall. Then reload the real file and assert case (a) drops again.
+log "Case (e): fips.nft scoped to an interface that is not the TUN"
+
+# Control first: with the real file loaded, the report must read "true".
+# This proves the query path answers before its "false" is trusted below.
+FW_ACTIVE="$(read_firewall_active "$CONTAINER_B")"
+if [ "$FW_ACTIVE" != "true" ]; then
+    fail "(e) control: with the real fips.nft loaded, show_listening_sockets firewall_active should be true (got '${FW_ACTIVE}'; empty means the control socket did not answer)"
+fi
+
+OTHER_IF="notfips0"
+docker exec "$CONTAINER_B" sh -c \
+    "sed 's/\"fips0\"/\"${OTHER_IF}\"/g' /etc/fips/fips.nft > /tmp/fips-other-if.nft"
+docker exec "$CONTAINER_B" nft -f /tmp/fips-other-if.nft
+if ! docker exec "$CONTAINER_B" nft list table inet fips \
+    | grep -q "iifname != \"${OTHER_IF}\" return"; then
+    fail "(e) the rewritten table is not scoped to ${OTHER_IF}; the sed did not change the scoping rule"
+fi
+
+set +e
+docker exec "$CONTAINER_A" curl -6 --silent --output /dev/null \
+    --max-time 5 "http://[${ADDR_B}]:${UNALLOWED_PORT}/"
+RC=$?
+set -e
+if [ "$RC" -ne 0 ]; then
+    fail "(e) with the table scoped to ${OTHER_IF}, TCP/${UNALLOWED_PORT} on fips0 should be reachable (curl rc=$RC)"
+fi
+pass "(e) table scoped to ${OTHER_IF} does not police fips0: TCP/${UNALLOWED_PORT} reachable"
+
+FW_ACTIVE="$(read_firewall_active "$CONTAINER_B")"
+if [ "$FW_ACTIVE" != "false" ]; then
+    fail "(e) table scoped to ${OTHER_IF} while the TUN is fips0: show_listening_sockets should report firewall_active false (got '${FW_ACTIVE}')"
+fi
+pass "(e) listener report shows the firewall as not policing the TUN"
+
+activate_firewall "$CONTAINER_B"
+assert_baseline_loaded "$CONTAINER_B"
+set +e
+docker exec "$CONTAINER_A" curl -6 --silent --output /dev/null \
+    --max-time 5 "http://[${ADDR_B}]:${UNALLOWED_PORT}/"
+RC=$?
+set -e
+if [ "$RC" -ne "$CURL_TIMEOUT_RC" ]; then
+    fail "(e) after reloading the real fips.nft, TCP/${UNALLOWED_PORT} should be dropped again (curl rc=$RC, expected $CURL_TIMEOUT_RC)"
+fi
+FW_ACTIVE="$(read_firewall_active "$CONTAINER_B")"
+if [ "$FW_ACTIVE" != "true" ]; then
+    fail "(e) after reloading the real fips.nft, firewall_active should be true again (got '${FW_ACTIVE}')"
+fi
+pass "(e) real fips.nft reloaded: TCP/${UNALLOWED_PORT} dropped and the report shows the firewall active"
 
 log "Firewall integration test passed"

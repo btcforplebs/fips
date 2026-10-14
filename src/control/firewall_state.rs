@@ -30,6 +30,14 @@
 //! Conntrack-related accepts (`ct state established,related accept`)
 //! and the ICMPv6-echo-request accept are not classified — they
 //! don't pertain to listening TCP/UDP ports the operator binds.
+//!
+//! The chain is scoped to one interface by its opening
+//! `iifname != "<name>" return` rule ([`Scope`]). A loaded table
+//! protects the node only when that name is the live TUN's
+//! ([`FilterClassifier::polices`]); a scope that cannot be read is
+//! treated as not protecting it. The first rule that returns or that
+//! matches on the input interface by any key decides the scope, so a
+//! chain scoped some other way is unreadable rather than unscoped.
 
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
@@ -57,6 +65,22 @@ impl FilterState {
     }
 }
 
+/// Which interfaces the loaded `inbound` chain polices.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Scope {
+    /// No rule returns or matches on the input interface: the chain sees
+    /// every interface.
+    Unscoped,
+    /// The first such rule is exactly `iifname != "<name>" return` with a
+    /// literal name: the chain polices only that interface.
+    Iface(String),
+    /// The first such rule has any other shape (a set, a wildcard, `==`,
+    /// another interface key such as `iif` or `iifgroup`, a verdict map, a
+    /// verdict other than `return`, further matches). Which interfaces it
+    /// polices is not read, so it is not taken to police the TUN.
+    Unreadable,
+}
+
 /// Cached snapshot of the `inet fips` inbound chain at the moment
 /// the panel was queried. Build once per `show_listening_sockets`
 /// call and consult per row.
@@ -79,12 +103,14 @@ struct Rule {
 /// when classifying.
 #[derive(Debug, Clone)]
 enum MatchExpr {
-    /// `meta iifname == "fips0"` / `!= "fips0"`.
-    /// The shipped baseline returns immediately when iifname is not
-    /// fips0; rules after that line apply only to fips0 traffic, so we
-    /// don't need to model this. We just recognize the shape so we
-    /// don't bucket these lines into [`MatchExpr::Unrecognized`].
-    Iifname,
+    /// A match or verdict map on the input interface (`meta iifname`,
+    /// `iif`, `iifgroup`, `iiftype`, `iifkind`). `name` is the right-hand
+    /// side only for `iifname` against a literal name; it is `None` for
+    /// another key, a set, a named set (`@name`), a wildcard (`*`) or any
+    /// other shape. The shipped baseline's `iifname != "fips0" return`
+    /// sets the chain's [`Scope`]. Port classification skips a literal
+    /// match and treats any other shape like [`MatchExpr::Unrecognized`].
+    Iifname { op: String, name: Option<String> },
     /// `meta l4proto == tcp/udp`.
     L4Proto(Proto),
     /// `tcp dport == N` / `udp dport == N` / dport in set / dport in range.
@@ -118,7 +144,10 @@ impl PortMatch {
 enum Verdict {
     Accept,
     Drop,
-    /// `return`, `continue`, `jump`, `goto`, `reject`, `queue`, etc.
+    /// `return`. Classified like [`Verdict::Other`]; kept apart only so
+    /// the scoping rule can be recognized.
+    Return,
+    /// `continue`, `jump`, `goto`, `reject`, `queue`, etc.
     /// We don't follow control-flow verdicts — anything that isn't a
     /// terminal accept/drop forces classification to [`FilterState::Unknown`]
     /// when the rule otherwise references the port.
@@ -149,10 +178,70 @@ impl FilterClassifier {
         Self::no_firewall()
     }
 
+    /// Build a classifier from captured `nft -j list table inet fips`
+    /// output, as [`Self::query`] would from the live kernel.
+    #[cfg(test)]
+    pub(crate) fn from_nft_json(json: &Value) -> Self {
+        Self {
+            rules: Some(parse_inbound_rules(json)),
+        }
+    }
+
     /// True iff the `inet fips` table is currently loaded — i.e.
     /// `fips-firewall.service` is active.
     pub fn is_active(&self) -> bool {
         self.rules.is_some()
+    }
+
+    /// The interface scope of the loaded chain, `None` when no table is
+    /// loaded. Read from the first rule that returns or that matches on
+    /// the input interface.
+    pub fn scope(&self) -> Option<Scope> {
+        let rules = self.rules.as_ref()?;
+        let Some(rule) = rules.iter().find(|r| {
+            r.verdict == Verdict::Return
+                || r.matches
+                    .iter()
+                    .any(|m| matches!(m, MatchExpr::Iifname { .. }))
+        }) else {
+            return Some(Scope::Unscoped);
+        };
+        let scope = match (rule.matches.as_slice(), rule.verdict) {
+            (
+                [
+                    MatchExpr::Iifname {
+                        op,
+                        name: Some(name),
+                    },
+                ],
+                Verdict::Return,
+            ) if op == "!=" => Scope::Iface(name.clone()),
+            _ => Scope::Unreadable,
+        };
+        Some(scope)
+    }
+
+    /// True only when the table is loaded and polices `tun`: the chain is
+    /// unscoped, or scoped to exactly `tun`. A missing table, a chain
+    /// scoped to another interface and an unreadable scope are all false,
+    /// so the caller reports the TUN as unprotected rather than assuming
+    /// it is filtered.
+    pub fn polices(&self, tun: &str) -> bool {
+        match self.scope() {
+            Some(Scope::Unscoped) => true,
+            Some(Scope::Iface(name)) => name == tun,
+            Some(Scope::Unreadable) | None => false,
+        }
+    }
+
+    /// The interface the loaded chain is scoped to, when that is a single
+    /// interface other than `tun`. This is the case the startup warning
+    /// names; an unreadable scope is reported only by [`Self::polices`].
+    pub fn foreign_scope(&self, tun: &str) -> Option<String> {
+        match self.scope() {
+            Some(Scope::Iface(name)) if name != tun => Some(name),
+            _ => None,
+        }
     }
 
     /// Classify a single (proto, port) pair.
@@ -172,7 +261,7 @@ impl FilterClassifier {
 
             for m in &rule.matches {
                 match m {
-                    MatchExpr::Iifname => {
+                    MatchExpr::Iifname { name: Some(_), .. } => {
                         // The `iifname != "fips0" return` rule is
                         // structurally the table's iif scoping. Skip
                         // it — it shouldn't affect classification of
@@ -195,7 +284,7 @@ impl FilterClassifier {
                             canonical_for_port = false;
                         }
                     }
-                    MatchExpr::Unrecognized => {
+                    MatchExpr::Iifname { name: None, .. } | MatchExpr::Unrecognized => {
                         // Source filters, daddr filters, anything
                         // else — rule is not the canonical
                         // unrestricted accept.
@@ -233,7 +322,7 @@ impl FilterClassifier {
                     // looking. Operator wrote a deny.
                     return FilterState::Drop;
                 }
-                Verdict::Other => {
+                Verdict::Return | Verdict::Other => {
                     saw_unknown_for_port = true;
                 }
             }
@@ -245,6 +334,29 @@ impl FilterClassifier {
             FilterState::Drop
         }
     }
+}
+
+/// Check off the async thread whether the loaded `inet fips` table is
+/// scoped to an interface other than the TUN just brought up, and warn
+/// once naming both when it is. Called once per TUN bring-up; the `nft`
+/// query blocks, so it runs on the blocking pool in a detached task.
+#[cfg(target_os = "linux")]
+pub fn spawn_scope_check(tun: &str) {
+    let tun = tun.to_string();
+    tokio::spawn(async move {
+        let Ok(classifier) = tokio::task::spawn_blocking(FilterClassifier::query).await else {
+            return;
+        };
+        if let Some(scope) = classifier.foreign_scope(&tun) {
+            tracing::warn!(
+                tun = %tun,
+                firewall_iface = %scope,
+                "The inet fips firewall polices {scope}, not the TUN {tun}: \
+                 listeners on {tun} are reachable from the mesh. Set fips_if \
+                 in /etc/fips/fips.nft to the tun.name and reload the firewall"
+            );
+        }
+    });
 }
 
 /// Heuristic: does this rule, taken as a whole, reference our port?
@@ -309,6 +421,16 @@ fn parse_rule(rule: &Value) -> Rule {
     for e in &exprs {
         if let Some(m) = e.get("match") {
             matches.push(parse_match(m));
+        } else if let Some(map) = e.get("vmap") {
+            // A verdict map picks the verdict per packet. Only one keyed on
+            // the input interface is recorded, as an unreadable scope.
+            if let Some(key) = map.get("key").and_then(input_iface_key) {
+                matches.push(MatchExpr::Iifname {
+                    op: format!("vmap {key}"),
+                    name: None,
+                });
+            }
+            verdict = Verdict::Other;
         } else if e.get("accept").is_some() {
             verdict = Verdict::Accept;
         } else if e.get("drop").is_some() {
@@ -318,8 +440,9 @@ fn parse_rule(rule: &Value) -> Rule {
             // verdict (the counter usually precedes the verdict).
             // The trailing `counter drop` rule has only `counter` +
             // `drop` exprs, which is handled above.
-        } else if e.get("return").is_some()
-            || e.get("jump").is_some()
+        } else if e.get("return").is_some() {
+            verdict = Verdict::Return;
+        } else if e.get("jump").is_some()
             || e.get("goto").is_some()
             || e.get("continue").is_some()
             || e.get("reject").is_some()
@@ -340,13 +463,16 @@ fn parse_match(m: &Value) -> MatchExpr {
     let left = m.get("left").cloned().unwrap_or(Value::Null);
     let right = m.get("right").cloned().unwrap_or(Value::Null);
 
-    // meta iifname
-    if let Some(meta) = left.get("meta")
-        && meta.get("key").and_then(|v| v.as_str()) == Some("iifname")
-        && right.as_str().is_some()
-    {
-        let _ = op; // op is informational here; we don't use negation.
-        return MatchExpr::Iifname;
+    // The input interface, by any key and with any right-hand side
+    if let Some(key) = input_iface_key(&left) {
+        let name = right
+            .as_str()
+            .filter(|n| key == "iifname" && !n.starts_with('@') && !n.contains('*'))
+            .map(str::to_string);
+        return MatchExpr::Iifname {
+            op: op.to_string(),
+            name,
+        };
     }
 
     // meta l4proto
@@ -390,6 +516,12 @@ fn parse_match(m: &Value) -> MatchExpr {
     }
 
     MatchExpr::Unrecognized
+}
+
+/// The `meta` key of `left` when it names the input interface.
+fn input_iface_key(left: &Value) -> Option<&str> {
+    let key = left.get("meta")?.get("key")?.as_str()?;
+    matches!(key, "iif" | "iifname" | "iifgroup" | "iiftype" | "iifkind").then_some(key)
 }
 
 fn parse_proto(s: &str) -> Option<Proto> {
@@ -655,5 +787,211 @@ mod tests {
             ]
         ]));
         assert_eq!(c.classify(Proto::Tcp, 22), FilterState::Accept);
+    }
+
+    /// The shipped baseline's inbound chain as `nft -j` reports it with
+    /// `define fips_if = "fips0"` (nft 1.0.9 stores the expanded literal),
+    /// with the scoping rule's right-hand side replaced by `scope_rhs`.
+    fn baseline_chain(scope_rhs: Value) -> FilterClassifier {
+        make_classifier(json!([
+            [
+                {"match": {"op": "!=", "left": {"meta": {"key": "iifname"}}, "right": scope_rhs}},
+                {"return": null}
+            ],
+            [
+                {"match": {"op": "in", "left": {"ct": {"key": "state"}}, "right": ["established", "related"]}},
+                {"accept": null}
+            ],
+            [
+                {"match": {"op": "==", "left": {"payload": {"protocol": "icmpv6", "field": "type"}}, "right": "echo-request"}},
+                {"accept": null}
+            ],
+            [
+                {"counter": {"packets": 0, "bytes": 0}},
+                {"drop": null}
+            ],
+        ]))
+    }
+
+    #[test]
+    fn inet_fips_scoped_to_fips0_does_not_police_a_tun_named_mesh0() {
+        let c = baseline_chain(json!("fips0"));
+        assert!(c.is_active());
+        assert_eq!(c.scope(), Some(Scope::Iface("fips0".into())));
+        assert!(!c.polices("mesh0"));
+        assert_eq!(c.foreign_scope("mesh0").as_deref(), Some("fips0"));
+    }
+
+    #[test]
+    fn inet_fips_scoped_to_fips0_polices_a_tun_named_fips0() {
+        let c = baseline_chain(json!("fips0"));
+        assert!(c.polices("fips0"));
+        assert_eq!(c.foreign_scope("fips0"), None);
+        assert_eq!(c.classify(Proto::Tcp, 22), FilterState::Drop);
+        assert_eq!(c.classify(Proto::Udp, 5353), FilterState::Drop);
+    }
+
+    #[test]
+    fn chain_with_no_iifname_return_polices_every_tun() {
+        let c = make_classifier(json!([
+            [
+                {"match": {"op": "in", "left": {"ct": {"key": "state"}}, "right": ["established", "related"]}},
+                {"accept": null}
+            ],
+            [
+                {"counter": {"packets": 0, "bytes": 0}},
+                {"drop": null}
+            ],
+        ]));
+        assert_eq!(c.scope(), Some(Scope::Unscoped));
+        assert!(c.polices("fips0"));
+        assert!(c.polices("mesh0"));
+        assert_eq!(c.foreign_scope("mesh0"), None);
+    }
+
+    #[test]
+    fn scoping_rule_with_a_set_is_reported_as_not_policing() {
+        // `iifname != { "fips0", "mesh0" } return`, in the shape nft 1.0.9
+        // reports it.
+        let c = baseline_chain(json!({"set": ["mesh0", "fips0"]}));
+        assert_eq!(c.scope(), Some(Scope::Unreadable));
+        assert!(!c.polices("fips0"));
+        assert!(!c.polices("mesh0"));
+        // Not a single other interface, so the startup warning stays quiet;
+        // the listener report still shows the TUN unprotected.
+        assert_eq!(c.foreign_scope("mesh0"), None);
+    }
+
+    #[test]
+    fn scoping_rule_that_matches_the_name_rather_than_excluding_it_is_unreadable() {
+        // `iifname "fips0" return` (op `==`) would exempt the mesh instead
+        // of scoping to it.
+        let c = make_classifier(json!([
+            [
+                {"match": {"op": "==", "left": {"meta": {"key": "iifname"}}, "right": "fips0"}},
+                {"return": null}
+            ],
+        ]));
+        assert_eq!(c.scope(), Some(Scope::Unreadable));
+        assert!(!c.polices("fips0"));
+    }
+
+    #[test]
+    fn no_table_polices_nothing() {
+        let c = FilterClassifier::no_firewall();
+        assert_eq!(c.scope(), None);
+        assert!(!c.polices("fips0"));
+        assert_eq!(c.foreign_scope("fips0"), None);
+    }
+
+    /// A chain whose only scoping rule is `scope_rule`, followed by the
+    /// baseline's trailing drop.
+    fn scoped_by(scope_rule: Value) -> FilterClassifier {
+        make_classifier(json!([
+            scope_rule,
+            [
+                {"counter": {"packets": 0, "bytes": 0}},
+                {"drop": null}
+            ],
+        ]))
+    }
+
+    #[test]
+    fn scoping_by_iifname_vmap_is_unreadable_not_unscoped() {
+        // `iifname vmap { "fips0" : continue, * : return }`, as nft 1.0.9
+        // reports it: the chain returns everything not on fips0.
+        let c = scoped_by(json!([
+            {"vmap": {
+                "key": {"meta": {"key": "iifname"}},
+                "data": {"set": [["fips0", {"continue": null}], ["*", {"return": null}]]}
+            }}
+        ]));
+        assert_eq!(c.scope(), Some(Scope::Unreadable));
+        assert!(!c.polices("mesh0"));
+        assert!(!c.polices("fips0"));
+        assert_eq!(c.foreign_scope("mesh0"), None);
+    }
+
+    #[test]
+    fn scoping_by_meta_iif_is_unreadable_not_unscoped() {
+        // `meta iif != "fips0" return`, as nft 1.0.9 reports it.
+        let c = scoped_by(json!([
+            {"match": {"op": "!=", "left": {"meta": {"key": "iif"}}, "right": "fips0"}},
+            {"return": null}
+        ]));
+        assert_eq!(c.scope(), Some(Scope::Unreadable));
+        assert!(!c.polices("mesh0"));
+        assert_eq!(c.foreign_scope("mesh0"), None);
+    }
+
+    #[test]
+    fn scoping_by_iifgroup_is_unreadable_not_unscoped() {
+        let c = scoped_by(json!([
+            {"match": {"op": "!=", "left": {"meta": {"key": "iifgroup"}}, "right": 7}},
+            {"return": null}
+        ]));
+        assert_eq!(c.scope(), Some(Scope::Unreadable));
+        assert!(!c.polices("mesh0"));
+    }
+
+    #[test]
+    fn return_on_a_non_interface_match_is_unreadable_not_unscoped() {
+        // An early return keyed on anything else also exempts traffic from
+        // the trailing drop, so the chain is not taken to police the TUN.
+        let c = scoped_by(json!([
+            {"match": {"op": "==", "left": {"payload": {"protocol": "ip6", "field": "saddr"}}, "right": "fd00::1"}},
+            {"return": null}
+        ]));
+        assert_eq!(c.scope(), Some(Scope::Unreadable));
+        assert!(!c.polices("fips0"));
+    }
+
+    #[test]
+    fn wildcard_scope_is_unreadable_and_does_not_name_a_foreign_interface() {
+        // `iifname != "fips*" return`: nft reports the wildcard as a plain
+        // string. It covers fips0, so naming it as another interface would
+        // make the startup warning false.
+        let c = baseline_chain(json!("fips*"));
+        assert_eq!(c.scope(), Some(Scope::Unreadable));
+        assert_eq!(c.foreign_scope("fips0"), None);
+        assert!(!c.polices("fips0"));
+    }
+
+    #[test]
+    fn named_set_scope_is_unreadable_not_an_interface_called_at_set() {
+        // `iifname != @meshifs return`: nft reports the set reference as the
+        // string "@meshifs".
+        let c = baseline_chain(json!("@meshifs"));
+        assert_eq!(c.scope(), Some(Scope::Unreadable));
+        assert_eq!(c.foreign_scope("fips0"), None);
+        assert!(!c.polices("fips0"));
+    }
+
+    #[test]
+    fn scoping_rule_with_a_counter_still_reads_as_the_interface() {
+        // `iifname != "fips0" counter return`: a counter is not a match, so
+        // the rule keeps the exact scoping shape.
+        let c = scoped_by(json!([
+            {"match": {"op": "!=", "left": {"meta": {"key": "iifname"}}, "right": "fips0"}},
+            {"counter": {"packets": 0, "bytes": 0}},
+            {"return": null}
+        ]));
+        assert_eq!(c.scope(), Some(Scope::Iface("fips0".into())));
+        assert!(c.polices("fips0"));
+        assert!(!c.polices("mesh0"));
+    }
+
+    #[test]
+    fn allow_rule_with_an_iifname_set_classifies_as_unknown() {
+        // A set-shaped iifname match on an allow rule is not decomposed,
+        // so the port it opens is reported as needing inspection.
+        let c = make_classifier(json!([
+            [
+                {"match": {"op": "==", "left": {"meta": {"key": "iifname"}}, "right": {"set": ["fips0", "mesh0"]}}},
+                {"match": {"op": "==", "left": {"payload": {"protocol": "tcp", "field": "dport"}}, "right": 22}},
+                {"accept": null}
+            ],
+        ]));
+        assert_eq!(c.classify(Proto::Tcp, 22), FilterState::Unknown);
     }
 }

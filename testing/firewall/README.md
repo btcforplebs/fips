@@ -20,6 +20,16 @@ documented in the file's header are actually true on a live mesh:
 A drop-counter check after case (a) confirms the connection was
 actively DROP'd by the fips chain (not silently unrouted).
 
+- **(e)** The file's chain is scoped by `iifname != $fips_if return`, so
+  a table scoped to an interface that is not the TUN polices nothing on
+  it. The suite loads the production file with its interface name
+  rewritten to `notfips0`, asserts that node-a then reaches the case-(a)
+  port and that node-b's `show_listening_sockets` control reply reports
+  `firewall_active: false`, then reloads the real file and asserts the
+  port is dropped again and the reply reads `true`. The reply is read
+  once with the real file loaded before the rewrite, so a control socket
+  that does not answer fails the case instead of passing it.
+
 ## Topology
 
 Two FIPS nodes peered over UDP on a Docker bridge network:
@@ -102,6 +112,11 @@ PASS: (b) outbound from node-b got HTTP 200 via conntrack reply path
 PASS: (d) drop-in allowlisted TCP/22 reachable
 === Drop counter incremented (case a should have ticked it)
 PASS: drop counter = N (case a was actually dropped, not just unrouted)
+=== Case (e): fips.nft scoped to an interface that is not the TUN
+PASS: (e) table scoped to notfips0 does not police fips0: TCP/8000 reachable
+PASS: (e) listener report shows the firewall as not policing the TUN
+PASS: fips-fw-container-b: fips.nft baseline + drop-in loaded
+PASS: (e) real fips.nft reloaded: TCP/8000 dropped and the report shows the firewall active
 === Firewall integration test passed
 ```
 

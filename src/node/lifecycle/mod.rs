@@ -1979,6 +1979,10 @@ impl Node {
 
                             self.tun_state = TunState::Active;
                             self.tun_name = Some(name);
+                            #[cfg(target_os = "linux")]
+                            if let Some(tun) = self.tun_name() {
+                                crate::control::firewall_state::spawn_scope_check(tun);
+                            }
                             self.supervisor.tun_tx = Some(tun_tx);
                             self.supervisor.tun_outbound_rx = Some(outbound_rx);
                             self.supervisor.tun_reader_handle = Some(reader_handle);

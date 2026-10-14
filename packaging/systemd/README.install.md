@@ -149,8 +149,12 @@ unit. Enable it explicitly:
 sudo systemctl enable --now fips-firewall.service
 ```
 
-The baseline polices only `fips0`, leaving Docker, Tor, the host
-firewall, and other interfaces untouched. Outbound from `fips0` is
+The baseline polices only the interface named by the `fips_if` define
+at the top of the file (`fips0`, the default `tun.name`), leaving
+Docker, Tor, the host firewall, and other interfaces untouched. If you
+set `tun.name` to another name, change `fips_if` to match and reload;
+until then the baseline polices nothing on the TUN, the daemon logs a
+warning at startup, and `fipstop` shows every listener as exposed. Outbound from `fips0` is
 unrestricted; inbound is dropped except for replies to outbound
 flows, ICMPv6 echo-request, and any operator drop-ins under
 `/etc/fips/fips.d/*.nft`. Read the comments at the top of

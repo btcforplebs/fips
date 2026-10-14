@@ -4,22 +4,33 @@
 # ║              fips0 nftables policy — security baseline             ║
 # ╚═══════════════════════════════════════════════════════════════════╝
 #
-# Polices ONLY the fips0 mesh interface — every packet not arriving
-# on fips0 returns immediately, leaving Docker, Tor, OPNsense, the
-# host's main /etc/nftables.conf, and any other firewall undisturbed.
+# Polices ONLY the FIPS mesh interface named by `fips_if` below —
+# every packet not arriving on it returns immediately, leaving Docker,
+# Tor, OPNsense, the host's main /etc/nftables.conf, and any other
+# firewall undisturbed.
+#
+# ─── THE MESH INTERFACE NAME ────────────────────────────────────────
+#
+# `fips_if` must equal the daemon's `tun.name` in fips.yaml (default
+# "fips0"). If you rename the TUN, change the define to match and
+# reload. Until you do, this table polices an interface that does not
+# carry mesh traffic, and every listener on the renamed TUN is
+# reachable from the mesh. The daemon logs a warning at startup when
+# the loaded table is scoped to another interface, and fipstop's
+# listening panel reports every listener as exposed.
 #
 # ─── DEFAULT POLICY ─────────────────────────────────────────────────
 #
-#   INBOUND on fips0:   DROP everything except —
+#   INBOUND on mesh:    DROP everything except —
 #                         • replies to outbound flows we initiated
 #                           (conntrack established/related)
 #                         • ICMPv6 echo-request (ping6 reachability)
 #                         • rules in /etc/fips/fips.d/*.nft drop-ins
 #
-#   OUTBOUND from fips0: unrestricted
+#   OUTBOUND from mesh: unrestricted
 #
 # Why default-deny: services binding to 0.0.0.0 or [::] accept
-# connections on fips0 by default. This baseline ensures that
+# connections on the mesh interface by default. This baseline ensures that
 # accidental exposure of HTTP, SSH, databases, etc. through the
 # mesh is impossible without explicit operator action.
 #
@@ -87,8 +98,11 @@
 #
 # All hook at standard filter priority (0). Order between same-family
 # same-priority tables is determined by load order, but the early-
-# return for non-fips0 traffic makes this chain a no-op for anything
-# not on fips0, so coexistence is safe.
+# return for non-mesh traffic makes this chain a no-op for anything
+# not on the mesh interface, so coexistence is safe.
+
+# The mesh interface this table polices. Must equal `tun.name`.
+define fips_if = "fips0"
 
 # ━━━ Idempotent table replacement ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 add table inet fips
@@ -99,9 +113,9 @@ table inet fips {
     chain inbound {
         type filter hook input priority 0; policy accept;
 
-        # Non-fips0 traffic returns immediately — chain is a no-op
-        # for anything not arriving on the fips0 mesh interface.
-        iifname != "fips0" return
+        # Non-mesh traffic returns immediately — chain is a no-op
+        # for anything not arriving on the mesh interface.
+        iifname != $fips_if return
 
         # Replies to outbound flows + related ICMPv6 errors
         # (Packet Too Big for PMTU, Destination Unreachable, etc.)
