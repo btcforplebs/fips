@@ -48,13 +48,14 @@ FLUSHLIST=/tmp/fw-flush-listing
 SMALL=/fw-small
 COPY=/tmp/fips-firewall.uci
 MCOPY=/tmp/fips-mesh-firewall.uci
+WCOPY=/tmp/fips-mesh-wireless.uci
 STUB=/tmp/fw-wrap/stub
 OUT="$WORK/out"
 SYSPATH=/usr/sbin:/usr/bin:/sbin:/bin
 
 # The number of cases in the full run, counted by hand from the list at the
 # end of this file. A run that completes fewer exits 2.
-ALL_CASES=74
+ALL_CASES=80
 
 FAILURES=0
 CASES=0
@@ -338,6 +339,7 @@ fw_clean() {
 	rm -f /etc/nftables.d/zz-*.nft "$FLUSHONLY" "$FLUSHLIST" "$RELOADLOG"
 	rm -f /etc/fips/firewall.sh /etc/hotplug.d/net/99-fips /etc/uci-defaults/90-fips-setup
 	rm -f "$COPY" "$COPY.staged" "$COPY.now" "$MCOPY" "$MCOPY.staged" "$MCOPY.now"
+	rm -f "$WCOPY" "$WCOPY.staged" "$WCOPY.now"
 	rm -f /usr/bin/fips-mesh-setup
 	for l in /sys/class/net/fips-mesh*; do
 		[ -e "$l" ] && ip link del "${l##*/}" >/dev/null 2>&1
@@ -1599,7 +1601,10 @@ mesh_failsafe() { mesh_drop_heads input "$1" && mesh_drop_heads forward "$1"; }
 
 no_mesh_drop() { table_lacks fips-mesh-reload-failed; }
 
-# mesh_wireless_made <radio> <ifname>: the sections the helper has always made.
+# The basic rates the helper gives every mesh interface.
+RATES='6000 12000 24000'
+
+# mesh_wireless_made <radio> <ifname>: the sections the helper makes.
 mesh_wireless_made() {
 	local s="fips_mesh_$1"
 	[ "$(uget "wireless.$s")" = wifi-iface ] &&
@@ -1607,6 +1612,7 @@ mesh_wireless_made() {
 		[ "$(uget "wireless.$s.mode")" = mesh ] &&
 		[ "$(uget "wireless.$s.encryption")" = none ] &&
 		[ "$(uget "wireless.$s.mesh_fwding")" = 0 ] &&
+		[ "$(uget "wireless.$s.basic_rate")" = "$RATES" ] &&
 		[ "$(uget "wireless.$s.ifname")" = "$2" ] &&
 		[ "$(uget "wireless.$s.network")" = "$s" ] &&
 		[ "$(uget "network.$s")" = interface ] &&
@@ -1620,6 +1626,15 @@ mesh_exports_save() {
 
 mesh_exports_same() {
 	uci export wireless > "$WORK/wireless.after"
+	uci export network > "$WORK/network.after"
+	cmp -s "$WORK/wireless.before" "$WORK/wireless.after" &&
+		cmp -s "$WORK/network.before" "$WORK/network.after"
+}
+
+# Network is unchanged, and wireless is unchanged but for basic_rate lines
+# with the helper's rates.
+mesh_exports_same_but_rates() {
+	uci export wireless | grep -vxF "	option basic_rate '$RATES'" > "$WORK/wireless.after"
 	uci export network > "$WORK/network.after"
 	cmp -s "$WORK/wireless.before" "$WORK/wireless.after" &&
 		cmp -s "$WORK/network.before" "$WORK/network.after"
@@ -1656,8 +1671,10 @@ mesh_add_puts_interface_in_reject_zone() {
 	fi
 	check "the firewall reloads, then the radio" log_is "$(printf 'reload\nwifi reload')"
 	check "the wireless and network sections are as before" mesh_wireless_made radio0 fips-mesh0
+	check "the mesh interface has basic_rate '$RATES'" same "$(uget wireless.fips_mesh_radio0.basic_rate)" "$RATES"
 	check "no failsafe rule" no_mesh_drop
 	check "the closing message names the zone" said "fips-mesh0 $ZONED"
+	check "the closing message says 22.03 and 23.05 ignore the rates" said 'and 23.05 ignore basic_rate on a mesh'
 	fw_end
 }
 
@@ -2023,7 +2040,7 @@ mesh_upgrade_zones_existing_interfaces() {
 		check "fips-mesh1 is in the zone" mesh_jumps fips-mesh1
 		check "no failsafe rule" no_mesh_drop
 		check "no wifi reload" no_wifi
-		check "wireless and network are unchanged" mesh_exports_same
+		check "wireless and network are unchanged but for the basic rates" mesh_exports_same_but_rates
 		check "the fips zone is made as in a fresh install" zone_made
 	fi
 	fw_end
@@ -2037,10 +2054,14 @@ mesh_second_upgrade_changes_nothing() {
 		if precond "the first upgrade zoned both interfaces" \
 			eval 'mesh_zone_made "'"'fips-mesh0' 'fips-mesh1'"'" && mesh_jumps fips-mesh0 && mesh_jumps fips-mesh1'; then
 			uci export firewall > "$WORK/first.uci"
+			uci export wireless > "$WORK/first.wireless"
 			run_postinst
 			uci export firewall > "$WORK/second.uci"
+			uci export wireless > "$WORK/second.wireless"
 			check "uci export firewall is byte-identical" cmp -s "$WORK/first.uci" "$WORK/second.uci"
+			check "uci export wireless is byte-identical" cmp -s "$WORK/first.wireless" "$WORK/second.wireless"
 			check "no firewall reload" no_reload
+			refute "no line about basic rates" said 'basic_rate'
 		fi
 	fi
 	fw_end
@@ -2159,6 +2180,7 @@ mesh_hook_after_damaged_save_closes_without_reload() {
 	for v in 1 0; do
 		mesh_begin mesh_hook_after_damaged_save_closes_without_reload "when the fips zone's save leaves the file damaged ($v page free), the mesh is closed and nothing saved"
 		run_released_mesh radio0
+		uci export wireless > "$WORK/wireless.before"
 		mesh_install
 		if [ "$v" = 1 ]; then
 			full_save_start 1 pad
@@ -2174,6 +2196,10 @@ mesh_hook_after_damaged_save_closes_without_reload() {
 			check "$v: fips0's pair is in forward" pair_once forward
 			check "$v: the damaged save is reported" said "$DAMAGED"
 			check "$v: the mesh interface is reported closed" said "$MESHCLOSED"
+			uci export wireless > "$WORK/wireless.after"
+			check "$v: the wireless configuration is left alone" \
+				eval 'cmp -s "$WORK/wireless.before" "$WORK/wireless.after" && [ -z "$(uci -q changes wireless)" ]'
+			refute "$v: no line about basic rates" said 'basic_rate'
 		fi
 	done
 	fw_end
@@ -2334,6 +2360,159 @@ mesh_hook_failed_reload_drops_mesh_input() {
 	fw_end
 }
 
+# ── The mesh's basic rates ──────────────────────────────────────────────────
+# fips-mesh-setup gives each mesh interface basic_rate '6000 12000 24000', and
+# 90-fips-setup gives it to those made by earlier packages, which set none.
+
+# wrap_uci_commit_fails_for <config>: a uci wrapper whose commit of <config>
+# fails.
+wrap_uci_commit_fails_for() {
+	cat > "$WRAP/uci" <<EOF
+#!/bin/sh
+echo "\$*" >> /tmp/fw-wrap/uci.log
+[ "\$*" = "commit $1" ] && exit 1
+exec /sbin/uci "\$@"
+EOF
+	chmod 0755 "$WRAP/uci"
+}
+
+mesh_upgrade_sets_basic_rate_on_existing_interfaces() {
+	mesh_begin mesh_upgrade_sets_basic_rate_on_existing_interfaces "an upgrade gives the interfaces the 0.5.2 helper made the mesh's basic rates, without a wifi reload"
+	if mesh_released_two &&
+		precond "the 0.5.2 helper set no basic_rate" \
+			eval '[ -z "$(uget wireless.fips_mesh_radio0.basic_rate)" ] && [ -z "$(uget wireless.fips_mesh_radio1.basic_rate)" ]'; then
+		mesh_install
+		run_postinst
+		check "the setup exits 0 and is deleted" eval '[ "$RC" = 0 ] && [ ! -e /etc/uci-defaults/90-fips-setup ]'
+		check "fips_mesh_radio0 has basic_rate '$RATES'" same "$(uget wireless.fips_mesh_radio0.basic_rate)" "$RATES"
+		check "fips_mesh_radio1 has basic_rate '$RATES'" same "$(uget wireless.fips_mesh_radio1.basic_rate)" "$RATES"
+		check "the rates are saved, not only staged" \
+			eval '[ "$(grep -cxF "	option basic_rate '"'$RATES'"'" /etc/config/wireless)" = 2 ] && [ -z "$(uci -q changes wireless)" ]'
+		check "nothing else in wireless or network changed" mesh_exports_same_but_rates
+		check "no wifi reload" no_wifi
+		check "the line names both interfaces and that any network reload applies the rates" \
+			said "set basic_rate '$RATES' on fips-mesh0 fips-mesh1; it applies at the next reboot or network reload, which 'wifi reload' and a LuCI apply make, as can the fips gateway's start or stop"
+		check "a line says to upgrade routers reached over the mesh farthest first" \
+			said 'when you reach routers over the mesh, upgrade and reload them one at a time, farthest first'
+	fi
+	fw_end
+}
+
+mesh_upgrade_leaves_other_wifi_ifaces_alone() {
+	mesh_begin mesh_upgrade_leaves_other_wifi_ifaces_alone "an upgrade sets no basic_rate on wifi-ifaces fips-mesh-setup did not make"
+	run_released_mesh radio0
+	uci set wireless.own_mesh=wifi-iface &&
+		uci set wireless.own_mesh.device=radio1 &&
+		uci set wireless.own_mesh.mode=mesh &&
+		uci set wireless.own_mesh.mesh_id=other &&
+		uci set wireless.own_mesh.encryption=none &&
+		uci set wireless.default_radio1=wifi-iface &&
+		uci set wireless.default_radio1.device=radio1 &&
+		uci set wireless.default_radio1.mode=ap &&
+		uci set wireless.default_radio1.ssid=OpenWrt &&
+		uci commit wireless || harness_fail "cannot add the operator's wifi-ifaces"
+	dump wireless.own_mesh > "$WORK/own.before"
+	dump wireless.default_radio1 > "$WORK/ap.before"
+	if precond "fips_mesh_radio0 exists without basic_rate" \
+		eval '[ "$(uget wireless.fips_mesh_radio0)" = wifi-iface ] && [ -z "$(uget wireless.fips_mesh_radio0.basic_rate)" ]'; then
+		mesh_install
+		run_postinst
+		dump wireless.own_mesh > "$WORK/own.after"
+		dump wireless.default_radio1 > "$WORK/ap.after"
+		check "the setup exits 0 and is deleted" eval '[ "$RC" = 0 ] && [ ! -e /etc/uci-defaults/90-fips-setup ]'
+		check "fips_mesh_radio0 has basic_rate '$RATES'" same "$(uget wireless.fips_mesh_radio0.basic_rate)" "$RATES"
+		check "the operator's mesh wifi-iface is unchanged" cmp -s "$WORK/own.before" "$WORK/own.after"
+		check "the operator's mesh wifi-iface has no basic_rate" same "$(uget wireless.own_mesh.basic_rate)" ""
+		check "the AP wifi-iface is unchanged" cmp -s "$WORK/ap.before" "$WORK/ap.after"
+		check "/etc/config/wireless has one basic_rate" same "$(grep -c basic_rate /etc/config/wireless)" 1
+	fi
+	fw_end
+}
+
+mesh_upgrade_keeps_operator_basic_rate() {
+	mesh_begin mesh_upgrade_keeps_operator_basic_rate "an upgrade keeps a basic_rate the operator set on a fips mesh interface, and names it"
+	if mesh_released_two; then
+		uci set wireless.fips_mesh_radio1.basic_rate='1000 2000 5500 11000' && uci commit wireless ||
+			harness_fail "cannot set the operator's basic_rate"
+		dump wireless.fips_mesh_radio1 > "$WORK/radio1.before"
+		mesh_install
+		run_postinst
+		dump wireless.fips_mesh_radio1 > "$WORK/radio1.after"
+		check "the setup exits 0 and is deleted" eval '[ "$RC" = 0 ] && [ ! -e /etc/uci-defaults/90-fips-setup ]'
+		check "fips_mesh_radio0 has basic_rate '$RATES'" same "$(uget wireless.fips_mesh_radio0.basic_rate)" "$RATES"
+		check "fips_mesh_radio1 keeps the operator's basic_rate" same "$(uget wireless.fips_mesh_radio1.basic_rate)" '1000 2000 5500 11000'
+		check "fips_mesh_radio1 is otherwise unchanged" cmp -s "$WORK/radio1.before" "$WORK/radio1.after"
+		check "one line names the kept rates" said_once "fips-mesh1 keeps its basic_rate '1000 2000 5500 11000'"
+		check "the set line names only fips-mesh0" said "set basic_rate '$RATES' on fips-mesh0;"
+	fi
+	fw_end
+}
+
+mesh_readd_keeps_operator_basic_rate() {
+	mesh_begin mesh_readd_keeps_operator_basic_rate "running the helper again on a radio keeps a basic_rate the operator set"
+	run_mesh radio0
+	if precond "the first add set basic_rate '$RATES'" same "$(uget wireless.fips_mesh_radio0.basic_rate)" "$RATES"; then
+		uci set wireless.fips_mesh_radio0.basic_rate='12000 24000' && uci commit wireless ||
+			harness_fail "cannot set the operator's basic_rate"
+		run_mesh radio0
+		check "the second add exits 0" same "$RC" 0
+		check "the operator's basic_rate is kept" same "$(uget wireless.fips_mesh_radio0.basic_rate)" '12000 24000'
+		check "the closing message names the kept rates" said "basic_rate '12000 24000'"
+	fi
+	fw_end
+}
+
+mesh_rates_failed_save_keeps_setup() {
+	mesh_begin mesh_rates_failed_save_keeps_setup "an upgrade whose wireless save fails says so and keeps the setup for the next boot"
+	if mesh_released_two; then
+		mesh_install
+		wrap_uci_commit_fails_for wireless
+		run_postinst wrap
+		if precond "the uci wrapper failed a commit wireless" wrap_called uci 'commit wireless'; then
+			check "the setup ends non-zero and is kept" eval '[ "$RC" != 0 ] && [ -f /etc/uci-defaults/90-fips-setup ]'
+			check "the failed save is reported" said "the wireless configuration could not be saved, so the mesh interfaces keep the basic rates they had"
+			check "/etc/config/wireless has no basic_rate" eval '! grep -q basic_rate /etc/config/wireless'
+			check "the mesh zone was still made" mesh_zone_made "'fips-mesh0' 'fips-mesh1'"
+			rm -f "$WRAP/uci"
+			run_boot
+			check "the next boot exits 0 and removes the setup" eval '[ "$RC" = 0 ] && [ ! -e /etc/uci-defaults/90-fips-setup ]'
+			check "the next boot saves the rates" same "$(grep -cxF "	option basic_rate '$RATES'" /etc/config/wireless)" 2
+			check "the next boot says it saved the rates staged before, on both interfaces" \
+				said "set basic_rate '$RATES' on fips-mesh0 fips-mesh1;"
+		fi
+	fi
+	fw_end
+}
+
+mesh_rates_damaged_save_names_copy() {
+	mesh_begin mesh_rates_damaged_save_names_copy "a rates save onto a full overlay that empties the wireless file says so, and its copy restores it"
+	if mesh_released_two; then
+		small_config
+		if precond "no wireless copy is left from before" eval '[ ! -e "$WCOPY" ]' &&
+			precond "the small tmpfs has no page free" small_free 0; then
+			run_mesh rates
+			if precond "the save left /etc/config/wireless without radio0" \
+				eval '! grep -qF "config wifi-device '"'radio0'"'" /etc/config/wireless'; then
+				check "the helper exits 1" same "$RC" 1
+				check "the damaged save is reported" said 'the wireless configuration could not be saved and /etc/config/wireless was left damaged'
+				check "the line names the copy to import" said "uci import wireless < $WCOPY"
+				refute "no line says the rates were set" said "set basic_rate '$RATES' on"
+				check "the copy holds radio0 and the rates" \
+					eval 'grep -qF "config wifi-device '"'radio0'"'" "$WCOPY" && [ "$(grep -cxF "	option basic_rate '"'$RATES'"'" "$WCOPY")" = 2 ]'
+				rm -f "$SMALL/fill"
+				uci import wireless < "$WCOPY" 2>/dev/null
+				check "after the import: both radios are back" \
+					eval '[ "$(uget wireless.radio0)" = wifi-device ] && [ "$(uget wireless.radio1)" = wifi-device ]'
+				check "after the import: both mesh interfaces have the rates" \
+					eval '[ "$(uget wireless.fips_mesh_radio0.basic_rate)" = "$RATES" ] && [ "$(uget wireless.fips_mesh_radio1.basic_rate)" = "$RATES" ]'
+				run_mesh rates
+				check "a later run exits 0 and says nothing" eval '[ "$RC" = 0 ] && [ ! -s "$OUT" ]'
+			fi
+		fi
+	fi
+	fw_end
+}
+
 # ── Harness start ───────────────────────────────────────────────────────────
 
 [ -r "$FW_SETUP" ] || harness_fail "cannot read the setup under test, $FW_SETUP"
@@ -2443,7 +2622,13 @@ mesh_add_failed_save_does_not_create_mesh
 mesh_readd_after_failed_save_saves_staged_zone
 mesh_add_failed_close_does_not_create_mesh
 mesh_readd_unnumbered_radio_moves_zone_entry
-mesh_hook_failed_reload_drops_mesh_input"
+mesh_hook_failed_reload_drops_mesh_input
+mesh_upgrade_sets_basic_rate_on_existing_interfaces
+mesh_upgrade_leaves_other_wifi_ifaces_alone
+mesh_upgrade_keeps_operator_basic_rate
+mesh_readd_keeps_operator_basic_rate
+mesh_rates_failed_save_keeps_setup
+mesh_rates_damaged_save_names_copy"
 
 # The five continuation cases run only right after the case they continue.
 if [ -n "$FW_CASES" ]; then

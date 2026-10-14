@@ -11,7 +11,7 @@ OpenWrt 22.03+ router via the standard `opkg` package system.
 | `/usr/bin/fipsctl` | CLI control tool (`fipsctl show peers`, `fipsctl show links`, …) |
 | `/usr/bin/fipstop` | Live TUI dashboard |
 | `/usr/bin/fips-gateway` | Outbound LAN gateway service (not started by default) |
-| `/usr/bin/fips-mesh-setup` | Opt-in helper — creates an open 802.11s mesh interface for router↔router backhaul, in the `fips_mesh` firewall zone |
+| `/usr/bin/fips-mesh-setup` | Opt-in helper — creates an open 802.11s mesh interface for router↔router backhaul, in the `fips_mesh` firewall zone, with basic rates 6, 12 and 24 Mb/s |
 | `/usr/bin/fips-ap-setup` | Opt-in helper — creates the open `!FIPS` access SSID for client devices |
 | `/etc/init.d/fips` | procd service for the daemon (auto-start, crash respawn) |
 | `/etc/init.d/fips-gateway` | procd service for the gateway (disabled by default) |
@@ -562,4 +562,76 @@ uci set firewall.fips_ping.family=ipv6
 uci set firewall.fips_ping.target=ACCEPT
 uci commit firewall
 /etc/init.d/firewall reload
+```
+
+### Upgrading from 0.5.2 or earlier: the 802.11s mesh's basic rates
+
+802.11s mesh points peer only when they join with the same basic rates. The
+`fips-mesh-setup` in those packages set none, and OpenWrt releases then differ:
+24.10 joins through `iw` with the radio's basic rates, by default 6, 12 and
+24 Mb/s on 2.4 GHz, while 25.12 joins with the kernel's, 1, 2, 5.5 and 11 Mb/s
+on 2.4 GHz. A 24.10 router and a 25.12 router each hear the other's beacons and
+never peer. `fips-mesh-setup` now sets `basic_rate '6000 12000 24000'` on every
+mesh interface it creates, which 24.10 and 25.12 both honour. On those releases
+a `basic_rate` on the interface overrides one set on the radio, so a rate
+choice you made on the radio (`basic_rate`, `legacy_rates` or `cell_density`)
+no longer applies to the mesh; set it on the mesh interface instead.
+
+The upgrade sets that value on each mesh interface `fips-mesh-setup` made that
+has no `basic_rate`, and prints a line naming them. It leaves wireless
+interfaces the helper did not make alone, and keeps a `basic_rate` you set on a
+fips mesh interface yourself, printing a line that names it. Running
+`fips-mesh-setup <radio>` again also keeps one. The upgrade saves the wireless
+configuration and does not run `wifi reload` itself, but the rates apply at the
+next reboot or network reload of any kind: `wifi reload`,
+`/etc/init.d/network reload`, a LuCI apply, or the fips gateway starting or
+being turned off. On a router with the gateway enabled, an upgrade from 0.5.2
+or earlier starts the gateway, which reloads the network to set the LAN
+prefix, so the rates apply during the upgrade itself.
+
+From then on the router peers only with mesh points that join with the same
+rates. A router still on the old package, or upgraded but not yet reloaded,
+stops peering with it if it joins with other rates: on 2.4 GHz that is a 25.12
+router, or any 22.03 or 23.05 router (see below), while a 24.10 router on
+default settings already uses these rates. On 5 GHz both releases are expected
+to use these rates already; that has not been checked on a router.
+
+When you reach routers over the mesh, upgrade them one at a time, farthest
+first, and run `wifi reload` on each right after its upgrade. A router that
+loses its peerings then is at the edge of what you reach, and the routers you
+reach it through keep theirs until their own turn, when the link to it comes
+back. Upgrading a near router first can cut off every router reached through
+it, which then needs another path, such as its LAN, to finish the upgrade.
+
+OpenWrt 22.03 and 23.05 pass no basic rates to a mesh join, whatever is set on
+the interface or the radio, so on 2.4 GHz they join with 1, 2, 5.5 and 11 Mb/s.
+Upgrading the package does not change that, and such a router stops peering
+with 24.10 and later routers once those are upgraded and reloaded. To keep a
+22.03 or 23.05 router in a 2.4 GHz mesh, set the rates it uses on the 2.4 GHz
+mesh interface of every 24.10 or later router in that mesh (here the one on
+`radio1`); the upgrade keeps them:
+
+```bash
+uci set wireless.fips_mesh_radio1.basic_rate='1000 2000 5500 11000'
+uci commit wireless
+wifi reload
+```
+
+A reinstall of the same version with a plain `opkg install` does not run the
+package's setup, so run the helper's `rates` subcommand yourself:
+
+```bash
+fips-mesh-setup rates
+wifi reload
+```
+
+If the wireless configuration cannot be saved, the upgrade says so, and its
+setup runs again at each boot until it can save. When the upgrade could not
+save the firewall configuration, which can mean the overlay is full, it leaves
+the wireless configuration alone and sets the rates at a later boot. When the
+save left `/etc/config/wireless` damaged, the warning says so; free space on the
+overlay and restore it before the router reboots:
+
+```bash
+uci import wireless < /tmp/fips-mesh-wireless.uci
 ```

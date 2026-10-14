@@ -1,18 +1,18 @@
 #!/bin/sh
 # FIPS first-boot setup — runs once after package installation.
 # Loads the kernel modules, creates the fips firewall zone for fips0, adds
-# existing 802.11s mesh interfaces to the fips_mesh zone and registers the
-# .fips forwarding with dnsmasq. The UCI defaults mechanism runs
-# it once and deletes it when it ends with status 0.
+# existing 802.11s mesh interfaces to the fips_mesh zone, gives them the
+# mesh's basic rates and registers the .fips forwarding with dnsmasq. The UCI
+# defaults mechanism runs it once and deletes it when it ends with status 0.
 #
 # It is executed by the package's postinst, but sourced, not executed, by
 # OpenWrt's default_postinst for a package built from the SDK feed and by the
 # first-boot uci-defaults run after a sysupgrade. Nothing here may exit early,
 # change directory or set shell options. It ends with status 0, except when
-# the firewall configuration could not be saved: it then ends with status 1,
-# so that it is kept and runs again at the next boot. A package built from the
-# SDK feed runs it twice in one install, so a run may find the previous run's
-# firewall changes staged but not saved.
+# the firewall or wireless configuration could not be saved: it then ends
+# with status 1, so that it is kept and runs again at the next boot. A
+# package built from the SDK feed runs it twice in one install, so a run may
+# find the previous run's firewall or wireless changes staged but not saved.
 
 # ---------------------------------------------------------------------------
 # 1. Kernel modules
@@ -408,6 +408,30 @@ if [ -x /usr/bin/fips-mesh-setup ]; then
 	else
 		/usr/bin/fips-mesh-setup close
 	fi
+fi
+
+# ---------------------------------------------------------------------------
+# 2c. Wireless: the mesh's basic rates
+# ---------------------------------------------------------------------------
+# fips-mesh-setup in packages up to 0.5.2 set no basic_rate on the mesh
+# interfaces it created, so OpenWrt 24.10 and 25.12 joined the mesh with
+# different basic rates and never peered. Its rates subcommand sets
+# basic_rate on each of them that has none, keeps one the operator set, and
+# saves the wireless configuration without reloading the radios itself. The
+# rates apply at the next reboot or network reload, and that can come during
+# the upgrade: on an upgrade from 0.5.2 or earlier with the gateway enabled,
+# the postinst starts the gateway, which reloads the network to set the LAN
+# prefix. So an upgrade run over the mesh can lose the router's peerings, and
+# the README has routers reached over the mesh upgraded one at a time,
+# farthest first. It touches only the wifi-ifaces fips-mesh-setup made, and
+# does nothing when there is no mesh. When a firewall save above failed, the
+# overlay may be full, and a wireless file a save cuts short takes every radio
+# down at the next reload or reboot, so nothing is saved here: the setup
+# already ends with status 1 and sets the rates at the next boot. A failed
+# save here also ends the setup with status 1.
+
+if [ -x /usr/bin/fips-mesh-setup ] && [ "$fwstatus" = 0 ]; then
+	/usr/bin/fips-mesh-setup rates || fwstatus=1
 fi
 
 # ---------------------------------------------------------------------------

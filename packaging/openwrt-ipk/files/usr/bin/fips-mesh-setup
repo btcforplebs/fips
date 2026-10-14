@@ -8,6 +8,8 @@
 #                                        fips_mesh firewall zone
 #   fips-mesh-setup close                drop IP traffic arriving on them
 #                                        until the firewall next reloads
+#   fips-mesh-setup rates                give existing mesh interfaces that
+#                                        have no basic_rate the mesh's rates
 #
 # Creates a mesh-point interface on the given radio and leaves everything
 # above L2 to FIPS. Run once per radio: dual-band routers can mesh on both
@@ -25,6 +27,13 @@
 #   - mesh_fwding '0'    — disables 802.11s HWMP forwarding so each mesh
 #     link is a plain L2 neighbor link. FIPS is the routing layer; two
 #     routing layers would fight.
+#   - basic_rate '6000 12000 24000' — mesh points peer only when their basic
+#     rates match, and OpenWrt releases differ when none is set: 24.10 joins
+#     through iw with the radio's (by default 6, 12 and 24 Mb/s on 2.4 GHz),
+#     25.12 with the kernel's (1, 2, 5.5 and 11 on 2.4 GHz). Setting them makes
+#     24.10 and later join alike. 22.03 and 23.05 pass no basic rates to a mesh
+#     join, so on 2.4 GHz they keep the kernel's and do not peer with these
+#     routers. A basic_rate already on the interface is kept.
 #   - firewall zone 'fips_mesh' — the interfaces get a firewall zone of
 #     their own, which rejects all IP input and forwarding, FIPS UDP and
 #     mDNS included. The mesh is open, and an interface in no zone meets
@@ -46,6 +55,7 @@
 # See docs/how-to/set-up-80211s-mesh-backhaul.md for the full guide.
 
 DEFAULT_MESH_ID="fips-mesh"
+BASIC_RATES="6000 12000 24000"
 CONFIG="/etc/fips/fips.yaml"
 FWCOPY=/tmp/fips-mesh-firewall.uci
 
@@ -93,6 +103,7 @@ usage() {
 	echo "       fips-mesh-setup remove [radio]" >&2
 	echo "       fips-mesh-setup zone" >&2
 	echo "       fips-mesh-setup close" >&2
+	echo "       fips-mesh-setup rates" >&2
 	echo "Radios on this device:" >&2
 	uci show wireless 2>/dev/null | sed -n "s/^wireless\.\([^.]*\)=wifi-device$/  \1/p" >&2
 	exit 1
@@ -252,19 +263,23 @@ mesh_zone_add() {
 	staged=1
 }
 
-# Save the staged firewall configuration and check that the file now holds it.
-# On a full overlay uci commit can exit 0 after writing a truncated or empty
-# file and dropping the staged changes. The staged configuration is first
-# exported to $FWCOPY, unless an earlier run in this boot left a copy there,
-# and is removed once saved. Returns 0 when saved, 1 when it could not be
-# saved and is still staged, and 2 when the file no longer holds it.
+# Save the staged configuration $1 (firewall unless given) and check that the
+# file now holds it. On a full overlay uci commit can exit 0 after writing a
+# truncated or empty file and dropping the staged changes. The staged
+# configuration is first exported to /tmp/fips-mesh-$1.uci ($FWCOPY for the
+# firewall), unless an earlier run in this boot left a copy there, and is
+# removed once saved. Returns 0 when saved, 1 when it could not be saved and
+# is still staged, and 2 when the file no longer holds it.
 mesh_commit() {
-	local want="$FWCOPY.staged" now="$FWCOPY.now"
-	uci -q export firewall > "$want" 2>/dev/null || return 1
-	[ -e "$FWCOPY" ] || cp "$want" "$FWCOPY" 2>/dev/null
-	uci commit firewall || return 1
-	if uci -q export firewall > "$now" 2>/dev/null && cmp -s "$want" "$now"; then
-		rm -f "$want" "$now" "$FWCOPY"
+	local cfg="${1:-firewall}" copy want now
+	copy="/tmp/fips-mesh-$cfg.uci"
+	want="$copy.staged"
+	now="$copy.now"
+	uci -q export "$cfg" > "$want" 2>/dev/null || return 1
+	[ -e "$copy" ] || cp "$want" "$copy" 2>/dev/null
+	uci commit "$cfg" || return 1
+	if uci -q export "$cfg" > "$now" 2>/dev/null && cmp -s "$want" "$now"; then
+		rm -f "$want" "$now" "$copy"
 		return 0
 	fi
 	rm -f "$want" "$now"
@@ -502,6 +517,50 @@ if [ "$1" = "close" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# rates — give every mesh interface that has no basic_rate the mesh's basic
+# rates. The package's setup runs it at upgrade, so mesh interfaces made by
+# earlier packages, which set none, peer across OpenWrt releases. A basic_rate
+# already set is the operator's and is kept. Saves the wireless configuration
+# but does not reload the radios itself: the rates apply at the next reboot or
+# network reload, which wifi reload and a LuCI apply make, as can the fips
+# gateway's start or stop. Exits 1 only when the wireless configuration could not be saved.
+# ---------------------------------------------------------------------------
+
+if [ "$1" = "rates" ]; then
+	SET_IFS=""
+	# Rates left staged by an earlier run whose save failed are saved too.
+	STAGED=" $(uci -q changes wireless | sed -n "s/^wireless\.\(fips_mesh[^.]*\)\.basic_rate='$BASIC_RATES'\$/\1/p" | tr '\n' ' ')"
+	for section in $(mesh_sections); do
+		ifname="$(uci -q get "wireless.$section.ifname")"
+		rates="$(uci -q get "wireless.$section.basic_rate")"
+		if [ -z "$rates" ]; then
+			uci set "wireless.$section.basic_rate=$BASIC_RATES"
+			SET_IFS="$SET_IFS ${ifname:-$section}"
+		elif [ "$rates" = "$BASIC_RATES" ]; then
+			case "$STAGED" in
+			*" $section "*) SET_IFS="$SET_IFS ${ifname:-$section}" ;;
+			esac
+		else
+			mesh_say "${ifname:-$section} keeps its basic_rate '$rates'; it peers only with mesh points whose basic rates are the same, and fips-mesh-setup gives new mesh interfaces '$BASIC_RATES'"
+		fi
+	done
+	SET_IFS="${SET_IFS# }"
+	[ -n "$SET_IFS" ] || exit 0
+	mesh_commit wireless
+	saved=$?
+	if [ "$saved" = 2 ]; then
+		mesh_say "the wireless configuration could not be saved and /etc/config/wireless was left damaged, which the next network reload or reboot loads; free space on the overlay, then, before the router reboots, run 'uci import wireless < /tmp/fips-mesh-wireless.uci'"
+		exit 1
+	elif [ "$saved" != 0 ]; then
+		mesh_say "the wireless configuration could not be saved, so the mesh interfaces keep the basic rates they had; free space on the overlay, then run 'fips-mesh-setup rates' again"
+		exit 1
+	fi
+	echo "fips-mesh-setup: set basic_rate '$BASIC_RATES' on $SET_IFS; it applies at the next reboot or network reload, which 'wifi reload' and a LuCI apply make, as can the fips gateway's start or stop, and from then on they peer only with mesh points whose basic rates are the same, which a router set up by an older fips package may not have until its package is upgraded, and a router on OpenWrt 22.03 or 23.05 does not have on 2.4 GHz"
+	echo "fips-mesh-setup: when you reach routers over the mesh, upgrade and reload them one at a time, farthest first, so the routers you reach them through keep their peerings until last"
+	exit 0
+fi
+
+# ---------------------------------------------------------------------------
 # remove [radio] — delete the wireless and network sections created below,
 # and take the interfaces out of the fips_mesh zone
 # ---------------------------------------------------------------------------
@@ -663,6 +722,8 @@ esac
 # Wireless: open 802.11s mesh point, HWMP forwarding off
 # ---------------------------------------------------------------------------
 
+# A basic_rate the section already has is the operator's, and is kept.
+RATES="$(uci -q get "wireless.$SECTION.basic_rate")"
 uci -q delete "wireless.$SECTION"
 uci set "wireless.$SECTION=wifi-iface"
 uci set "wireless.$SECTION.device=$RADIO"
@@ -670,6 +731,7 @@ uci set "wireless.$SECTION.mode=mesh"
 uci set "wireless.$SECTION.mesh_id=$MESH_ID"
 uci set "wireless.$SECTION.encryption=none"
 uci set "wireless.$SECTION.mesh_fwding=0"
+uci set "wireless.$SECTION.basic_rate=${RATES:-$BASIC_RATES}"
 uci set "wireless.$SECTION.ifname=$MESH_IFNAME"
 uci set "wireless.$SECTION.network=$SECTION"
 
@@ -779,6 +841,12 @@ $FW_NOTE
 ALL routers in this backhaul must share this mesh ID AND channel
 (per band). On a dual-band router, run fips-mesh-setup for the other
 radio too — second band is a standby path (failover, not multipath).
+
+They must also share the basic rates, basic_rate '${RATES:-$BASIC_RATES}'.
+A router set up by an older fips package may join with other rates and
+not peer with this one until its package is upgraded. OpenWrt 22.03
+and 23.05 ignore basic_rate on a mesh and, on 2.4 GHz, join with
+1, 2, 5.5 and 11 Mb/s, so they do not peer with this router there.
 
 Next steps:
   1. $TRANSPORT_NOTE
