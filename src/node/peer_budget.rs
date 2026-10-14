@@ -1,14 +1,16 @@
-//! Per-link-peer budget for induced routing-error emissions.
+//! Per-link-peer token budget.
 //!
-//! A transit node synthesizes a routing error (CoordsRequired, PathBroken or
-//! MtuExceeded) in response to a datagram it could not forward. Every field of
-//! that datagram is chosen by whoever sent it, so a per-destination or
-//! per-source gate can be escaped by varying the field it is keyed on. The one
-//! value at the emission point an attacker cannot mint is the authenticated
-//! link peer the frame arrived from, whose cardinality is bounded by the peer
-//! table and by admission. This budget is keyed on it, and is consulted ahead
-//! of any address-keyed structure so that those structures only grow at the
-//! budget rate.
+//! A budget limits how fast one authenticated link peer may make this node do
+//! something on its behalf. Every field of a datagram is chosen by whoever sent
+//! it, so a per-destination or per-source gate can be escaped by varying the
+//! field it is keyed on. The one value an attacker cannot mint is the
+//! authenticated link peer the frame arrived from, whose cardinality is bounded
+//! by the peer table and by admission. Each budget is keyed on it.
+//!
+//! The routing-error instance bounds induced routing-error emissions (a transit
+//! node synthesizes CoordsRequired, PathBroken or MtuExceeded in response to a
+//! datagram it could not forward). It is consulted ahead of any address-keyed
+//! structure so that those structures only grow at the budget rate.
 
 use crate::NodeAddr;
 use std::collections::HashMap;
@@ -50,9 +52,9 @@ struct Bucket {
     last_refill: Instant,
 }
 
-/// Token-bucket budget for routing errors, keyed on the authenticated link
-/// peer that induced them.
-pub struct PeerErrorBudget {
+/// Token-bucket budget keyed on the authenticated link peer that is spending
+/// it.
+pub struct PeerBudget {
     buckets: HashMap<NodeAddr, Bucket>,
     /// Refill rate in thousandths of a token per millisecond.
     milli_per_ms: u64,
@@ -61,8 +63,8 @@ pub struct PeerErrorBudget {
     last_sweep: Instant,
 }
 
-impl PeerErrorBudget {
-    /// Create a budget at the shipped rate and burst.
+impl PeerBudget {
+    /// Create a routing-error budget at the shipped rate and burst.
     pub fn new() -> Self {
         Self::with_rate(PEER_ERROR_RATE_PER_SEC, PEER_ERROR_BURST)
     }
@@ -137,7 +139,7 @@ impl PeerErrorBudget {
     }
 }
 
-impl Default for PeerErrorBudget {
+impl Default for PeerBudget {
     fn default() -> Self {
         Self::new()
     }
@@ -154,7 +156,7 @@ mod tests {
     }
 
     /// Spend one token per admitted emission.
-    fn spend(budget: &mut PeerErrorBudget, peer: &NodeAddr, now: Instant) -> bool {
+    fn spend(budget: &mut PeerBudget, peer: &NodeAddr, now: Instant) -> bool {
         if !budget.has_token(peer, now) {
             return false;
         }
@@ -164,7 +166,7 @@ mod tests {
 
     #[test]
     fn a_peer_may_emit_its_full_burst_then_is_suppressed() {
-        let mut budget = PeerErrorBudget::new();
+        let mut budget = PeerBudget::new();
         let now = Instant::now();
         let peer = addr(1);
 
@@ -176,7 +178,7 @@ mod tests {
 
     #[test]
     fn an_exhausted_budget_refills_at_the_sustained_rate() {
-        let mut budget = PeerErrorBudget::new();
+        let mut budget = PeerBudget::new();
         let start = Instant::now();
         let peer = addr(1);
 
@@ -198,7 +200,7 @@ mod tests {
 
     #[test]
     fn one_peer_exhausting_its_budget_does_not_silence_another() {
-        let mut budget = PeerErrorBudget::new();
+        let mut budget = PeerBudget::new();
         let now = Instant::now();
         let noisy = addr(1);
         let quiet = addr(2);
@@ -212,7 +214,7 @@ mod tests {
 
     #[test]
     fn peeking_does_not_spend_a_token() {
-        let mut budget = PeerErrorBudget::with_rate(1, 1);
+        let mut budget = PeerBudget::with_rate(1, 1);
         let now = Instant::now();
         let peer = addr(1);
 
@@ -224,7 +226,7 @@ mod tests {
 
     #[test]
     fn full_buckets_are_dropped_by_the_sweep() {
-        let mut budget = PeerErrorBudget::new();
+        let mut budget = PeerBudget::new();
         let start = Instant::now();
         for i in 0..50u8 {
             assert!(spend(&mut budget, &addr(i), start));

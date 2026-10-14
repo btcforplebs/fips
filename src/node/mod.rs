@@ -17,7 +17,7 @@ pub(crate) mod encrypt_worker;
 mod handlers;
 mod lifecycle;
 pub(crate) mod metrics;
-mod peer_error_budget;
+mod peer_budget;
 mod peering;
 mod rate_limit;
 pub(crate) mod reject;
@@ -31,7 +31,7 @@ pub(crate) mod stats_history;
 mod tests;
 mod tree;
 
-use self::peer_error_budget::PeerErrorBudget;
+use self::peer_budget::PeerBudget;
 use self::rate_limit::{HandshakeRateLimiter, LookupSignRateLimiter, SessionSetupRateLimiter};
 use self::reloadable::Reloadable;
 
@@ -709,7 +709,7 @@ pub struct Node {
     /// only value at the emission point a sender cannot mint; the
     /// per-destination interval inside `routing` is keyed on a field the
     /// sender chooses and is an aggregate suppressor, not a bound.
-    peer_error_budget: PeerErrorBudget,
+    peer_error_budget: PeerBudget,
     /// Routing-subsystem state (routing error-signal rate limiter).
     routing: Router,
     /// FMP connection-lifecycle decision anchor (stateless; drives the
@@ -986,7 +986,7 @@ impl Node {
             msg1_rate_limiter,
             setup_rate_limiter,
             icmp_rate_limiter: IcmpRateLimiter::new(),
-            peer_error_budget: PeerErrorBudget::new(),
+            peer_error_budget: PeerBudget::new(),
             routing: Router::new(),
             fmp: Fmp::new(),
             fsp: Fsp::new(),
@@ -1151,7 +1151,7 @@ impl Node {
             msg1_rate_limiter,
             setup_rate_limiter,
             icmp_rate_limiter: IcmpRateLimiter::new(),
-            peer_error_budget: PeerErrorBudget::new(),
+            peer_error_budget: PeerBudget::new(),
             routing: Router::new(),
             fmp: Fmp::new(),
             fsp: Fsp::new(),

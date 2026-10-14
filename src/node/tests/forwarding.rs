@@ -5,7 +5,7 @@
 //! multi-hop forwarding through live node topologies.
 
 use super::*;
-use crate::node::peer_error_budget::PEER_ERROR_BURST;
+use crate::node::peer_budget::PEER_ERROR_BURST;
 use crate::proto::fsp::wire::{FSP_FLAG_CP, build_fsp_header};
 use crate::proto::fsp::{SessionAck, SessionSetup};
 use crate::proto::link::SessionDatagram;
