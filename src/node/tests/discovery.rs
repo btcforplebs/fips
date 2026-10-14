@@ -1050,8 +1050,8 @@ async fn test_discovery_100_nodes() {
     verify_tree_convergence(&nodes);
 
     // Disable forward rate limiting: in this test all 100 nodes look up
-    // the same 10 targets in <1s wall time. The 2s per-target rate limit
-    // would suppress nearly all transit forwarding.
+    // the same 10 targets in <1s wall time. The 2s rate limit per link peer
+    // and target would suppress nearly all transit forwarding.
     for tn in nodes.iter_mut() {
         tn.node.disable_discovery_forward_rate_limit();
     }

@@ -35,7 +35,8 @@ pub(crate) use core::plan_forward;
 #[cfg(test)]
 pub(crate) use core::Ineligibility;
 pub(crate) use limits::{
-    LookupBackoff, LookupForwardRateLimiter, MAX_BACKOFF_ENTRIES, MAX_RECENT_LOOKUP_REQUESTS,
+    LookupBackoff, LookupForwardRateLimiter, MAX_BACKOFF_ENTRIES, MAX_FORWARD_ENTRIES,
+    MAX_RECENT_LOOKUP_REQUESTS,
 };
 pub(crate) use state::{Lookup, PendingLookup};
 #[cfg(test)]

@@ -276,8 +276,8 @@ pub struct LookupConfig {
     /// Maximum backoff cap in seconds (`node.lookup.backoff_max_secs`).
     #[serde(default = "LookupConfig::default_backoff_max_secs")]
     pub backoff_max_secs: u64,
-    /// Minimum interval between forwarded lookups for the same target in seconds
-    /// (`node.lookup.forward_min_interval_secs`).
+    /// Minimum interval between forwarded lookups for the same target from the
+    /// same link peer, in seconds (`node.lookup.forward_min_interval_secs`).
     /// Defense-in-depth against misbehaving nodes.
     #[serde(default = "LookupConfig::default_forward_min_interval_secs")]
     pub forward_min_interval_secs: u64,

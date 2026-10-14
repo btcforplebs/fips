@@ -9,7 +9,8 @@ use crate::node::Node;
 use crate::node::reject::DiscoveryReject;
 use crate::peer::ActivePeer;
 use crate::proto::lookup::{
-    LookupAction, LookupRequest, LookupResponse, MAX_BACKOFF_ENTRIES, MAX_RECENT_LOOKUP_REQUESTS,
+    LookupAction, LookupRequest, LookupResponse, MAX_BACKOFF_ENTRIES, MAX_FORWARD_ENTRIES,
+    MAX_RECENT_LOOKUP_REQUESTS,
 };
 use crate::proto::probe::LookupOutcomeKind;
 use crate::proto::stp::TreeState;
@@ -198,16 +199,7 @@ impl Node {
                 self.send_lookup_response(&request).await;
             }
             RequestOutcome::Forward => {
-                self.metrics().lookup.req_forwarded.inc();
                 self.forward_lookup_request(from, request).await;
-            }
-            RequestOutcome::ForwardRateLimited => {
-                self.metrics().lookup.req_forward_rate_limited.inc();
-                debug!(
-                    request_id = request.request_id,
-                    target = %self.peer_display_name(&request.target),
-                    "Forward rate limited, suppressing LookupRequest"
-                );
             }
             RequestOutcome::TtlExhausted => {
                 self.metrics()
@@ -638,10 +630,37 @@ impl Node {
             tree_state: &self.tree_state,
             my_addr: *self.node_addr(),
         };
-        let outcome =
-            crate::proto::lookup::plan_transit_forward(&mut self.lookup, &mut request, from, &rv);
+        let outcome = crate::proto::lookup::plan_transit_forward(
+            &mut self.lookup,
+            &mut request,
+            from,
+            &rv,
+            Self::now_ms(),
+        );
+        // A full limiter evicts rather than failing open; one warn for the
+        // flood that fills it, then counted until it drains.
+        let evicted = self.lookup.forward_limiter.take_evicted();
+        if self.forward_bound_log.refused(evicted) {
+            warn!(
+                bound = MAX_FORWARD_ENTRIES,
+                "Lookup forward limiter at its bound; the peer holding the most entries loses its oldest"
+            );
+        }
+        if !matches!(outcome, crate::proto::lookup::ForwardOutcome::RateLimited) {
+            self.metrics().lookup.req_forwarded.inc();
+        }
         match outcome {
             crate::proto::lookup::ForwardOutcome::TtlExhausted => {}
+            crate::proto::lookup::ForwardOutcome::RateLimited => {
+                self.metrics().lookup.req_forward_rate_limited.inc();
+                debug!(
+                    request_id = request.request_id,
+                    from = %self.peer_display_name(from),
+                    target = %self.peer_display_name(&request.target),
+                    reason = "rate-limited",
+                    "Forward rate limited, suppressing LookupRequest"
+                );
+            }
             crate::proto::lookup::ForwardOutcome::NoPeers => {
                 self.metrics().lookup.req_no_tree_peer.inc();
                 trace!(
@@ -878,6 +897,21 @@ impl Node {
             info!(
                 evicted,
                 "Lookup failure table below its bound again; entries evicted while it was full"
+            );
+        }
+
+        // Entries of peers that have gone quiet are only cleared by the
+        // limiter's sweep, so run it here as well as on arrivals, or a
+        // flood that stops would hold the latch.
+        self.lookup.forward_limiter.prune(now_ms);
+        let at_bound = self.lookup.forward_limiter.entry_count() >= MAX_FORWARD_ENTRIES;
+        if let Some(evicted) = self
+            .forward_bound_log
+            .tick(at_bound, std::time::Instant::now())
+        {
+            info!(
+                evicted,
+                "Lookup forward limiter below its bound again; entries evicted while it was full"
             );
         }
     }

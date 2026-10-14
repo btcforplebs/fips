@@ -259,11 +259,17 @@ information arrives.
 
 ### Transit-Side Rate Limiting
 
-Transit nodes enforce a per-target minimum interval (default 2s, configurable
-via `forward_min_interval_secs`) for forwarded lookups. This is
-defense-in-depth against misbehaving nodes that generate fresh `request_id`s
-at high rate to bypass dedup. The rate limiter collapses rapid-fire lookups
-for the same target regardless of `request_id`.
+Transit nodes enforce a minimum interval per link peer and target (default
+2s, configurable via `forward_min_interval_secs`) for forwarded lookups. This
+is defense-in-depth against misbehaving nodes that generate fresh
+`request_id`s at high rate to bypass dedup. The rate limiter collapses
+rapid-fire lookups for the same target from the same link peer regardless of
+`request_id`. It is keyed on the link peer rather than the request's origin,
+which is unsigned and chosen by the sender, so one neighbour repeating a
+target does not suppress other neighbours' requests for it. Only a request
+that some peer can carry is recorded. The limiter holds at most 4096 entries;
+at that bound the peer holding the most entries loses its oldest, and the new
+entry is always recorded.
 
 ### LookupResponse
 

@@ -71,6 +71,10 @@ pub(crate) enum ForwardOutcome {
         actions: Vec<LookupAction>,
         used_fallback: bool,
     },
+    /// A peer could carry it, but the link peer it came from asked for the
+    /// same target within the forward limiter's interval. Only
+    /// [`plan_transit_forward`] returns this.
+    RateLimited,
 }
 
 /// Plan the transit forward of an inbound LookupRequest.
@@ -130,21 +134,32 @@ pub(crate) fn plan_forward(
 /// Plan the transit forward of an inbound LookupRequest and record, on the
 /// request's recent-request entry, the link peers it was sent to.
 ///
-/// Runs [`plan_forward`]; on `Forward` the selected peers become the
-/// request's `forwarded_to`, the only peers a response to it is accepted
-/// from (see [`classify_response`]). `NoPeers` and `TtlExhausted` record
-/// nothing, so a response to a request this node did not forward is never
-/// eligible. The request must already be recorded by [`classify_request`].
+/// Runs [`plan_forward`]; on `Forward` it consults the forward limiter for
+/// `(from, target)`, and when that admits the request the selected peers
+/// become the request's `forwarded_to`, the only peers a response to it is
+/// accepted from (see [`classify_response`]). `NoPeers`, `TtlExhausted` and
+/// `RateLimited` record nothing, so a response to a request this node did
+/// not forward is never eligible, and a target no peer reaches takes no
+/// limiter entry. The request must already be recorded by
+/// [`classify_request`].
 pub(crate) fn plan_transit_forward(
     lookup: &mut Lookup,
     request: &mut LookupRequest,
     from: &NodeAddr,
     rv: &impl RoutingView,
+    now_ms: u64,
 ) -> ForwardOutcome {
     let outcome = plan_forward(request, from, rv);
-    if let ForwardOutcome::Forward { actions, .. } = &outcome
-        && let Some(recent) = lookup.recent_requests.get_mut(&request.request_id)
+    let ForwardOutcome::Forward { actions, .. } = &outcome else {
+        return outcome;
+    };
+    if !lookup
+        .forward_limiter
+        .should_forward(from, &request.target, now_ms)
     {
+        return ForwardOutcome::RateLimited;
+    }
+    if let Some(recent) = lookup.recent_requests.get_mut(&request.request_id) {
         recent.forwarded_to = actions
             .iter()
             .filter_map(|action| match action {
@@ -205,10 +220,9 @@ pub(crate) enum RequestOutcome {
     OwnRequestLooped,
     /// We are the lookup target — the shell generates + sends the response.
     RespondAsTarget,
-    /// Forward the request onward (the shell calls the forward planner).
+    /// Forward the request onward (the shell calls the forward planner,
+    /// which also applies the forward limiter).
     Forward,
-    /// Transit forward suppressed by the per-target forward rate limiter.
-    ForwardRateLimited,
     /// TTL exhausted, not the target — drop.
     TtlExhausted,
 }
@@ -269,10 +283,10 @@ fn make_room(
     })
 }
 
-/// Classify an inbound LookupRequest against the recent-request dedup cache and
-/// the transit forward rate limiter. Purges expired dedup entries, records the
-/// request for reverse-path forwarding on the non-drop paths, and decides the
-/// route. Pure over Lookup state + node addr + injected clock; no I/O, no view.
+/// Classify an inbound LookupRequest against the recent-request dedup cache.
+/// Purges expired dedup entries, records the request for reverse-path
+/// forwarding on the non-drop paths, and decides the route. Pure over Lookup
+/// state + node addr + injected clock; no I/O, no view.
 ///
 /// A full cache evicts rather than refuses. Refusing put the capacity check
 /// ahead of the check for whether the request names this node, so one link
@@ -284,7 +298,7 @@ fn make_room(
 /// The loosening this accepts: an evicted `request_id` arriving again inside
 /// the dedup window is forwarded a second time rather than recognised as a
 /// duplicate, and a response still in flight for it has lost its reverse
-/// path. The per-target forward limiter and the request TTL already bound
+/// path. The transit forward limiter and the request TTL already bound
 /// what that second forward can cost, and the alternative — refusing the
 /// arrival — is the availability defect above.
 ///
@@ -353,14 +367,7 @@ pub(crate) fn classify_request(
     let outcome = if request.target == *my_addr {
         RequestOutcome::RespondAsTarget
     } else if request.can_forward() {
-        if lookup
-            .forward_limiter
-            .should_forward(from, &request.target, now_ms)
-        {
-            RequestOutcome::Forward
-        } else {
-            RequestOutcome::ForwardRateLimited
-        }
+        RequestOutcome::Forward
     } else {
         RequestOutcome::TtlExhausted
     };
@@ -686,8 +693,7 @@ mod dedup_eviction_tests {
     }
 
     /// Deliver one transit request from `from`, discarding the route
-    /// decision: these tests are about which entries survive, and the
-    /// forward limiter's verdict does not affect what is cached.
+    /// decision: these tests are about which entries survive.
     fn deliver(
         lookup: &mut Lookup,
         request_id: u64,

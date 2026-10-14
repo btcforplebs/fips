@@ -637,6 +637,8 @@ pub struct Node {
     /// Log latch for the lookup failure table at its bound. Held here rather
     /// than inside `lookup` because the shell logs it on the monotonic clock.
     backoff_bound_log: BoundLog,
+    /// Log latch for the lookup forward limiter at `MAX_FORWARD_ENTRIES`.
+    forward_bound_log: BoundLog,
 
     // === Diagnostics ===
     /// In-flight `probe` jobs plus their per-target ownership claims. Driven
@@ -1033,6 +1035,7 @@ impl Node {
             ),
             discovery_sign_limiter: LookupSignRateLimiter::new(),
             backoff_bound_log: BoundLog::default(),
+            forward_bound_log: BoundLog::default(),
             peering: peering::reconcile::Peering::new(),
             last_parent_reeval: None,
             last_congestion_log: None,
@@ -1196,6 +1199,7 @@ impl Node {
             lookup: Lookup::new(LookupBackoff::new(), LookupForwardRateLimiter::new()),
             discovery_sign_limiter: LookupSignRateLimiter::new(),
             backoff_bound_log: BoundLog::default(),
+            forward_bound_log: BoundLog::default(),
             peering: peering::reconcile::Peering::new(),
             last_parent_reeval: None,
             last_congestion_log: None,

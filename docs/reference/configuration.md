@@ -226,7 +226,7 @@ the current coordinates of a mesh address the node already knows.
 | `node.lookup.recent_expiry_secs` | u64 | `10` | Dedup cache expiry for recent request IDs |
 | `node.lookup.backoff_base_secs` | u64 | `0` | Optional post-failure suppression base in seconds; doubles per consecutive failure. `0` disables (default); the per-attempt sequence is the only retry pacing |
 | `node.lookup.backoff_max_secs` | u64 | `0` | Cap on optional post-failure backoff |
-| `node.lookup.forward_min_interval_secs` | u64 | `2` | Transit-side rate limiting: minimum interval between forwarded lookups for the same target |
+| `node.lookup.forward_min_interval_secs` | u64 | `2` | Transit-side rate limiting: minimum interval between forwarded lookups for the same target from the same link peer |
 
 ### Peer Rendezvous (`node.rendezvous.*`)
 

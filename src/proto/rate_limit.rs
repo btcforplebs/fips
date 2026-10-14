@@ -106,11 +106,6 @@ impl PerAddrRateLimiter {
     }
 
     #[cfg(test)]
-    pub(crate) fn set_interval_ms(&mut self, interval_ms: u64) {
-        self.min_interval_ms = interval_ms;
-    }
-
-    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.last.len()
     }

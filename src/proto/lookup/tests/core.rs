@@ -841,20 +841,31 @@ fn classify_request_ttl_exhausted_for_non_target() {
 }
 
 #[test]
-fn classify_request_forward_rate_limited() {
+fn plan_transit_forward_rate_limited() {
     let mut lookup = empty_lookup();
     let from = make_node_addr(0x01);
     let my_addr = make_node_addr(0x99);
     let target = make_node_addr(0xAA);
-    // Pre-seed the forward limiter so should_forward(target) returns false
-    // on the next call within the (default 2s) min interval.
+    // Pre-seed the forward limiter so should_forward(from, target) returns
+    // false on the next call within the (default 2s) min interval.
     assert!(lookup.forward_limiter.should_forward(&from, &target, 1000));
 
-    let request = make_request_id(1, target, 3);
+    let mut request = make_request_id(1, target, 3);
     assert!(matches!(
         classify_request(&mut lookup, &request, &from, &my_addr, 1000, 5000, 4096, 1).outcome,
-        RequestOutcome::ForwardRateLimited
+        RequestOutcome::Forward
     ));
+    let rv = MockRoutingView {
+        peers: vec![(make_node_addr(0x02), true, true)],
+    };
+    assert!(matches!(
+        plan_transit_forward(&mut lookup, &mut request, &from, &rv, 1000),
+        ForwardOutcome::RateLimited
+    ));
+    assert!(
+        lookup.recent_requests[&1].forwarded_to.is_empty(),
+        "a rate-limited request records no peer it was sent to"
+    );
 }
 
 #[test]
@@ -1045,7 +1056,7 @@ fn forwarded(
         downstream.iter().map(|peer| (*peer, true, true)).collect();
     peers.push((upstream, true, true));
     let rv = MockRoutingView { peers };
-    match plan_transit_forward(lookup, &mut request, &upstream, &rv) {
+    match plan_transit_forward(lookup, &mut request, &upstream, &rv, 1000) {
         ForwardOutcome::Forward { actions, .. } => {
             assert_eq!(action_peers(&actions), downstream, "precondition: sent on")
         }
@@ -1119,7 +1130,7 @@ fn a_response_to_a_request_this_node_did_not_forward_is_ineligible() {
     };
     assert!(
         matches!(
-            plan_transit_forward(&mut lookup, &mut request, &upstream, &rv),
+            plan_transit_forward(&mut lookup, &mut request, &upstream, &rv, 1000),
             ForwardOutcome::NoPeers
         ),
         "precondition: no peer reaches the target"
@@ -1251,4 +1262,179 @@ fn a_ninth_distinct_response_is_still_relayed() {
         classify_response(&mut lookup, 7, &target, &responder(), digest(0xFF)),
         ResponseRoute::Transit { .. }
     ));
+}
+
+// --- Transit forward limiter: who shares a slot, and what fills it ---
+
+/// Deliver one transit request through `classify_request` and
+/// `plan_transit_forward`, as the shell does, with a dedup cache large enough
+/// that its own eviction policy never interferes and one tree peer that
+/// reaches every target.
+fn transit_request(
+    lookup: &mut Lookup,
+    request_id: u64,
+    target: NodeAddr,
+    from: &NodeAddr,
+    now_ms: u64,
+) -> ForwardOutcome {
+    let my_addr = make_node_addr(0x99);
+    let mut request = make_request_id(request_id, target, 5);
+    let classification =
+        classify_request(lookup, &request, from, &my_addr, now_ms, 60_000, 1 << 20, 2);
+    assert!(
+        matches!(classification.outcome, RequestOutcome::Forward),
+        "precondition: a fresh transit request is to be forwarded"
+    );
+    let rv = MockRoutingView {
+        peers: vec![(make_node_addr(0x77), true, true)],
+    };
+    plan_transit_forward(lookup, &mut request, from, &rv, now_ms)
+}
+
+#[test]
+fn one_peer_refreshing_a_target_does_not_suppress_another_peers_request_for_it() {
+    let mut lookup = empty_lookup();
+    let attacker = make_node_addr(0x01);
+    let honest = make_node_addr(0x02);
+    let target = make_node_addr(0xAA);
+
+    assert!(matches!(
+        transit_request(&mut lookup, 1, target, &attacker, 1_000),
+        ForwardOutcome::Forward { .. }
+    ));
+    assert!(
+        matches!(
+            transit_request(&mut lookup, 2, target, &honest, 1_500),
+            ForwardOutcome::Forward { .. }
+        ),
+        "another link peer's request for the same target was suppressed by the first \
+         peer's entry"
+    );
+}
+
+#[test]
+fn a_peer_repeating_a_target_within_the_interval_is_still_suppressed() {
+    let mut lookup = empty_lookup();
+    let peer = make_node_addr(0x01);
+    let target = make_node_addr(0xAA);
+
+    assert!(matches!(
+        transit_request(&mut lookup, 1, target, &peer, 1_000),
+        ForwardOutcome::Forward { .. }
+    ));
+    assert!(matches!(
+        transit_request(&mut lookup, 2, target, &peer, 1_500),
+        ForwardOutcome::RateLimited
+    ));
+}
+
+#[test]
+fn a_target_no_peer_reaches_takes_no_limiter_entry() {
+    let mut lookup = empty_lookup();
+    let from = make_node_addr(0x01);
+    let my_addr = make_node_addr(0x99);
+    let unreachable = make_node_addr(0xAB);
+    let mut request = make_request_id(1, unreachable, 5);
+    classify_request(
+        &mut lookup,
+        &request,
+        &from,
+        &my_addr,
+        1_000,
+        60_000,
+        4096,
+        2,
+    );
+    // A peer exists, but no peer's filter reaches the target.
+    let rv = MockRoutingView {
+        peers: vec![(make_node_addr(0x05), true, false)],
+    };
+
+    assert!(
+        matches!(
+            plan_transit_forward(&mut lookup, &mut request, &from, &rv, 1_000),
+            ForwardOutcome::NoPeers
+        ),
+        "precondition: no peer can carry the request"
+    );
+    assert_eq!(
+        lookup.forward_limiter.len(),
+        0,
+        "a request no peer can carry took a forward limiter entry"
+    );
+
+    // The same peer and target once a peer reaches it: the limiter records
+    // it and suppresses the repeat, so the zero above is the planner leaving
+    // the limiter alone and not a limiter that records nothing.
+    let rv = MockRoutingView {
+        peers: vec![(make_node_addr(0x05), true, true)],
+    };
+    let mut request = make_request_id(2, unreachable, 5);
+    classify_request(
+        &mut lookup,
+        &request,
+        &from,
+        &my_addr,
+        1_100,
+        60_000,
+        4096,
+        2,
+    );
+    assert!(matches!(
+        plan_transit_forward(&mut lookup, &mut request, &from, &rv, 1_100),
+        ForwardOutcome::Forward { .. }
+    ));
+    assert_eq!(lookup.forward_limiter.len(), 1);
+    let mut request = make_request_id(3, unreachable, 5);
+    classify_request(
+        &mut lookup,
+        &request,
+        &from,
+        &my_addr,
+        1_200,
+        60_000,
+        4096,
+        2,
+    );
+    assert!(matches!(
+        plan_transit_forward(&mut lookup, &mut request, &from, &rv, 1_200),
+        ForwardOutcome::RateLimited
+    ));
+}
+
+#[test]
+fn a_full_limiter_still_records_the_newcomer() {
+    // MAX_FORWARD_ENTRIES (4096) is the production bound on the limiter.
+    let mut lookup = empty_lookup();
+    let flooder = make_node_addr(0x01);
+    let honest = make_node_addr(0x02);
+    let now = 1_000;
+    for i in 0..MAX_FORWARD_ENTRIES as u32 {
+        transit_request(
+            &mut lookup,
+            10_000 + u64::from(i),
+            distinct_addr(i + 1),
+            &flooder,
+            now,
+        );
+    }
+    assert_eq!(
+        lookup.forward_limiter.len(),
+        MAX_FORWARD_ENTRIES,
+        "precondition: the flooder's made-up targets fill the limiter"
+    );
+
+    let target = make_node_addr(0xAA);
+    assert!(matches!(
+        transit_request(&mut lookup, 1, target, &honest, now),
+        ForwardOutcome::Forward { .. }
+    ));
+    assert!(
+        matches!(
+            transit_request(&mut lookup, 2, target, &honest, now + 100),
+            ForwardOutcome::RateLimited
+        ),
+        "with the limiter full, a repeat for the same target inside the interval was \
+         forwarded: the newcomer was admitted without being recorded"
+    );
 }
