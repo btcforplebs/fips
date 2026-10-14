@@ -1507,3 +1507,66 @@ async fn an_inbound_claim_checked_while_its_peer_moves_links_is_still_declined()
     assert_eq!(verified_at(&nodes[1], &l1).await, Some(false), "L1 is not");
     cleanup_nodes(&mut nodes).await;
 }
+
+// ============================================================================
+// Impostor links and the opportunistic dial budget
+// ============================================================================
+
+/// With BLE `auto_connect` on and node 0 not configured, four links claiming
+/// node 0 whose handshakes are never answered must not stop node 1 dialling
+/// node 0's genuine link when it arrives.
+#[tokio::test]
+async fn a_genuine_ble_link_is_dialled_while_impostor_links_claiming_its_node_are_unanswered() {
+    let auto = BleConfig {
+        auto_connect: Some(true),
+        ..base_config()
+    };
+    let mut nodes = vec![
+        make_test_node_ble_with(1, auto.clone()).await,
+        make_test_node_ble_with(2, auto).await,
+    ];
+    // Node 1 holds the larger key, so it admits inbounds claiming node 0.
+    larger_second(&mut nodes);
+    let key_0 = nodes[0].node.identity().pubkey().serialize();
+    let n0 = *nodes[0].node.node_addr();
+    let tid = nodes[1].transport_id;
+    // The opportunistic layer dials only while the node runs.
+    nodes[1].node.supervisor.state = NodeState::Running;
+
+    let mut impostors = Vec::new();
+    for n in 20..24 {
+        let at = ble_addr(n).to_transport_addr();
+        impostors.push(inject_claim(&nodes, 1, &ble_addr(n), key_0).await);
+        assert!(
+            until(|| pooled_at(&nodes[1], &at)).await,
+            "impostor link {n} is pooled"
+        );
+    }
+    nodes[1].node.poll_transport_discovery().await;
+    for n in 20..24 {
+        let at = ble_addr(n).to_transport_addr();
+        assert!(
+            nodes[1].node.is_connecting_to_peer_on_path(&n0, tid, &at),
+            "node 1 dials impostor link {n} for node 0"
+        );
+    }
+
+    // Node 0's genuine link arrives while the four handshakes are unanswered.
+    let _bank = link_genuinely(&nodes).await;
+    let genuine = nodes[1].addr.clone();
+    assert!(
+        until(|| pooled_at(&nodes[1], &genuine)).await,
+        "node 1 admits node 0's genuine link"
+    );
+    nodes[1].node.poll_transport_discovery().await;
+    assert!(
+        nodes[1]
+            .node
+            .is_connecting_to_peer_on_path(&n0, tid, &genuine),
+        "node 1 does not dial node 0's genuine link while four impostor \
+         handshakes claiming node 0 are in flight"
+    );
+
+    drop(impostors);
+    cleanup_nodes(&mut nodes).await;
+}

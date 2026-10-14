@@ -29,9 +29,10 @@
 //!    dial happens on a later retry-slot invocation (the two-phase timing,
 //!    below).
 //! 3. **Opportunistic growth** — transport-neighbor beacons (subsumes
-//!    `poll_transport_discovery`, budget + per-peer cap) and LAN mDNS peers
-//!    (held candidates from `poll_lan_rendezvous`, budget, admission and an
-//!    in-flight cap on unconfigured dials).
+//!    `poll_transport_discovery`, budget and admission, one dial per distinct
+//!    path) and LAN mDNS peers (held candidates from `poll_lan_rendezvous`,
+//!    budget, admission, the per-peer cap and an in-flight cap on unconfigured
+//!    dials).
 //! 4. **Ceiling** — not a separate pass; the `node.limits` triple plus the
 //!    per-tick and per-peer caps are enforced inline in every layer through the
 //!    [`Budget`] the driver builds. "Any limb binds → stop growing".
@@ -131,7 +132,10 @@ pub(crate) struct Budget {
     pub discovery_per_tick: usize,
     /// `MAX_RETRY_CONNECTIONS_PER_TICK` (16).
     pub retry_per_tick: usize,
-    /// `MAX_PARALLEL_PATH_CANDIDATES_PER_PEER` (4).
+    /// `MAX_PARALLEL_PATH_CANDIDATES_PER_PEER` (4). Applies to LAN
+    /// candidates only: a transport neighbour's key is the remote's
+    /// unproven claim, so counting its dials against the claimed node would
+    /// let links claiming a node use up that node's genuine path.
     pub per_peer_cap: usize,
 }
 
@@ -166,8 +170,8 @@ pub(crate) struct Observed {
     /// Peers with an in-flight outbound connection (`is_connecting_to_peer`).
     pub connecting: HashSet<NodeAddr>,
     /// In-flight legs per peer = connections(expected == addr) +
-    /// pending_connects(addr), used by the per-peer parallel cap. Anonymous
-    /// None-identity legs never key this map.
+    /// pending_connects(addr), used by the LAN layer's per-peer parallel cap.
+    /// Anonymous None-identity legs never key this map.
     pub in_flight_by_peer: HashMap<NodeAddr, usize>,
     /// Unconfigured LAN dials still connecting, held against
     /// [`MAX_LAN_DIALS_IN_FLIGHT`].
@@ -714,7 +718,9 @@ impl PeeringReconciler {
     /// Layer 3 — opportunistic growth (transport neighbors + LAN).
     ///
     /// Transport-neighbor growth (subsumes `poll_transport_discovery`) uses the
-    /// discovery connect budget and the per-peer parallel cap. LAN growth
+    /// discovery connect budget and needs admission for a new peer; it dials
+    /// each distinct path once per call and counts nothing per claimed node,
+    /// since the claim is unproven until the handshake. LAN growth
     /// (from the held mDNS candidates) continues from the same budget, needs
     /// admission for a new peer, and keeps unconfigured LAN handshakes in
     /// flight to at most `MAX_LAN_DIALS_IN_FLIGHT`. The driver pre-filters
@@ -728,30 +734,32 @@ impl PeeringReconciler {
         pools: &DiscoveryPools,
         actions: &mut Vec<PeeringAction>,
     ) {
-        // Transport neighbors: discovery_connect_budget ∧ per-peer cap.
+        // Transport neighbors: discovery_connect_budget ∧ admission, one dial
+        // per distinct path.
         let mut connect_budget = budget
             .handshake_slots
             .min(budget.link_slots)
             .min(budget.discovery_per_tick);
-        let mut queued_per_peer: HashMap<NodeAddr, usize> = HashMap::new();
+        let mut queued_paths: HashSet<(TransportId, &TransportAddr, NodeAddr)> = HashSet::new();
 
         for cand in &pools.transport_neighbors {
             let Some(identity) = cand.identity else {
-                continue; // anonymous leg cannot key the per-peer cap
+                continue; // an anonymous leg is not dialled from here
             };
+            if connect_budget == 0 {
+                break;
+            }
             let addr = *identity.node_addr();
-            let queued = queued_per_peer.get(&addr).copied().unwrap_or(0);
-            let per_peer = self
-                .path_candidate_budget(&addr, observed, budget)
-                .saturating_sub(queued);
-            if connect_budget == 0 || per_peer == 0 {
+            let connected = observed.connected.contains(&addr);
+            if !connected && !budget.admission_ok {
                 continue;
             }
-            let connected = observed.connected.contains(&addr);
+            if !queued_paths.insert((cand.transport_id, &cand.remote_addr, addr)) {
+                continue;
+            }
             let mut emit = cand.clone();
             emit.active_refresh = connected;
             actions.push(PeeringAction::Connect(emit));
-            *queued_per_peer.entry(addr).or_default() += 1;
             connect_budget = connect_budget.saturating_sub(1);
         }
 
@@ -792,7 +800,7 @@ impl PeeringReconciler {
         }
     }
 
-    /// The per-peer parallel-attempt budget (subsumes
+    /// The per-peer parallel-attempt budget for LAN candidates (subsumes
     /// `path_candidate_attempt_budget`): zero when the peer is new and admission
     /// binds, else `min(handshake_slots, link_slots, per_peer_cap - in_flight)`.
     fn path_candidate_budget(
@@ -1352,38 +1360,6 @@ mod tests {
         );
     }
 
-    // ---- Parity: per-peer parallel cap (4 legs max) ------------------------
-
-    #[test]
-    fn per_peer_parallel_cap_limits_legs() {
-        let (id, _addr, _npub) = mk_peer();
-        // Five distinct paths to the SAME peer.
-        let neighbors: Vec<Candidate> = (0..5)
-            .map(|i| Candidate {
-                transport_id: TransportId::new(1),
-                remote_addr: TransportAddr::from_string(&format!("203.0.113.{i}:2121")),
-                identity: Some(id),
-                active_refresh: false,
-            })
-            .collect();
-        let pools = DiscoveryPools {
-            transport_neighbors: neighbors,
-            ..DiscoveryPools::default()
-        };
-
-        let mut r = PeeringReconciler::default();
-        let actions = r.reconcile(
-            &base_policy(),
-            &Observed::default(),
-            &ample_budget(),
-            &pools,
-            10_000,
-            Gate::Reconciling,
-        );
-        // per_peer_cap == 4, in_flight == 0 → at most 4 legs to one peer.
-        assert_eq!(count_connects(&actions), 4);
-    }
-
     // ---- Parity: per-tick retry cap (17 due → 16 dial + 1 deferred) --------
 
     #[test]
@@ -1592,5 +1568,130 @@ mod tests {
         assert_eq!(opportunistic(&ample_budget(), &at(8), &pools), 1);
         // One finished: one unconfigured dial resumes beside the configured.
         assert_eq!(opportunistic(&ample_budget(), &at(7), &pools), 2);
+    }
+
+    #[test]
+    fn a_lan_candidate_waits_while_four_handshakes_to_its_node_are_in_flight() {
+        let (id, addr, _) = mk_peer();
+        let pools = DiscoveryPools {
+            lan: vec![lan_cand(id, 10_000)],
+            ..DiscoveryPools::default()
+        };
+        let at = |in_flight| Observed {
+            in_flight_by_peer: [(addr, in_flight)].into_iter().collect(),
+            ..Observed::default()
+        };
+        assert_eq!(
+            opportunistic(&ample_budget(), &at(4), &pools),
+            0,
+            "the per-peer cap holds a LAN candidate back"
+        );
+        // The control: one fewer in flight and the same candidate is dialled.
+        assert_eq!(opportunistic(&ample_budget(), &at(3), &pools), 1);
+    }
+
+    // ---- Transport neighbours: other claims to a node do not block a path ---
+
+    /// A transport-neighbour candidate for `identity` at a distinct BLE
+    /// address `n`.
+    fn neighbour_cand(identity: PeerIdentity, n: u8) -> Candidate {
+        Candidate {
+            transport_id: TransportId::new(1),
+            remote_addr: TransportAddr::from_string(&format!("hci0/AA:BB:CC:DD:EE:{n:02X}")),
+            identity: Some(identity),
+            active_refresh: false,
+        }
+    }
+
+    /// Four handshakes in flight to addresses claiming a node, answered or
+    /// not, must not stop a new path to that node being dialled.
+    #[test]
+    fn a_transport_neighbour_is_dialled_while_four_handshakes_claiming_its_node_are_in_flight() {
+        let (id, addr, _) = mk_peer();
+        let pools = DiscoveryPools {
+            transport_neighbors: vec![neighbour_cand(id, 1)],
+            ..DiscoveryPools::default()
+        };
+        let observed = Observed {
+            in_flight_by_peer: [(addr, 4)].into_iter().collect(),
+            ..Observed::default()
+        };
+        assert_eq!(
+            opportunistic(&ample_budget(), &observed, &pools),
+            1,
+            "the new path is dropped because four other handshakes claim its node"
+        );
+    }
+
+    /// Five distinct transport-neighbour paths to one node in one poll are
+    /// all dialled within the per-tick budget.
+    #[test]
+    fn five_transport_neighbours_for_one_node_in_one_poll_are_all_dialled() {
+        let (id, _, _) = mk_peer();
+        let pools = DiscoveryPools {
+            transport_neighbors: (1..=5).map(|n| neighbour_cand(id, n)).collect(),
+            ..DiscoveryPools::default()
+        };
+        assert_eq!(
+            opportunistic(&ample_budget(), &Observed::default(), &pools),
+            5,
+            "candidates beyond four for one node in a poll are dropped"
+        );
+    }
+
+    /// Dropping the per-node count leaves the per-tick discovery budget as
+    /// the bound on one poll's dials, for one node's paths as for many.
+    #[test]
+    fn discovery_per_tick_still_caps_a_poll() {
+        let (id, _, _) = mk_peer();
+        let pools = DiscoveryPools {
+            transport_neighbors: (1..=20).map(|n| neighbour_cand(id, n)).collect(),
+            ..DiscoveryPools::default()
+        };
+        assert_eq!(
+            opportunistic(&ample_budget(), &Observed::default(), &pools),
+            16
+        );
+    }
+
+    /// A transport neighbour for a node not yet a peer is not dialled while
+    /// admission refuses new peers; one for a connected peer still is.
+    #[test]
+    fn admission_still_blocks_a_new_node() {
+        let (id, addr, _) = mk_peer();
+        let pools = DiscoveryPools {
+            transport_neighbors: vec![neighbour_cand(id, 1)],
+            ..DiscoveryPools::default()
+        };
+        let closed = Budget {
+            admission_ok: false,
+            ..ample_budget()
+        };
+        assert_eq!(opportunistic(&closed, &Observed::default(), &pools), 0);
+        let connected = Observed {
+            connected: [addr].into_iter().collect(),
+            ..Observed::default()
+        };
+        assert_eq!(opportunistic(&closed, &connected, &pools), 1);
+    }
+
+    /// The same path offered twice in one poll is dialled once; a second
+    /// node claimed at that address is a distinct candidate.
+    #[test]
+    fn the_same_path_twice_in_one_poll_dials_once() {
+        let (id, _, _) = mk_peer();
+        let (other, _, _) = mk_peer();
+        let pools = DiscoveryPools {
+            transport_neighbors: vec![
+                neighbour_cand(id, 1),
+                neighbour_cand(id, 1),
+                neighbour_cand(other, 1),
+            ],
+            ..DiscoveryPools::default()
+        };
+        assert_eq!(
+            opportunistic(&ample_budget(), &Observed::default(), &pools),
+            2
+        );
     }
 }
