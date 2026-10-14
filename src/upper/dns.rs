@@ -11,6 +11,7 @@
 //! cache population, enabling subsequent TUN packet routing.
 
 use crate::dnsmsg::{self, AA, Outcome, Query, Rcode, Screen, TYPE_AAAA};
+use crate::identity::FIPS_ADDRESS_PREFIX;
 use crate::upper::hosts::{HostMap, HostMapReloader};
 use crate::{NodeAddr, PeerIdentity};
 use std::net::Ipv6Addr;
@@ -158,15 +159,95 @@ fn answer(query: &Query<'_>, ttl: u32, hosts: &HostMap) -> (Vec<u8>, Option<DnsR
 /// `odhcpd` and NetworkManager ULA auto-generation) would collide with the
 /// FIPS mesh prefix under a source-prefix filter; this filter is immune.
 ///
-/// The filter does not cover the reply's path. A reply goes to the query's
-/// source by the routing table, so a query arriving on another interface with
-/// a forged mesh source address is answered into the mesh, from this node's
-/// mesh address. Only a non-loopback bind exposes that to other hosts.
+/// The filter does not cover the reply's path; [`reply_path`] does. On Linux
+/// with the socket bound to the wildcard address, a reply to a mesh source
+/// address (`fd00::/8`) leaves only by the interface the query arrived on;
+/// with the socket bound to a specific address, a query from a mesh source
+/// address that arrived on any interface but the mesh interface gets no
+/// reply, provided the mesh interface's index is known. So on a wildcard
+/// bind, and on a specific bind with a known mesh index, a query arriving on
+/// another interface with a forged mesh source address is not answered into
+/// the mesh by this socket; on a specific bind with no known mesh index it
+/// can be. A node that forwards IPv6 from that interface into the mesh can
+/// still have the reply routed back to it and forward it into the mesh, as
+/// it would any packet from that network to a mesh address. On other
+/// platforms the reply goes to the query's source by the routing table, and
+/// such a query is answered into the mesh, from this node's mesh address;
+/// only a non-loopback bind exposes that to other hosts.
 fn is_mesh_interface_query(arrival_ifindex: Option<u32>, mesh_ifindex: Option<u32>) -> bool {
     match (arrival_ifindex, mesh_ifindex) {
         (Some(arrival), Some(mesh)) => arrival == mesh,
         _ => false,
     }
+}
+
+/// How a reply to a DNS query is sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplyPath {
+    /// To the query's source by the routing table.
+    Routed,
+    /// To the query's source, only out of the interface with this index.
+    Pinned(u32),
+    /// Not sent: no path is known to keep the reply out of the mesh.
+    Withheld,
+}
+
+/// Choose how to send the reply to a query from `src` that arrived on
+/// `arrival_ifindex`, given the mesh interface's index and whether the
+/// socket is bound to the wildcard address (`::` or `0.0.0.0`).
+///
+/// A reply to a mesh source address (`fd00::/8`, first byte
+/// [`FIPS_ADDRESS_PREFIX`]) is pinned to the arrival interface, so a query
+/// that arrived on a LAN with a forged mesh source is not answered into the
+/// mesh by the TUN's `fd00::/8` route. Everything else is routed. Four kernel
+/// facts set the rule, measured on Linux:
+///
+/// - the mesh route is `fd00::/8`, so only those destinations can be drawn
+///   into the mesh;
+/// - Linux holds a reply strictly to a requested outgoing interface only when
+///   the source address is left unspecified, so the pin names the interface
+///   alone (a pinned source address still leaves by the mesh);
+/// - a socket bound to a specific address always sends from that address,
+///   so on such a socket the pin is not strict and the reply can still leave
+///   by the mesh;
+/// - a send to a v4-mapped address with an unspecified IPv6 source fails with
+///   `EINVAL`, so IPv4 clients on a dual-stack socket are never pinned.
+///
+/// On a wildcard socket, a mesh source with a known arrival interface is
+/// pinned and one with an unknown arrival interface is routed. On a socket
+/// bound to a specific address, a mesh source is answered (pinned) only when
+/// it arrived on the mesh interface; when it arrived on any other interface,
+/// or its arrival interface is unknown, the reply is withheld. With no known
+/// mesh interface (no TUN, an application-supplied TUN, or an unresolved
+/// index) the wildcard rule applies.
+///
+/// The decision is the same on every target; the responder applies it on
+/// Linux only and routes every reply elsewhere.
+fn reply_path(
+    src: std::net::SocketAddr,
+    arrival_ifindex: Option<u32>,
+    mesh_ifindex: Option<u32>,
+    wildcard: bool,
+) -> ReplyPath {
+    let std::net::SocketAddr::V6(v6) = src else {
+        return ReplyPath::Routed;
+    };
+    if v6.ip().octets()[0] != FIPS_ADDRESS_PREFIX || v6.ip().to_ipv4_mapped().is_some() {
+        return ReplyPath::Routed;
+    }
+    match (arrival_ifindex, mesh_ifindex) {
+        (Some(arrival), Some(mesh)) if !wildcard && arrival != mesh => ReplyPath::Withheld,
+        (None, Some(_)) if !wildcard => ReplyPath::Withheld,
+        (Some(arrival), _) => ReplyPath::Pinned(arrival),
+        (None, _) => ReplyPath::Routed,
+    }
+}
+
+/// Whether a socket with local address `local` is bound to the wildcard
+/// address (`::` or `0.0.0.0`). An unreadable address counts as specific,
+/// the form for which [`reply_path`] withholds more.
+fn wildcard_bind(local: std::io::Result<std::net::SocketAddr>) -> bool {
+    local.is_ok_and(|addr| addr.ip().is_unspecified())
 }
 
 /// Run the DNS responder UDP server loop.
@@ -208,6 +289,7 @@ pub(crate) async fn run_responder(
     mesh_ifindex: Option<u32>,
 ) {
     let mut buf = vec![0u8; dnsmsg::MAX_DATAGRAM];
+    let wildcard = wildcard_bind(socket.local_addr());
 
     loop {
         let (len, src, arrival_ifindex) = match recv_with_pktinfo(&socket, &mut buf).await {
@@ -255,10 +337,133 @@ pub(crate) async fn run_responder(
             let _ = identity_tx.send(id).await;
         }
 
-        if let Err(e) = socket.send_to(&response_bytes, src).await {
+        let path = reply_path(src, arrival_ifindex, mesh_ifindex, wildcard);
+        if let Err(e) = send_reply(&socket, &response_bytes, src, path).await {
             debug!(error = %e, "DNS send error");
         }
     }
+}
+
+/// Send `buf` to `dst` by `path`: on Linux pinned to the arrival interface,
+/// routed, or dropped when withheld; on other targets always routed.
+async fn send_reply(
+    socket: &tokio::net::UdpSocket,
+    buf: &[u8],
+    dst: std::net::SocketAddr,
+    path: ReplyPath,
+) -> std::io::Result<usize> {
+    match path {
+        ReplyPath::Routed => socket.send_to(buf, dst).await,
+        #[cfg(target_os = "linux")]
+        ReplyPath::Pinned(ifindex) => send_pinned(socket, buf, dst, ifindex).await,
+        #[cfg(target_os = "linux")]
+        ReplyPath::Withheld => {
+            debug!(
+                src = %dst,
+                reason = "mesh-source-off-mesh-interface",
+                "DNS reply withheld on a specific bind"
+            );
+            Ok(0)
+        }
+        #[cfg(not(target_os = "linux"))]
+        ReplyPath::Pinned(_) | ReplyPath::Withheld => socket.send_to(buf, dst).await,
+    }
+}
+
+/// Send `buf` to the IPv6 address `dst` only out of interface `ifindex`.
+///
+/// One `sendmsg` carrying an `IPV6_PKTINFO` control message with the
+/// interface index and an unspecified source address, so the kernel picks
+/// the source and fails the send (`ENETUNREACH`) rather than route it by
+/// another interface when `dst` is not reachable through `ifindex`.
+#[cfg(target_os = "linux")]
+async fn send_pinned(
+    socket: &tokio::net::UdpSocket,
+    buf: &[u8],
+    dst: std::net::SocketAddr,
+    ifindex: u32,
+) -> std::io::Result<usize> {
+    use std::os::fd::AsRawFd;
+    let std::net::SocketAddr::V6(dst) = dst else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "pinned DNS reply to a non-IPv6 address",
+        ));
+    };
+    loop {
+        socket.writable().await?;
+        let fd = socket.as_raw_fd();
+        match socket.try_io(tokio::io::Interest::WRITABLE, || {
+            sendmsg_pinned(fd, buf, &dst, ifindex)
+        }) {
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+            other => return other,
+        }
+    }
+}
+
+/// Non-blocking `sendmsg` of `buf` to `dst` with one `IPV6_PKTINFO` control
+/// message naming `ifindex` and an unspecified source address.
+///
+/// Returns `Err(WouldBlock)` when the socket buffer is full (caller should
+/// await writability again).
+#[cfg(target_os = "linux")]
+fn sendmsg_pinned(
+    fd: std::os::fd::RawFd,
+    buf: &[u8],
+    dst: &std::net::SocketAddrV6,
+    ifindex: u32,
+) -> std::io::Result<usize> {
+    // SAFETY: an all-zero sockaddr_in6 is a valid value; the fields set
+    // below are the ones sendmsg reads.
+    let mut name: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+    name.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+    name.sin6_port = dst.port().to_be();
+    name.sin6_flowinfo = dst.flowinfo();
+    name.sin6_addr.s6_addr = dst.ip().octets();
+    name.sin6_scope_id = dst.scope_id();
+
+    let mut iov = libc::iovec {
+        iov_base: buf.as_ptr() as *mut _,
+        iov_len: buf.len(),
+    };
+
+    let info_len = std::mem::size_of::<libc::in6_pktinfo>() as u32;
+    // u64 elements keep the buffer aligned for cmsghdr; 64 bytes is ample
+    // for one IPV6_PKTINFO message.
+    let mut cmsg_buf = [0u64; 8];
+
+    // SAFETY: an all-zero msghdr is valid; every pointer stored in it below
+    // refers to a local that outlives the sendmsg call.
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_name = &mut name as *mut _ as *mut _;
+    msg.msg_namelen = std::mem::size_of::<libc::sockaddr_in6>() as u32;
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cmsg_buf.as_mut_ptr() as *mut _;
+    // SAFETY: CMSG_SPACE is a pure size computation.
+    msg.msg_controllen = unsafe { libc::CMSG_SPACE(info_len) } as _;
+
+    // SAFETY: msg_control points at a buffer of at least msg_controllen
+    // bytes, so CMSG_FIRSTHDR is non-null and its data fits one in6_pktinfo.
+    unsafe {
+        let cmsg = libc::CMSG_FIRSTHDR(&msg);
+        (*cmsg).cmsg_level = libc::IPPROTO_IPV6;
+        (*cmsg).cmsg_type = libc::IPV6_PKTINFO;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(info_len) as _;
+        let info = libc::in6_pktinfo {
+            ipi6_addr: libc::in6_addr { s6_addr: [0; 16] },
+            ipi6_ifindex: ifindex,
+        };
+        std::ptr::write_unaligned(libc::CMSG_DATA(cmsg) as *mut libc::in6_pktinfo, info);
+    }
+
+    // SAFETY: msg is fully initialised above and its buffers are live.
+    let n = unsafe { libc::sendmsg(fd, &msg, libc::MSG_DONTWAIT) };
+    if n < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(n as usize)
 }
 
 /// Bring the responder's host map up to date before answering a query.
@@ -287,10 +492,12 @@ fn refresh_hosts(
 /// Receive a UDP datagram with arrival-interface info via `IPV6_PKTINFO`.
 ///
 /// Returns `(len, src, arrival_ifindex)`. The ifindex is `Some` when the
-/// kernel delivered an `IPV6_PKTINFO` control message; `None` otherwise
-/// (IPv4 arrival on a dual-stack socket without `IP_PKTINFO` set, or
+/// kernel delivered an `IPV6_PKTINFO` control message, which Linux does for
+/// IPv4 arrivals on a dual-stack socket too; `None` otherwise (for example
 /// `IPV6_RECVPKTINFO` not enabled). A `None` ifindex disables filtering
-/// for that packet — fail-open on unknown arrival.
+/// for that packet — fail-open on unknown arrival — and leaves its reply
+/// routed, except a reply to a mesh source on a socket bound to a specific
+/// address, which [`reply_path`] withholds.
 #[cfg(unix)]
 async fn recv_with_pktinfo(
     socket: &tokio::net::UdpSocket,
@@ -889,6 +1096,13 @@ mod tests {
     /// mirroring the setup done in `Node::bind_dns_socket`.
     #[cfg(unix)]
     fn bind_loopback_v6_with_pktinfo() -> tokio::net::UdpSocket {
+        tokio::net::UdpSocket::from_std(bind_pktinfo("[::1]:0".parse().unwrap())).unwrap()
+    }
+
+    /// Build a dual-stack socket bound to `addr` with `IPV6_RECVPKTINFO`
+    /// enabled, mirroring the setup done in `Node::bind_dns_socket`.
+    #[cfg(unix)]
+    fn bind_pktinfo(addr: std::net::SocketAddr) -> std::net::UdpSocket {
         use socket2::{Domain, Protocol, Socket, Type};
         use std::os::fd::AsRawFd;
         let sock = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP)).unwrap();
@@ -905,9 +1119,8 @@ mod tests {
         };
         assert_eq!(ret, 0, "setsockopt IPV6_RECVPKTINFO failed");
         sock.set_nonblocking(true).unwrap();
-        let addr: std::net::SocketAddr = "[::1]:0".parse().unwrap();
         sock.bind(&addr.into()).unwrap();
-        tokio::net::UdpSocket::from_std(sock.into()).unwrap()
+        sock.into()
     }
 
     #[cfg(unix)]
@@ -991,6 +1204,551 @@ mod tests {
         );
 
         responder_handle.abort();
+    }
+
+    /// On a wildcard bind, only a reply to a non-v4-mapped mesh source
+    /// (`fd00::/8`) with a known arrival interface is pinned; everything else
+    /// is routed. On a specific bind, a reply to a mesh source is withheld
+    /// unless it arrived on the known mesh interface; with no known mesh
+    /// interface the wildcard rule applies. Non-mesh sources are routed on
+    /// either bind.
+    #[test]
+    fn reply_path_pins_mesh_sources_and_withholds_them_off_the_mesh_on_a_specific_bind() {
+        use ReplyPath::{Pinned, Routed, Withheld};
+        let at = |ip: &str| std::net::SocketAddr::new(ip.parse().unwrap(), 4444);
+        const WILD: bool = true;
+        const SPECIFIC: bool = false;
+        let cases = [
+            // Wildcard bind, mesh interface 3.
+            ("fd11:2233::7", Some(2), Some(3), WILD, Pinned(2)),
+            ("fd11:2233::7", None, Some(3), WILD, Routed),
+            ("fdab::2", Some(5), Some(3), WILD, Pinned(5)),
+            ("2001:db8::2", Some(2), Some(3), WILD, Routed),
+            ("fe80::1", Some(2), Some(3), WILD, Routed),
+            ("::1", Some(1), Some(3), WILD, Routed),
+            ("::ffff:192.0.2.2", Some(2), Some(3), WILD, Routed),
+            ("::ffff:127.0.0.1", Some(1), Some(3), WILD, Routed),
+            ("192.0.2.2", Some(2), Some(3), WILD, Routed),
+            // Wildcard bind, no known mesh interface.
+            ("fd11:2233::7", Some(2), None, WILD, Pinned(2)),
+            ("fd11:2233::7", None, None, WILD, Routed),
+            // Specific bind, mesh interface 3: a mesh source is answered only
+            // when it arrived on the mesh interface.
+            ("fd11:2233::7", Some(2), Some(3), SPECIFIC, Withheld),
+            ("fdab::2", Some(5), Some(3), SPECIFIC, Withheld),
+            ("fd11:2233::7", Some(1), Some(3), SPECIFIC, Withheld),
+            ("fd11:2233::7", None, Some(3), SPECIFIC, Withheld),
+            ("fd11:2233::7", Some(3), Some(3), SPECIFIC, Pinned(3)),
+            ("2001:db8::2", Some(2), Some(3), SPECIFIC, Routed),
+            ("fe80::1", Some(2), Some(3), SPECIFIC, Routed),
+            ("::1", Some(1), Some(3), SPECIFIC, Routed),
+            ("::ffff:192.0.2.2", Some(2), Some(3), SPECIFIC, Routed),
+            ("192.0.2.2", Some(2), Some(3), SPECIFIC, Routed),
+            // Specific bind, no known mesh interface.
+            ("fd11:2233::7", Some(2), None, SPECIFIC, Pinned(2)),
+            ("fd11:2233::7", None, None, SPECIFIC, Routed),
+        ];
+        for (ip, arrival, mesh, wildcard, want) in cases {
+            assert_eq!(
+                reply_path(at(ip), arrival, mesh, wildcard),
+                want,
+                "source {ip}, arrival {arrival:?}, mesh {mesh:?}, wildcard {wildcard}"
+            );
+        }
+    }
+
+    /// Only a socket bound to `::` or `0.0.0.0` counts as a wildcard bind; a
+    /// specific address, and an address that cannot be read, do not.
+    #[test]
+    fn wildcard_bind_is_true_only_for_the_unspecified_addresses() {
+        let at = |addr: &str| Ok(addr.parse::<std::net::SocketAddr>().unwrap());
+        assert!(wildcard_bind(at("[::]:5354")));
+        assert!(wildcard_bind(at("0.0.0.0:5354")));
+        assert!(!wildcard_bind(at("[::1]:5354")));
+        assert!(!wildcard_bind(at("127.0.0.1:5354")));
+        assert!(!wildcard_bind(at("[2001:db8:1::1]:5354")));
+        assert!(!wildcard_bind(at("192.0.2.1:5354")));
+        assert!(!wildcard_bind(Err(std::io::Error::other("no address"))));
+    }
+
+    /// A withheld reply is not sent at all.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_withheld_reply_is_not_delivered() {
+        let sender = bind_loopback_v6_with_pktinfo();
+        let receiver = tokio::net::UdpSocket::bind("[::1]:0").await.unwrap();
+        let dst = receiver.local_addr().unwrap();
+        send_reply(&sender, b"withheld", dst, ReplyPath::Withheld)
+            .await
+            .unwrap();
+        let mut buf = [0u8; 16];
+        let got = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            receiver.recv_from(&mut buf),
+        )
+        .await;
+        assert!(got.is_err(), "the withheld reply was delivered: {got:?}");
+    }
+
+    /// The same send as a routed reply is delivered, so the receiver above
+    /// would see a reply that was sent.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_routed_reply_to_the_same_receiver_is_delivered() {
+        let sender = bind_loopback_v6_with_pktinfo();
+        let receiver = tokio::net::UdpSocket::bind("[::1]:0").await.unwrap();
+        let dst = receiver.local_addr().unwrap();
+        send_reply(&sender, b"routed", dst, ReplyPath::Routed)
+            .await
+            .unwrap();
+        let mut buf = [0u8; 16];
+        let (len, _) = tokio::time::timeout(
+            std::time::Duration::from_millis(2000),
+            receiver.recv_from(&mut buf),
+        )
+        .await
+        .expect("the routed reply was not delivered")
+        .unwrap();
+        assert_eq!(&buf[..len], b"routed");
+    }
+
+    /// A responder on a dual-stack `IPV6_RECVPKTINFO` socket still answers
+    /// IPv6 and IPv4 loopback clients, whose replies are routed.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_responder_still_answers_ipv6_and_ipv4_loopback_clients() {
+        let server =
+            tokio::net::UdpSocket::from_std(bind_pktinfo("[::]:0".parse().unwrap())).unwrap();
+        let port = server.local_addr().unwrap().port();
+        let reloader = HostMapReloader::new(
+            HostMap::new(),
+            std::path::PathBuf::from("/nonexistent/hosts"),
+        );
+        let (identity_tx, _identity_rx) = tokio::sync::mpsc::channel(16);
+        let responder = tokio::spawn(run_responder(
+            server,
+            identity_tx,
+            300,
+            reloader,
+            None,
+            None,
+        ));
+
+        for (client, server) in [("[::1]:0", "[::1]"), ("127.0.0.1:0", "127.0.0.1")] {
+            let socket = tokio::net::UdpSocket::bind(client).await.unwrap();
+            let target: std::net::SocketAddr = format!("{server}:{port}").parse().unwrap();
+            let query =
+                build_test_query(&format!("{}.fips", Identity::generate().npub()), TYPE::AAAA);
+            socket.send_to(&query, target).await.unwrap();
+            let mut buf = [0u8; 512];
+            let (len, _) = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                socket.recv_from(&mut buf),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("the {server} client is answered"))
+            .unwrap();
+            assert_eq!(Packet::parse(&buf[..len]).unwrap().answers.len(), 1);
+        }
+        responder.abort();
+    }
+
+    /// A pinned send to `[::1]` out of the loopback interface is delivered.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_reply_pinned_to_loopback_reaches_a_loopback_client() {
+        let lo = loopback_ifindex_for_test();
+        assert_ne!(lo, 0, "loopback has an index");
+        let sender = bind_loopback_v6_with_pktinfo();
+        let receiver = tokio::net::UdpSocket::bind("[::1]:0").await.unwrap();
+        let dst = receiver.local_addr().unwrap();
+
+        let sent = send_pinned(&sender, b"pinned", dst, lo).await.unwrap();
+        assert_eq!(sent, 6);
+        let mut buf = [0u8; 16];
+        let (len, src) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            receiver.recv_from(&mut buf),
+        )
+        .await
+        .expect("the pinned send is delivered")
+        .unwrap();
+        assert_eq!(&buf[..len], b"pinned");
+        assert_eq!(src, sender.local_addr().unwrap());
+    }
+
+    /// A pinned send naming an interface that does not exist fails and
+    /// delivers nothing, so the send carries the pin. Whether the kernel
+    /// holds the reply strictly to the pinned interface is checked only by
+    /// the root-namespace test below.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_reply_pinned_to_a_missing_interface_fails_and_is_not_delivered() {
+        let sender = bind_loopback_v6_with_pktinfo();
+        let receiver = tokio::net::UdpSocket::bind("[::1]:0").await.unwrap();
+        let dst = receiver.local_addr().unwrap();
+
+        let sent = send_pinned(&sender, b"pinned", dst, 0x7fff_fff0).await;
+        assert!(
+            sent.is_err(),
+            "a send pinned to a missing interface went out: {sent:?}"
+        );
+        let mut buf = [0u8; 16];
+        let got = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            receiver.recv_from(&mut buf),
+        )
+        .await;
+        assert!(got.is_err(), "the pinned datagram was delivered: {got:?}");
+    }
+
+    /// Two root network namespaces joined by a veth, deleted on drop.
+    ///
+    /// The responder side carries a dummy `fips0` with a mesh address and
+    /// the `fd00::/8` route, as the daemon's TUN gives it, and an nft counter
+    /// of UDP leaving `fips0` from the responder's port. Needs root.
+    #[cfg(target_os = "linux")]
+    struct ForgedSourceNetns {
+        node: String,
+        lan: String,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl ForgedSourceNetns {
+        const PORT: u16 = 5354;
+
+        /// Create and configure both namespaces.
+        fn new() -> Self {
+            // Tests run in parallel in one process, so each pair gets its own
+            // sequence number.
+            static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let id = std::process::id();
+            let ns = Self {
+                node: format!("fipsdns-node-{id}-{seq}"),
+                lan: format!("fipsdns-lan-{id}-{seq}"),
+            };
+            let (a, b) = (ns.node.as_str(), ns.lan.as_str());
+            for args in [
+                vec!["netns", "add", a],
+                vec!["netns", "add", b],
+                vec![
+                    "link", "add", "a0", "netns", a, "type", "veth", "peer", "name", "b0", "netns",
+                    b,
+                ],
+                vec!["-n", a, "link", "set", "lo", "up"],
+                vec!["-n", b, "link", "set", "lo", "up"],
+                vec!["-n", a, "link", "set", "a0", "up"],
+                vec!["-n", b, "link", "set", "b0", "up"],
+                vec![
+                    "-n",
+                    a,
+                    "addr",
+                    "add",
+                    "2001:db8:1::1/64",
+                    "dev",
+                    "a0",
+                    "nodad",
+                ],
+                vec![
+                    "-n",
+                    b,
+                    "addr",
+                    "add",
+                    "2001:db8:1::2/64",
+                    "dev",
+                    "b0",
+                    "nodad",
+                ],
+                vec!["-n", a, "addr", "add", "fdab::1/64", "dev", "a0", "nodad"],
+                vec!["-n", b, "addr", "add", "fdab::2/64", "dev", "b0", "nodad"],
+                vec![
+                    "-n",
+                    b,
+                    "addr",
+                    "add",
+                    "fd11:2233::7/128",
+                    "dev",
+                    "b0",
+                    "nodad",
+                ],
+                vec!["-n", a, "link", "add", "fips0", "type", "dummy"],
+                vec!["-n", a, "link", "set", "fips0", "up"],
+                vec![
+                    "-n",
+                    a,
+                    "addr",
+                    "add",
+                    "fd99::1/128",
+                    "dev",
+                    "fips0",
+                    "nodad",
+                ],
+                vec!["-n", a, "route", "add", "fd00::/8", "dev", "fips0"],
+            ] {
+                run_ok("ip", &args);
+            }
+            let rule = format!(
+                "oifname \"fips0\" udp sport {} counter name refl",
+                Self::PORT
+            );
+            for cmd in [
+                "add table inet dnstest".to_string(),
+                "add counter inet dnstest refl".to_string(),
+                "add chain inet dnstest out { type filter hook output priority 0 ; }".to_string(),
+                format!("add rule inet dnstest out {rule}"),
+            ] {
+                let mut args = vec!["netns", "exec", a, "nft"];
+                args.extend(cmd.split(' '));
+                run_ok("ip", &args);
+            }
+            ns
+        }
+
+        /// Run `f` on a thread that has entered namespace `name`, so any
+        /// socket it creates belongs to that namespace.
+        fn enter<T: Send + 'static>(name: &str, f: impl FnOnce() -> T + Send + 'static) -> T {
+            use std::os::fd::AsRawFd;
+            let path = format!("/run/netns/{name}");
+            std::thread::spawn(move || {
+                let file = std::fs::File::open(&path).expect("open netns");
+                let ret = unsafe { libc::setns(file.as_raw_fd(), libc::CLONE_NEWNET) };
+                assert_eq!(ret, 0, "setns: {}", std::io::Error::last_os_error());
+                f()
+            })
+            .join()
+            .unwrap()
+        }
+
+        /// Index of the responder side's `fips0`.
+        fn mesh_ifindex(&self) -> u32 {
+            Self::enter(&self.node, || {
+                let c = std::ffi::CString::new("fips0").unwrap();
+                unsafe { libc::if_nametoindex(c.as_ptr()) }
+            })
+        }
+
+        /// UDP packets from the responder's port that have left by `fips0`.
+        fn mesh_replies(&self) -> u64 {
+            let out = std::process::Command::new("ip")
+                .args([
+                    "netns", "exec", &self.node, "nft", "list", "counter", "inet", "dnstest",
+                    "refl",
+                ])
+                .output()
+                .unwrap();
+            let text = String::from_utf8_lossy(&out.stdout);
+            let n = text
+                .split_whitespace()
+                .skip_while(|w| *w != "packets")
+                .nth(1)
+                .unwrap_or_else(|| panic!("no packet count in nft output: {text}"));
+            n.parse().unwrap()
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for ForgedSourceNetns {
+        fn drop(&mut self) {
+            for ns in [&self.node, &self.lan] {
+                let _ = std::process::Command::new("ip")
+                    .args(["netns", "del", ns])
+                    .status();
+            }
+        }
+    }
+
+    /// Run a command and panic unless it succeeds.
+    #[cfg(target_os = "linux")]
+    fn run_ok(cmd: &str, args: &[&str]) {
+        let out = std::process::Command::new(cmd).args(args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{cmd} {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// A LAN host that forges a mesh source address must not make this node
+    /// send the reply into the mesh. The responder is bound to `[::]` as with
+    /// a non-loopback `dns.bind_addr`, and the query arrives on the LAN veth,
+    /// so the mesh-interface filter does not apply to it.
+    ///
+    /// Needs root (network namespaces, nft): build with
+    /// `cargo test --lib --no-run` and run the test binary under `sudo` with
+    /// `--ignored`.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "needs root: creates network namespaces"]
+    async fn a_lan_query_with_a_forged_mesh_source_is_not_answered_into_the_mesh() {
+        let ns = ForgedSourceNetns::new();
+        let mesh_ifindex = ns.mesh_ifindex();
+        assert_ne!(mesh_ifindex, 0, "fips0 has an index");
+
+        let server = ForgedSourceNetns::enter(&ns.node, || {
+            let addr = std::net::SocketAddr::from((Ipv6Addr::UNSPECIFIED, ForgedSourceNetns::PORT));
+            bind_pktinfo(addr)
+        });
+        let server = tokio::net::UdpSocket::from_std(server).unwrap();
+        let (genuine, ula, forged) = ForgedSourceNetns::enter(&ns.lan, || {
+            let bind = |a: &str| {
+                let s = std::net::UdpSocket::bind(a).unwrap();
+                s.set_nonblocking(true).unwrap();
+                s
+            };
+            (
+                bind("[2001:db8:1::2]:4443"),
+                bind("[fdab::2]:4445"),
+                bind("[fd11:2233::7]:4444"),
+            )
+        });
+        let genuine = tokio::net::UdpSocket::from_std(genuine).unwrap();
+        let ula = tokio::net::UdpSocket::from_std(ula).unwrap();
+        let forged = tokio::net::UdpSocket::from_std(forged).unwrap();
+
+        let reloader = HostMapReloader::new(
+            HostMap::new(),
+            std::path::PathBuf::from("/nonexistent/hosts"),
+        );
+        let (identity_tx, mut identity_rx) = tokio::sync::mpsc::channel(16);
+        let responder = tokio::spawn(run_responder(
+            server,
+            identity_tx,
+            300,
+            reloader,
+            None,
+            Some(mesh_ifindex),
+        ));
+
+        let target: std::net::SocketAddr = "[2001:db8:1::1]:5354".parse().unwrap();
+        let ula_target: std::net::SocketAddr = "[fdab::1]:5354".parse().unwrap();
+
+        // Healthy path: a LAN client's query is answered on the LAN, and so
+        // is an on-link ULA client's, whose source is in fd00::/8 too.
+        for (client, to, what) in [
+            (&genuine, target, "the LAN client is answered"),
+            (&ula, ula_target, "the on-link ULA client is answered"),
+        ] {
+            expect_answer(client, to, &mut identity_rx, what).await;
+        }
+
+        // The forged query reaches the responder and is resolved, but its
+        // reply must not leave by the mesh interface.
+        send_unanswered(&forged, target, &mut identity_rx).await;
+        let into_mesh = ns.mesh_replies();
+        responder.abort();
+        assert_eq!(
+            into_mesh, 0,
+            "a LAN query from forged source fd11:2233::7 was answered into the mesh: \
+             {into_mesh} UDP packet(s) from port 5354 left by fips0"
+        );
+    }
+
+    /// A LAN host that forges a mesh source address must not make this node
+    /// send the reply into the mesh when the responder is bound to one
+    /// specific LAN address. Such a socket sends from that address, so the
+    /// kernel does not hold a pinned reply to the arrival interface; the
+    /// reply must be withheld instead. A LAN client with a global source is
+    /// still answered.
+    ///
+    /// Needs root (network namespaces, nft): build with
+    /// `cargo test --lib --no-run` and run the test binary under `sudo` with
+    /// `--ignored`.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "needs root: creates network namespaces"]
+    async fn a_lan_query_with_a_forged_mesh_source_is_not_answered_into_the_mesh_on_a_specific_bind()
+     {
+        let ns = ForgedSourceNetns::new();
+        let mesh_ifindex = ns.mesh_ifindex();
+        assert_ne!(mesh_ifindex, 0, "fips0 has an index");
+
+        let target: std::net::SocketAddr = "[2001:db8:1::1]:5354".parse().unwrap();
+        let server = ForgedSourceNetns::enter(&ns.node, move || bind_pktinfo(target));
+        let server = tokio::net::UdpSocket::from_std(server).unwrap();
+        let (genuine, forged) = ForgedSourceNetns::enter(&ns.lan, || {
+            let bind = |a: &str| {
+                let s = std::net::UdpSocket::bind(a).unwrap();
+                s.set_nonblocking(true).unwrap();
+                s
+            };
+            (bind("[2001:db8:1::2]:4443"), bind("[fd11:2233::7]:4444"))
+        });
+        let genuine = tokio::net::UdpSocket::from_std(genuine).unwrap();
+        let forged = tokio::net::UdpSocket::from_std(forged).unwrap();
+
+        let reloader = HostMapReloader::new(
+            HostMap::new(),
+            std::path::PathBuf::from("/nonexistent/hosts"),
+        );
+        let (identity_tx, mut identity_rx) = tokio::sync::mpsc::channel(16);
+        let responder = tokio::spawn(run_responder(
+            server,
+            identity_tx,
+            300,
+            reloader,
+            None,
+            Some(mesh_ifindex),
+        ));
+
+        expect_answer(
+            &genuine,
+            target,
+            &mut identity_rx,
+            "the LAN client is answered",
+        )
+        .await;
+        send_unanswered(&forged, target, &mut identity_rx).await;
+        let into_mesh = ns.mesh_replies();
+        responder.abort();
+        assert_eq!(
+            into_mesh, 0,
+            "with the responder bound to 2001:db8:1::1, a LAN query from forged source \
+             fd11:2233::7 was answered into the mesh: {into_mesh} UDP packet(s) from port 5354 \
+             left by fips0"
+        );
+    }
+
+    /// Send an AAAA query for a fresh npub from `client` to `to` and expect
+    /// an answer with one record, and the resolved identity on `identity_rx`.
+    #[cfg(target_os = "linux")]
+    async fn expect_answer(
+        client: &tokio::net::UdpSocket,
+        to: std::net::SocketAddr,
+        identity_rx: &mut DnsIdentityRx,
+        what: &str,
+    ) {
+        let wait = std::time::Duration::from_secs(2);
+        let query = build_test_query(&format!("{}.fips", Identity::generate().npub()), TYPE::AAAA);
+        client.send_to(&query, to).await.unwrap();
+        let mut buf = [0u8; 512];
+        let (len, _) = tokio::time::timeout(wait, client.recv_from(&mut buf))
+            .await
+            .expect(what)
+            .unwrap();
+        assert_eq!(Packet::parse(&buf[..len]).unwrap().answers.len(), 1);
+        tokio::time::timeout(wait, identity_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    /// Send an AAAA query for a fresh npub from `client` to `to`, wait until
+    /// the responder has resolved it, then long enough for its reply to
+    /// leave.
+    #[cfg(target_os = "linux")]
+    async fn send_unanswered(
+        client: &tokio::net::UdpSocket,
+        to: std::net::SocketAddr,
+        identity_rx: &mut DnsIdentityRx,
+    ) {
+        let query = build_test_query(&format!("{}.fips", Identity::generate().npub()), TYPE::AAAA);
+        client.send_to(&query, to).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), identity_rx.recv())
+            .await
+            .expect("the forged query reaches the responder")
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     }
 
     /// Build a test DNS query packet for a given name and record type.
