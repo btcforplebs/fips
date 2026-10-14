@@ -1368,3 +1368,118 @@ fn openwrt_services_respawn_without_a_retry_limit() {
         problems.join("\n  ")
     );
 }
+
+/// Returns the value of every `key=` line in a systemd unit, in file order.
+fn unit_values(unit: &str, key: &str) -> Vec<String> {
+    let prefix = format!("{key}=");
+    unit.lines()
+        .map(str::trim)
+        .filter_map(|l| l.strip_prefix(prefix.as_str()))
+        .map(|v| v.trim().to_string())
+        .collect()
+}
+
+/// Guards the restart backoff of the units that systemd restarts on failure.
+///
+/// `Restart=on-failure` with a fixed `RestartSec=` and the default start limit
+/// restarts a daemon whose start cannot succeed every few seconds for as long
+/// as it is left. Each tarball and `.deb` unit that sets `Restart=` to anything
+/// but `no` must also set `RestartSteps=` and `RestartMaxDelaySec=`, the two
+/// copies of a unit must agree on both, and each NixOS service restarted on
+/// failure must set both to the values of the unit of the same name.
+#[test]
+fn restarting_units_back_off_between_restarts() {
+    const DIRS: [&str; 2] = ["packaging/systemd", "packaging/debian"];
+    /// A unit copy's path with its `RestartSteps=` and `RestartMaxDelaySec=` values.
+    type UnitCopy = (String, Vec<String>, Vec<String>);
+    let mut backoff: HashMap<String, Vec<UnitCopy>> = HashMap::new();
+    for dir in DIRS {
+        for rel in repo_dir_files(dir) {
+            let Some(name) = rel.rsplit('/').next().filter(|n| n.ends_with(".service")) else {
+                continue;
+            };
+            let name = name.to_string();
+            let unit = repo_file(&rel);
+            let restart = unit_values(&unit, "Restart");
+            if restart.is_empty() || restart == ["no"] {
+                continue;
+            }
+            let steps = unit_values(&unit, "RestartSteps");
+            let max = unit_values(&unit, "RestartMaxDelaySec");
+            assert_eq!(
+                steps.len(),
+                1,
+                "{rel}: Restart={restart:?} needs exactly one RestartSteps=, read {steps:?}"
+            );
+            assert_eq!(
+                max.len(),
+                1,
+                "{rel}: Restart={restart:?} needs exactly one RestartMaxDelaySec=, read {max:?}"
+            );
+            backoff.entry(name).or_default().push((rel, steps, max));
+        }
+    }
+    for name in ["fips.service", "fips-gateway.service"] {
+        assert_eq!(
+            backoff.get(name).map(Vec::len),
+            Some(DIRS.len()),
+            "control: {name} is no longer restarted on failure in each of {DIRS:?}"
+        );
+    }
+    for copies in backoff.values() {
+        let (first, rest) = copies.split_first().unwrap();
+        for other in rest {
+            assert_eq!(
+                (&first.1, &first.2),
+                (&other.1, &other.2),
+                "{} and {} disagree on RestartSteps=/RestartMaxDelaySec=",
+                first.0,
+                other.0
+            );
+        }
+    }
+
+    let rel = "packaging/nixos/default.nix";
+    let nix = repo_file(rel);
+    let mut services: Vec<(String, Vec<&str>)> = Vec::new();
+    for line in nix.lines().map(str::trim) {
+        if let Some(rest) = line.strip_prefix("systemd.services.") {
+            let name = rest.split_whitespace().next().unwrap_or_default();
+            services.push((format!("{name}.service"), Vec::new()));
+        } else if let Some((_, body)) = services.last_mut() {
+            body.push(line);
+        }
+    }
+    let nix_value = |body: &[&str], key: &str| -> Vec<String> {
+        let prefix = format!("{key} = ");
+        body.iter()
+            .filter_map(|l| l.strip_prefix(prefix.as_str()))
+            .map(|v| v.trim_end_matches(';').trim().to_string())
+            .collect()
+    };
+    let mut restarting = 0;
+    for (name, body) in &services {
+        if !body.contains(&"Restart = \"on-failure\";") {
+            continue;
+        }
+        restarting += 1;
+        let (unit, steps, max) = backoff
+            .get(name)
+            .and_then(|copies| copies.first())
+            .unwrap_or_else(|| {
+                panic!("{rel}: {name} restarts on failure but no unit of that name does")
+            });
+        assert_eq!(
+            (
+                &nix_value(body, "RestartSteps"),
+                &nix_value(body, "RestartMaxDelaySec")
+            ),
+            (steps, max),
+            "{rel}: {name} disagrees with {unit} on RestartSteps/RestartMaxDelaySec"
+        );
+    }
+    assert!(
+        restarting >= 2,
+        "control: expected Restart = \"on-failure\" in both services of {rel}, found {restarting}"
+    );
+}
