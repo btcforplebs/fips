@@ -55,6 +55,7 @@ pub mod io_linux;
 pub mod neighbor;
 pub mod pool;
 pub mod psm;
+mod recall;
 pub mod stats;
 pub mod stream_read;
 
@@ -69,6 +70,7 @@ use addr::BleAddr;
 use io::{BleIo, BleScanner, BleStream};
 use neighbor::NeighborBuffer;
 use pool::{BleConnection, ConnectionPool, Insert, Verify};
+use recall::Recall;
 use stats::BleStats;
 use stream_read::BleStreamRead;
 
@@ -156,6 +158,9 @@ pub struct BleTransport<I: BleIo> {
     accept_task: Option<JoinHandle<()>>,
     /// Combined scan + probe loop task handle.
     scan_probe_task: Option<JoinHandle<()>>,
+    /// What the scan + probe loop has learned about link addresses; a fresh
+    /// one for each loop started.
+    probe_memory: SharedProbeMemory,
     /// Neighbor buffer for discovered peers.
     neighbor_buffer: Arc<NeighborBuffer>,
     /// Transport statistics.
@@ -196,6 +201,7 @@ impl<I: BleIo> BleTransport<I> {
             packet_tx,
             accept_task: None,
             scan_probe_task: None,
+            probe_memory: SharedProbeMemory::default(),
             neighbor_buffer: Arc::new(NeighborBuffer::new(transport_id)),
             stats: Arc::new(BleStats::new()),
             local_pubkey: None,
@@ -215,6 +221,12 @@ impl<I: BleIo> BleTransport<I> {
     /// Get the I/O implementation (for test injection).
     pub fn io(&self) -> &Arc<I> {
         &self.io
+    }
+
+    /// What the scan + probe loop has learned about link addresses.
+    #[cfg(test)]
+    fn probe_memory(&self) -> std::sync::MutexGuard<'_, ProbeMemory> {
+        recall(&self.probe_memory)
     }
 
     /// Set the local public key for pre-handshake identity exchange.
@@ -303,6 +315,7 @@ impl<I: BleIo> BleTransport<I> {
         if self.config.scan() {
             match self.io.start_scanning().await {
                 Ok(scanner) => {
+                    self.probe_memory = SharedProbeMemory::default();
                     self.scan_probe_task = Some(tokio::spawn(scan_probe_loop::<I>(
                         scanner,
                         Arc::clone(&self.io),
@@ -316,6 +329,7 @@ impl<I: BleIo> BleTransport<I> {
                         local_node_addr,
                         self.packet_tx.clone(),
                         self.transport_id,
+                        Arc::clone(&self.probe_memory),
                     )));
                     debug!(adapter = %adapter, "BLE scan+probe loop started");
                 }
@@ -1409,6 +1423,11 @@ impl PendingProbes {
         self.entries.iter().position(|e| &e.addr == addr)
     }
 
+    /// Whether `addr` is in the book.
+    fn contains(&self, addr: &BleAddr) -> bool {
+        self.position(addr).is_some()
+    }
+
     /// Record a sighting. A previously unseen address becomes immediately
     /// eligible; a known one keeps whatever backoff it has earned, so a
     /// scanner that re-reports the same address many times a second cannot
@@ -1497,6 +1516,42 @@ enum Learned {
     Decline,
 }
 
+/// What the probe loop has learned about link addresses.
+#[derive(Debug, Default)]
+struct ProbeMemory {
+    /// Link addresses already resolved to a node identity by a completed
+    /// pubkey exchange, and how. Lets the loop skip an address it has
+    /// *already* learned belongs to a peer it is connected to, instead of
+    /// paying a full connect and exchange to rediscover that every cooldown.
+    /// Rotation adds one per rotation, so an entry is dropped once its node no
+    /// longer holds the link that justified the skip: a peer that genuinely
+    /// goes away is probed again normally.
+    known_node_of: Recall<(NodeAddr, Learned)>,
+    /// L2CAP listener PSMs read out of peers' advertisements. A peer whose
+    /// platform assigns its listener PSM cannot be dialled at a configured
+    /// constant, so it publishes the number it actually bound and we dial
+    /// that. A peer that advertises nothing is dialled at the configured PSM,
+    /// which is every peer that predates this and every backend that does not
+    /// advertise service data.
+    learned_psm: Recall<u16>,
+}
+
+/// The probe memory, shared between the loop and its transport. The lock is
+/// a `std` mutex and is never held across an await.
+type SharedProbeMemory = Arc<std::sync::Mutex<ProbeMemory>>;
+
+/// Lock the probe memory. A panic while it was held leaves nothing half
+/// written that the loop relies on, so a poisoned lock is used as it is.
+fn recall(memory: &SharedProbeMemory) -> std::sync::MutexGuard<'_, ProbeMemory> {
+    memory.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Whether the probe loop still depends on what it learned about `addr`: a
+/// link is pooled there, or the address is in the retry book.
+fn is_live<S>(pool: &ConnectionPool<S>, pending: &PendingProbes, addr: &BleAddr) -> bool {
+    pending.contains(addr) || pool.contains(&addr.to_transport_addr())
+}
+
 /// Combined scan + probe loop.
 ///
 /// Scanner events arrive continuously (both sides advertise continuously).
@@ -1523,6 +1578,7 @@ async fn scan_probe_loop<I: io::BleIo>(
     local_node_addr: Option<NodeAddr>,
     packet_tx: PacketTx,
     transport_id: TransportId,
+    memory: SharedProbeMemory,
 ) {
     // Addresses discovered but not yet connected — retried after cooldown even
     // if the scanner doesn't fire again (BlueZ deduplicates), on a per-address
@@ -1530,21 +1586,6 @@ async fn scan_probe_loop<I: io::BleIo>(
     // an address leaves the book the moment it reaches a conclusive outcome,
     // after which the pool and `known_node_of` guards below cover it.
     let mut pending = PendingProbes::new(std::time::Duration::from_secs(cooldown_secs));
-    // Link addresses already resolved to a node identity by a completed pubkey
-    // exchange, and how. Lets the loop skip an address it has *already*
-    // learned belongs to a peer it is connected to, instead of paying a full
-    // connect and exchange to rediscover that every cooldown. Rotation means
-    // this grows by one per rotation, so entries are dropped once their node
-    // no longer holds the link that justified the skip: a peer that genuinely
-    // goes away is probed again normally.
-    let mut known_node_of: HashMap<BleAddr, (NodeAddr, Learned)> = HashMap::new();
-    // L2CAP listener PSMs read out of peers' advertisements. A peer whose
-    // platform assigns its listener PSM cannot be dialled at a configured
-    // constant, so it publishes the number it actually bound and we dial
-    // that. A peer that advertises nothing is dialled at `configured_psm`,
-    // which is every peer that predates this and every backend that does not
-    // advertise service data.
-    let mut learned_psm: HashMap<BleAddr, u16> = HashMap::new();
     let retry_interval = tokio::time::interval(std::time::Duration::from_secs(cooldown_secs));
     tokio::pin!(retry_interval);
     retry_interval.tick().await; // consume initial tick
@@ -1557,7 +1598,13 @@ async fn scan_probe_loop<I: io::BleIo>(
                     Some(advert) => {
                         if let Some(psm) = advert.psm {
                             trace!(addr = %advert.addr, psm, "BLE scan: learned peer PSM");
-                            learned_psm.insert(advert.addr.clone(), psm);
+                            let pool_guard = pool.lock().await;
+                            recall(&memory).learned_psm.note(
+                                &advert.addr,
+                                psm,
+                                tokio::time::Instant::now(),
+                                |a| is_live(&pool_guard, &pending, a),
+                            );
                         }
                         advert.addr
                     }
@@ -1571,6 +1618,13 @@ async fn scan_probe_loop<I: io::BleIo>(
                 // Re-probe pending addresses that aren't connected
                 let pool_guard = pool.lock().await;
                 pending.drop_connected(|a| pool_guard.contains(&a.to_transport_addr()));
+                {
+                    let now = tokio::time::Instant::now();
+                    let live = |a: &BleAddr| is_live(&pool_guard, &pending, a);
+                    let mut memory = recall(&memory);
+                    memory.known_node_of.prune(now, live);
+                    memory.learned_psm.prune(now, live);
+                }
                 drop(pool_guard);
                 // Rotating rather than always taking the head is what stops one
                 // slow or dead address from starving every other pending one.
@@ -1606,26 +1660,36 @@ async fn scan_probe_loop<I: io::BleIo>(
         // to. Without this the loop re-dials every rotated address of a live
         // peer once per cooldown, forever: the duplicate is declined so it
         // never enters the pool, so the pool-keyed guard above never sees it.
-        if let Some((node, learned)) = known_node_of.get(&addr) {
+        let known = recall(&memory).known_node_of.get(&addr).copied();
+        if let Some((node, learned)) = known {
             let still_connected = {
                 let pool_guard = pool.lock().await;
-                match learned {
+                let held = match learned {
                     // We yield on this address whatever is pooled, so any
                     // claim to the node may stand in for it: probing again
                     // could only end in the same yield.
-                    Learned::Yield => pool_guard.claims(node),
+                    Learned::Yield => pool_guard.claims(&node),
                     // The decline needed a verified link, and so does the
                     // skip: an unverified claim must not hide the node's own
                     // address.
-                    Learned::Decline => pool_guard.find_verified(node).is_some(),
+                    Learned::Decline => pool_guard.find_verified(&node).is_some(),
+                };
+                if held {
+                    // Still in use: seen now.
+                    pending.resolve(&addr);
+                    recall(&memory)
+                        .known_node_of
+                        .note(&addr, (node, learned), now, |a| {
+                            is_live(&pool_guard, &pending, a)
+                        });
                 }
+                held
             };
             if still_connected {
-                pending.resolve(&addr);
                 continue;
             }
             // That peer is gone — forget the mapping and probe normally.
-            known_node_of.remove(&addr);
+            recall(&memory).known_node_of.remove(&addr);
         }
 
         // Record probe time (before attempt, so cooldown applies on failure too)
@@ -1641,7 +1705,11 @@ async fn scan_probe_loop<I: io::BleIo>(
         };
 
         // L2CAP connect, at whatever PSM this peer advertised.
-        let dial_psm = learned_psm.get(&addr).copied().unwrap_or(configured_psm);
+        let dial_psm = recall(&memory)
+            .learned_psm
+            .get(&addr)
+            .copied()
+            .unwrap_or(configured_psm);
         // Stamped here so every outcome below can report how long the peer
         // took to go from advertisement to conclusion.
         let probe_started = tokio::time::Instant::now();
@@ -1663,7 +1731,7 @@ async fn scan_probe_loop<I: io::BleIo>(
                 // A learned PSM that does not answer is stale — forget it, so
                 // the next advert re-learns it and the fallback applies in the
                 // meantime. Costs one retry.
-                learned_psm.remove(&addr);
+                recall(&memory).learned_psm.remove(&addr);
                 continue;
             }
             Err(_) => {
@@ -1674,7 +1742,7 @@ async fn scan_probe_loop<I: io::BleIo>(
                     psm = dial_psm, discovery_ms = probe_started.elapsed().as_millis() as u64,
                     failures, "BLE probe connect timeout"
                 );
-                learned_psm.remove(&addr);
+                recall(&memory).learned_psm.remove(&addr);
                 continue;
             }
         };
@@ -1710,7 +1778,15 @@ async fn scan_probe_loop<I: io::BleIo>(
                     // address outright instead of paying another connect and
                     // exchange to yield again. The tie-breaker decision itself
                     // is unchanged — only the cost of re-reaching it.
-                    known_node_of.insert(addr.clone(), (peer_node, Learned::Yield));
+                    {
+                        let pool_guard = pool.lock().await;
+                        recall(&memory).known_node_of.note(
+                            &addr,
+                            (peer_node, Learned::Yield),
+                            tokio::time::Instant::now(),
+                            |a| is_live(&pool_guard, &pending, a),
+                        );
+                    }
                     let announced = announced_addr(&pool, &peer_node, &addr).await;
                     buffer.add_peer_with_pubkey(&announced, peer_pubkey);
                     continue;
@@ -1739,7 +1815,15 @@ async fn scan_probe_loop<I: io::BleIo>(
                     // Remember what this address resolved to, so the next
                     // cooldown skips it outright rather than paying another
                     // connect and exchange to reach the same conclusion.
-                    known_node_of.insert(addr.clone(), (peer_node, Learned::Decline));
+                    {
+                        let pool_guard = pool.lock().await;
+                        recall(&memory).known_node_of.note(
+                            &addr,
+                            (peer_node, Learned::Decline),
+                            tokio::time::Instant::now(),
+                            |a| is_live(&pool_guard, &pending, a),
+                        );
+                    }
                     // Report the peer under the address its live link is on,
                     // so the node layer is not handed an alias with no
                     // connection behind it.
@@ -4281,6 +4365,106 @@ mod tests {
             "the probe refused at an occupied address announced its claim"
         );
         assert_eq!(claim_at(&transport, &x).await, Some(node_of(&q)));
+        transport.stop_async().await.unwrap();
+    }
+
+    // ------------------------------------------------------------------
+    // The probe loop's memory of addresses it has seen
+    // ------------------------------------------------------------------
+
+    /// One of a flood of distinct link addresses.
+    fn flood_addr(i: u16) -> BleAddr {
+        let [hi, lo] = i.to_be_bytes();
+        BleAddr {
+            adapter: "hci0".to_string(),
+            device: [0x20, 0x00, 0x00, 0x00, hi, lo],
+        }
+    }
+
+    /// Distinct addresses in each probe-memory flood: far more than any
+    /// bound the memory could reasonably have.
+    const FLOOD: u16 = 1_000;
+
+    /// A probing transport holding `ours`, whose dials to `peer_at` hand the
+    /// remote end to the returned receiver and whose every other dial is
+    /// hung up at once, so its exchange fails and nothing is pooled.
+    fn psm_flood_transport(
+        ours: [u8; 32],
+        peer_at: &BleAddr,
+    ) -> (
+        BleTransport<MockBleIo>,
+        tokio::sync::mpsc::UnboundedReceiver<MockBleStream>,
+    ) {
+        let io = MockBleIo::new("hci0", test_addr(1));
+        let (peer_tx, peer_rx) = tokio::sync::mpsc::unbounded_channel();
+        let peer_at = peer_at.clone();
+        io.set_connect_handler(move |addr, _psm| {
+            let (mine, theirs) = MockBleStream::pair(test_addr(1), addr.clone(), 2048);
+            if *addr == peer_at {
+                peer_tx
+                    .send(theirs)
+                    .map_err(|_| TransportError::ConnectionRefused)?;
+            }
+            Ok(mine)
+        });
+        let config = BleConfig {
+            scan: Some(true),
+            accept_connections: Some(false),
+            ..identity_test_config()
+        };
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut transport = BleTransport::new(TransportId::new(1), None, config, io, tx);
+        transport.set_local_pubkey(ours);
+        (transport, peer_rx)
+    }
+
+    /// Advertise each of `FLOOD` new addresses with a PSM and wait until
+    /// every one has been probed and has failed its exchange.
+    async fn flood_psm_adverts(transport: &BleTransport<MockBleIo>) {
+        let before = transport.stats.snapshot().pubkey_exchange_failures;
+        for i in 0..FLOOD {
+            transport
+                .io
+                .inject_scan_advert(io::ScanAdvert::with_psm(flood_addr(i), 0x00C3))
+                .await;
+        }
+        let stats = Arc::clone(&transport.stats);
+        wait_for("every flood address to be probed", || {
+            stats.snapshot().pubkey_exchange_failures >= before + u64::from(FLOOD)
+        })
+        .await;
+    }
+
+    /// A pooled peer is live, so a flood of new advertising addresses must
+    /// not cost it the PSM it advertised.
+    #[tokio::test]
+    async fn a_pooled_peers_learned_psm_survives_an_address_flood() {
+        let keys = pubkeys_by_node_addr(2);
+        let (ours, peer) = (keys[0], keys[1]);
+        let a = test_addr(2);
+        let (mut transport, mut peer_rx) = psm_flood_transport(ours, &a);
+        transport.start_async().await.unwrap();
+
+        transport
+            .io
+            .inject_scan_advert(io::ScanAdvert::with_psm(a.clone(), 0x00C1))
+            .await;
+        let theirs = tokio::time::timeout(std::time::Duration::from_secs(5), peer_rx.recv())
+            .await
+            .expect("the peer is probed")
+            .unwrap();
+        peer_side_exchange(&theirs, &peer).await;
+        wait_for("the peer to be pooled", || pooled(&transport, &a)).await;
+
+        flood_psm_adverts(&transport).await;
+
+        assert!(pooled(&transport, &a), "the peer's link is still pooled");
+        assert_eq!(
+            transport.probe_memory().learned_psm.get(&a).copied(),
+            Some(0x00C1),
+            "the pooled peer's learned PSM was lost to the flood"
+        );
+        drop(theirs);
         transport.stop_async().await.unwrap();
     }
 }
