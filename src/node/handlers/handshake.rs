@@ -51,6 +51,150 @@ use tracing::{debug, info, warn};
 /// replacement of one peer inside the interval count as two teardowns.
 const EPOCH_RESTART_MIN_INTERVAL_SECS: u64 = 15;
 
+/// How long a peering promoted on a received msg1 is kept against another
+/// msg1 from the same peer while nothing has been heard on it.
+///
+/// An unheard responder peering may have come from a captured msg1, so the
+/// genuine peer's own msg1 has to be able to replace it, but not at once. A
+/// dialer that opens two paths to this node in one tick sends two fresh
+/// msg1s, and the second reaches this node before the dialer's first frame
+/// on the session the first one opened. Replacing on it would tear down the
+/// session the dialer may keep when it resolves its two completions by
+/// address order, and neither end could then read the other. The second
+/// msg1 of such a dial arrives within about one round trip of the first.
+///
+/// Not above the initiator's first msg1 resend (`handshake_resend_interval_ms`,
+/// 1 s at the defaults), so a genuine msg1 that meets a phantom promoted just
+/// before it is accepted at its first resend. A parallel dial over a path
+/// whose first frame takes longer than this can still be split. An attacker
+/// holding k distinct captures of a peer, each timed to land just ahead of
+/// the peer's own msg1, holds that peer's reconnect off for about k seconds
+/// per 15 s. No measured basis.
+pub(in crate::node) const UNHEARD_PEERING_MIN_AGE_MS: u64 = 1_000;
+
+/// Most msg1s per peer whose promotion of an unheard peering is remembered.
+///
+/// A msg1 carries nothing fresh, so a captured one promotes a peering that
+/// nothing proves is live, and the genuine peer's own msg1 must be able to
+/// replace it. Each distinct capture can then replace the one before, and
+/// every replacement costs this node a DH, a teardown, and a msg2 and initial
+/// TreeAnnounce sent to the msg1's source address, which the replayer chose.
+/// Remembering the ephemerals already used stops a capture from being spent
+/// twice inside `EPOCH_RESTART_MIN_INTERVAL_SECS`; at this bound a further
+/// replacement of an unheard peering is refused, as the dampener refuses.
+///
+/// So blocking the genuine peer's reconnect costs an attacker this many
+/// distinct captures of that peer per interval, and this is also the most
+/// replay-driven msg2s per peer per interval (one without the memory). A
+/// genuine peer uses one or two (its first msg1 and, if that peering was
+/// replaced before its first frame, its next). No measured basis.
+const MAX_REPLAYED_MSG1S: usize = 8;
+
+/// A digest of the initiator ephemeral a link handshake msg1 carries.
+///
+/// The ephemeral is authenticated by the msg1's own AEAD (it is mixed into
+/// the handshake hash before the encrypted static), so a copy with a changed
+/// header still carries the same ephemeral, while the whole-message digest
+/// that recognises resends does not match it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::node) struct EphemeralDigest([u8; 32]);
+
+impl EphemeralDigest {
+    /// Digest the ephemeral at the start of a Noise IK msg1, or `None` if the
+    /// message is too short to carry one.
+    pub(in crate::node) fn of_noise_msg1(noise_msg1: &[u8]) -> Option<Self> {
+        use sha2::{Digest, Sha256};
+        let ephemeral = noise_msg1.get(..crate::noise::PUBKEY_SIZE)?;
+        Some(Self(Sha256::digest(ephemeral).into()))
+    }
+}
+
+/// What the replay memory says about a msg1 that would replace an unheard
+/// peering.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::node) enum ReplayVerdict {
+    /// Not seen inside the interval, and the peer has room: may replace.
+    Fresh,
+    /// Its ephemeral already promoted a peering inside the interval.
+    Seen,
+    /// The peer has used `MAX_REPLAYED_MSG1S` ephemerals inside the interval.
+    Full,
+}
+
+/// Per peer, the ephemerals of the msg1s that promoted an unheard responder
+/// peering in the last `EPOCH_RESTART_MIN_INTERVAL_SECS`.
+///
+/// Held on the node rather than on `ActivePeer`, because a replacement tears
+/// the peer entry down and the memory has to outlive it. A peer's entries are
+/// forgotten when one of its peerings is heard from, since the attack they
+/// bound is over.
+#[derive(Debug, Default)]
+pub(in crate::node) struct ReplayedMsg1s {
+    by_peer: std::collections::HashMap<NodeAddr, Vec<(EphemeralDigest, u64)>>,
+}
+
+impl ReplayedMsg1s {
+    /// Drop every entry older than the interval at `now_ms`.
+    fn prune(&mut self, now_ms: u64) {
+        let window = EPOCH_RESTART_MIN_INTERVAL_SECS * 1000;
+        self.by_peer.retain(|_, seen| {
+            seen.retain(|&(_, at)| now_ms.saturating_sub(at) < window);
+            !seen.is_empty()
+        });
+    }
+
+    /// Judge a msg1 with ephemeral `ephemeral` that would replace `peer`'s
+    /// unheard peering at `now_ms`.
+    pub(in crate::node) fn verdict(
+        &mut self,
+        peer: &NodeAddr,
+        ephemeral: &EphemeralDigest,
+        now_ms: u64,
+    ) -> ReplayVerdict {
+        self.prune(now_ms);
+        let Some(seen) = self.by_peer.get(peer) else {
+            return ReplayVerdict::Fresh;
+        };
+        if seen.iter().any(|(e, _)| e == ephemeral) {
+            ReplayVerdict::Seen
+        } else if seen.len() >= MAX_REPLAYED_MSG1S {
+            ReplayVerdict::Full
+        } else {
+            ReplayVerdict::Fresh
+        }
+    }
+
+    /// Remember that `ephemeral` promoted an unheard peering for `peer` at
+    /// `now_ms`. Past the bound the oldest entry goes, which is reached only
+    /// by net-new promotions, the path that does not consult the memory.
+    pub(in crate::node) fn note(
+        &mut self,
+        peer: NodeAddr,
+        ephemeral: EphemeralDigest,
+        now_ms: u64,
+    ) {
+        self.prune(now_ms);
+        let seen = self.by_peer.entry(peer).or_default();
+        if !seen.iter().any(|(e, _)| *e == ephemeral) {
+            seen.push((ephemeral, now_ms));
+        }
+        if seen.len() > MAX_REPLAYED_MSG1S {
+            seen.remove(0);
+        }
+    }
+
+    /// Forget `peer`'s entries: one of its peerings has been heard from.
+    pub(in crate::node) fn forget(&mut self, peer: &NodeAddr) {
+        self.by_peer.remove(peer);
+    }
+
+    /// How many ephemerals are remembered for `peer`. Test-only.
+    #[cfg(test)]
+    pub(in crate::node) fn count(&self, peer: &NodeAddr) -> usize {
+        self.by_peer.get(peer).map_or(0, Vec::len)
+    }
+}
+
 /// Why an inbound msg1 got past the `accept_connections` gate, and against
 /// what identity the post-DH confirmation must check it.
 ///
@@ -594,6 +738,7 @@ impl Node {
         // handshake state keeps its own and clears that on drop.
         let mut our_keypair = self.identity().keypair();
         let noise_msg1 = &packet.data[header.noise_msg1_offset..];
+        let ephemeral = EphemeralDigest::of_noise_msg1(noise_msg1);
         let init_result = machine.receive_handshake_init(
             our_keypair,
             self.startup_epoch(),
@@ -963,30 +1108,89 @@ impl Node {
                 // epoch is not in the answered record, which starts empty at
                 // each peering. So it is gated by the same two conditions and
                 // the same per-peer dampener.
+                //
+                // The peering's own promotion is not evidence that it is
+                // alive: a responder promotion came from a msg1, which may be
+                // a capture. Until its first authenticated frame it counts as
+                // idle once `UNHEARD_PEERING_MIN_AGE_MS` old (by the msg1
+                // clock it was promoted on), so the genuine peer's msg1 can
+                // replace it, while the second msg1 of a dialer opening two
+                // paths at once cannot replace the first. What bounds
+                // that churn instead is the replay memory: an ephemeral that
+                // already promoted an unheard peering of this peer inside the
+                // interval is not answered again (a header-changed copy of a
+                // capture lands here, past the resend check), and once the
+                // peer has spent `MAX_REPLAYED_MSG1S` of them a further
+                // replacement waits for the oldest to age out.
                 let now_ms = Self::now_ms();
-                let peering_idle_ms = self
+                let old_heard = self.peers.get(&peer).is_some_and(|p| p.is_heard());
+                if !old_heard
+                    && self.peers.contains_key(&peer)
+                    && let Some(ephemeral) = ephemeral.as_ref()
+                {
+                    let verdict =
+                        self.replayed_msg1s
+                            .verdict(&peer, ephemeral, packet.timestamp_ms);
+                    if verdict != ReplayVerdict::Fresh {
+                        debug!(
+                            peer = %self.peer_display_name(&peer),
+                            remote_addr = %packet.remote_addr,
+                            reason = match verdict {
+                                ReplayVerdict::Seen => "replayed-ephemeral",
+                                _ => "replay-memory-full",
+                            },
+                            "Msg1 replacing an unheard peering was already used or over the per-peer bound, dropping"
+                        );
+                        self.stats_mut()
+                            .record_reject(RejectReason::Handshake(HandshakeReject::BadState));
+                        return;
+                    }
+                }
+                let (peering_idle_ms, min_idle_ms) = self
                     .peers
                     .get(&peer)
-                    .map(|p| p.idle_time(now_ms))
-                    .unwrap_or(u64::MAX);
+                    .map(|p| {
+                        if p.is_heard() {
+                            (p.idle_time(now_ms), EPOCH_RESTART_MIN_INTERVAL_SECS * 1000)
+                        } else {
+                            (
+                                packet.timestamp_ms.saturating_sub(p.authenticated_at()),
+                                UNHEARD_PEERING_MIN_AGE_MS,
+                            )
+                        }
+                    })
+                    .unwrap_or((u64::MAX, 0));
                 let dampened = self
                     .restart_dampener
                     .get(&peer)
                     .is_some_and(|t| t.elapsed().as_secs() < EPOCH_RESTART_MIN_INTERVAL_SECS);
-                if peering_idle_ms < EPOCH_RESTART_MIN_INTERVAL_SECS * 1000 || dampened {
+                if peering_idle_ms < min_idle_ms || dampened {
+                    // For an unheard peering `idle_ms` is its age since
+                    // promotion, not time since the peer was heard.
+                    let reason = if peering_idle_ms >= min_idle_ms {
+                        "dampened"
+                    } else if old_heard {
+                        "heard-within-interval"
+                    } else {
+                        "unheard-peering-young"
+                    };
                     if replacing {
                         debug!(
                             peer = %self.peer_display_name(&peer),
+                            remote_addr = %packet.remote_addr,
                             idle_ms = peering_idle_ms,
                             dampened,
-                            "Same-epoch msg1 from a peer heard from within the interval, dropping"
+                            reason,
+                            "Same-epoch msg1 inside the peering's replacement interval, dropping"
                         );
                     } else {
                         debug!(
                             peer = %self.peer_display_name(&peer),
+                            remote_addr = %packet.remote_addr,
                             idle_ms = peering_idle_ms,
                             dampened,
-                            "Epoch mismatch dampened, dropping msg1"
+                            reason,
+                            "Epoch mismatch inside the peering's restart interval, dropping msg1"
                         );
                     }
                     // Silent drop: the stored msg2 is bound to the original
@@ -1009,10 +1213,16 @@ impl Node {
                 }
                 // Stamped on acceptance only. A refusal that slid the window
                 // would let a sustained replay starve a genuinely restarting
-                // peer for as long as it kept sending.
+                // peer for as long as it kept sending. Stamped only when the
+                // peering torn down had been heard from: the dampener bounds
+                // churn a peer drives on its own, and a peering that never
+                // carried a frame is not that. Stamping it would let two
+                // captured msg1s refuse the genuine peer for the interval.
                 let cutoff = Duration::from_secs(EPOCH_RESTART_MIN_INTERVAL_SECS);
                 self.restart_dampener.retain(|_, t| t.elapsed() < cutoff);
-                self.restart_dampener.insert(peer, Instant::now());
+                if old_heard {
+                    self.restart_dampener.insert(peer, Instant::now());
+                }
 
                 if replacing {
                     debug!(
@@ -1179,6 +1389,7 @@ impl Node {
                         peer.set_handshake_msg2(wire_msg2.clone());
                         peer.note_setup(wire.msg1_digest);
                     }
+                    self.note_unheard_promotion(&peer_node_addr, ephemeral, packet.timestamp_ms);
                     // Send initial tree announce to new peer
                     if let Err(e) = self.send_tree_announce_to_peer(&peer_node_addr).await {
                         debug!(peer = %self.peer_display_name(&peer_node_addr), error = %e, "Failed to send initial TreeAnnounce");
@@ -1312,6 +1523,7 @@ impl Node {
                         peer.set_handshake_msg2(wire_msg2.clone());
                         peer.note_setup(wire.msg1_digest);
                     }
+                    self.note_unheard_promotion(&peer_node_addr, ephemeral, packet.timestamp_ms);
                     // Send initial tree announce to new peer
                     if let Err(e) = self.send_tree_announce_to_peer(&peer_node_addr).await {
                         debug!(peer = %self.peer_display_name(&peer_node_addr), error = %e, "Failed to send initial TreeAnnounce");
@@ -1321,6 +1533,21 @@ impl Node {
                     self.reset_lookup_backoff();
                 }
             }
+        }
+    }
+
+    /// Remember the ephemeral of a msg1 that promoted `peer` here, if the
+    /// peering it left is unheard (a cross-connection may have kept a peering
+    /// this node initiated instead).
+    fn note_unheard_promotion(
+        &mut self,
+        peer: &NodeAddr,
+        ephemeral: Option<EphemeralDigest>,
+        now_ms: u64,
+    ) {
+        let unheard = self.peers.get(peer).is_some_and(|p| !p.is_heard());
+        if unheard && let Some(ephemeral) = ephemeral {
+            self.replayed_msg1s.note(*peer, ephemeral, now_ms);
         }
     }
 

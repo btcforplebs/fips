@@ -305,6 +305,7 @@ impl Node {
 
         let mut address_changed = false;
         let mut present = false;
+        let mut first_heard = false;
         let mut prior = None;
         if let Some(peer) = self.peers.get_mut(&node_addr) {
             present = true;
@@ -329,6 +330,7 @@ impl Node {
                 peer.set_current_addr(packet.transport_id, packet.remote_addr.clone());
             peer.link_stats_mut()
                 .record_recv(packet.data.len(), packet.timestamp_ms);
+            first_heard = !peer.is_heard();
             peer.touch(packet.timestamp_ms);
         }
 
@@ -341,6 +343,12 @@ impl Node {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         if address_changed {
             self.clear_connected_udp_for_peer(&node_addr);
+        }
+
+        // The first authenticated frame proves the peering live, so the
+        // memory of msg1s that promoted it unheard has nothing left to bound.
+        if first_heard {
+            self.replayed_msg1s.forget(&node_addr);
         }
 
         // Tell the transports which link carries the peer: on a roam the old
@@ -455,6 +463,7 @@ impl Node {
         let now_ms = crate::time::mono_ms();
         let mut address_changed = false;
         let mut present = false;
+        let mut first_heard = false;
         let mut prior = None;
         if let Some(peer) = self.peers.get_mut(node_addr) {
             present = true;
@@ -466,6 +475,7 @@ impl Node {
             address_changed = peer.set_current_addr(transport_id, remote_addr.clone());
             peer.link_stats_mut()
                 .record_recv(packet_len, packet_timestamp_ms);
+            first_heard = !peer.is_heard();
             peer.touch(packet_timestamp_ms);
             if slot == LinkSlot::Current
                 && let Some(mmp) = peer.mmp_mut()
@@ -481,6 +491,11 @@ impl Node {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         if address_changed {
             self.clear_connected_udp_for_peer(node_addr);
+        }
+        // The first authenticated frame proves the peering live, so the
+        // memory of msg1s that promoted it unheard has nothing left to bound.
+        if first_heard {
+            self.replayed_msg1s.forget(node_addr);
         }
         // As on the inline path. A bounce for a peer already removed (the
         // decrypt worker can finish after a Disconnect) marks nothing: no
@@ -506,14 +521,34 @@ impl Node {
         let plaintext = &fallback.packet_data[fallback.fmp_plaintext_offset
             ..fallback.fmp_plaintext_offset + fallback.fmp_plaintext_len];
         // The worker decrypted with the session registered under the
-        // frame's receiver index. Only the current session's index is
-        // current; any other is the previous session draining, or one
-        // already gone by the time the bounce is processed.
-        let current = self
+        // frame's receiver index: the peering's current session, its
+        // previous one draining, or one already gone by the time the bounce
+        // is processed. A session that is gone authenticates nothing about
+        // the peering now holding the address: a replayed msg1 may have
+        // replaced it, and counting the frame would mark that phantom heard
+        // and move it to the genuine peer's address. The inline path cannot
+        // decrypt such a frame at all, so it is dropped here too.
+        let (current, previous) = self
             .peers
             .get(&fallback.source_node_addr)
-            .and_then(|p| p.our_index())
-            .is_some_and(|idx| idx.as_u32() == fallback.receiver_idx);
+            .map(|p| {
+                let receiver = Some(fallback.receiver_idx);
+                (
+                    p.our_index().map(|i| i.as_u32()) == receiver,
+                    p.previous_our_index().map(|i| i.as_u32()) == receiver,
+                )
+            })
+            .unwrap_or((false, false));
+        if !current && !previous {
+            debug!(
+                peer = %self.peer_display_name(&fallback.source_node_addr),
+                remote_addr = %fallback.remote_addr,
+                receiver_idx = fallback.receiver_idx,
+                reason = "session-gone",
+                "Decrypted frame's session no longer belongs to the peering, dropping"
+            );
+            return;
+        }
         let slot = if current {
             LinkSlot::Current
         } else {

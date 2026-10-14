@@ -104,7 +104,9 @@ impl Node {
     /// Remove an active peer and clean up all associated state.
     ///
     /// Frees session index, removes link and address mappings. Used for
-    /// both graceful disconnect and timeout-based eviction.
+    /// both graceful disconnect and timeout-based eviction. Ends the
+    /// end-to-end session with the node too, unless the peering was never
+    /// heard from.
     ///
     /// Also handles tree state cleanup: if the removed peer was our parent,
     /// selects an alternative or becomes root, and marks remaining peers
@@ -147,12 +149,26 @@ impl Node {
         //   2. initiate_session() finds is_established() == true on the stale entry
         //      and silently returns Ok(()), preventing a new session from being
         //      established even after the link layer reconnects successfully.
-        if let Some(session_entry) = self.sessions.remove(node_addr)
-            && let Some(mmp) = session_entry.mmp()
-        {
-            Self::log_session_mmp_teardown(&peer_name, mmp);
-        }
-        self.pending_tun_packets.remove(node_addr);
+        //
+        // A peering never heard from is the exception. No frame arrived on
+        // it, so an end-to-end session with the same node runs elsewhere in
+        // the mesh and owes this link nothing. A replayed msg1 can promote
+        // and replace such a peering as often as the replay memory allows,
+        // and ending the session each time would let a replayer end it that
+        // often. The session and its held packets stay, set aside while the
+        // path MTU release below runs so the estimate it made of its own path
+        // is kept too.
+        let kept_session = if peer.is_heard() {
+            if let Some(session_entry) = self.sessions.remove(node_addr)
+                && let Some(mmp) = session_entry.mmp()
+            {
+                Self::log_session_mmp_teardown(&peer_name, mmp);
+            }
+            self.pending_tun_packets.remove(node_addr);
+            None
+        } else {
+            self.sessions.remove(node_addr)
+        };
 
         // Release the path MTU state this peer's promotion seeded: the link it
         // measured has just gone. The other callers all fire on session state,
@@ -163,6 +179,9 @@ impl Node {
         // keeps a peer returning over a wider link from being clamped to the
         // one it left.
         self.path_mtu_lookup_release(node_addr);
+        if let Some(entry) = kept_session {
+            self.sessions.insert(*node_addr, entry);
+        }
 
         let link_id = peer.link_id();
         let transport_id = peer.transport_id();

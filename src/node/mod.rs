@@ -721,6 +721,10 @@ pub struct Node {
     /// the peer entry itself. Pruned on insert; see
     /// `EPOCH_RESTART_MIN_INTERVAL_SECS`.
     restart_dampener: HashMap<NodeAddr, std::time::Instant>,
+    /// Per peer, the ephemerals of msg1s that promoted a peering not yet
+    /// heard from. Held beside `restart_dampener` for the same reason: a
+    /// replacement destroys the peer entry. See `MAX_REPLAYED_MSG1S`.
+    replayed_msg1s: handlers::handshake::ReplayedMsg1s,
 
     // === Rate Limiting ===
     /// Rate limiter for msg1 processing (DoS protection).
@@ -1012,6 +1016,7 @@ impl Node {
             peers_by_index: HashMap::new(),
             pending_outbound: HashMap::new(),
             restart_dampener: HashMap::new(),
+            replayed_msg1s: Default::default(),
             msg1_rate_limiter,
             setup_rate_limiter,
             icmp_rate_limiter: IcmpRateLimiter::new(),
@@ -1179,6 +1184,7 @@ impl Node {
             peers_by_index: HashMap::new(),
             pending_outbound: HashMap::new(),
             restart_dampener: HashMap::new(),
+            replayed_msg1s: Default::default(),
             msg1_rate_limiter,
             setup_rate_limiter,
             icmp_rate_limiter: IcmpRateLimiter::new(),
@@ -2084,6 +2090,12 @@ impl Node {
     #[cfg(test)]
     pub(crate) fn restart_dampener_stamp(&self, peer: &NodeAddr) -> Option<std::time::Instant> {
         self.restart_dampener.get(peer).copied()
+    }
+
+    /// How many msg1 ephemerals the replay memory holds for `peer`. Test-only.
+    #[cfg(test)]
+    pub(crate) fn replayed_msg1_count(&self, peer: &NodeAddr) -> usize {
+        self.replayed_msg1s.count(peer)
     }
 
     #[cfg(test)]
@@ -3567,9 +3579,11 @@ impl Node {
             return None;
         }
 
-        // 2. Direct peer
+        // 2. Direct peer, once heard from: a peering promoted on a received
+        // msg1 may stand on a replayer's link until its first frame.
         if let Some(peer) = self.peers.get(dest_node_addr)
             && peer.can_send()
+            && peer.is_heard()
         {
             return Some(peer);
         }

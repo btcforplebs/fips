@@ -2215,3 +2215,1037 @@ async fn a_first_epoch_change_against_a_silent_peering_still_restarts_it() {
         "the replacement must carry the epoch the msg1 announced"
     );
 }
+
+// ============================================================================
+// A replayed msg1 from a sender with no peering here
+// ============================================================================
+//
+// A msg1 authenticates its sender's static key but carries nothing fresh, so
+// a captured copy, replayed while the sender has no peering at this node,
+// promotes the sender on whatever link the copy arrived on. These tests drive
+// that through `handle_msg1` with two genuine msg1s built from the same
+// initiator: the first stands for a capture replayed from the attacker's
+// address, the second for the initiator's own fresh dial from its real one.
+
+/// The address a replayed capture is sourced from: a link the replayer holds.
+fn replayer_addr() -> TransportAddr {
+    TransportAddr::from_string("127.0.0.1:41101")
+}
+
+/// The genuine initiator's own address.
+fn genuine_addr() -> TransportAddr {
+    TransportAddr::from_string("127.0.0.1:41102")
+}
+
+/// When a replay delivered before the genuine msg1 arrived: long enough
+/// before it that the phantom it promoted is past the age at which an
+/// unheard peering may be replaced.
+fn replayed_before_now() -> u64 {
+    Node::now_ms()
+        .saturating_sub(crate::node::handlers::handshake::UNHEARD_PEERING_MIN_AGE_MS + 500)
+}
+
+/// Deliver a fresh genuine msg1 from `initiator` to `node` from `addr` on
+/// `transport_id`, stamped `at_ms`. Each call builds a new msg1, so two calls
+/// stand for two distinct captures.
+async fn deliver_msg1(
+    node: &mut Node,
+    initiator: &Node,
+    transport_id: TransportId,
+    addr: &TransportAddr,
+    at_ms: u64,
+) {
+    let msg1 = genuine_msg1(initiator, node);
+    node.handle_msg1(ReceivedPacket::with_timestamp(
+        transport_id,
+        addr.clone(),
+        msg1,
+        at_ms,
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn a_genuine_msg1_replaces_a_phantom_promoted_by_a_replay() {
+    let transport_id = TransportId::new(1);
+    let mut node = make_node();
+    let initiator = make_node();
+    let initiator_addr = node_addr_of(&initiator);
+
+    // The capture, replayed while the initiator is not peered here.
+    deliver_msg1(
+        &mut node,
+        &initiator,
+        transport_id,
+        &replayer_addr(),
+        replayed_before_now(),
+    )
+    .await;
+    assert_eq!(
+        node.get_peer(&initiator_addr)
+            .and_then(|p| p.current_addr().cloned()),
+        Some(replayer_addr()),
+        "the replay must have promoted a peer on the replayer's address, or \
+         this test is not exercising the replay"
+    );
+
+    // The initiator dials from its own address with a fresh msg1. Nothing
+    // has been heard from the phantom: no frame authenticated on its session.
+    deliver_msg1(
+        &mut node,
+        &initiator,
+        transport_id,
+        &genuine_addr(),
+        Node::now_ms(),
+    )
+    .await;
+
+    assert_eq!(
+        node.get_peer(&initiator_addr)
+            .and_then(|p| p.current_addr().cloned()),
+        Some(genuine_addr()),
+        "the initiator's own msg1 must replace a peering promoted from a \
+         replay that has never carried an authenticated frame; instead the \
+         peering stays on the replayer's address"
+    );
+}
+
+#[tokio::test]
+async fn two_replayed_msg1s_do_not_stamp_the_restart_dampener() {
+    let transport_id = TransportId::new(1);
+    let mut node = make_node();
+    let initiator = make_node();
+    let initiator_addr = node_addr_of(&initiator);
+
+    // First capture, replayed long enough ago that the phantom it promoted
+    // has gone past the restart interval with nothing heard on it (it is
+    // reaped only at the 30 s link-dead check).
+    let long_ago = Node::now_ms().saturating_sub(IDLE_SECS * 1000);
+    deliver_msg1(
+        &mut node,
+        &initiator,
+        transport_id,
+        &replayer_addr(),
+        long_ago,
+    )
+    .await;
+    assert!(
+        node.get_peer(&initiator_addr).is_some(),
+        "the first replay must have promoted a phantom"
+    );
+
+    // Second, distinct capture from another address the replayer holds. It
+    // replaces the first phantom, which was never heard from.
+    let second_replayer = TransportAddr::from_string("127.0.0.1:41103");
+    deliver_msg1(
+        &mut node,
+        &initiator,
+        transport_id,
+        &second_replayer,
+        replayed_before_now(),
+    )
+    .await;
+    assert_eq!(
+        node.get_peer(&initiator_addr)
+            .and_then(|p| p.current_addr().cloned()),
+        Some(second_replayer.clone()),
+        "the second replay must have replaced the first phantom, or this test \
+         is not exercising the dampener stamp"
+    );
+
+    assert_eq!(
+        node.restart_dampener_stamp(&initiator_addr),
+        None,
+        "tearing down a peering that was never heard from must not stamp the \
+         restart dampener: two replays would then refuse the initiator's own \
+         msg1 for the whole interval"
+    );
+
+    deliver_msg1(
+        &mut node,
+        &initiator,
+        transport_id,
+        &genuine_addr(),
+        Node::now_ms(),
+    )
+    .await;
+    assert_eq!(
+        node.get_peer(&initiator_addr)
+            .and_then(|p| p.current_addr().cloned()),
+        Some(genuine_addr()),
+        "the initiator's own msg1 must be promoted after two replays"
+    );
+}
+
+#[tokio::test]
+async fn find_next_hop_does_not_return_a_phantom() {
+    let transport_id = TransportId::new(1);
+    let mut node = make_node();
+    let initiator = make_node();
+    let initiator_addr = node_addr_of(&initiator);
+
+    deliver_msg1(
+        &mut node,
+        &initiator,
+        transport_id,
+        &replayer_addr(),
+        Node::now_ms(),
+    )
+    .await;
+    assert!(
+        node.get_peer(&initiator_addr).is_some(),
+        "the replay must have promoted a phantom"
+    );
+
+    let next_hop = node
+        .find_next_hop(&initiator_addr)
+        .and_then(|p| p.current_addr().cloned());
+    assert_eq!(
+        next_hop, None,
+        "traffic for the initiator must not be routed to a peering promoted \
+         from a replay that has never carried an authenticated frame"
+    );
+}
+
+// ============================================================================
+// What counts as hearing from a peering, and the memory of used captures
+// ============================================================================
+//
+// A responder promotion is evidence of nothing until the peer's first
+// authenticated frame, so the genuine peer's own msg1 can replace a phantom.
+// What bounds that churn is a per-peer memory of the ephemerals that promoted
+// an unheard peering in the last 15 s.
+
+/// `msg1` with the sender index in its header changed. The index lies
+/// outside Noise, so the copy authenticates exactly as the original does,
+/// while its whole-message digest no longer matches the original's.
+fn with_sender_idx(msg1: &[u8], sender_idx: u32) -> Vec<u8> {
+    let mut copy = msg1.to_vec();
+    copy[4..8].copy_from_slice(&sender_idx.to_le_bytes());
+    copy
+}
+
+/// The link of `node`'s peering with `peer`, if it holds one.
+fn peering_link(node: &Node, peer: &NodeAddr) -> Option<LinkId> {
+    node.get_peer(peer).map(|p| p.link_id())
+}
+
+/// Deliver `msg1` to `node` from `addr` at `at_ms`, and report whether it
+/// promoted a new peering for `peer`.
+async fn promotes(
+    node: &mut Node,
+    peer: &NodeAddr,
+    addr: &TransportAddr,
+    msg1: Vec<u8>,
+    at_ms: u64,
+) -> bool {
+    let before = peering_link(node, peer);
+    node.handle_msg1(ReceivedPacket::with_timestamp(
+        TransportId::new(1),
+        addr.clone(),
+        msg1,
+        at_ms,
+    ))
+    .await;
+    let after = peering_link(node, peer);
+    after.is_some() && after != before
+}
+
+#[tokio::test]
+async fn a_replayed_msg1_replacing_a_silent_peer_leaves_it_unheard() {
+    let transport_id = TransportId::new(1);
+    let mut node = make_node();
+    let initiator = make_node();
+    let initiator_addr = node_addr_of(&initiator);
+
+    // A peering silent past the interval, at another epoch: the replay is
+    // accepted as a restart.
+    let stale_link = install_peering_at_a_different_epoch(
+        &mut node,
+        &initiator,
+        transport_id,
+        &genuine_addr(),
+        IDLE_SECS,
+    );
+    assert!(
+        node.get_peer(&initiator_addr).is_some_and(|p| p.is_heard()),
+        "precondition: the silent peering had been heard from"
+    );
+    deliver_msg1(
+        &mut node,
+        &initiator,
+        transport_id,
+        &replayer_addr(),
+        Node::now_ms(),
+    )
+    .await;
+
+    let peer = node
+        .get_peer(&initiator_addr)
+        .expect("the restart must have promoted a peering");
+    assert_ne!(
+        peer.link_id(),
+        stale_link,
+        "precondition: the silent peering was replaced"
+    );
+    assert!(
+        !peer.is_heard(),
+        "a peering promoted on a received msg1 must count as unheard until \
+         its first authenticated frame, whatever it replaced"
+    );
+    assert!(
+        node.restart_dampener_stamp(&initiator_addr).is_some(),
+        "tearing down a peering that had been heard from still stamps the \
+         dampener"
+    );
+}
+
+#[tokio::test]
+async fn a_replay_with_a_changed_sender_idx_is_dropped_before_teardown() {
+    let mut node = make_node();
+    let initiator = make_node();
+    let initiator_addr = node_addr_of(&initiator);
+    let capture = genuine_msg1(&initiator, &node);
+
+    // Promoted long enough ago that the phantom's age alone would not
+    // refuse a replacement: only the ephemeral memory can.
+    assert!(
+        promotes(
+            &mut node,
+            &initiator_addr,
+            &replayer_addr(),
+            capture.clone(),
+            replayed_before_now(),
+        )
+        .await,
+        "precondition: the capture promoted a phantom"
+    );
+    let phantom = peering_link(&node, &initiator_addr);
+    let links = node.link_count();
+    let bad_state = node.stats().handshake.bad_state;
+
+    // The same capture under a new sender index, so the resend check does
+    // not recognise it, from another address the replayer holds.
+    let copy = with_sender_idx(&capture, 0x0bad_cafe);
+    assert_ne!(
+        crate::proto::fmp::Msg1Digest::of(&copy),
+        crate::proto::fmp::Msg1Digest::of(&capture),
+        "precondition: the copy does not digest as a resend"
+    );
+    node.handle_msg1(ReceivedPacket::with_timestamp(
+        TransportId::new(1),
+        TransportAddr::from_string("127.0.0.1:41104"),
+        copy,
+        Node::now_ms(),
+    ))
+    .await;
+
+    assert_eq!(
+        peering_link(&node, &initiator_addr),
+        phantom,
+        "a header-changed copy of the capture that promoted the peering must \
+         not tear it down and promote again"
+    );
+    assert_eq!(
+        node.link_count(),
+        links,
+        "the dropped copy must leave no link behind, so no msg2 went out"
+    );
+    assert_eq!(
+        node.stats().handshake.bad_state - bad_state,
+        1,
+        "the drop must be counted"
+    );
+}
+
+#[tokio::test]
+async fn alternating_two_captures_twenty_times_in_fifteen_seconds_promotes_at_most_two_phantoms() {
+    let mut node = make_node();
+    let initiator = make_node();
+    let initiator_addr = node_addr_of(&initiator);
+    let captures = [
+        (replayer_addr(), genuine_msg1(&initiator, &node)),
+        (
+            TransportAddr::from_string("127.0.0.1:41103"),
+            genuine_msg1(&initiator, &node),
+        ),
+    ];
+
+    let start = Node::now_ms();
+    let mut promoted = 0;
+    for i in 0..20u64 {
+        let (addr, msg1) = &captures[(i % 2) as usize];
+        if promotes(
+            &mut node,
+            &initiator_addr,
+            addr,
+            msg1.clone(),
+            start + i * 700,
+        )
+        .await
+        {
+            promoted += 1;
+        }
+    }
+    assert!(
+        promoted >= 1,
+        "precondition: the first capture promoted a phantom"
+    );
+    assert!(
+        promoted <= 2,
+        "two captures replayed in turn must promote at most one phantom each \
+         inside the interval; promoted {promoted}"
+    );
+}
+
+#[tokio::test]
+async fn nine_distinct_captures_in_fifteen_seconds_promote_at_most_eight() {
+    let mut node = make_node();
+    let initiator = make_node();
+    let initiator_addr = node_addr_of(&initiator);
+
+    let start = Node::now_ms();
+    let mut promoted = 0;
+    for i in 0..9u64 {
+        let addr = TransportAddr::from_string(&format!("127.0.0.1:{}", 41200 + i));
+        let msg1 = genuine_msg1(&initiator, &node);
+        if promotes(&mut node, &initiator_addr, &addr, msg1, start + i * 1000).await {
+            promoted += 1;
+        }
+    }
+    assert!(
+        promoted >= 1,
+        "precondition: the first capture promoted a phantom"
+    );
+    assert!(
+        promoted <= 8,
+        "nine distinct captures inside the interval must promote at most \
+         eight phantoms; promoted {promoted}"
+    );
+    assert_eq!(
+        node.replayed_msg1_count(&initiator_addr),
+        promoted,
+        "every promotion of an unheard peering is remembered"
+    );
+}
+
+#[tokio::test]
+async fn the_genuine_msg1_still_replaces_a_phantom_after_the_ephemeral_is_stored() {
+    let transport_id = TransportId::new(1);
+    let mut node = make_node();
+    let initiator = make_node();
+    let initiator_addr = node_addr_of(&initiator);
+
+    deliver_msg1(
+        &mut node,
+        &initiator,
+        transport_id,
+        &replayer_addr(),
+        replayed_before_now(),
+    )
+    .await;
+    assert_eq!(
+        node.replayed_msg1_count(&initiator_addr),
+        1,
+        "precondition: the replay's ephemeral is remembered"
+    );
+
+    deliver_msg1(
+        &mut node,
+        &initiator,
+        transport_id,
+        &genuine_addr(),
+        Node::now_ms(),
+    )
+    .await;
+    assert_eq!(
+        node.get_peer(&initiator_addr)
+            .and_then(|p| p.current_addr().cloned()),
+        Some(genuine_addr()),
+        "a remembered ephemeral must refuse only its own msg1, not the \
+         initiator's fresh one"
+    );
+}
+
+#[tokio::test]
+async fn a_genuine_msg1_meeting_a_phantom_promoted_just_before_it_replaces_it_at_its_resend() {
+    let mut node = make_node();
+    let initiator = make_node();
+    let initiator_addr = node_addr_of(&initiator);
+    let start = Node::now_ms();
+
+    deliver_msg1(
+        &mut node,
+        &initiator,
+        TransportId::new(1),
+        &replayer_addr(),
+        start,
+    )
+    .await;
+    // The initiator's own msg1 lands just after the replay: a second msg1
+    // this soon is what a dialer opening two paths sends, so it is refused.
+    let genuine = genuine_msg1(&initiator, &node);
+    assert!(
+        !promotes(
+            &mut node,
+            &initiator_addr,
+            &genuine_addr(),
+            genuine.clone(),
+            start + 100,
+        )
+        .await,
+        "a second msg1 inside the minimum age must not replace the peering"
+    );
+
+    // Its first resend, the same bytes a second later, replaces the phantom.
+    assert!(
+        promotes(
+            &mut node,
+            &initiator_addr,
+            &genuine_addr(),
+            genuine,
+            start + 100 + 1_000,
+        )
+        .await,
+        "the genuine msg1's resend must replace a phantom that has had the \
+         minimum age and was never heard from"
+    );
+    assert_eq!(
+        node.get_peer(&initiator_addr)
+            .and_then(|p| p.current_addr().cloned()),
+        Some(genuine_addr())
+    );
+}
+
+/// A decrypt-worker bounce for a frame that authenticated on `receiver_idx`,
+/// as the worker hands it back to the receive loop: an empty link message
+/// behind the inner timestamp.
+#[cfg(unix)]
+fn bounce_from(
+    source: NodeAddr,
+    transport_id: TransportId,
+    remote_addr: TransportAddr,
+    receiver_idx: u32,
+) -> crate::node::decrypt_worker::DecryptFallback {
+    let mut data = 0u32.to_le_bytes().to_vec();
+    data.push(0xFF);
+    crate::node::decrypt_worker::DecryptFallback {
+        source_node_addr: source,
+        transport_id,
+        remote_addr,
+        timestamp_ms: Node::now_ms(),
+        packet_len: data.len() + 32,
+        receiver_idx,
+        fmp_counter: 1,
+        fmp_flags: 0,
+        fmp_plaintext_len: data.len(),
+        packet_data: data,
+        fmp_plaintext_offset: 0,
+    }
+}
+
+// The genuine peering is still unheard 1.5 s after its promotion, and its
+// first frame has gone to the decrypt worker. Before the worker's bounce is
+// handled, a replayed capture replaces the peering. The bounce authenticates
+// only the torn-down session, so it must not count as hearing the phantom.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_worker_bounce_from_a_replaced_session_does_not_mark_the_phantom_heard() {
+    let transport_id = TransportId::new(1);
+    let mut node = make_node();
+    let initiator = make_node();
+    let initiator_addr = node_addr_of(&initiator);
+
+    deliver_msg1(
+        &mut node,
+        &initiator,
+        transport_id,
+        &genuine_addr(),
+        replayed_before_now(),
+    )
+    .await;
+    let genuine = node.get_peer(&initiator_addr).expect("genuine peering");
+    assert!(!genuine.is_heard(), "precondition: genuine peering unheard");
+    let genuine_idx = genuine.our_index().expect("genuine index").as_u32();
+
+    deliver_msg1(
+        &mut node,
+        &initiator,
+        transport_id,
+        &replayer_addr(),
+        Node::now_ms(),
+    )
+    .await;
+    let phantom = node.get_peer(&initiator_addr).expect("phantom peering");
+    assert_eq!(
+        phantom.current_addr().cloned(),
+        Some(replayer_addr()),
+        "precondition: the replay replaced the genuine peering"
+    );
+    assert_ne!(phantom.our_index().map(|i| i.as_u32()), Some(genuine_idx));
+
+    node.process_decrypt_fallback(bounce_from(
+        initiator_addr,
+        transport_id,
+        genuine_addr(),
+        genuine_idx,
+    ))
+    .await;
+
+    let phantom = node.get_peer(&initiator_addr).expect("phantom peering");
+    let heard = phantom.is_heard();
+    let addr = phantom.current_addr().cloned();
+    let next_hop = node.find_next_hop(&initiator_addr).is_some();
+    assert!(
+        !heard && !next_hop && addr == Some(replayer_addr()),
+        "a frame authenticated on a session that no longer belongs to the \
+         peering must not count as hearing the phantom that replaced it; \
+         phantom heard {heard}, address now {addr:?}, find_next_hop returns \
+         it {next_hop}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_worker_bounce_on_the_current_session_marks_the_peering_heard() {
+    let transport_id = TransportId::new(1);
+    let mut node = make_node();
+    let initiator = make_node();
+    let initiator_addr = node_addr_of(&initiator);
+
+    deliver_msg1(
+        &mut node,
+        &initiator,
+        transport_id,
+        &genuine_addr(),
+        Node::now_ms(),
+    )
+    .await;
+    let idx = node
+        .get_peer(&initiator_addr)
+        .and_then(|p| p.our_index())
+        .expect("promoted peering")
+        .as_u32();
+
+    node.process_decrypt_fallback(bounce_from(
+        initiator_addr,
+        transport_id,
+        genuine_addr(),
+        idx,
+    ))
+    .await;
+
+    assert!(
+        node.get_peer(&initiator_addr).is_some_and(|p| p.is_heard()),
+        "a frame the worker authenticated on the peering's own session must \
+         mark it heard"
+    );
+}
+
+/// Install an established end-to-end session between `node` and `initiator`,
+/// built from a real XK handshake, as if it ran over the mesh rather than over
+/// any link peering between the two.
+fn install_end_to_end_session(node: &mut Node, initiator: &Node) {
+    use crate::node::session::{EndToEndState, SessionEntry};
+    use crate::noise::HandshakeState;
+
+    let mut ini = HandshakeState::new_xk_initiator(
+        initiator.identity().keypair(),
+        node.identity().pubkey_full(),
+    );
+    ini.set_local_epoch(initiator.startup_epoch());
+    let mut resp = HandshakeState::new_xk_responder(node.identity().keypair());
+    resp.set_local_epoch(node.startup_epoch());
+    let m1 = ini.write_xk_message_1().unwrap();
+    resp.read_xk_message_1(&m1).unwrap();
+    let m2 = resp.write_xk_message_2().unwrap();
+    ini.read_xk_message_2(&m2).unwrap();
+    let m3 = ini.write_xk_message_3().unwrap();
+    resp.read_xk_message_3(&m3).unwrap();
+    let session = resp.into_session().unwrap();
+    let mut entry = SessionEntry::new(
+        node_addr_of(initiator),
+        initiator.identity().pubkey_full(),
+        EndToEndState::Established(session),
+        Node::now_ms(),
+        false,
+    );
+    entry.touch(Node::now_ms());
+    node.sessions.insert(node_addr_of(initiator), entry);
+}
+
+/// Whether `node` holds an established end-to-end session with `peer`.
+fn end_to_end_alive(node: &Node, peer: &NodeAddr) -> bool {
+    node.get_session(peer).is_some_and(|e| e.is_established())
+}
+
+#[tokio::test]
+async fn a_replay_replacing_an_unheard_phantom_leaves_the_end_to_end_session_alone() {
+    let mut node = make_node();
+    let initiator = make_node();
+    let initiator_addr = node_addr_of(&initiator);
+    let start = Node::now_ms();
+
+    // A capture replayed while the initiator has no link peering here.
+    let capture = genuine_msg1(&initiator, &node);
+    assert!(
+        promotes(&mut node, &initiator_addr, &replayer_addr(), capture, start).await,
+        "precondition: the first capture promoted a phantom"
+    );
+    install_end_to_end_session(&mut node, &initiator);
+
+    // A second, distinct capture once the phantom may be replaced.
+    let capture = genuine_msg1(&initiator, &node);
+    let replaced = promotes(
+        &mut node,
+        &initiator_addr,
+        &TransportAddr::from_string("127.0.0.1:41103"),
+        capture,
+        start + 1_100,
+    )
+    .await;
+    assert!(
+        replaced,
+        "precondition: the second capture replaced the phantom"
+    );
+    assert!(
+        end_to_end_alive(&node, &initiator_addr),
+        "a replayed msg1 replacing a phantom that never carried a frame must \
+         not end the end-to-end session with that node"
+    );
+}
+
+#[tokio::test]
+async fn eight_captures_in_fifteen_seconds_never_end_the_end_to_end_session() {
+    let mut node = make_node();
+    let initiator = make_node();
+    let initiator_addr = node_addr_of(&initiator);
+    let start = Node::now_ms();
+    install_end_to_end_session(&mut node, &initiator);
+
+    let mut replacements = 0;
+    let mut endings = 0;
+    for i in 0..8u64 {
+        let capture = genuine_msg1(&initiator, &node);
+        let before = peering_link(&node, &initiator_addr);
+        if promotes(
+            &mut node,
+            &initiator_addr,
+            &TransportAddr::from_string(&format!("127.0.0.1:{}", 41200 + i)),
+            capture,
+            start + i * 1_100,
+        )
+        .await
+            && before.is_some()
+        {
+            replacements += 1;
+        }
+        if !end_to_end_alive(&node, &initiator_addr) {
+            endings += 1;
+            install_end_to_end_session(&mut node, &initiator);
+        }
+    }
+    assert!(
+        replacements >= 2,
+        "precondition: the captures replaced the phantom repeatedly \
+         ({replacements} replacements)"
+    );
+    assert_eq!(
+        endings, 0,
+        "distinct captures replacing an unheard phantom must not end the \
+         end-to-end session ({replacements} replacements)"
+    );
+}
+
+#[tokio::test]
+async fn removing_an_unheard_peering_keeps_the_end_to_end_session() {
+    let mut node = make_node();
+    let initiator = make_node();
+    let initiator_addr = node_addr_of(&initiator);
+    let capture = genuine_msg1(&initiator, &node);
+
+    assert!(
+        promotes(
+            &mut node,
+            &initiator_addr,
+            &replayer_addr(),
+            capture,
+            Node::now_ms(),
+        )
+        .await,
+        "precondition: the capture promoted a phantom"
+    );
+    install_end_to_end_session(&mut node, &initiator);
+
+    // The link-dead reap of a phantom goes through the same removal.
+    node.remove_active_peer(&initiator_addr);
+
+    assert!(
+        node.get_peer(&initiator_addr).is_none(),
+        "precondition: the peering was removed"
+    );
+    assert!(
+        end_to_end_alive(&node, &initiator_addr),
+        "removing a peering that never carried a frame must not end the \
+         end-to-end session with that node"
+    );
+}
+
+#[tokio::test]
+async fn a_restart_of_a_heard_peering_still_ends_the_end_to_end_session() {
+    let transport_id = TransportId::new(1);
+    let mut node = make_node();
+    let initiator = make_node();
+    let initiator_addr = node_addr_of(&initiator);
+
+    let stale_link = install_peering_at_a_different_epoch(
+        &mut node,
+        &initiator,
+        transport_id,
+        &genuine_addr(),
+        IDLE_SECS,
+    );
+    assert!(
+        node.get_peer(&initiator_addr).is_some_and(|p| p.is_heard()),
+        "precondition: the peering had been heard from"
+    );
+    install_end_to_end_session(&mut node, &initiator);
+
+    deliver_msg1(
+        &mut node,
+        &initiator,
+        transport_id,
+        &genuine_addr(),
+        Node::now_ms(),
+    )
+    .await;
+
+    assert_ne!(
+        peering_link(&node, &initiator_addr),
+        Some(stale_link),
+        "precondition: the restart replaced the peering"
+    );
+    assert!(
+        !end_to_end_alive(&node, &initiator_addr),
+        "a restart of a peering that had been heard from must still end the \
+         end-to-end session, which the restarted peer no longer holds"
+    );
+}
+
+mod heard {
+    //! Two loopback nodes over a real handshake: A dials B.
+
+    use super::super::spanning_tree::{
+        TestNode, cleanup_nodes, drain_all_packets, initiate_handshake, make_test_node,
+    };
+    use super::*;
+    use crate::proto::fmp::wire::{CommonPrefix, PHASE_MSG2};
+
+    const A: usize = 0;
+    const B: usize = 1;
+
+    /// Two loopback nodes, A having sent B its msg1, which is queued at B.
+    async fn dialled_pair() -> Vec<TestNode> {
+        let mut nodes = vec![make_test_node().await, make_test_node().await];
+        initiate_handshake(&mut nodes, A, B).await;
+        nodes
+    }
+
+    /// Hand `tn` a msg1 from `remote_addr`, arriving now.
+    async fn msg1_at(tn: &mut TestNode, remote_addr: &TransportAddr, data: Vec<u8>) {
+        let transport_id = tn.transport_id;
+        tn.node
+            .handle_msg1(ReceivedPacket::with_timestamp(
+                transport_id,
+                remote_addr.clone(),
+                data,
+                Node::now_ms(),
+            ))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn an_identical_resend_after_a_lost_msg2_still_draws_the_stored_msg2() {
+        let mut nodes = dialled_pair().await;
+        let a_addr = node_addr_of(&nodes[A].node);
+        let setup = nodes[B]
+            .packet_rx
+            .try_recv()
+            .expect("precondition: A's msg1 is queued at B");
+        let copy = setup.clone();
+        nodes[B].node.handle_msg1(setup).await;
+        let link = peering_link(&nodes[B].node, &a_addr).expect("precondition: B promoted A");
+        assert!(
+            !nodes[B].node.get_peer(&a_addr).unwrap().is_heard(),
+            "precondition: B has heard nothing from A yet"
+        );
+        // A's msg2 is lost: everything B sent is discarded unread.
+        let first: Vec<Vec<u8>> = std::iter::from_fn(|| nodes[A].packet_rx.try_recv().ok())
+            .map(|p| p.data)
+            .collect();
+        let stored = first
+            .iter()
+            .find(|d| CommonPrefix::parse(d).is_some_and(|p| p.phase == PHASE_MSG2))
+            .expect("precondition: B answered with a msg2")
+            .clone();
+
+        msg1_at(&mut nodes[B], &copy.remote_addr, copy.data.clone()).await;
+
+        let answers: Vec<Vec<u8>> = std::iter::from_fn(|| nodes[A].packet_rx.try_recv().ok())
+            .map(|p| p.data)
+            .collect();
+        assert_eq!(
+            answers,
+            vec![stored],
+            "A's own resend of its msg1 must draw B's stored msg2, not the \
+             replay memory's refusal"
+        );
+        assert_eq!(
+            peering_link(&nodes[B].node, &a_addr),
+            Some(link),
+            "the resend must leave B's peering as it was"
+        );
+        cleanup_nodes(&mut nodes).await;
+    }
+
+    #[tokio::test]
+    async fn a_responder_peering_that_has_decrypted_a_frame_still_refuses_a_replay_inside_the_interval()
+     {
+        let mut nodes = dialled_pair().await;
+        let a_addr = node_addr_of(&nodes[A].node);
+        let a_link_addr = nodes[A].addr.clone();
+        let setup = nodes[B]
+            .packet_rx
+            .try_recv()
+            .expect("precondition: A's msg1 is queued at B");
+        nodes[B].node.handle_msg1(setup).await;
+        assert_eq!(
+            nodes[B].node.replayed_msg1_count(&a_addr),
+            1,
+            "precondition: B remembers the msg1 that promoted A unheard"
+        );
+        drain_all_packets(&mut nodes, false).await;
+        let link = {
+            let p = nodes[B]
+                .node
+                .get_peer(&a_addr)
+                .expect("precondition: B holds A");
+            assert!(
+                p.is_heard(),
+                "an authenticated frame from A must mark B's peering heard"
+            );
+            p.link_id()
+        };
+        assert_eq!(
+            nodes[B].node.replayed_msg1_count(&a_addr),
+            0,
+            "hearing from A must clear the memory of msg1s that promoted it"
+        );
+
+        let capture = genuine_msg1(&nodes[A].node, &nodes[B].node);
+        msg1_at(&mut nodes[B], &replayer_addr(), capture).await;
+
+        let p = nodes[B]
+            .node
+            .get_peer(&a_addr)
+            .expect("a peering carrying authenticated frames must survive a replay");
+        assert_eq!(
+            (p.link_id(), p.current_addr().cloned()),
+            (link, Some(a_link_addr)),
+            "a peering heard from inside the interval must refuse a replayed msg1"
+        );
+        cleanup_nodes(&mut nodes).await;
+    }
+
+    #[tokio::test]
+    async fn an_initiator_promoted_peering_refuses_a_replay_immediately() {
+        let mut nodes = dialled_pair().await;
+        let b_addr = node_addr_of(&nodes[B].node);
+        let b_link_addr = nodes[B].addr.clone();
+        let setup = nodes[B]
+            .packet_rx
+            .try_recv()
+            .expect("precondition: A's msg1 is queued at B");
+        nodes[B].node.handle_msg1(setup).await;
+
+        // A reads B's msg2 and nothing else: no frame from B is processed.
+        let replies: Vec<ReceivedPacket> =
+            std::iter::from_fn(|| nodes[A].packet_rx.try_recv().ok()).collect();
+        let msg2 = replies
+            .into_iter()
+            .find(|p| CommonPrefix::parse(&p.data).is_some_and(|c| c.phase == PHASE_MSG2))
+            .expect("precondition: B answered with a msg2");
+        nodes[A].node.handle_msg2(msg2).await;
+        let link = peering_link(&nodes[A].node, &b_addr).expect("precondition: A promoted B");
+
+        let capture = genuine_msg1(&nodes[B].node, &nodes[A].node);
+        msg1_at(&mut nodes[A], &replayer_addr(), capture).await;
+
+        let p = nodes[A]
+            .node
+            .get_peer(&b_addr)
+            .expect("a peering this node initiated must survive a replay");
+        assert_eq!(
+            (p.link_id(), p.current_addr().cloned()),
+            (link, Some(b_link_addr)),
+            "a peering promoted by our own msg1's answer is fresh evidence, \
+             and must refuse a replay before any frame arrives"
+        );
+        cleanup_nodes(&mut nodes).await;
+    }
+
+    /// Two loopback nodes, returned with the indices of the dialer and the
+    /// responder, the dialer's address larger than the responder's when
+    /// `dialer_larger`.
+    async fn ordered_pair(dialer_larger: bool) -> (Vec<TestNode>, usize, usize) {
+        let nodes = vec![make_test_node().await, make_test_node().await];
+        let zero_larger = nodes[0].node.node_addr() > nodes[1].node.node_addr();
+        if zero_larger == dialer_larger {
+            (nodes, 0, 1)
+        } else {
+            (nodes, 1, 0)
+        }
+    }
+
+    /// A dialer sends the responder two link-setup msg1s in one tick, as it
+    /// does when it opens several paths to one peer at once, and both ends
+    /// must then hold a peering that has decrypted the other's frames.
+    async fn two_msg1s_in_one_tick_leave_a_working_peering(dialer_larger: bool) {
+        let (mut nodes, d, r) = ordered_pair(dialer_larger).await;
+        let d_addr = node_addr_of(&nodes[d].node);
+        let r_addr = node_addr_of(&nodes[r].node);
+        initiate_handshake(&mut nodes, d, r).await;
+        initiate_handshake(&mut nodes, d, r).await;
+        drain_all_packets(&mut nodes, false).await;
+
+        let at_r = nodes[r]
+            .node
+            .get_peer(&d_addr)
+            .map(|p| (p.is_heard(), p.link_stats().packets_recv));
+        let at_d = nodes[d]
+            .node
+            .get_peer(&r_addr)
+            .map(|p| p.link_stats().packets_recv);
+        assert!(
+            at_r.is_some_and(|(heard, n)| heard && n > 0),
+            "the responder must have decrypted the dialer's frames on the \
+             peering it kept; (heard, frames) {at_r:?}"
+        );
+        assert!(
+            at_d.is_some_and(|n| n > 0),
+            "the dialer must have decrypted the responder's frames on the \
+             peering it kept; frames {at_d:?}"
+        );
+        cleanup_nodes(&mut nodes).await;
+    }
+
+    #[tokio::test]
+    async fn two_msg1s_in_one_tick_from_the_larger_address_leave_a_working_peering() {
+        two_msg1s_in_one_tick_leave_a_working_peering(true).await;
+    }
+
+    #[tokio::test]
+    async fn two_msg1s_in_one_tick_from_the_smaller_address_leave_a_working_peering() {
+        two_msg1s_in_one_tick_leave_a_working_peering(false).await;
+    }
+}
