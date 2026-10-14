@@ -6,6 +6,7 @@
 //! encrypted data, and error signals (CoordsRequired, PathBroken).
 
 use crate::NodeAddr;
+use crate::cache::Funding;
 use crate::node::handlers::mmp::format_throughput;
 use crate::node::rate_limit::Msg1Class;
 use crate::node::reject::{RejectReason, SessionReject};
@@ -1364,7 +1365,23 @@ impl Node {
         entry.set_handshake_payload(msg3_payload, now_ms + resend_interval);
         entry.touch(now_ms);
         self.sessions.insert(*src_addr, entry);
-        self.insert_coord_hint(*src_addr, ack.src_coords.clone(), now_ms);
+        // Not charged to a link peer: this node started the handshake, and
+        // msg2 has authenticated, so the write happens once per session.
+        if self
+            .insert_coord_hint(
+                *src_addr,
+                ack.src_coords.clone(),
+                now_ms,
+                Funding::Uncharged,
+            )
+            .is_none()
+        {
+            debug!(
+                src = %self.peer_display_name(src_addr),
+                reason = "foreign root",
+                "SessionAck coordinate hint refused"
+            );
+        }
 
         // Flush any queued outbound packets for this destination
         self.flush_pending_packets(src_addr).await;

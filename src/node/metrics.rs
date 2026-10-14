@@ -90,6 +90,12 @@ pub struct ForwardingMetrics {
     /// still inside its verification window, or because the cache was full of
     /// live-verified entries and declined to evict one.
     pub coord_hint_rejected: Counter,
+    /// Hint writes the writing link peer's budget could not pay for: a new
+    /// destination placed in the cache's probation segment, or an update that
+    /// would have grown an entry kept at its old coordinates. The frame is
+    /// routed either way. Non-zero in honest operation means the per-peer rate
+    /// is below what some neighbour's honest traffic needs.
+    pub coord_hint_unfunded: Counter,
     pub ttl_exhausted_packets: Counter,
     pub ttl_exhausted_bytes: Counter,
     pub delivered_packets: Counter,
@@ -159,6 +165,11 @@ impl ForwardingMetrics {
     /// root.
     pub fn record_warm_foreign_root(&self) {
         self.coord_warm_foreign_root.inc();
+    }
+
+    /// Record a hint write its link peer's budget could not pay for.
+    pub fn record_hint_unfunded(&self) {
+        self.coord_hint_unfunded.inc();
     }
 
     /// Record a warm write whose coordinate does not name its own key.
@@ -247,6 +258,7 @@ impl ForwardingMetrics {
             coord_warm_key_mismatch: self.coord_warm_key_mismatch.get(),
             coord_hint_changed: self.coord_hint_changed.get(),
             coord_hint_rejected: self.coord_hint_rejected.get(),
+            coord_hint_unfunded: self.coord_hint_unfunded.get(),
             ttl_exhausted_packets: self.ttl_exhausted_packets.get(),
             ttl_exhausted_bytes: self.ttl_exhausted_bytes.get(),
             delivered_packets: self.delivered_packets.get(),

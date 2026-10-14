@@ -8,6 +8,7 @@
 //! error signal generated on routing failure.
 
 use crate::NodeAddr;
+use crate::cache::Funding;
 use crate::node::reject::ForwardingReject;
 use crate::node::{Node, NodeError, NodeRoutingView};
 use crate::proto::fsp::wire::{
@@ -52,7 +53,7 @@ impl Node {
         // coords a peer put on the wire are equally valid whichever way those
         // go, and the only arrivals this newly warms from are those with an
         // exhausted TTL, whose every insert is already achievable at TTL 1.
-        self.try_warm_coord_cache_ref(&datagram_ref, payload.len());
+        self.try_warm_coord_cache_ref(from, &datagram_ref, payload.len());
 
         // Pre-resolve the next hop only for datagrams the core can actually
         // forward: not locally destined, and carrying a TTL that survives the
@@ -227,11 +228,19 @@ impl Node {
     /// reconstructed from the header size so the malformed-frame byte counter
     /// measures the same population as its siblings — which are charged the
     /// outer slice — instead of the inner FSP payload.
-    /// Warm one coordinate-cache entry from a plaintext session header.
+    /// Warm one coordinate-cache entry from a plaintext session header, paid
+    /// for by `from`, the authenticated link peer the frame arrived over.
     ///
     /// The key and the value both come off the wire unauthenticated. The
     /// foreign-root refusal applies to every hint write and lives in
     /// `Node::insert_coord_hint`; this adds the check only the warm path makes.
+    ///
+    /// **Per-peer budget: decides placement, never routing.** At a transit the
+    /// cache write is the route, so a write the link peer cannot pay for is
+    /// still made, in the cache's probation segment, where it evicts nothing a
+    /// paid write placed. The budget is spent only by what the cache reports
+    /// the write added, so a refused write costs nothing. Buckets of link
+    /// peers that have left the peer table are swept here, ahead of the read.
     ///
     /// **Key mismatch: counted only.** A coordinate whose first element is not
     /// the address it is filed under is wrong, but refusing it here would also
@@ -241,14 +250,45 @@ impl Node {
     /// not established, so this counts and does not refuse. It is **not** a
     /// security check either way — an attacker satisfies it by naming the
     /// victim as its own child, which is the forgery worth making.
-    fn warm_coord(&mut self, key: NodeAddr, coords: TreeCoordinate, now_ms: u64) {
+    fn warm_coord(&mut self, from: &NodeAddr, key: NodeAddr, coords: TreeCoordinate, now_ms: u64) {
         let mismatch = *coords.node_addr() != key;
-        if self.insert_coord_hint(key, coords, now_ms) && mismatch {
+        let now = Instant::now();
+        let peers = &self.peers;
+        self.coord_hint_budget
+            .sweep_departed(now, |peer| peers.contains_key(peer));
+        let funding = Funding::Upto(self.coord_hint_budget.available(from, now));
+        let Some(placed) = self.insert_coord_hint(key, coords, now_ms, funding) else {
+            debug!(
+                peer = %self.peer_display_name(from),
+                addr = %key,
+                reason = "foreign root",
+                "Coordinate hint refused"
+            );
+            return;
+        };
+        if mismatch {
             self.metrics().forwarding.record_warm_key_mismatch();
+        }
+        if placed.added_weight > 0 {
+            self.coord_hint_budget.spend(from, placed.added_weight, now);
+        }
+        if placed.unfunded {
+            debug!(
+                peer = %self.peer_display_name(from),
+                addr = %key,
+                reason = "over link peer's hint budget",
+                segment = ?placed.segment,
+                "Coordinate hint not paid for"
+            );
         }
     }
 
-    fn try_warm_coord_cache_ref(&mut self, datagram: &SessionDatagramRef<'_>, outer_len: usize) {
+    fn try_warm_coord_cache_ref(
+        &mut self,
+        from: &NodeAddr,
+        datagram: &SessionDatagramRef<'_>,
+        outer_len: usize,
+    ) {
         let prefix = match FspCommonPrefix::parse(datagram.payload) {
             Some(p) => p,
             None => return,
@@ -264,8 +304,8 @@ impl Node {
         match prefix.phase {
             FSP_PHASE_MSG1 => match SessionSetup::decode(inner) {
                 Ok(setup) => {
-                    self.warm_coord(datagram.src_addr, setup.src_coords, now_ms);
-                    self.warm_coord(datagram.dest_addr, setup.dest_coords, now_ms);
+                    self.warm_coord(from, datagram.src_addr, setup.src_coords, now_ms);
+                    self.warm_coord(from, datagram.dest_addr, setup.dest_coords, now_ms);
                     debug!(
                         src = %datagram.src_addr,
                         dest = %datagram.dest_addr,
@@ -278,8 +318,8 @@ impl Node {
             },
             FSP_PHASE_MSG2 => match SessionAck::decode(inner) {
                 Ok(ack) => {
-                    self.warm_coord(datagram.src_addr, ack.src_coords, now_ms);
-                    self.warm_coord(datagram.dest_addr, ack.dest_coords, now_ms);
+                    self.warm_coord(from, datagram.src_addr, ack.src_coords, now_ms);
+                    self.warm_coord(from, datagram.dest_addr, ack.dest_coords, now_ms);
                     debug!(
                         src = %datagram.src_addr,
                         dest = %datagram.dest_addr,
@@ -315,10 +355,10 @@ impl Node {
                 match parse_encrypted_coords(coord_data) {
                     Ok((src_coords, dest_coords, _bytes_consumed)) => {
                         if let Some(coords) = src_coords {
-                            self.warm_coord(datagram.src_addr, coords, now_ms);
+                            self.warm_coord(from, datagram.src_addr, coords, now_ms);
                         }
                         if let Some(coords) = dest_coords {
-                            self.warm_coord(datagram.dest_addr, coords, now_ms);
+                            self.warm_coord(from, datagram.dest_addr, coords, now_ms);
                         }
                         debug!(
                             src = %datagram.src_addr,

@@ -329,6 +329,7 @@ pub struct ForwardingStatsSnapshot {
     pub coord_warm_key_mismatch: u64,
     pub coord_hint_changed: u64,
     pub coord_hint_rejected: u64,
+    pub coord_hint_unfunded: u64,
     pub ttl_exhausted_packets: u64,
     pub ttl_exhausted_bytes: u64,
     pub delivered_packets: u64,

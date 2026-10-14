@@ -9,7 +9,8 @@ mod entry;
 use thiserror::Error;
 
 pub use coord_cache::{
-    CoordCache, DEFAULT_COORD_CACHE_SIZE, DEFAULT_COORD_CACHE_TTL_MS, HintOutcome,
+    ADDRS_PER_ENTRY, CoordCache, DEFAULT_COORD_CACHE_SIZE, DEFAULT_COORD_CACHE_TTL_MS, Funding,
+    HintOutcome, PROBATION_SHARE_DIVISOR, Placed, Segment,
 };
 pub use entry::{CacheEntry, CoordSource, VERIFIED_TTL_MS};
 

@@ -41,7 +41,7 @@ use self::reloadable::Reloadable;
 /// dual-initiation in symmetric-start meshes; the configured
 /// `node.rekey.after_secs` remains the nominal interval (mean preserved).
 pub(crate) const REKEY_JITTER_SECS: i64 = 15;
-use crate::cache::CoordCache;
+use crate::cache::{CoordCache, Funding, Placed};
 use crate::node::session::SessionEntry;
 use crate::peer::machine::{PeerMachine, TimerKind};
 use crate::peer::{ActivePeer, ConnectivityState};
@@ -710,6 +710,10 @@ pub struct Node {
     /// per-destination interval inside `routing` is keyed on a field the
     /// sender chooses and is an aggregate suppressor, not a bound.
     peer_error_budget: PeerBudget,
+    /// Budget each authenticated link peer pays coordinate-cache hints from,
+    /// in units of cache weight. Decides where a hint is placed, never whether
+    /// the frame carrying it is routed.
+    coord_hint_budget: PeerBudget,
     /// Routing-subsystem state (routing error-signal rate limiter).
     routing: Router,
     /// FMP connection-lifecycle decision anchor (stateless; drives the
@@ -987,6 +991,7 @@ impl Node {
             setup_rate_limiter,
             icmp_rate_limiter: IcmpRateLimiter::new(),
             peer_error_budget: PeerBudget::new(),
+            coord_hint_budget: PeerBudget::coord_hints(),
             routing: Router::new(),
             fmp: Fmp::new(),
             fsp: Fsp::new(),
@@ -1152,6 +1157,7 @@ impl Node {
             setup_rate_limiter,
             icmp_rate_limiter: IcmpRateLimiter::new(),
             peer_error_budget: PeerBudget::new(),
+            coord_hint_budget: PeerBudget::coord_hints(),
             routing: Router::new(),
             fmp: Fmp::new(),
             fsp: Fsp::new(),
@@ -3509,22 +3515,33 @@ impl Node {
     /// write time instead of waiting for the next move. It is checked here,
     /// not at a caller, so that no write site can skip it.
     ///
-    /// Returns whether the hint was accepted: `false` if it was refused for a
-    /// foreign root.
+    /// `funding` is what the writer can pay toward the cache space the hint
+    /// takes; see `CoordCache::insert_funded`. Returns what the write did, or
+    /// `None` if it was refused for a foreign root, which the caller logs with
+    /// the hint's source; the caller spends the returned `added_weight` from
+    /// the writer's budget.
     pub(crate) fn insert_coord_hint(
         &mut self,
         addr: NodeAddr,
         coords: TreeCoordinate,
         now_ms: u64,
-    ) -> bool {
+        funding: Funding,
+    ) -> Option<Placed> {
         if coords.root_id() != self.tree_state.my_coords().root_id() {
             self.metrics().forwarding.record_warm_foreign_root();
-            tracing::trace!(addr = %addr, "Hint names a foreign root; not caching");
-            return false;
+            return None;
         }
-        let outcome = self.coord_cache.insert(addr, coords, now_ms);
-        self.metrics().forwarding.record_hint_outcome(outcome);
-        true
+        let placed = self
+            .coord_cache
+            .insert_funded(addr, coords, now_ms, funding);
+        if placed.unfunded {
+            self.metrics().forwarding.record_hint_unfunded();
+        } else {
+            self.metrics()
+                .forwarding
+                .record_hint_outcome(placed.outcome);
+        }
+        Some(placed)
     }
 
     pub fn find_next_hop(&mut self, dest_node_addr: &NodeAddr) -> Option<&ActivePeer> {

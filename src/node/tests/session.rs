@@ -7572,9 +7572,12 @@ async fn test_a_data_frame_to_a_destination_with_no_cached_coordinates_carries_n
     // node 0 is removed first, so the only way node 1 can learn node 0's
     // coordinates again is from a frame that carries them.
     let now_ms = wall_clock_ms();
-    nodes[0]
-        .node
-        .insert_coord_hint(node1_addr, node1_coords, now_ms);
+    let _ = nodes[0].node.insert_coord_hint(
+        node1_addr,
+        node1_coords,
+        now_ms,
+        crate::cache::Funding::Uncharged,
+    );
     nodes[1].node.coord_cache.remove(&node0_addr);
     nodes[0]
         .node

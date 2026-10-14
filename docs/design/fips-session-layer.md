@@ -441,7 +441,27 @@ transit, CP-flagged data packets, LookupResponse — write to the same cache.
   addresses it stores at 16 per configured entry. Each entry is charged its
   coordinate length or 16, whichever is larger, and a write that would exceed
   the bound evicts like a write to a full cache. Deep coordinates still cache
-  and route; they reduce how many entries fit
+  and route; they reduce how many entries fit. A coordinate heavier than the
+  whole bound is stored alone
+- **Per-link-peer budget**: Each authenticated link peer pays for the hints it
+  writes through this node, in units of the weight above, at 1,024 units a
+  second up to 4,096; a newly seen peer starts with none, and a peer keeps
+  what it accrues while it stays connected. A new destination the peer can pay
+  for goes into the cache's main segment, or into probation if every main
+  entry is live-verified. One it cannot pay for goes into a
+  probation segment of `max(1, coord_size / 32)` entries on top, which evicts
+  only its own least recently used entries, so the frame is still routed and
+  nothing a paid write placed is displaced. A later write of the same
+  destination that pays its whole weight, and at least the most weight
+  probation has held for it, promotes it; using an entry does not. A write
+  of an expired entry is placed as a new destination's would be. An update
+  is charged only for depth beyond the most the entry has been charged for,
+  and one that is not paid for keeps the old coordinates; making an entry
+  shallower does not lower its charge, so a forged shallow rewrite
+  does not make the honest correction cost anything. Writes this node's own
+  handshakes make (the SessionAck's source coordinates) and verified lookup
+  results are not charged. The `coord_hint_unfunded` counter counts unpaid
+  writes
 - **Flush on parent change**: When the local node's tree parent changes, the
   entire coordinate cache is flushed. Tree parent changes mean the node's own
   coordinates have changed, making cached coordinates for other nodes

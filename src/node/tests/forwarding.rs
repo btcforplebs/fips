@@ -5,7 +5,8 @@
 //! multi-hop forwarding through live node topologies.
 
 use super::*;
-use crate::node::peer_budget::PEER_ERROR_BURST;
+use crate::cache::Funding;
+use crate::node::peer_budget::{PEER_ERROR_BURST, PeerBudget};
 use crate::proto::fsp::wire::{FSP_FLAG_CP, build_fsp_header};
 use crate::proto::fsp::{SessionAck, SessionSetup};
 use crate::proto::link::SessionDatagram;
@@ -1466,9 +1467,132 @@ fn setup_frame(
     encoded[1..].to_vec()
 }
 
+/// New destinations one link peer may place per second once its budget is
+/// spent, and the entries the probation segment holds whatever their depth, at the
+/// default cache size.
+const HINT_KEYS_PER_SEC: u64 = crate::node::peer_budget::COORD_HINT_WEIGHT_PER_SEC as u64
+    / crate::cache::ADDRS_PER_ENTRY as u64;
+const UNPAID_HINT_ENTRIES: u64 =
+    (crate::cache::DEFAULT_COORD_CACHE_SIZE / crate::cache::PROBATION_SHARE_DIVISOR) as u64;
+
+#[tokio::test]
+async fn one_link_peer_cannot_put_more_new_destinations_in_the_cache_than_its_budget_and_probation_allow()
+ {
+    let mut node = make_node();
+    let from = make_node_addr(0xAA);
+    let root = *node.tree_state.my_coords().root_id();
+    let dest = make_node_addr(0x02);
+    let dest_coords = coords_of_len(dest, root, 2);
+    let _ = node
+        .coord_cache_mut()
+        .insert(dest, dest_coords.clone(), wall_ms());
+
+    let sent = 5_000u32;
+    let started = std::time::Instant::now();
+    for i in 0..sent {
+        let src = minted_dest(i);
+        let frame = setup_frame(
+            src,
+            coords_of_len(src, root, 2),
+            dest,
+            dest_coords.clone(),
+            8,
+        );
+        node.handle_session_datagram(&from, &frame, false).await;
+    }
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    let allowed = (elapsed_ms * HINT_KEYS_PER_SEC).div_ceil(1000) + UNPAID_HINT_ENTRIES;
+    assert!(
+        allowed < u64::from(sent),
+        "the run took {elapsed_ms} ms, too long for the bound to discriminate"
+    );
+
+    let now = wall_ms();
+    let present = (0..sent)
+        .filter(|&i| node.coord_cache().get(&minted_dest(i), now).is_some())
+        .count() as u64;
+    assert!(
+        node.coord_cache().get(&dest, now).is_some(),
+        "the fixed destination must stay cached"
+    );
+    assert!(
+        present <= allowed,
+        "one link peer placed {present} of {sent} new destinations in the \
+         cache in {elapsed_ms} ms, against an allowance of {allowed}"
+    );
+}
+
+#[tokio::test]
+async fn a_drained_link_peer_still_forwards_an_honest_setup_for_a_new_destination() {
+    // 3-node chain: 0 -- 1 -- 2. Node 1 is the transit under test.
+    let edges = vec![(0, 1), (1, 2)];
+    let mut nodes = run_tree_test(3, &edges, false).await;
+    verify_tree_convergence(&nodes);
+
+    let node0 = *nodes[0].node.node_addr();
+    let node2_coords = nodes[2].node.tree_state().my_coords().clone();
+    let root = *nodes[1].node.tree_state().my_coords().root_id();
+
+    // Drain: far more fresh source keys from node 0 than any budget pays for.
+    // TTL 1 keeps them off the wire; warming runs before the TTL decision.
+    let sink = make_node_addr(0x02);
+    for i in 0..2_000u32 {
+        let src = minted_dest(i);
+        let frame = setup_frame(
+            src,
+            coords_of_len(src, root, 2),
+            sink,
+            coords_of_len(sink, root, 2),
+            1,
+        );
+        nodes[1]
+            .node
+            .handle_session_datagram(&node0, &frame, false)
+            .await;
+    }
+
+    // An honest setup for a destination behind node 2 that node 1 has never
+    // cached: the setup's own coordinates are the only route to it.
+    let fresh_dest = make_node_addr(0x77);
+    let mut path = vec![fresh_dest];
+    path.extend(node2_coords.node_addrs().copied());
+    let fresh_coords = TreeCoordinate::from_addrs(path).unwrap();
+    let honest_src = make_node_addr(0x66);
+    let frame = setup_frame(
+        honest_src,
+        coords_of_len(honest_src, root, 2),
+        fresh_dest,
+        fresh_coords,
+        64,
+    );
+
+    let fwd = &nodes[1].node.metrics().forwarding;
+    let (forwarded, no_route) = (fwd.forwarded_packets.get(), fwd.drop_no_route_packets.get());
+    nodes[1]
+        .node
+        .handle_session_datagram(&node0, &frame, false)
+        .await;
+    let fwd = &nodes[1].node.metrics().forwarding;
+    assert_eq!(
+        fwd.drop_no_route_packets.get(),
+        no_route,
+        "the honest setup was dropped for want of a route"
+    );
+    assert_eq!(
+        fwd.forwarded_packets.get(),
+        forwarded + 1,
+        "the honest setup must be forwarded"
+    );
+
+    cleanup_nodes(&mut nodes).await;
+}
+
 #[tokio::test]
 async fn a_session_setup_at_a_full_cache_examines_a_bounded_number_of_entries() {
     let mut node = make_node();
+    // A link peer that pays for every write, so each source goes to main and
+    // main's eviction runs.
+    node.coord_hint_budget = PeerBudget::with_rate(0, u32::MAX);
     let from = make_node_addr(0xAA);
     let root = *node.tree_state.my_coords().root_id();
     let capacity = node.coord_cache().max_entries() as u32;
@@ -1503,19 +1627,66 @@ async fn a_session_setup_at_a_full_cache_examines_a_bounded_number_of_entries() 
         node.coord_cache()
             .get(&minted_dest(frames - 1), wall_ms())
             .is_some(),
-        "the last frame's source must have been cached, so eviction ran"
+        "the last frame's source must have been cached"
     );
-    let mean = (node.coord_cache().eviction_examined() - before) / u64::from(frames);
+    let examined = node.coord_cache().eviction_examined() - before;
+    assert!(
+        examined >= u64::from(frames),
+        "main eviction must run once per frame, examined {examined}"
+    );
+    let mean = examined / u64::from(frames);
     assert!(
         mean <= 8,
         "each SessionSetup at a full cache examined {mean} entries on average, \
          against a bound of 8"
+    );
+
+    // Sources the link peer cannot pay for go to probation, so fill that too
+    // and check its eviction is as cheap.
+    node.coord_hint_budget = PeerBudget::coord_hints();
+    let now = wall_ms();
+    let mut i = 2_000_000;
+    while node.coord_cache().probation_len() < UNPAID_HINT_ENTRIES as usize {
+        let addr = minted_dest(i);
+        let _ = node.coord_cache_mut().insert_funded(
+            addr,
+            coords_of_len(addr, root, 2),
+            now,
+            Funding::Upto(0),
+        );
+        i += 1;
+    }
+    let before = node.coord_cache().eviction_examined();
+    for i in 0..frames {
+        let src = minted_dest(3_000_000 + i);
+        let frame = setup_frame(
+            src,
+            coords_of_len(src, root, 2),
+            dest,
+            dest_coords.clone(),
+            8,
+        );
+        node.handle_session_datagram(&from, &frame, false).await;
+    }
+    let examined = node.coord_cache().eviction_examined() - before;
+    assert!(
+        examined >= u64::from(frames) / 2,
+        "probation eviction must have run"
+    );
+    let mean = examined / u64::from(frames);
+    assert!(
+        mean <= 8,
+        "each SessionSetup at a full probation segment examined {mean} entries \
+         on average, against a bound of 8"
     );
 }
 
 #[tokio::test]
 async fn a_link_peer_cannot_fill_the_cache_with_deep_coordinates_past_the_address_budget() {
     let mut node = make_node();
+    // A link peer that can pay for every write, so each deep key is placed in
+    // main and only the address bound limits what the cache stores.
+    node.coord_hint_budget = PeerBudget::with_rate(0, u32::MAX);
     let from = make_node_addr(0xAA);
     let root = *node.tree_state.my_coords().root_id();
     let capacity = node.coord_cache().max_entries();
@@ -1560,6 +1731,11 @@ async fn a_link_peer_cannot_fill_the_cache_with_deep_coordinates_past_the_addres
         "the last deep source must have been cached"
     );
 
+    assert_eq!(
+        node.coord_cache().probation_len(),
+        0,
+        "every write was paid"
+    );
     let budget = capacity * 16;
     assert!(
         node.coord_cache().stored_addrs() <= budget,
@@ -1648,7 +1824,7 @@ async fn a_hint_write_under_a_foreign_root_is_refused_at_insert_coord_hint() {
     let coords = TreeCoordinate::from_addrs(vec![addr, foreign_root]).unwrap();
 
     let now = wall_ms();
-    node.insert_coord_hint(addr, coords, now);
+    let _ = node.insert_coord_hint(addr, coords, now, Funding::Uncharged);
     assert!(
         node.coord_cache().get(&addr, now).is_none(),
         "a hint under a foreign root was cached through insert_coord_hint"
@@ -1657,36 +1833,607 @@ async fn a_hint_write_under_a_foreign_root_is_refused_at_insert_coord_hint() {
     // Control: the same write under this node's root lands.
     let root = *node.tree_state.my_coords().root_id();
     let ours = TreeCoordinate::from_addrs(vec![addr, root]).unwrap();
-    node.insert_coord_hint(addr, ours.clone(), now);
+    let _ = node.insert_coord_hint(addr, ours.clone(), now, Funding::Uncharged);
     assert_eq!(node.coord_cache().get(&addr, now), Some(&ours));
+}
+
+// --- Per-link-peer hint budget ---
+
+/// Stored placements of `count` minted sources from `first`: (main, probation).
+fn placements(node: &Node, first: u32, count: u32) -> (u64, u64) {
+    let (mut main, mut probation) = (0, 0);
+    for i in first..first + count {
+        match node.coord_cache().segment_of(&minted_dest(i)) {
+            Some(crate::cache::Segment::Main) => main += 1,
+            Some(crate::cache::Segment::Probation) => probation += 1,
+            None => {}
+        }
+    }
+    (main, probation)
+}
+
+/// Send `count` SessionSetups over `from`, each with a fresh source of
+/// `len` addresses from `first`, to one fixed cached destination.
+async fn send_fresh_sources(node: &mut Node, from: &NodeAddr, first: u32, count: u32, len: usize) {
+    let root = *node.tree_state.my_coords().root_id();
+    let dest = make_node_addr(0x02);
+    let dest_coords = coords_of_len(dest, root, 2);
+    for i in first..first + count {
+        let src = minted_dest(i);
+        let frame = setup_frame(
+            src,
+            coords_of_len(src, root, len),
+            dest,
+            dest_coords.clone(),
+            8,
+        );
+        node.handle_session_datagram(from, &frame, false).await;
+    }
+}
+
+/// A node with the fixed destination of `send_fresh_sources` cached.
+fn node_with_cached_dest() -> Node {
+    let mut node = make_node();
+    let root = *node.tree_state.my_coords().root_id();
+    let dest = make_node_addr(0x02);
+    let _ = node
+        .coord_cache_mut()
+        .insert(dest, coords_of_len(dest, root, 2), wall_ms());
+    node
+}
+
+#[tokio::test]
+async fn main_placements_match_the_budget_and_the_rest_are_counted_unfunded() {
+    let mut node = node_with_cached_dest();
+    let from = make_node_addr(0xAA);
+    let sent = 3_000u32;
+    let unfunded = node.metrics().forwarding.coord_hint_unfunded.get();
+
+    let started = std::time::Instant::now();
+    send_fresh_sources(&mut node, &from, 0, sent, 2).await;
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+
+    let (main, probation) = placements(&node, 0, sent);
+    let counted = node.metrics().forwarding.coord_hint_unfunded.get() - unfunded;
+    let allowed = (elapsed_ms * HINT_KEYS_PER_SEC).div_ceil(1000);
+    assert!(
+        main <= allowed,
+        "one link peer placed {main} new destinations in main in {elapsed_ms} ms, \
+         against an allowance of {allowed}"
+    );
+    assert_eq!(
+        main + counted,
+        u64::from(sent),
+        "every source not paid into main must be counted unfunded"
+    );
+    assert_eq!(probation, counted.min(UNPAID_HINT_ENTRIES));
+}
+
+#[tokio::test]
+async fn twenty_fresh_link_peers_place_no_more_in_main_than_twenty_initial_fills_and_their_refill()
+{
+    let mut node = node_with_cached_dest();
+    let (peers, each) = (20u32, 200u32);
+    let started = std::time::Instant::now();
+    for p in 0..peers {
+        let from = make_node_addr(0x40 + p as u8);
+        send_fresh_sources(&mut node, &from, p * each, each, 2).await;
+    }
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+
+    // Each peer starts with no weight and earns at most its rate for the run.
+    // The initial fill of zero is what this test pins, so it is not read from
+    // the constant.
+    let allowed = u64::from(peers) * (elapsed_ms * HINT_KEYS_PER_SEC).div_ceil(1000);
+    let (main, _) = placements(&node, 0, peers * each);
+    assert!(
+        allowed < u64::from(peers * each),
+        "the run took {elapsed_ms} ms, too long for the bound to discriminate"
+    );
+    assert!(
+        main <= allowed,
+        "{peers} fresh link peers placed {main} new destinations in main in \
+         {elapsed_ms} ms, against an allowance of {allowed}"
+    );
+}
+
+#[tokio::test]
+async fn a_peer_holding_fifteen_units_places_a_depth_sixteen_key_in_probation() {
+    // A budget that never refills, so the peer holds exactly what it starts with.
+    let mut node = node_with_cached_dest();
+    node.coord_hint_budget = PeerBudget::with_initial(0, 4_096, 15);
+    let from = make_node_addr(0xAA);
+    send_fresh_sources(&mut node, &from, 0, 1, 16).await;
+    assert_eq!(
+        node.coord_cache().segment_of(&minted_dest(0)),
+        Some(crate::cache::Segment::Probation),
+        "fifteen units do not pay for a key of weight sixteen"
+    );
+
+    // Control: sixteen units do.
+    let mut node = node_with_cached_dest();
+    node.coord_hint_budget = PeerBudget::with_initial(0, 4_096, 16);
+    send_fresh_sources(&mut node, &from, 0, 1, 16).await;
+    assert_eq!(
+        node.coord_cache().segment_of(&minted_dest(0)),
+        Some(crate::cache::Segment::Main)
+    );
+    assert_eq!(
+        node.coord_hint_budget
+            .available(&from, std::time::Instant::now()),
+        0
+    );
+}
+
+#[tokio::test]
+async fn a_second_link_peer_is_still_paid_for() {
+    let mut node = node_with_cached_dest();
+    node.coord_hint_budget = PeerBudget::with_initial(0, 4_096, 64);
+    let (noisy, quiet) = (make_node_addr(0xAA), make_node_addr(0xBB));
+    send_fresh_sources(&mut node, &noisy, 0, 10, 2).await;
+    assert_eq!(
+        placements(&node, 0, 10),
+        (4, 6),
+        "64 units pay for four keys"
+    );
+
+    send_fresh_sources(&mut node, &quiet, 100, 1, 2).await;
+    assert_eq!(
+        node.coord_cache().segment_of(&minted_dest(100)),
+        Some(crate::cache::Segment::Main),
+        "another link peer's budget is its own"
+    );
+}
+
+#[tokio::test]
+async fn a_hint_refused_for_a_verified_entry_costs_its_link_peer_nothing() {
+    let mut node = node_with_cached_dest();
+    node.coord_hint_budget = PeerBudget::with_initial(0, 4_096, 100);
+    let root = *node.tree_state.my_coords().root_id();
+    let from = make_node_addr(0xAA);
+    let src = minted_dest(0);
+    node.coord_cache_mut()
+        .insert_verified(src, coords_of_len(src, root, 2), wall_ms());
+
+    // A deeper rewrite of the verified source would cost 24 if it were made.
+    let refused = node.metrics().forwarding.coord_hint_rejected.get();
+    send_fresh_sources(&mut node, &from, 0, 1, 40).await;
+    assert_eq!(
+        node.metrics().forwarding.coord_hint_rejected.get(),
+        refused + 1,
+        "the write must have been refused for the verified entry"
+    );
+    assert_eq!(
+        node.coord_hint_budget
+            .available(&from, std::time::Instant::now()),
+        100,
+        "a refused write must not be charged"
+    );
+}
+
+/// Run a session from node 0 to node 3 over the chain 0 - 1 - 2 - 3, with
+/// node 1's cache emptied so both its link peers' hints are unpaid, and
+/// `flood` unpaid depth-70 keys from node 0 arriving at node 1 between the
+/// ack and the msg3. With `touch`, one frame from node 0 to node 3 that
+/// carries no coordinates is routed by node 1 halfway through the flood, using
+/// node 3's entry. Returns the nodes, with node 1's no-route drops during the
+/// msg3's arrival.
+async fn session_through_drained_transit(flood: u32, touch: bool) -> (Vec<TestNode>, u64) {
+    let edges = vec![(0, 1), (1, 2), (2, 3)];
+    let mut nodes = run_tree_test(4, &edges, false).await;
+    verify_tree_convergence(&nodes);
+    populate_all_coord_caches(&mut nodes);
+    nodes[1].node.coord_cache_mut().clear();
+
+    let node0 = *nodes[0].node.node_addr();
+    let node3 = *nodes[3].node.node_addr();
+    let node3_pubkey = nodes[3].node.identity().pubkey_full();
+    nodes[0]
+        .node
+        .initiate_session(node3, node3_pubkey)
+        .await
+        .expect("initiate_session failed");
+
+    // Setup 0 -> 1 -> 2 -> 3, then ack 3 -> 2 -> 1 -> 0: six hops.
+    for _ in 0..6 {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        process_available_packets(&mut nodes).await;
+    }
+    assert!(
+        nodes[0]
+            .node
+            .get_session(&node3)
+            .is_some_and(|e| e.is_established()),
+        "the initiator is established once its msg3 leaves"
+    );
+    assert_eq!(
+        nodes[1].node.coord_cache().segment_of(&node3),
+        Some(crate::cache::Segment::Probation),
+        "the responder's entry at the transit must be unpaid"
+    );
+
+    let root = *nodes[1].node.tree_state.my_coords().root_id();
+    let sink = make_node_addr(0x02);
+    for i in 0..flood {
+        if touch && i == flood / 2 {
+            // Too short for an FSP prefix, so it warms nothing, and node 3
+            // drops it.
+            let frame = SessionDatagram::new(make_node_addr(0x55), node3, vec![0u8; 2])
+                .with_ttl(64)
+                .encode()[1..]
+                .to_vec();
+            nodes[1]
+                .node
+                .handle_session_datagram(&node0, &frame, false)
+                .await;
+        }
+        let src = minted_dest(i);
+        let frame = setup_frame(
+            src,
+            coords_of_len(src, root, 71),
+            sink,
+            coords_of_len(sink, root, 2),
+            1,
+        );
+        nodes[1]
+            .node
+            .handle_session_datagram(&node0, &frame, false)
+            .await;
+    }
+
+    // The msg3, 0 -> 1, then on to 2 and 3 if node 1 can route it.
+    let no_route = nodes[1]
+        .node
+        .metrics()
+        .forwarding
+        .drop_no_route_packets
+        .get();
+    for _ in 0..3 {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        process_available_packets(&mut nodes).await;
+    }
+    let dropped = nodes[1]
+        .node
+        .metrics()
+        .forwarding
+        .drop_no_route_packets
+        .get()
+        - no_route;
+    (nodes, dropped)
+}
+
+#[tokio::test]
+async fn a_session_completes_through_a_transit_with_both_sides_drained_under_a_deep_flood_below_the_probation_size()
+ {
+    // Below the probation size: the msg3 is forwarded and the session completes.
+    let (mut nodes, dropped) = session_through_drained_transit(1_000, false).await;
+    let node0 = *nodes[0].node.node_addr();
+    assert_eq!(dropped, 0, "the msg3 must not meet a missing route");
+    assert!(
+        nodes[3]
+            .node
+            .get_session(&node0)
+            .is_some_and(|e| e.is_established()),
+        "the responder must complete the session"
+    );
+    cleanup_nodes(&mut nodes).await;
+
+    // The accepted residual: past the probation size the msg3 meets no route,
+    // and the session completes once the flood stops, through the warmup the
+    // routing error draws and the msg3 resend.
+    let (mut nodes, dropped) = session_through_drained_transit(2_000, false).await;
+    let node0 = *nodes[0].node.node_addr();
+    assert_eq!(
+        dropped, 1,
+        "past the probation size the msg3 meets no route"
+    );
+    assert!(
+        !nodes[3]
+            .node
+            .get_session(&node0)
+            .is_some_and(|e| e.is_established())
+    );
+    let interval_ms = nodes[0]
+        .node
+        .config()
+        .node
+        .rate_limit
+        .handshake_resend_interval_ms;
+    nodes[0]
+        .node
+        .resend_pending_session_handshakes(Node::now_ms() + interval_ms + 1)
+        .await;
+    for _ in 0..6 {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        process_available_packets(&mut nodes).await;
+    }
+    assert!(
+        nodes[3]
+            .node
+            .get_session(&node0)
+            .is_some_and(|e| e.is_established()),
+        "the responder must complete the session once the msg3 is resent"
+    );
+    cleanup_nodes(&mut nodes).await;
+}
+
+#[tokio::test]
+async fn a_session_completes_through_a_drained_transit_past_the_probation_size_when_a_frame_used_the_responders_entry()
+ {
+    // The flood that makes the msg3 meet no route above, but a frame of the
+    // flow has used node 3's entry since it was written, so it is restamped
+    // rather than evicted.
+    let (mut nodes, dropped) = session_through_drained_transit(2_000, true).await;
+    let node0 = *nodes[0].node.node_addr();
+    assert_eq!(dropped, 0, "the used entry must survive the flood");
+    assert!(
+        nodes[3]
+            .node
+            .get_session(&node0)
+            .is_some_and(|e| e.is_established()),
+        "the responder must complete the session"
+    );
+    cleanup_nodes(&mut nodes).await;
+}
+
+#[tokio::test]
+async fn an_honest_rewrite_corrects_a_shallow_forgery_of_a_deep_destination() {
+    let mut node = make_node();
+    let (honest, attacker) = (make_node_addr(0xAA), make_node_addr(0xBB));
+    let root = *node.tree_state.my_coords().root_id();
+
+    // A destination nineteen hops deep, cached from earlier honest traffic,
+    // and a key the hub's own traffic deepens by one address at a time.
+    let d = make_node_addr(0x42);
+    let real = coords_of_len(d, root, 20);
+    let _ = node.coord_cache_mut().insert(d, real.clone(), wall_ms());
+    let sink = make_node_addr(0x02);
+    let sink_coords = coords_of_len(sink, root, 2);
+    let _ = node
+        .coord_cache_mut()
+        .insert(sink, sink_coords.clone(), wall_ms());
+    let k = make_node_addr(0x43);
+    let _ = node
+        .coord_cache_mut()
+        .insert(k, coords_of_len(k, root, 16), wall_ms());
+
+    // The forgery: shallow coordinates for d from another link peer, unpaid.
+    let forged = coords_of_len(d, root, 3);
+    let frame = setup_frame(d, forged.clone(), sink, sink_coords.clone(), 1);
+    node.handle_session_datagram(&attacker, &frame, false).await;
+    assert_eq!(node.coord_cache().get(&d, wall_ms()), Some(&forged));
+
+    // Traffic through the honest hub spends its budget.
+    for i in 0..64u32 {
+        let s = minted_dest(i);
+        let frame = setup_frame(s, coords_of_len(s, root, 2), sink, sink_coords.clone(), 1);
+        node.handle_session_datagram(&honest, &frame, false).await;
+    }
+    for _ in 0..32 {
+        for len in [17, 16] {
+            let frame = setup_frame(k, coords_of_len(k, root, len), sink, sink_coords.clone(), 1);
+            node.handle_session_datagram(&honest, &frame, false).await;
+        }
+    }
+
+    // d's own traffic carries its real coordinates through the hub.
+    let frame = setup_frame(d, real.clone(), sink, sink_coords.clone(), 1);
+    node.handle_session_datagram(&honest, &frame, false).await;
+    assert_eq!(
+        node.coord_cache().get(&d, wall_ms()),
+        Some(&real),
+        "the honest rewrite did not replace the forged shallow coordinates"
+    );
+}
+
+#[tokio::test]
+async fn a_paid_shallow_write_cannot_promote_a_deep_destination_past_its_honest_correction() {
+    let mut node = make_node();
+    // Every link peer starts with 16 units and never refills, so the test
+    // does not depend on the wall clock.
+    node.coord_hint_budget = PeerBudget::with_initial(0, 4_096, 16);
+    let (honest, attacker) = (make_node_addr(0xAA), make_node_addr(0xBB));
+    let root = *node.tree_state.my_coords().root_id();
+    let sink = make_node_addr(0x02);
+    let sink_coords = coords_of_len(sink, root, 2);
+    let _ = node
+        .coord_cache_mut()
+        .insert(sink, sink_coords.clone(), wall_ms());
+
+    // The honest hub spends its 16 units on one ordinary new destination.
+    let x = minted_dest(1);
+    let frame = setup_frame(x, coords_of_len(x, root, 2), sink, sink_coords.clone(), 1);
+    node.handle_session_datagram(&honest, &frame, false).await;
+    assert_eq!(
+        node.coord_cache().segment_of(&x),
+        Some(crate::cache::Segment::Main)
+    );
+
+    // d, twenty addresses deep, first appears through the drained hub, so it
+    // goes to probation.
+    let d = make_node_addr(0x42);
+    let real = coords_of_len(d, root, 20);
+    let frame = setup_frame(d, real.clone(), sink, sink_coords.clone(), 1);
+    node.handle_session_datagram(&honest, &frame, false).await;
+    assert_eq!(
+        node.coord_cache().segment_of(&d),
+        Some(crate::cache::Segment::Probation)
+    );
+
+    // Another link peer, holding 16 units, names d with shallow coordinates.
+    let forged = coords_of_len(d, root, 3);
+    let frame = setup_frame(d, forged.clone(), sink, sink_coords.clone(), 1);
+    node.handle_session_datagram(&attacker, &frame, false).await;
+
+    // d's own traffic carries its real coordinates through the hub again.
+    let frame = setup_frame(d, real.clone(), sink, sink_coords.clone(), 1);
+    node.handle_session_datagram(&honest, &frame, false).await;
+    assert_eq!(
+        node.coord_cache().get(&d, wall_ms()),
+        Some(&real),
+        "the honest rewrite did not replace the forged coordinates"
+    );
+}
+
+/// Node 1 holds an expired entry for a destination behind node 2, more than
+/// sixteen addresses deep. A SessionSetup for it arrives over node 0, whose
+/// coordinate budget is empty, carrying coordinates one level deeper when
+/// `deepen` is set, or at the same depth. The setup carries the only route to
+/// the destination, so node 1 must forward it either way. Returns the frames
+/// forwarded and the frames dropped for want of a route.
+async fn setup_for_an_expired_destination(deepen: bool) -> (u64, u64) {
+    let edges = vec![(0, 1), (1, 2)];
+    let mut nodes = run_tree_test(3, &edges, false).await;
+    verify_tree_convergence(&nodes);
+
+    let node0 = *nodes[0].node.node_addr();
+    let node2_coords = nodes[2].node.tree_state().my_coords().clone();
+    let root = *nodes[1].node.tree_state().my_coords().root_id();
+    nodes[1].node.coord_hint_budget = PeerBudget::with_initial(0, 0, 0);
+
+    let dest = make_node_addr(0x77);
+    let deep = |fillers: u32| {
+        let mut path = vec![dest];
+        path.extend((0..fillers).map(|i| {
+            let mut bytes = [0u8; 16];
+            bytes[..4].copy_from_slice(&i.to_le_bytes());
+            bytes[15] = 0xe0;
+            NodeAddr::from_bytes(bytes)
+        }));
+        path.extend(node2_coords.node_addrs().copied());
+        TreeCoordinate::from_addrs(path).unwrap()
+    };
+    let old = deep(15);
+    let new = if deepen { deep(16) } else { deep(15) };
+    assert!(
+        old.entries().len() > 16,
+        "old depth {}",
+        old.entries().len()
+    );
+    assert!(!deepen || new.entries().len() == old.entries().len() + 1);
+
+    // Cached long enough ago that its TTL has lapsed, and never used since.
+    let long_ago = wall_ms() - 2 * crate::cache::DEFAULT_COORD_CACHE_TTL_MS;
+    let _ = nodes[1].node.coord_cache_mut().insert(dest, old, long_ago);
+
+    let src = make_node_addr(0x66);
+    let frame = setup_frame(src, coords_of_len(src, root, 2), dest, new, 64);
+    let fwd = &nodes[1].node.metrics().forwarding;
+    let (forwarded, no_route) = (fwd.forwarded_packets.get(), fwd.drop_no_route_packets.get());
+    nodes[1]
+        .node
+        .handle_session_datagram(&node0, &frame, false)
+        .await;
+    let fwd = &nodes[1].node.metrics().forwarding;
+    let result = (
+        fwd.forwarded_packets.get() - forwarded,
+        fwd.drop_no_route_packets.get() - no_route,
+    );
+    cleanup_nodes(&mut nodes).await;
+    result
+}
+
+#[tokio::test]
+async fn a_drained_peers_setup_for_an_expired_destination_at_the_same_depth_is_forwarded() {
+    assert_eq!(setup_for_an_expired_destination(false).await, (1, 0));
+}
+
+#[tokio::test]
+async fn a_drained_peers_setup_for_an_expired_destination_one_level_deeper_is_forwarded() {
+    assert_eq!(
+        setup_for_an_expired_destination(true).await,
+        (1, 0),
+        "the setup was dropped for want of a route"
+    );
+}
+
+/// Node 1's main segment holds only live-verified entries (its own lookups),
+/// so a hint cannot make room there. An honest SessionSetup for a destination
+/// behind node 2 that node 1 has never cached arrives over node 0, whose
+/// coordinate budget can pay for it when `paid` is set and is empty otherwise.
+/// The budget decides where the hint is placed, never whether the frame
+/// routes. Returns the frames forwarded and the frames dropped for want of a
+/// route.
+async fn setup_through_a_transit_full_of_verified_entries(paid: bool) -> (u64, u64) {
+    let edges = vec![(0, 1), (1, 2)];
+    let mut nodes = run_tree_test(3, &edges, false).await;
+    verify_tree_convergence(&nodes);
+
+    let node0 = *nodes[0].node.node_addr();
+    let node2_coords = nodes[2].node.tree_state().my_coords().clone();
+    let root = *nodes[1].node.tree_state().my_coords().root_id();
+
+    *nodes[1].node.coord_cache_mut() = crate::cache::CoordCache::new(4, 300_000);
+    for i in 0..4u32 {
+        let a = minted_dest(900_000 + i);
+        nodes[1]
+            .node
+            .coord_cache_mut()
+            .insert_verified(a, coords_of_len(a, root, 2), wall_ms());
+    }
+    nodes[1].node.coord_hint_budget = if paid {
+        PeerBudget::with_initial(0, 4_096, 4_096)
+    } else {
+        PeerBudget::with_initial(0, 0, 0)
+    };
+
+    let dest = make_node_addr(0x77);
+    let mut path = vec![dest];
+    path.extend(node2_coords.node_addrs().copied());
+    let dest_coords = TreeCoordinate::from_addrs(path).unwrap();
+    let src = make_node_addr(0x66);
+    let frame = setup_frame(src, coords_of_len(src, root, 2), dest, dest_coords, 64);
+
+    let fwd = &nodes[1].node.metrics().forwarding;
+    let (forwarded, no_route) = (fwd.forwarded_packets.get(), fwd.drop_no_route_packets.get());
+    nodes[1]
+        .node
+        .handle_session_datagram(&node0, &frame, false)
+        .await;
+    let fwd = &nodes[1].node.metrics().forwarding;
+    let result = (
+        fwd.forwarded_packets.get() - forwarded,
+        fwd.drop_no_route_packets.get() - no_route,
+    );
+    cleanup_nodes(&mut nodes).await;
+    result
+}
+
+#[tokio::test]
+async fn a_drained_peers_setup_routes_through_a_transit_full_of_verified_entries() {
+    assert_eq!(
+        setup_through_a_transit_full_of_verified_entries(false).await,
+        (1, 0)
+    );
+}
+
+#[tokio::test]
+async fn a_paying_peers_setup_routes_through_a_transit_full_of_verified_entries() {
+    assert_eq!(
+        setup_through_a_transit_full_of_verified_entries(true).await,
+        (1, 0),
+        "the paid setup was dropped for want of a route while an unpaid one routes"
+    );
 }
 
 #[tokio::test]
 async fn a_foreign_root_write_is_not_counted_as_a_key_mismatch() {
     let mut node = make_node();
     let from = make_node_addr(0xAA);
-    let my_addr = *node.node_addr();
-    let my_coords = node.tree_state.my_coords().clone();
+    let root = *node.tree_state.my_coords().root_id();
     let foreign_root = make_node_addr(0xF0);
-    assert_ne!(&foreign_root, my_coords.root_id());
+    assert_ne!(foreign_root, root);
     // A foreign-root coordinate that also names another key first.
-    let src_addr = make_node_addr(0x01);
+    let src = make_node_addr(0x01);
     let src_coords = TreeCoordinate::from_addrs(vec![make_node_addr(0x03), foreign_root]).unwrap();
-
-    let header = build_fsp_header(0, FSP_FLAG_CP, 20);
-    let mut data_payload = header.to_vec();
-    encode_coords(&src_coords, &mut data_payload);
-    encode_coords(&my_coords, &mut data_payload);
-    data_payload.extend_from_slice(&[0xCC; 36]);
-    let encoded = SessionDatagram::new(src_addr, my_addr, data_payload).encode();
-
+    let dest = make_node_addr(0x02);
+    let frame = setup_frame(src, src_coords, dest, coords_of_len(dest, root, 2), 8);
     let fwd = &node.metrics().forwarding;
     let (foreign, mismatch) = (
         fwd.coord_warm_foreign_root.get(),
         fwd.coord_warm_key_mismatch.get(),
     );
-    node.handle_session_datagram(&from, &encoded[1..], false)
-        .await;
+    node.handle_session_datagram(&from, &frame, false).await;
     let fwd = &node.metrics().forwarding;
     assert_eq!(fwd.coord_warm_foreign_root.get(), foreign + 1);
     assert_eq!(

@@ -11,8 +11,15 @@
 //! node synthesizes CoordsRequired, PathBroken or MtuExceeded in response to a
 //! datagram it could not forward). It is consulted ahead of any address-keyed
 //! structure so that those structures only grow at the budget rate.
+//!
+//! The coordinate-hint instance pays for the coordinate-cache space a link
+//! peer's hints take, in units of cache weight. A newly seen peer starts it
+//! empty, so a fresh link identity buys nothing, and a peer that stays
+//! connected keeps what it accrues while quiet. Its buckets are dropped when
+//! their peer leaves the peer table ([`PeerBudget::sweep_departed`]).
 
 use crate::NodeAddr;
+use crate::cache::ADDRS_PER_ENTRY;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -35,13 +42,45 @@ pub const PEER_ERROR_RATE_PER_SEC: u32 = 20;
 /// lowering it makes a legitimate convergence burst arrive as a trickle.
 pub const PEER_ERROR_BURST: u32 = 50;
 
+/// Sustained rate, in units of coordinate-cache weight per second, at which one
+/// authenticated link peer pays for the hints it writes.
+///
+/// A unit is one stored coordinate address, and an entry costs at least
+/// [`ADDRS_PER_ENTRY`], so this is 64 new destinations a second of depth up to
+/// sixteen, fewer when deeper. At this rate one peer needs about 781 seconds to
+/// turn over the default cache's 800,000 units, more than the entry TTL, so it
+/// cannot push out an honest entry that traffic keeps using. Lower places an
+/// honest hub's new destinations in probation sooner; higher lets one peer turn
+/// the cache over faster. The budget is per link peer, so an attacker holding
+/// `k` links pays at `k` times this rate (about six seconds of main turnover at
+/// 128 peers); admission and `max_peers` bound `k`. No measured basis for the
+/// honest rate behind one hub peer.
+pub const COORD_HINT_WEIGHT_PER_SEC: u32 = 64 * ADDRS_PER_ENTRY as u32;
+
+/// The most coordinate-cache weight one link peer accrues while quiet.
+///
+/// 256 destinations of depth up to sixteen. A newly seen peer starts with
+/// none ([`COORD_HINT_INITIAL_WEIGHT`]), so this is earned by four quiet
+/// seconds, not bought by a new link identity, and kept while the peer stays
+/// in the peer table. An attacker holding `k` links can spend `k` times this
+/// at once, once each has accrued it. No measured basis.
+pub const COORD_HINT_WEIGHT_BURST: u32 = 256 * ADDRS_PER_ENTRY as u32;
+
+/// The coordinate-cache weight a newly seen link peer starts with.
+///
+/// Zero, so reconnecting under a fresh identity buys nothing: at the stranger
+/// handshake rate a full first bucket would buy thousands of units a second.
+pub const COORD_HINT_INITIAL_WEIGHT: u32 = 0;
+
 /// Tokens are carried in thousandths so the refill of a sub-millisecond
 /// interval is not rounded away.
 const MILLI: u64 = 1000;
 
-/// A peer whose bucket has refilled to full carries no state worth keeping, so
-/// entries are dropped once per this interval to bound the map across peer
-/// churn.
+/// How often buckets are swept to bound the map across peer churn.
+///
+/// Where a newly seen peer starts full, a full bucket carries no state worth
+/// keeping and is dropped. Where it starts below full, a full bucket is what
+/// the peer accrued, so only the buckets of peers that have left are dropped.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 
 /// One peer's token bucket.
@@ -60,6 +99,8 @@ pub struct PeerBudget {
     milli_per_ms: u64,
     /// Bucket ceiling, in thousandths of a token.
     capacity: u64,
+    /// What a newly seen peer's bucket starts with, in thousandths of a token.
+    initial: u64,
     last_sweep: Instant,
 }
 
@@ -69,14 +110,36 @@ impl PeerBudget {
         Self::with_rate(PEER_ERROR_RATE_PER_SEC, PEER_ERROR_BURST)
     }
 
-    /// Create a budget with an explicit sustained rate and burst.
+    /// Create a budget with an explicit sustained rate and burst, where a
+    /// newly seen peer starts with a full bucket.
     pub fn with_rate(per_sec: u32, burst: u32) -> Self {
+        Self::with_initial(per_sec, burst, burst)
+    }
+
+    /// Create a budget where a newly seen peer starts with `initial` tokens
+    /// (at most `burst`).
+    ///
+    /// A dropped bucket comes back at `initial`, and is dropped only when it
+    /// holds at least that, so a peer gains nothing by leaving and returning.
+    /// Below `burst`, a connected peer's full bucket is kept; the owner drops
+    /// departed peers' buckets with [`Self::sweep_departed`].
+    pub fn with_initial(per_sec: u32, burst: u32, initial: u32) -> Self {
         Self {
             buckets: HashMap::new(),
             milli_per_ms: u64::from(per_sec),
             capacity: u64::from(burst) * MILLI,
+            initial: u64::from(initial.min(burst)) * MILLI,
             last_sweep: Instant::now(),
         }
+    }
+
+    /// Create the budget link peers pay coordinate-cache hints from.
+    pub fn coord_hints() -> Self {
+        Self::with_initial(
+            COORD_HINT_WEIGHT_PER_SEC,
+            COORD_HINT_WEIGHT_BURST,
+            COORD_HINT_INITIAL_WEIGHT,
+        )
     }
 
     /// Whether `peer` has a token to spend, without spending it.
@@ -102,12 +165,33 @@ impl PeerBudget {
         self.sweep(now);
     }
 
-    /// Bring `peer`'s bucket up to date, creating a full one on first sighting.
+    /// Whole tokens `peer` has to spend, without spending any.
+    pub fn available(&mut self, peer: &NodeAddr, now: Instant) -> u64 {
+        self.sweep(now);
+        self.refill(peer, now);
+        self.buckets.get(peer).map_or(0, |b| b.milli_tokens / MILLI)
+    }
+
+    /// Spend `tokens` for `peer`. The caller spends only what
+    /// [`Self::available`] said it could, so this never overspends.
+    pub fn spend(&mut self, peer: &NodeAddr, tokens: u64, now: Instant) {
+        self.refill(peer, now);
+        if let Some(bucket) = self.buckets.get_mut(peer) {
+            let cost = tokens.saturating_mul(MILLI);
+            debug_assert!(cost <= bucket.milli_tokens, "spent more than available");
+            bucket.milli_tokens = bucket.milli_tokens.saturating_sub(cost);
+        }
+        self.sweep(now);
+    }
+
+    /// Bring `peer`'s bucket up to date, creating one at the initial fill on
+    /// first sighting.
     fn refill(&mut self, peer: &NodeAddr, now: Instant) {
         let capacity = self.capacity;
         let milli_per_ms = self.milli_per_ms;
+        let initial = self.initial;
         let bucket = self.buckets.entry(*peer).or_insert(Bucket {
-            milli_tokens: capacity,
+            milli_tokens: initial,
             last_refill: now,
         });
         let elapsed_ms = now
@@ -119,17 +203,39 @@ impl PeerBudget {
         }
     }
 
-    /// Drop full buckets, at most once per [`SWEEP_INTERVAL`].
+    /// Drop full buckets, at most once per [`SWEEP_INTERVAL`], where a newly
+    /// seen peer starts full. A budget that starts peers below full keeps
+    /// them: a full bucket there is a connected peer's accrued tokens, and its
+    /// owner sweeps departed peers instead.
     fn sweep(&mut self, now: Instant) {
+        if self.initial < self.capacity {
+            return;
+        }
+        let capacity = self.capacity;
+        self.sweep_where(now, |_, tokens| tokens >= capacity);
+    }
+
+    /// Drop the buckets of peers `present` says have left, at most once per
+    /// [`SWEEP_INTERVAL`], keeping any that hold less than a newly seen peer
+    /// starts with (dropping one would refill it).
+    pub fn sweep_departed(&mut self, now: Instant, present: impl Fn(&NodeAddr) -> bool) {
+        let initial = self.initial;
+        self.sweep_where(now, |peer, tokens| !present(peer) && tokens >= initial);
+    }
+
+    /// Drop the buckets `drop` accepts, given each one's tokens (in
+    /// thousandths) brought up to `now`, at most once per [`SWEEP_INTERVAL`].
+    fn sweep_where(&mut self, now: Instant, drop: impl Fn(&NodeAddr, u64) -> bool) {
         if now.saturating_duration_since(self.last_sweep) < SWEEP_INTERVAL {
             return;
         }
         self.last_sweep = now;
         let capacity = self.capacity;
         let milli_per_ms = self.milli_per_ms;
-        self.buckets.retain(|_, b| {
+        self.buckets.retain(|peer, b| {
             let elapsed_ms = now.saturating_duration_since(b.last_refill).as_millis() as u64;
-            b.milli_tokens + elapsed_ms * milli_per_ms < capacity
+            let tokens = (b.milli_tokens + elapsed_ms * milli_per_ms).min(capacity);
+            !drop(peer, tokens)
         });
     }
 
@@ -237,5 +343,124 @@ mod tests {
         let later = start + SWEEP_INTERVAL + Duration::from_secs(1);
         assert!(spend(&mut budget, &addr(200), later));
         assert_eq!(budget.len(), 1);
+    }
+
+    #[test]
+    fn a_budget_with_no_initial_fill_starts_a_new_peer_empty_and_refills_it() {
+        let mut budget = PeerBudget::with_initial(1_000, 4_000, 0);
+        let start = Instant::now();
+        let peer = addr(1);
+        assert_eq!(budget.available(&peer, start), 0);
+        assert_eq!(
+            budget.available(&peer, start + Duration::from_millis(250)),
+            250
+        );
+        assert_eq!(
+            budget.available(&peer, start + Duration::from_secs(60)),
+            4_000
+        );
+    }
+
+    #[test]
+    fn spend_takes_exactly_the_tokens_it_is_given() {
+        let mut budget = PeerBudget::with_initial(1, 100, 100);
+        let now = Instant::now();
+        let peer = addr(1);
+        budget.spend(&peer, 37, now);
+        assert_eq!(budget.available(&peer, now), 63);
+        budget.spend(&peer, 0, now);
+        assert_eq!(budget.available(&peer, now), 63);
+        budget.spend(&peer, 63, now);
+        assert_eq!(budget.available(&peer, now), 0);
+    }
+
+    #[test]
+    fn a_departed_peers_bucket_is_swept_and_comes_back_at_the_initial_fill_not_full() {
+        let mut budget = PeerBudget::with_initial(100, 100, 0);
+        let start = Instant::now();
+        let peer = addr(1);
+        assert_eq!(budget.available(&peer, start), 0);
+
+        // Gone long enough to refill to full, then a sweep drops the bucket.
+        let later = start + SWEEP_INTERVAL + Duration::from_secs(1);
+        budget.sweep_departed(later, |p| *p != peer);
+        assert_eq!(budget.len(), 0, "the departed peer's bucket was swept");
+        assert_eq!(budget.available(&peer, later), 0);
+    }
+
+    #[test]
+    fn a_quiet_peer_keeps_the_burst_it_accrued_across_a_sweep() {
+        let mut budget = PeerBudget::coord_hints();
+        let start = Instant::now();
+        let (hub, other) = (addr(1), addr(2));
+        assert_eq!(budget.available(&hub, start), 0);
+        assert_eq!(budget.available(&other, start), 0);
+        let burst = u64::from(COORD_HINT_WEIGHT_BURST);
+        assert_eq!(
+            budget.available(&hub, start + Duration::from_secs(5)),
+            burst
+        );
+
+        // Another peer's spend runs the sweep while the hub is still connected.
+        let later = start + SWEEP_INTERVAL + Duration::from_secs(1);
+        budget.spend(&other, 16, later);
+        assert_eq!(
+            budget.available(&hub, later),
+            burst,
+            "the quiet hub lost the burst it accrued"
+        );
+    }
+
+    #[test]
+    fn buckets_of_departed_peers_are_swept_without_a_spend() {
+        let mut budget = PeerBudget::coord_hints();
+        let start = Instant::now();
+        // One frame each from 1,000 successive link identities, each gone
+        // before the next arrives; nothing is paid. The owner sweeps departed
+        // peers ahead of each read, as the hint path does.
+        for i in 0..1_000u32 {
+            let mut bytes = [0u8; 16];
+            bytes[..4].copy_from_slice(&i.to_le_bytes());
+            let peer = NodeAddr::from_bytes(bytes);
+            let now = start + (SWEEP_INTERVAL * 2) * i;
+            budget.sweep_departed(now, |p| *p == peer);
+            assert_eq!(budget.available(&peer, now), 0);
+        }
+        assert!(
+            budget.len() <= 2,
+            "{} buckets kept for departed peers",
+            budget.len()
+        );
+    }
+
+    #[test]
+    fn a_departed_peer_holding_less_than_a_new_peer_starts_with_is_kept() {
+        // Dropping it would hand the peer a refill on return.
+        let mut budget = PeerBudget::with_initial(0, 100, 50);
+        let start = Instant::now();
+        let peer = addr(1);
+        budget.spend(&peer, 40, start);
+        let later = start + SWEEP_INTERVAL + Duration::from_secs(1);
+        budget.sweep_departed(later, |_| false);
+        assert_eq!(budget.available(&peer, later), 10);
+    }
+
+    #[test]
+    fn the_routing_error_budget_still_drops_full_buckets_on_read() {
+        let mut budget = PeerBudget::new();
+        let start = Instant::now();
+        assert!(spend(&mut budget, &addr(1), start));
+        let later = start + SWEEP_INTERVAL + Duration::from_secs(1);
+        let _ = budget.available(&addr(2), later);
+        assert_eq!(budget.len(), 1, "only the reader's bucket is left");
+    }
+
+    #[test]
+    fn the_routing_error_budget_still_starts_a_new_peer_full() {
+        let mut budget = PeerBudget::new();
+        assert_eq!(
+            budget.available(&addr(1), Instant::now()),
+            u64::from(PEER_ERROR_BURST)
+        );
     }
 }
