@@ -1315,3 +1315,56 @@ fn fips_dns_setup_no_resolver_hint_starts_resolved_and_names_no_package_manager_
         problems.join("\n  ")
     );
 }
+
+/// Returns the paths, relative to the crate root, of the files directly in
+/// `rel`, sorted, panicking with the path on failure.
+fn repo_dir_files(rel: &str) -> Vec<String> {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
+    let mut files: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("{rel}: {e}"))
+        .map(|entry| entry.unwrap_or_else(|e| panic!("{rel}: {e}")))
+        .filter(|entry| entry.path().is_file())
+        .map(|entry| format!("{rel}/{}", entry.file_name().to_string_lossy()))
+        .collect();
+    files.sort();
+    files
+}
+
+/// procd stops respawning a service for good once its retry count is used up,
+/// and nothing starts it again, so a router whose daemon fails a few times in
+/// a row would stay off the mesh. Every procd instance the OpenWrt package
+/// declares must respawn without a limit: `respawn <threshold> <timeout> 0`.
+#[test]
+fn openwrt_services_respawn_without_a_retry_limit() {
+    const DIR: &str = "packaging/openwrt-ipk/files/etc/init.d";
+    const RESPAWNING: [&str; 2] = ["fips", "fips-gateway"];
+    let inits = repo_dir_files(DIR);
+    let mut problems = Vec::new();
+    for name in RESPAWNING {
+        if !inits.contains(&format!("{DIR}/{name}")) {
+            problems.push(format!("control: {DIR}/{name} is missing"));
+        }
+    }
+    for init in &inits {
+        let script = repo_file(init);
+        let respawns: Vec<&str> = script
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.starts_with("procd_set_param respawn"))
+            .collect();
+        if respawns.is_empty() && RESPAWNING.iter().any(|n| init.ends_with(&format!("/{n}"))) {
+            problems.push(format!("{init}: no procd_set_param respawn line"));
+        }
+        for line in respawns {
+            let retry = line.split_whitespace().nth(4);
+            if retry != Some("0") {
+                problems.push(format!("{init}: retry limit is not 0: {line}"));
+            }
+        }
+    }
+    assert!(
+        problems.is_empty(),
+        "OpenWrt services must respawn without giving up:\n  {}",
+        problems.join("\n  ")
+    );
+}

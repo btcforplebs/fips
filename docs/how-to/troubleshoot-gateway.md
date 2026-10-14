@@ -94,12 +94,12 @@ gateway.dns.listen to a free port and point the resolver that
 forwards .fips at it
 ```
 
-Under systemd the unit restarts every five seconds and fails the same
-way each time; under procd on OpenWrt the service stops respawning
-after five failures within an hour. The gateway also exits, after
-removing its NAT table and routes, when the DNS resolver stops while
-the gateway is running; that log line reads "Gateway DNS resolver
-stopped; exiting so the service manager restarts the gateway".
+Under systemd and under procd on OpenWrt the service keeps restarting
+and fails the same way each time, until the port is freed. The
+gateway also exits, after removing its NAT table and routes, when the
+DNS resolver stops while the gateway is running; that log line reads
+"Gateway DNS resolver stopped; exiting so the service manager
+restarts the gateway".
 
 The error names the service most likely to hold the port:
 
