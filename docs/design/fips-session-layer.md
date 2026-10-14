@@ -429,8 +429,14 @@ transit, CP-flagged data packets, LookupResponse — write to the same cache.
   (default 300s)
 - **Refresh on use**: Active routing through a cache entry resets its TTL,
   keeping hot entries alive
-- **LRU eviction**: When the cache is full, least recently used entries are
-  evicted first
+- **LRU eviction**: When the cache is full, the least recently used entry is
+  evicted, skipping entries whose verification (from a lookup whose proof
+  this node checked) is still live; a hint is refused only when every entry
+  is live-verified. An expired entry is not sought out first: every hint
+  carries the same TTL, so the least recently used entry is also the first
+  to expire. The victim is found through an ordered index, so an insert at
+  capacity costs O(log n) rather than a scan of the cache, and ties are
+  broken by insertion order, never by address
 - **Flush on parent change**: When the local node's tree parent changes, the
   entire coordinate cache is flushed. Tree parent changes mean the node's own
   coordinates have changed, making cached coordinates for other nodes

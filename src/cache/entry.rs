@@ -90,6 +90,11 @@ impl CacheEntry {
         self.source == CoordSource::Verified && current_time_ms <= self.verified_until
     }
 
+    /// Until when a verified source outranks a hint (zero for a hint).
+    pub fn verified_until(&self) -> u64 {
+        self.verified_until
+    }
+
     /// Mark the current coordinates as verified, starting the verification
     /// clock at `current_time_ms`.
     pub fn mark_verified(&mut self, current_time_ms: u64) {

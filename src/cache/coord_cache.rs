@@ -4,6 +4,7 @@
 //! to be routed without carrying coordinates in every packet. Populated
 //! by SessionSetup packets.
 
+use alloc::collections::BTreeMap;
 use std::collections::HashMap;
 
 use super::CacheStats;
@@ -43,15 +44,50 @@ pub enum HintOutcome {
     Rejected,
 }
 
+/// Which eviction index holds a slot's key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Place {
+    /// In `by_use`, keyed `(stamp, seq)`: a candidate victim.
+    ByUse,
+    /// In `parked`, keyed `(verified_until, seq)`: live-verified when filed,
+    /// so eviction skips it until its verification lapses.
+    Parked,
+}
+
+/// One cached entry and where the eviction index files it.
+#[derive(Clone, Debug)]
+struct Slot {
+    entry: CacheEntry,
+    /// The slot's key in the index `place` names. For `ByUse` the first half
+    /// is the entry's `last_used` when it was filed; the entry may have been
+    /// touched since, which eviction notices and corrects lazily.
+    key: (u64, u64),
+    place: Place,
+}
+
 /// Coordinate cache for routing decisions.
 ///
 /// Maps node addresses to their tree coordinates, enabling data packets
 /// to be routed without carrying coordinates in every packet. Populated
 /// by SessionSetup packets.
+///
+/// Eviction takes the least recently used entry that is not live-verified,
+/// found through an ordered index rather than a scan of the map, so an insert
+/// at capacity costs O(log n) amortised. Touching an entry does no index
+/// work: the index is corrected when eviction reaches a stale key. Ties are
+/// broken by a per-cache insertion sequence, never by address, because peers
+/// choose addresses.
 #[derive(Clone, Debug)]
 pub struct CoordCache {
     /// NodeAddr -> coordinates mapping.
-    entries: HashMap<NodeAddr, CacheEntry>,
+    entries: HashMap<NodeAddr, Slot>,
+    /// Entries eviction may take, oldest stamp first.
+    by_use: BTreeMap<(u64, u64), NodeAddr>,
+    /// Entries that were live-verified when eviction reached them, by the
+    /// time their verification lapses.
+    parked: BTreeMap<(u64, u64), NodeAddr>,
+    /// Insertion sequence for index keys.
+    seq: u64,
     /// Maximum number of entries.
     max_entries: usize,
     /// Default TTL for entries (milliseconds).
@@ -67,6 +103,9 @@ impl CoordCache {
     pub fn new(max_entries: usize, default_ttl_ms: u64) -> Self {
         Self {
             entries: HashMap::with_capacity(max_entries.min(1000)),
+            by_use: BTreeMap::new(),
+            parked: BTreeMap::new(),
+            seq: 0,
             max_entries,
             default_ttl_ms,
             #[cfg(test)]
@@ -118,12 +157,13 @@ impl CoordCache {
         current_time_ms: u64,
         ttl_ms: u64,
     ) -> HintOutcome {
-        if let Some(entry) = self.entries.get_mut(&addr) {
-            if entry.is_verified(current_time_ms) {
+        if let Some(slot) = self.entries.get_mut(&addr) {
+            if slot.entry.is_verified(current_time_ms) {
                 return HintOutcome::Rejected;
             }
-            let changed = entry.coords() != &coords;
-            entry.update(coords, current_time_ms, ttl_ms);
+            let changed = slot.entry.coords() != &coords;
+            slot.entry.update(coords, current_time_ms, ttl_ms);
+            self.refile(addr);
             return if changed {
                 HintOutcome::Changed
             } else {
@@ -131,20 +171,15 @@ impl CoordCache {
             };
         }
 
-        // Evict if at capacity
-        if self.entries.len() >= self.max_entries {
-            self.evict_one(current_time_ms);
-        }
-
         // Eviction can decline to free a slot when every entry is a live
         // verified one, which is the case the hint must not be allowed to
         // force. Refuse rather than grow past the cap.
-        if self.entries.len() >= self.max_entries {
+        if self.entries.len() >= self.max_entries && !self.evict_one(current_time_ms) {
             return HintOutcome::Rejected;
         }
 
         let entry = CacheEntry::new(coords, current_time_ms, ttl_ms);
-        self.entries.insert(addr, entry);
+        self.file_new(addr, entry);
         HintOutcome::Inserted
     }
 
@@ -158,8 +193,10 @@ impl CoordCache {
         coords: TreeCoordinate,
         current_time_ms: u64,
     ) {
-        if let Some(entry) = self.entries.get_mut(&addr) {
-            entry.update_verified(coords, current_time_ms, self.default_ttl_ms);
+        if let Some(slot) = self.entries.get_mut(&addr) {
+            slot.entry
+                .update_verified(coords, current_time_ms, self.default_ttl_ms);
+            self.refile(addr);
             return;
         }
 
@@ -168,7 +205,7 @@ impl CoordCache {
         }
 
         let entry = CacheEntry::new_verified(coords, current_time_ms, self.default_ttl_ms);
-        self.entries.insert(addr, entry);
+        self.file_new(addr, entry);
     }
 
     /// Insert or update a verified cache entry with path MTU information.
@@ -183,22 +220,16 @@ impl CoordCache {
         current_time_ms: u64,
         path_mtu: u16,
     ) {
-        if let Some(entry) = self.entries.get_mut(&addr) {
-            entry.update_verified(coords, current_time_ms, self.default_ttl_ms);
-            entry.set_path_mtu(path_mtu);
-            return;
+        self.insert_verified(addr, coords, current_time_ms);
+        if let Some(slot) = self.entries.get_mut(&addr) {
+            slot.entry.set_path_mtu(path_mtu);
         }
-
-        if self.entries.len() >= self.max_entries {
-            self.evict_one(current_time_ms);
-        }
-
-        let mut entry = CacheEntry::new_verified(coords, current_time_ms, self.default_ttl_ms);
-        entry.set_path_mtu(path_mtu);
-        self.entries.insert(addr, entry);
     }
 
     /// Insert with a custom TTL.
+    ///
+    /// Eviction orders entries by last use, not by expiry, so an entry with a
+    /// short TTL is not evicted ahead of an older one with a long TTL.
     pub fn insert_with_ttl(
         &mut self,
         addr: NodeAddr,
@@ -211,46 +242,49 @@ impl CoordCache {
 
     /// Look up coordinates for an address (without touching).
     pub fn get(&self, addr: &NodeAddr, current_time_ms: u64) -> Option<&TreeCoordinate> {
-        self.entries.get(addr).and_then(|entry| {
-            if entry.is_expired(current_time_ms) {
+        self.entries.get(addr).and_then(|slot| {
+            if slot.entry.is_expired(current_time_ms) {
                 None
             } else {
-                Some(entry.coords())
+                Some(slot.entry.coords())
             }
         })
     }
 
     /// Look up coordinates and refresh (update last_used and extend TTL).
+    ///
+    /// Does no index work when it only touches, so the forwarding path pays
+    /// nothing for the eviction index.
     pub fn get_and_touch(
         &mut self,
         addr: &NodeAddr,
         current_time_ms: u64,
     ) -> Option<&TreeCoordinate> {
         // Check and remove if expired
-        if let Some(entry) = self.entries.get(addr)
-            && entry.is_expired(current_time_ms)
+        if self
+            .entries
+            .get(addr)
+            .is_some_and(|slot| slot.entry.is_expired(current_time_ms))
         {
-            self.entries.remove(addr);
+            self.remove_slot(addr);
             return None;
         }
 
         // Refresh TTL and return
-        if let Some(entry) = self.entries.get_mut(addr) {
-            entry.refresh(current_time_ms, self.default_ttl_ms);
-            Some(entry.coords())
-        } else {
-            None
-        }
+        let ttl_ms = self.default_ttl_ms;
+        let slot = self.entries.get_mut(addr)?;
+        slot.entry.refresh(current_time_ms, ttl_ms);
+        Some(slot.entry.coords())
     }
 
     /// Get the full cache entry.
     pub fn get_entry(&self, addr: &NodeAddr) -> Option<&CacheEntry> {
-        self.entries.get(addr)
+        self.entries.get(addr).map(|slot| &slot.entry)
     }
 
     /// Remove an entry.
     pub fn remove(&mut self, addr: &NodeAddr) -> Option<CacheEntry> {
-        self.entries.remove(addr)
+        self.remove_slot(addr).map(|slot| slot.entry)
     }
 
     /// Demote an entry to an unverified hint, keeping its coordinates and TTL.
@@ -259,8 +293,11 @@ impl CoordCache {
     /// whether an entry existed.
     pub fn demote(&mut self, addr: &NodeAddr) -> bool {
         match self.entries.get_mut(addr) {
-            Some(entry) => {
-                entry.mark_hint();
+            Some(slot) => {
+                slot.entry.mark_hint();
+                if slot.place == Place::Parked {
+                    self.refile(*addr);
+                }
                 true
             }
             None => false,
@@ -269,8 +306,8 @@ impl CoordCache {
 
     /// Forget the path MTU stored with an entry, keeping the entry.
     pub fn clear_path_mtu(&mut self, addr: &NodeAddr) {
-        if let Some(entry) = self.entries.get_mut(addr) {
-            entry.clear_path_mtu();
+        if let Some(slot) = self.entries.get_mut(addr) {
+            slot.entry.clear_path_mtu();
         }
     }
 
@@ -293,20 +330,20 @@ impl CoordCache {
     pub fn iter(&self, current_time_ms: u64) -> impl Iterator<Item = (&NodeAddr, &CacheEntry)> {
         self.entries
             .iter()
+            .map(|(addr, slot)| (addr, &slot.entry))
             .filter(move |(_, entry)| !entry.is_expired(current_time_ms))
     }
 
     /// Remove all expired entries.
     pub fn purge_expired(&mut self, current_time_ms: u64) -> usize {
-        let before = self.entries.len();
-        self.entries
-            .retain(|_, entry| !entry.is_expired(current_time_ms));
-        before - self.entries.len()
+        self.retain_entries(|entry| !entry.is_expired(current_time_ms))
     }
 
     /// Clear all entries.
     pub fn clear(&mut self) {
         self.entries.clear();
+        self.by_use.clear();
+        self.parked.clear();
     }
 
     /// Drop entries whose cached destination ancestry contains the given
@@ -320,10 +357,7 @@ impl CoordCache {
     ///
     /// Returns the count of entries removed.
     pub fn invalidate_via_node(&mut self, node_addr: &NodeAddr) -> usize {
-        let len_before = self.entries.len();
-        self.entries
-            .retain(|_, entry| !entry.coords().contains(node_addr));
-        len_before - self.entries.len()
+        self.retain_entries(|entry| !entry.coords().contains(node_addr))
     }
 
     /// Drop entries whose cached destination `root_id` differs from
@@ -337,47 +371,147 @@ impl CoordCache {
     ///
     /// Returns the count of entries removed.
     pub fn invalidate_other_roots(&mut self, current_root: &NodeAddr) -> usize {
+        self.retain_entries(|entry| entry.coords().root_id() == current_root)
+    }
+
+    /// Keep only the entries `keep` accepts, dropping the others' index keys.
+    /// Returns the count removed.
+    fn retain_entries(&mut self, mut keep: impl FnMut(&CacheEntry) -> bool) -> usize {
         let len_before = self.entries.len();
-        self.entries
-            .retain(|_, entry| entry.coords().root_id() == current_root);
+        let by_use = &mut self.by_use;
+        let parked = &mut self.parked;
+        self.entries.retain(|_, slot| {
+            if keep(&slot.entry) {
+                return true;
+            }
+            match slot.place {
+                Place::ByUse => by_use.remove(&slot.key),
+                Place::Parked => parked.remove(&slot.key),
+            };
+            false
+        });
         len_before - self.entries.len()
     }
 
-    /// Evict one entry (expired first, then LRU).
-    fn evict_one(&mut self, current_time_ms: u64) {
-        // First try to evict an expired entry
-        let expired_key = self
-            .entries
-            .iter()
-            .inspect(|_| self.note_examined())
-            .find(|(_, e)| e.is_expired(current_time_ms))
-            .map(|(k, _)| *k);
+    /// Next index key with the given first half.
+    fn next_key(&mut self, first: u64) -> (u64, u64) {
+        self.seq += 1;
+        (first, self.seq)
+    }
 
-        if let Some(key) = expired_key {
-            self.entries.remove(&key);
+    /// Add a slot for a key not in the map, filed for eviction by last use.
+    fn file_new(&mut self, addr: NodeAddr, entry: CacheEntry) {
+        let key = self.next_key(entry.last_used());
+        self.by_use.insert(key, addr);
+        self.entries.insert(
+            addr,
+            Slot {
+                entry,
+                key,
+                place: Place::ByUse,
+            },
+        );
+    }
+
+    /// Re-file an existing slot in `by_use` at its entry's current last use,
+    /// after a write changed it.
+    fn refile(&mut self, addr: NodeAddr) {
+        let Some(slot) = self.entries.get(&addr) else {
             return;
+        };
+        let (old, place, used) = (slot.key, slot.place, slot.entry.last_used());
+        match place {
+            Place::ByUse => self.by_use.remove(&old),
+            Place::Parked => self.parked.remove(&old),
+        };
+        let key = self.next_key(used);
+        self.by_use.insert(key, addr);
+        if let Some(slot) = self.entries.get_mut(&addr) {
+            slot.key = key;
+            slot.place = Place::ByUse;
+        }
+    }
+
+    /// Remove a slot and its index key.
+    fn remove_slot(&mut self, addr: &NodeAddr) -> Option<Slot> {
+        let slot = self.entries.remove(addr)?;
+        match slot.place {
+            Place::ByUse => self.by_use.remove(&slot.key),
+            Place::Parked => self.parked.remove(&slot.key),
+        };
+        Some(slot)
+    }
+
+    /// Evict the least recently used entry that is not live-verified.
+    /// Returns whether an entry was evicted.
+    ///
+    /// Restricting the victim pool is what stops a hint flood from
+    /// manufacturing the empty slot the precedence rule depends on: without
+    /// it, an attacker fills the cache with hints until a verified entry
+    /// becomes the LRU, evicts it, and then plants into a slot that is now
+    /// empty and so accepts an ordinary first write. Declining to evict is
+    /// the correct outcome when every entry is live-verified; the caller
+    /// refuses the hint rather than growing past the cap.
+    ///
+    /// Each key popped is either the victim, an entry touched since it was
+    /// filed (restamped at its last use, which the touch paid for), or a
+    /// live-verified entry (parked until its verification lapses). So the
+    /// work is amortised over the touches and verified writes that caused it.
+    fn evict_one(&mut self, current_time_ms: u64) -> bool {
+        // Entries whose verification has lapsed are victims again.
+        while let Some((&(until, _), _)) = self.parked.first_key_value() {
+            if until >= current_time_ms {
+                break;
+            }
+            let Some((_, addr)) = self.parked.pop_first() else {
+                break;
+            };
+            self.note_examined();
+            let used = self.entries.get(&addr).map(|s| s.entry.last_used());
+            let key = self.next_key(used.unwrap_or(0));
+            self.by_use.insert(key, addr);
+            if let Some(slot) = self.entries.get_mut(&addr) {
+                slot.key = key;
+                slot.place = Place::ByUse;
+            }
         }
 
-        // Otherwise evict the LRU among entries that are not live-verified.
-        //
-        // Restricting the victim pool is what stops a hint flood from
-        // manufacturing the empty slot the precedence rule depends on: without
-        // it, an attacker fills the cache with hints until a verified entry
-        // becomes the LRU, evicts it, and then plants into a slot that is now
-        // empty and so accepts an ordinary first write. Declining to evict is
-        // the correct outcome when every entry is live-verified; the caller
-        // refuses the hint rather than growing past the cap.
-        let lru_key = self
-            .entries
-            .iter()
-            .inspect(|_| self.note_examined())
-            .filter(|(_, e)| !e.is_verified(current_time_ms))
-            .max_by_key(|(_, e)| e.idle_time(current_time_ms))
-            .map(|(k, _)| *k);
-
-        if let Some(key) = lru_key {
-            self.entries.remove(&key);
+        let bound = 2 * self.by_use.len() + 1;
+        let mut visited = 0;
+        while let Some((stamp, addr)) = self.by_use.pop_first() {
+            self.note_examined();
+            visited += 1;
+            debug_assert!(visited <= bound, "eviction visited a key twice over");
+            let Some(slot) = self.entries.get(&addr) else {
+                debug_assert!(false, "an index key outlived its entry");
+                continue;
+            };
+            let (used, verified, until) = (
+                slot.entry.last_used(),
+                slot.entry.is_verified(current_time_ms),
+                slot.entry.verified_until(),
+            );
+            if used != stamp.0 {
+                let key = self.next_key(used);
+                self.by_use.insert(key, addr);
+                if let Some(slot) = self.entries.get_mut(&addr) {
+                    slot.key = key;
+                }
+                continue;
+            }
+            if verified {
+                let key = self.next_key(until);
+                self.parked.insert(key, addr);
+                if let Some(slot) = self.entries.get_mut(&addr) {
+                    slot.key = key;
+                    slot.place = Place::Parked;
+                }
+                continue;
+            }
+            self.entries.remove(&addr);
+            return true;
         }
+        false
     }
 
     /// Count one entry visited by an eviction scan; a no-op outside tests.
@@ -398,7 +532,7 @@ impl CoordCache {
     pub fn stored_addrs(&self) -> usize {
         self.entries
             .values()
-            .map(|e| e.coords().entries().len())
+            .map(|s| s.entry.coords().entries().len())
             .sum()
     }
 
@@ -407,7 +541,7 @@ impl CoordCache {
         let mut expired = 0;
         let mut total_age = 0u64;
 
-        for entry in self.entries.values() {
+        for entry in self.entries.values().map(|slot| &slot.entry) {
             if entry.is_expired(current_time_ms) {
                 expired += 1;
             }
@@ -942,5 +1076,284 @@ mod tests {
         let entry = cache.get_entry(&addr).unwrap();
         assert_eq!(entry.path_mtu(), None);
         assert!(entry.is_verified(10));
+    }
+
+    /// A distinct address per index, for fills larger than one byte can name.
+    fn minted_addr(tag: u8, val: u32) -> NodeAddr {
+        let mut bytes = [0u8; 16];
+        bytes[..4].copy_from_slice(&val.to_le_bytes());
+        bytes[15] = tag;
+        NodeAddr::from_bytes(bytes)
+    }
+
+    /// Coordinates for `addr` carrying `len` addresses in all: `addr`, then
+    /// `len - 2` minted ancestors, then `root`.
+    fn coords_of_len(addr: NodeAddr, root: NodeAddr, len: usize) -> TreeCoordinate {
+        let mut path = Vec::with_capacity(len);
+        path.push(addr);
+        path.extend((0..len as u32 - 2).map(|i| minted_addr(0xd0, i)));
+        path.push(root);
+        TreeCoordinate::from_addrs(path).unwrap()
+    }
+
+    /// The most entries one eviction may visit, averaged over many inserts, for
+    /// eviction to count as cheap. Any constant independent of the cache size
+    /// would do; a scan of the cache visits tens of thousands.
+    const MAX_MEAN_EXAMINED_PER_INSERT: u64 = 8;
+
+    #[test]
+    fn eviction_at_capacity_examines_a_bounded_number_of_entries() {
+        let mut cache = CoordCache::with_defaults();
+        let root = make_node_addr(0);
+        let capacity = DEFAULT_COORD_CACHE_SIZE as u32;
+        for i in 0..capacity {
+            let addr = minted_addr(0xfe, i);
+            let _ = cache.insert(addr, coords_of_len(addr, root, 2), 1_000 + u64::from(i));
+        }
+        assert_eq!(cache.len(), DEFAULT_COORD_CACHE_SIZE);
+        assert_eq!(
+            cache.eviction_examined(),
+            0,
+            "filling to capacity must not evict"
+        );
+
+        let fresh = 1_000u32;
+        let now = 1_000 + u64::from(capacity);
+        for i in 0..fresh {
+            let addr = minted_addr(0xfd, i);
+            assert_eq!(
+                cache.insert(addr, coords_of_len(addr, root, 2), now + u64::from(i)),
+                HintOutcome::Inserted
+            );
+        }
+        assert_eq!(cache.len(), DEFAULT_COORD_CACHE_SIZE);
+
+        let mean = cache.eviction_examined() / u64::from(fresh);
+        assert!(
+            mean <= MAX_MEAN_EXAMINED_PER_INSERT,
+            "each insert at capacity examined {mean} entries on average, \
+             against a bound of {MAX_MEAN_EXAMINED_PER_INSERT}"
+        );
+    }
+
+    #[test]
+    fn a_touched_entry_survives_a_flood_of_new_keys() {
+        let mut cache = CoordCache::new(1_000, DEFAULT_COORD_CACHE_TTL_MS);
+        let root = make_node_addr(0);
+        for i in 0..1_000u32 {
+            let addr = minted_addr(0xfe, i);
+            let _ = cache.insert(addr, coords_of_len(addr, root, 2), 1_000 + u64::from(i));
+        }
+        let kept = minted_addr(0xfe, 0);
+        let mut now = 3_000;
+        for i in 0..5_000u32 {
+            assert!(cache.get_and_touch(&kept, now).is_some(), "flood {i}");
+            let addr = minted_addr(0xfd, i);
+            let _ = cache.insert(addr, coords_of_len(addr, root, 2), now + 1);
+            now += 2;
+        }
+        assert!(cache.contains(&kept, now));
+        assert!(
+            !cache.contains(&minted_addr(0xfe, 1), now),
+            "an untouched entry should have been evicted by the flood"
+        );
+    }
+
+    /// Assert every slot is filed under its own key in exactly the index its
+    /// place names, and that the indexes hold nothing else.
+    fn assert_index_matches_map(cache: &CoordCache, step: &str) {
+        assert_eq!(
+            cache.by_use.len() + cache.parked.len(),
+            cache.entries.len(),
+            "{step}: index sizes do not add up to the map"
+        );
+        for (addr, slot) in &cache.entries {
+            let index = match slot.place {
+                Place::ByUse => &cache.by_use,
+                Place::Parked => &cache.parked,
+            };
+            assert_eq!(
+                index.get(&slot.key),
+                Some(addr),
+                "{step}: {addr:?} is not filed under its key"
+            );
+        }
+        for (key, addr) in cache.by_use.iter() {
+            let slot = cache
+                .entries
+                .get(addr)
+                .expect("by_use names a missing entry");
+            assert_eq!((slot.place, slot.key), (Place::ByUse, *key), "{step}");
+        }
+        for (key, addr) in cache.parked.iter() {
+            let slot = cache
+                .entries
+                .get(addr)
+                .expect("parked names a missing entry");
+            assert_eq!((slot.place, slot.key), (Place::Parked, *key), "{step}");
+        }
+    }
+
+    #[test]
+    fn the_eviction_index_matches_the_map_after_every_mutation() {
+        let root = make_node_addr(0);
+        let other_root = make_node_addr(9);
+        let via = minted_addr(0xd0, 0);
+        let mut cache = CoordCache::new(8, 1_000);
+        let mut now = 10_000u64;
+        let mut parked_seen = false;
+        let mut expiry_seen = false;
+
+        // A verified entry that eviction will reach first, and so park.
+        cache.insert_verified(
+            minted_addr(1, 0),
+            coords_of_len(minted_addr(1, 0), root, 2),
+            now,
+        );
+        assert_index_matches_map(&cache, "insert_verified");
+        cache.insert_verified_with_path_mtu(
+            minted_addr(1, 1),
+            coords_of_len(minted_addr(1, 1), root, 2),
+            now,
+            1400,
+        );
+        assert_index_matches_map(&cache, "insert_verified_with_path_mtu");
+
+        // A pseudo-random mix of every mutator, checked after each step.
+        let mut state = 0x2545_f491_u32;
+        for step in 0..4_000u32 {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            let addr = minted_addr(2, state % 24);
+            now += u64::from(state % 7);
+            let name = match (state >> 8) % 12 {
+                0..=3 => {
+                    let len = 2 + (state >> 4) as usize % 3;
+                    let _ = cache.insert(addr, coords_of_len(addr, root, len), now);
+                    "insert"
+                }
+                4 => {
+                    let had = cache.get_entry(&addr).is_some_and(|e| e.is_expired(now));
+                    let _ = cache.get_and_touch(&addr, now);
+                    expiry_seen |= had;
+                    "get_and_touch"
+                }
+                5 => {
+                    cache.insert_verified(addr, coords_of_len(addr, root, 2), now);
+                    "insert_verified"
+                }
+                6 => {
+                    let _ = cache.remove(&addr);
+                    "remove"
+                }
+                7 => {
+                    let _ = cache.demote(&addr);
+                    "demote"
+                }
+                8 => {
+                    let _ = cache.purge_expired(now);
+                    "purge_expired"
+                }
+                9 => {
+                    let _ = cache.insert(addr, coords_of_len(addr, other_root, 2), now);
+                    let _ = cache.invalidate_other_roots(&root);
+                    "invalidate_other_roots"
+                }
+                10 => {
+                    let _ = cache.invalidate_via_node(&via);
+                    "invalidate_via_node"
+                }
+                _ => {
+                    if step % 500 == 499 {
+                        cache.clear();
+                        "clear"
+                    } else {
+                        now += 2_000;
+                        "time passes"
+                    }
+                }
+            };
+            parked_seen |= !cache.parked.is_empty();
+            assert_index_matches_map(&cache, &format!("step {step} ({name})"));
+        }
+        assert!(parked_seen, "the sequence never parked a verified entry");
+        assert!(expiry_seen, "the sequence never expired an entry on touch");
+
+        // Demote an entry that is parked, then let a parked entry's
+        // verification lapse and be reached by eviction.
+        cache.clear();
+        cache.insert_verified(
+            minted_addr(3, 0),
+            coords_of_len(minted_addr(3, 0), root, 2),
+            now,
+        );
+        cache.insert_verified(
+            minted_addr(3, 1),
+            coords_of_len(minted_addr(3, 1), root, 2),
+            now,
+        );
+        for i in 0..8u32 {
+            let addr = minted_addr(4, i);
+            let _ = cache.insert(addr, coords_of_len(addr, root, 2), now + 1);
+        }
+        assert_eq!(cache.parked.len(), 2, "both verified entries were parked");
+        assert!(cache.demote(&minted_addr(3, 0)));
+        assert_index_matches_map(&cache, "demote of a parked entry");
+        let lapsed = now + VERIFIED_TTL_MS + 1;
+        let addr = minted_addr(5, 0);
+        let _ = cache.insert(addr, coords_of_len(addr, root, 2), lapsed);
+        assert_index_matches_map(&cache, "eviction after a verification lapsed");
+    }
+
+    #[test]
+    fn an_entry_whose_verification_lapsed_becomes_evictable() {
+        let mut cache = CoordCache::new(2, u64::MAX / 4);
+        let root = make_node_addr(0);
+        let verified = make_node_addr(1);
+        cache.insert_verified(verified, make_coords(&[1, 0]), 0);
+        let _ = cache.insert(make_node_addr(2), make_coords(&[2, 0]), 10);
+        // Inside the window the verified entry is parked and the hint goes.
+        let _ = cache.insert(make_node_addr(3), make_coords(&[3, 0]), 20);
+        assert!(cache.contains(&verified, 20));
+        assert!(!cache.contains(&make_node_addr(2), 20));
+
+        // Past it, the once-verified entry is the least recently used and so
+        // is the victim.
+        let after = VERIFIED_TTL_MS + 1;
+        let newcomer = minted_addr(0xfe, 0);
+        assert_eq!(
+            cache.insert(newcomer, coords_of_len(newcomer, root, 2), after),
+            HintOutcome::Inserted
+        );
+        assert!(
+            !cache.contains(&verified, after),
+            "an entry whose verification lapsed must become evictable"
+        );
+        assert!(cache.contains(&make_node_addr(3), after));
+    }
+
+    #[test]
+    fn entries_untouched_since_insertion_are_evicted_in_insertion_order() {
+        let mut cache = CoordCache::new(64, DEFAULT_COORD_CACHE_TTL_MS);
+        let root = make_node_addr(0);
+        // One timestamp for all, and addresses whose order runs against the
+        // insertion order, so only the sequence can explain the result.
+        let now = 1_000;
+        let addrs: Vec<NodeAddr> = (0..64u32).map(|i| minted_addr(0xfe, 1_000 - i)).collect();
+        for addr in &addrs {
+            let _ = cache.insert(*addr, coords_of_len(*addr, root, 2), now);
+        }
+        for i in 0..32u32 {
+            let addr = minted_addr(0xfd, i);
+            let _ = cache.insert(addr, coords_of_len(addr, root, 2), now);
+        }
+        for (i, addr) in addrs.iter().enumerate() {
+            assert_eq!(
+                cache.contains(addr, now),
+                i >= 32,
+                "entry {i} of the insertion order"
+            );
+        }
     }
 }

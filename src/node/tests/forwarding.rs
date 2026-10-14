@@ -1426,12 +1426,91 @@ async fn a_single_unroutable_datagram_still_produces_its_error() {
     assert_eq!(errors.emit_over_dest_interval.get(), 0);
 }
 
+// --- Coordinate cache bounds under transit warming ---
+
 /// Wall-clock milliseconds, the clock the warm path stamps entries with.
 fn wall_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64
+}
+
+/// Coordinates for `addr` carrying `len` addresses in all: `addr`, then
+/// `len - 2` minted ancestors, then `root`.
+fn coords_of_len(addr: NodeAddr, root: NodeAddr, len: usize) -> TreeCoordinate {
+    let mut path = Vec::with_capacity(len);
+    path.push(addr);
+    path.extend((0..len as u32 - 2).map(|i| {
+        let mut bytes = [0u8; 16];
+        bytes[..4].copy_from_slice(&i.to_le_bytes());
+        bytes[15] = 0xd0;
+        NodeAddr::from_bytes(bytes)
+    }));
+    path.push(root);
+    TreeCoordinate::from_addrs(path).unwrap()
+}
+
+/// One encoded SessionSetup from `src` to `dest`, without the msg_type byte.
+fn setup_frame(
+    src: NodeAddr,
+    src_coords: TreeCoordinate,
+    dest: NodeAddr,
+    dest_coords: TreeCoordinate,
+    ttl: u8,
+) -> Vec<u8> {
+    let payload = SessionSetup::new(src_coords, dest_coords).encode();
+    let encoded = SessionDatagram::new(src, dest, payload)
+        .with_ttl(ttl)
+        .encode();
+    encoded[1..].to_vec()
+}
+
+#[tokio::test]
+async fn a_session_setup_at_a_full_cache_examines_a_bounded_number_of_entries() {
+    let mut node = make_node();
+    let from = make_node_addr(0xAA);
+    let root = *node.tree_state.my_coords().root_id();
+    let capacity = node.coord_cache().max_entries() as u32;
+    let start = wall_ms();
+    let dest = make_node_addr(0x02);
+    let dest_coords = coords_of_len(dest, root, 2);
+    let _ = node
+        .coord_cache_mut()
+        .insert(dest, dest_coords.clone(), start);
+    for i in 1..capacity {
+        let addr = minted_dest(1_000_000 + i);
+        let _ = node
+            .coord_cache_mut()
+            .insert(addr, coords_of_len(addr, root, 2), start);
+    }
+    assert_eq!(node.coord_cache().len(), capacity as usize);
+
+    let frames = 100u32;
+    let before = node.coord_cache().eviction_examined();
+    for i in 0..frames {
+        let src = minted_dest(i);
+        let frame = setup_frame(
+            src,
+            coords_of_len(src, root, 2),
+            dest,
+            dest_coords.clone(),
+            8,
+        );
+        node.handle_session_datagram(&from, &frame, false).await;
+    }
+    assert!(
+        node.coord_cache()
+            .get(&minted_dest(frames - 1), wall_ms())
+            .is_some(),
+        "the last frame's source must have been cached, so eviction ran"
+    );
+    let mean = (node.coord_cache().eviction_examined() - before) / u64::from(frames);
+    assert!(
+        mean <= 8,
+        "each SessionSetup at a full cache examined {mean} entries on average, \
+         against a bound of 8"
+    );
 }
 
 // --- Foreign-root refusal at every hint write ---
