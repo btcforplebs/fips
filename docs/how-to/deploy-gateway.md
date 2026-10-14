@@ -384,32 +384,81 @@ through conntrack.
 
 ### Compose with the mesh firewall
 
-`gateway.port_forwards[]` opens *mesh-side* listeners on `fips0`. If
-the host's mesh firewall is enabled (see
-[enable-mesh-firewall.md](enable-mesh-firewall.md)), inbound TCP/UDP
-on `fips0` for these ports must be permitted in the baseline or via
-a drop-in. The default baseline allows established/related and
-ICMPv6 only, so without an explicit allow rule, mesh peers will see
-TCP RSTs or silent drops on the listen port.
+The mesh firewall baseline (`/etc/fips/fips.nft`, see
+[enable-mesh-firewall.md](enable-mesh-firewall.md)) does **not** gate
+port forwards. The gateway rewrites a forwarded connection's
+destination to the LAN target in its `prerouting` chain, so the kernel
+routes the packet through the `forward` hook to the LAN. The baseline
+hooks `input` only, and drop-ins under `/etc/fips/fips.d/` are included
+into that same `input` chain, so neither sees forwarded traffic. With
+the baseline loaded and nothing else, every mesh node that can reach the
+gateway can reach every configured port forward, and a `fips.d` rule
+such as `ip6 saddr <addr> tcp dport 8080 accept` has no effect on it.
 
-A typical drop-in for the worked example:
+To restrict who can use a port forward, load a table of your own with a
+`forward`-hook chain. For the worked example above, allowing one mesh
+node to use both forwards:
 
 ```nft
-# /etc/fips/fips.d/gateway-inbound.nft
-tcp dport 8080 accept
-udp dport 5353 accept
+# /etc/fips/port-forwards.nft
+# The node's tun.name, as in /etc/fips/fips.nft.
+define fips_if = "fips0"
+define allowed_peers = { fd97:1111:2222:3333:4444:5555:6666:7777 }
+
+add table inet fips_port_forwards
+flush table inet fips_port_forwards
+
+table inet fips_port_forwards {
+    chain forward {
+        type filter hook forward priority 0; policy accept;
+
+        # Only connections arriving from the mesh.
+        iifname != $fips_if return
+
+        ct state established,related accept
+
+        # Filter rules see the packet after the gateway rewrote its
+        # destination: match the target address and port, not listen_port.
+        ip6 saddr $allowed_peers ip6 daddr fd12:3456::10 tcp dport 80 accept
+        ip6 saddr $allowed_peers ip6 daddr fd12:3456::10 udp dport 53 accept
+
+        # Every other port-forwarded connection from the mesh.
+        ct status dnat counter drop
+    }
+}
 ```
 
-Reload the firewall:
+Connections from the mesh that the gateway did not translate, and LAN
+clients' own connections out to the mesh and their replies, pass this
+chain unchanged. A drop in any chain on the `forward` hook is final, so
+the order of this table against the gateway's own `inet fips_gateway`
+table does not matter.
+
+Load it with the firewall service, so it comes and goes with the
+baseline:
 
 ```sh
-sudo systemctl reload-or-restart fips-firewall.service
+sudo systemctl edit fips-firewall.service
 ```
 
-If the inbound half doesn't need access control beyond the listen
-port itself, no source filter is needed. To restrict to specific
-mesh peers, follow the `ip6 saddr <addr> tcp dport <port> accept`
-pattern from the firewall guide.
+```ini
+[Service]
+ExecStartPost=/usr/sbin/nft -f /etc/fips/port-forwards.nft
+ExecReload=/usr/sbin/nft -f /etc/fips/port-forwards.nft
+ExecStopPost=-/usr/sbin/nft delete table inet fips_port_forwards
+```
+
+Then `sudo systemctl reload-or-restart fips-firewall.service`. The
+drop counter shows refused connections:
+
+```sh
+sudo nft list table inet fips_port_forwards
+```
+
+On OpenWrt the packaged firewall zone already passes port forwards
+through fw4's forward chain; restrict them there with a `src fips`
+rule matching the target's port instead (see
+`packaging/openwrt-ipk/README.md`).
 
 ### Verify the inbound path
 

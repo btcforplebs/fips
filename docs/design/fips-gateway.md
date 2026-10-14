@@ -36,9 +36,9 @@ own FIPS identity: prerouting DNAT rewrites the destination from the
 virtual IP to the real `fd00::/8` mesh address, and postrouting
 masquerade rewrites the source from the LAN host's address to the
 gateway's `fips0` address. Return traffic follows the conntrack
-reverse path back to the originating LAN host, with postrouting SNAT
-restoring the virtual IP as source so the client sees a response from
-the address it connected to.
+reverse path back to the originating LAN host: conntrack reverses the
+prerouting DNAT on each reply, restoring the virtual IP as source so
+the client sees a response from the address it connected to.
 
 The **inbound half** carries traffic from mesh to LAN. A
 configuration entry in `gateway.port_forwards[]` exposes a LAN
@@ -93,8 +93,9 @@ fips_gateway`, with four chains and one set:
   `iifname <lan_interface>`) and mesh→LAN DNAT (per port-forward).
 - `postrouting` — `type nat hook postrouting priority srcnat (100)`,
   for the `oifname fips0` masquerade of LAN traffic, the per-mapping
-  return-path SNAT, and (when any port-forward is configured) the
-  LAN-side masquerade for inbound traffic.
+  SNAT of new flows sourced from a mapped mesh address, and (when any
+  port-forward is configured) the LAN-side masquerade for inbound
+  traffic.
 - `forward` — `type filter hook forward priority filter (0)`, which
   drops traffic into `fips0` from any interface other than the LAN
   interface unless it belongs to an established or related flow.
@@ -483,18 +484,19 @@ LAN flow's addresses and ports could otherwise send in that flow's
 original direction and have it translated and forwarded. Loopback is
 exempt so the gateway host's own connections to pool addresses work.
 
-**Postrouting SNAT (per mapping)** rewrites the source of return
-traffic from the mesh address back to the virtual IP:
+**Postrouting SNAT (per mapping)** rewrites the source of a new flow
+sourced from a mapped mesh address to that mapping's virtual IP:
 
 ```text
 match:  nfproto ipv6 && ip6 saddr == <mesh_addr>
 action: snat to <virtual_ip>
 ```
 
-Without it, the LAN client would see replies from the raw
-`fd00::/8` mesh address rather than from the virtual IP it had
-originally connected to, breaking application-layer assumptions about
-the destination address.
+NAT rules are consulted only for the first packet of a flow, so this
+rule does not touch the replies of a connection a LAN client opened.
+Those are translated by conntrack reversing the prerouting DNAT, which
+is what makes the LAN client see replies from the virtual IP it
+connected to rather than from the raw `fd00::/8` mesh address.
 
 ### Network Requirements (Outbound)
 
@@ -522,7 +524,9 @@ is a triple:
 | `proto` | `tcp` \| `udp` | Match protocol. |
 | `target` | `[ipv6]:port` | LAN destination. IPv4 targets are rejected at parse time by `SocketAddrV6`. |
 
-Validation runs at startup and on every config reload:
+Validation runs at startup (the gateway has no in-place reload; it
+handles only SIGTERM and SIGINT, and a reload of the service restarts
+it):
 `(listen_port, proto)` must be unique across the list, and zero
 listen ports are rejected. Forwards are independent of outbound
 configuration: a gateway with no `pool` consumers can still expose

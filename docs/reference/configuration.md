@@ -929,8 +929,11 @@ default for that protocol).
 Optional list of inbound port-forward rules. Each rule maps a TCP or
 UDP port on the gateway's `fips0` mesh-side address to a `host:port`
 on the LAN. Mesh peers connect to the gateway's mesh address on the
-listen port; the gateway terminates the connection and forwards the
-payload to the LAN target. This is the inverse of the outbound mode:
+listen port; the kernel rewrites the destination to the LAN target
+(DNAT) and forwards the packets, and the gateway's LAN-side masquerade
+makes them arrive from the gateway's LAN address. The mesh firewall baseline
+does not filter these connections; see the gateway how-to for a rule
+that does. This is the inverse of the outbound mode:
 the LAN service is exposed to the mesh, not the other way around. See
 [../how-to/deploy-gateway.md](../how-to/deploy-gateway.md) for the
 operator recipe.

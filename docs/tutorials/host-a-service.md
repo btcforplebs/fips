@@ -510,8 +510,10 @@ For more depth on the firewall and ACL surface:
 If you want to host a service that is *not* on a FIPS node — say,
 an existing HTTP server on a regular LAN box — and expose it to
 mesh peers through a `fips-gateway`, that's the inbound
-port-forward mode: the gateway runs a mesh-side listener on `fips0`
-and forwards to a LAN target. The operator recipe is at
+port-forward mode: the gateway's kernel rewrites connections to a
+listen port on its mesh address to a LAN target and forwards them. The
+mesh firewall baseline does not filter these connections. The operator
+recipe, including how to restrict who can use a forward, is at
 [../how-to/deploy-gateway.md#configure-the-inbound-half](../how-to/deploy-gateway.md#configure-the-inbound-half);
 a hand-held walk-through on an OpenWrt AP is at
 [deploy-fips-gateway.md](deploy-fips-gateway.md) under "Advanced"

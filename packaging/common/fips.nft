@@ -92,6 +92,9 @@
 #   inet fips_gateway   — created by the fips-gateway binary when
 #                          running (separate concern from this file).
 #                          See the fips-gateway design doc for details.
+#                          Its port forwards are forwarded traffic, which
+#                          this input chain never sees; to restrict them,
+#                          see docs/how-to/deploy-gateway.md.
 #
 #   ip / ip6 family     — Docker, /etc/nftables.conf, etc.
 #                          Independent of this table.

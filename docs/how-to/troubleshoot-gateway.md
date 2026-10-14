@@ -404,20 +404,24 @@ The masquerade is emitted only when at least one port-forward exists.
 If either rule is missing, restart the gateway — the table is rebuilt
 atomically on config load.
 
-**Step 2.** Verify the mesh firewall is not blocking the listen
-port. If `fips-firewall.service` is enabled, the default baseline
-drops everything inbound on `fips0` except established/related and
-ICMPv6. Add an explicit allow rule under `/etc/fips/fips.d/`:
+**Step 2.** Verify no `forward`-hook rule refuses the connection.
+The mesh firewall baseline (`fips-firewall.service`) hooks `input`
+only, so it neither blocks nor restricts port forwards, and an allow
+rule under `/etc/fips/fips.d/` has no effect on them. A forwarded
+connection is refused only by a `forward`-hook chain: the port-forward
+restriction from
+[deploy-gateway.md](deploy-gateway.md#compose-with-the-mesh-firewall),
+or another firewall on the host whose `forward` policy is drop. If you
+loaded the restriction, check that it allows the peer's address and the
+forward's target address and port (not `listen_port`), and that its
+`fips_if` is the node's `tun.name`. Its drop counter shows refused
+connections:
 
-```nft
-# /etc/fips/fips.d/gateway-inbound.nft
-tcp dport <listen_port> accept
+```sh
+sudo nft list table inet fips_port_forwards
 ```
 
-(See [enable-mesh-firewall.md](enable-mesh-firewall.md) for the
-full drop-in pattern, including source-address restrictions.)
-Without an allow rule, mesh peers see TCP RSTs (the firewall drops
-on the way in) or silent UDP loss.
+A dropped connection times out on the peer rather than being reset.
 
 **Step 3.** Verify the LAN target is reachable from the gateway
 itself:

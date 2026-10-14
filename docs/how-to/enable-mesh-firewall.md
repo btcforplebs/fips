@@ -58,6 +58,11 @@ name and reload:
 sudo systemctl reload-or-restart fips-firewall.service
 ```
 
+If you load the port-forward restriction from
+[deploy-gateway.md](deploy-gateway.md#compose-with-the-mesh-firewall),
+change `fips_if` in `/etc/fips/port-forwards.nft` as well; until you do,
+that chain returns every forwarded connection unrestricted.
+
 Until you do, the baseline filters nothing on the TUN and every listener
 on it is reachable from the mesh. The daemon checks this when it brings
 the TUN up and logs a warning naming both interfaces, and `fipstop`'s
@@ -67,6 +72,15 @@ Because `/etc/fips/fips.nft` is a configuration file, an upgrade that
 changes it while you have edited it asks whether to keep your version
 (dpkg) or installs the new one beside yours (`.pacnew` on Arch). Keep
 your file and carry over any change you want from the new one.
+
+## Gateway port forwards are outside the baseline
+
+The baseline polices traffic addressed to this host (the `input` hook).
+A `fips-gateway` port forward rewrites the destination to a LAN host,
+so its traffic is forwarded, never reaches the `input` hook, and is not
+filtered by the baseline or by any `fips.d` drop-in. To restrict port
+forwards, see [Compose with the mesh
+firewall](deploy-gateway.md#compose-with-the-mesh-firewall).
 
 ## Folding the baseline into the host's main nftables
 
