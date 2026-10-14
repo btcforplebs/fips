@@ -4,9 +4,19 @@ use super::util::{
     MockRoutingView, action_peers, distinct_addr, empty_lookup, make_request, make_request_id,
     suppressing_lookup,
 };
-use crate::TreeCoordinate;
 use crate::proto::lookup::*;
 use crate::testutil::make_node_addr;
+use crate::{NodeAddr, TreeCoordinate};
+
+/// The proof digest a response under test carries, where the test is not
+/// about telling responses apart.
+const DIGEST: [u8; 8] = [0x5A; 8];
+
+/// The link peer a response under test arrives from, where the test is not
+/// about which peer that is.
+fn responder() -> NodeAddr {
+    make_node_addr(0xE0)
+}
 
 #[test]
 fn picks_only_tree_peers_when_a_tree_peer_matches() {
@@ -155,7 +165,7 @@ fn classify_response_transit_on_fresh_forwarded_request() {
 
     // With no lookup of ours outstanding for the target, transit is decided by
     // the dedup record — pass a target no pending lookup mentions.
-    match classify_response(&mut lookup, 42, &make_node_addr(0xF1)) {
+    match classify_response(&mut lookup, 42, &make_node_addr(0xF1), &responder(), DIGEST) {
         ResponseRoute::Transit { from_peer: peer } => assert_eq!(peer, from_peer),
         _ => panic!("expected Transit"),
     }
@@ -173,11 +183,11 @@ fn classify_response_already_forwarded_on_second_call() {
 
     let target = make_node_addr(0xF2);
     assert!(matches!(
-        classify_response(&mut lookup, 7, &target),
+        classify_response(&mut lookup, 7, &target, &responder(), DIGEST),
         ResponseRoute::Transit { .. }
     ));
     assert!(matches!(
-        classify_response(&mut lookup, 7, &target),
+        classify_response(&mut lookup, 7, &target, &responder(), DIGEST),
         ResponseRoute::AlreadyForwarded
     ));
 }
@@ -201,7 +211,7 @@ fn classify_response_originator_wins_over_a_transit_dedup_record() {
     lookup.pending_lookups.insert(target, pending);
 
     assert!(matches!(
-        classify_response(&mut lookup, 4242, &target),
+        classify_response(&mut lookup, 4242, &target, &responder(), DIGEST),
         ResponseRoute::Originator
     ));
     // And nothing was reverse-path forwarded on our behalf.
@@ -226,7 +236,7 @@ fn classify_response_originator_when_a_pending_lookup_issued_the_id() {
     lookup.pending_lookups.insert(target, pending);
 
     assert!(matches!(
-        classify_response(&mut lookup, 999, &target),
+        classify_response(&mut lookup, 999, &target, &responder(), DIGEST),
         ResponseRoute::Originator
     ));
 }
@@ -242,7 +252,7 @@ fn classify_response_unsolicited_when_nothing_correlates_the_id() {
 
     // 1. Nothing outstanding at all.
     assert!(matches!(
-        classify_response(&mut lookup, 999, &target),
+        classify_response(&mut lookup, 999, &target, &responder(), DIGEST),
         ResponseRoute::Unsolicited
     ));
 
@@ -252,21 +262,21 @@ fn classify_response_unsolicited_when_nothing_correlates_the_id() {
     pending.record(1);
     lookup.pending_lookups.insert(target, pending);
     assert!(matches!(
-        classify_response(&mut lookup, 999, &target),
+        classify_response(&mut lookup, 999, &target, &responder(), DIGEST),
         ResponseRoute::Unsolicited
     ));
 
     // 3. The id was issued, but for a different target: the id is bound to the
     //    exchange it was drawn for and cannot be redirected onto another name.
     assert!(matches!(
-        classify_response(&mut lookup, 1, &other),
+        classify_response(&mut lookup, 1, &other, &responder(), DIGEST),
         ResponseRoute::Unsolicited
     ));
 
     // The matching pair still classifies as ours, so the checks above are
     // discriminating rather than rejecting everything.
     assert!(matches!(
-        classify_response(&mut lookup, 1, &target),
+        classify_response(&mut lookup, 1, &target, &responder(), DIGEST),
         ResponseRoute::Originator
     ));
 }
@@ -624,7 +634,7 @@ fn classify_request_drops_our_own_request_looped_back_to_us() {
     assert!(lookup.recent_by_peer.is_empty());
     // A response for it is then ours to accept.
     assert!(matches!(
-        classify_response(&mut lookup, 77, &target),
+        classify_response(&mut lookup, 77, &target, &responder(), DIGEST),
         ResponseRoute::Originator
     ));
 }
@@ -828,7 +838,7 @@ fn classify_request_forward_rate_limited() {
     let target = make_node_addr(0xAA);
     // Pre-seed the forward limiter so should_forward(target) returns false
     // on the next call within the (default 2s) min interval.
-    assert!(lookup.forward_limiter.should_forward(&target, 1000));
+    assert!(lookup.forward_limiter.should_forward(&from, &target, 1000));
 
     let request = make_request_id(1, target, 3);
     assert!(matches!(

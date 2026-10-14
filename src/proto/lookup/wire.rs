@@ -170,6 +170,20 @@ impl LookupResponse {
         bytes
     }
 
+    /// The first eight bytes of the proof: the start of the signature's nonce
+    /// commitment.
+    ///
+    /// A transit cannot verify the proof, but it can tell two responses
+    /// apart by it. Two signatures over the same message share their nonce
+    /// commitment only if the signer reused a nonce, and `path_mtu`, the one
+    /// field a transit rewrites, is outside the proof, so a relayed copy
+    /// keeps its digest.
+    pub fn proof_digest(&self) -> [u8; 8] {
+        let mut digest = [0u8; 8];
+        digest.copy_from_slice(&self.proof.as_ref()[..8]);
+        digest
+    }
+
     /// Encode as wire format (includes msg_type byte).
     ///
     /// Format: `[0x31][request_id:8][target:16][path_mtu:2][target_coords_cnt:2][target_coords:16×n][proof:64]`

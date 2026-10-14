@@ -204,44 +204,44 @@ fn with_a_zero_backoff_cap_and_a_nonzero_base_one_hundred_distinct_failures_reco
 #[test]
 fn test_forward_first_allowed() {
     let mut limiter = LookupForwardRateLimiter::new();
-    assert!(limiter.should_forward(&addr(1), 0));
+    assert!(limiter.should_forward(&addr(0xF0), &addr(1), 0));
 }
 
 #[test]
 fn test_forward_rapid_rate_limited() {
     let now = 1_000;
     let mut limiter = LookupForwardRateLimiter::new();
-    assert!(limiter.should_forward(&addr(1), now));
-    assert!(!limiter.should_forward(&addr(1), now));
-    assert!(!limiter.should_forward(&addr(1), now));
+    assert!(limiter.should_forward(&addr(0xF0), &addr(1), now));
+    assert!(!limiter.should_forward(&addr(0xF0), &addr(1), now));
+    assert!(!limiter.should_forward(&addr(0xF0), &addr(1), now));
 }
 
 #[test]
 fn test_forward_different_targets_independent() {
     let now = 1_000;
     let mut limiter = LookupForwardRateLimiter::new();
-    assert!(limiter.should_forward(&addr(1), now));
-    assert!(limiter.should_forward(&addr(2), now));
-    assert!(!limiter.should_forward(&addr(1), now));
-    assert!(!limiter.should_forward(&addr(2), now));
+    assert!(limiter.should_forward(&addr(0xF0), &addr(1), now));
+    assert!(limiter.should_forward(&addr(0xF0), &addr(2), now));
+    assert!(!limiter.should_forward(&addr(0xF0), &addr(1), now));
+    assert!(!limiter.should_forward(&addr(0xF0), &addr(2), now));
 }
 
 #[test]
 fn test_forward_allowed_after_interval() {
     let now = 1_000;
     let mut limiter = LookupForwardRateLimiter::with_interval_ms(100);
-    assert!(limiter.should_forward(&addr(1), now));
+    assert!(limiter.should_forward(&addr(0xF0), &addr(1), now));
 
     // Advance past the minimum interval.
-    assert!(limiter.should_forward(&addr(1), now + 110));
+    assert!(limiter.should_forward(&addr(0xF0), &addr(1), now + 110));
 }
 
 #[test]
 fn test_forward_cleanup_removes_old() {
     let now = 1_000;
     let mut limiter = LookupForwardRateLimiter::new();
-    assert!(limiter.should_forward(&addr(1), now));
-    assert!(limiter.should_forward(&addr(2), now));
+    assert!(limiter.should_forward(&addr(0xF0), &addr(1), now));
+    assert!(limiter.should_forward(&addr(0xF0), &addr(2), now));
     assert_eq!(limiter.len(), 2);
 
     let future = now + 61_000;
@@ -253,7 +253,7 @@ fn test_forward_cleanup_removes_old() {
 fn test_forward_cleanup_preserves_recent() {
     let now = 1_000;
     let mut limiter = LookupForwardRateLimiter::new();
-    assert!(limiter.should_forward(&addr(1), now));
+    assert!(limiter.should_forward(&addr(0xF0), &addr(1), now));
     assert_eq!(limiter.len(), 1);
 
     limiter.cleanup(now);

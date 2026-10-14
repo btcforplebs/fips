@@ -326,7 +326,7 @@ pub(crate) fn classify_request(
     } else if request.can_forward() {
         if lookup
             .forward_limiter
-            .should_forward(&request.target, now_ms)
+            .should_forward(from, &request.target, now_ms)
         {
             RequestOutcome::Forward
         } else {
@@ -360,10 +360,15 @@ pub(crate) enum ResponseRoute {
 ///
 /// Pure decision over `Lookup` state: sets `response_forwarded` when this is
 /// the first response we transit for the request. No I/O, no view, no metrics.
+///
+/// `from` is the link peer the response arrived from and `digest` its
+/// [`LookupResponse::proof_digest`](super::LookupResponse::proof_digest).
 pub(crate) fn classify_response(
     lookup: &mut Lookup,
     request_id: u64,
     target: &NodeAddr,
+    _from: &NodeAddr,
+    _digest: [u8; 8],
 ) -> ResponseRoute {
     // Originator-ness is decided first, ahead of the transit dedup record.
     // The response names a target this node has a lookup outstanding for and

@@ -239,6 +239,8 @@ impl Node {
             &mut self.lookup,
             response.request_id,
             &response.target,
+            from,
+            response.proof_digest(),
         ) {
             crate::proto::lookup::ResponseRoute::AlreadyForwarded => {
                 // Already forwarded a response for this request — drop to

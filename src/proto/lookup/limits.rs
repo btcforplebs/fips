@@ -262,8 +262,9 @@ impl LookupForwardRateLimiter {
     /// Check if we should forward a lookup for this target.
     ///
     /// Returns true if enough time has passed since the last forward
-    /// for this target. Updates internal state when returning true.
-    pub fn should_forward(&mut self, target: &NodeAddr, now_ms: u64) -> bool {
+    /// for this target. Updates internal state when returning true. `from`
+    /// is the link peer the request arrived from.
+    pub fn should_forward(&mut self, _from: &NodeAddr, target: &NodeAddr, now_ms: u64) -> bool {
         // A full map admits rather than refuses; for forwarding that is the
         // same fail-open direction the routing-error limiter takes, and the
         // per-target interval is the only thing lost.
