@@ -199,7 +199,9 @@ impl PeerBudget {
             .as_millis() as u64;
         if elapsed_ms > 0 {
             bucket.milli_tokens = (bucket.milli_tokens + elapsed_ms * milli_per_ms).min(capacity);
-            bucket.last_refill = now;
+            // Advance by the whole milliseconds credited, not to `now`, so the
+            // part of a millisecond left over counts toward the next refill.
+            bucket.last_refill += Duration::from_millis(elapsed_ms);
         }
     }
 
@@ -461,6 +463,40 @@ mod tests {
         assert_eq!(
             budget.available(&addr(1), Instant::now()),
             u64::from(PEER_ERROR_BURST)
+        );
+    }
+
+    #[test]
+    fn reads_a_millisecond_and_a_half_apart_accrue_the_configured_rate() {
+        let mut budget = PeerBudget::with_initial(1_024, 1_000_000, 0);
+        let peer = addr(7);
+        let start = Instant::now();
+        let _ = budget.available(&peer, start);
+        for i in 1..=1_000u64 {
+            let _ = budget.available(&peer, start + Duration::from_micros(1_500 * i));
+        }
+        // 1.5 s at 1,024 a second.
+        let got = budget.available(&peer, start + Duration::from_micros(1_500_000));
+        assert!(got >= 1_535, "accrued {got} of 1,536");
+    }
+
+    #[test]
+    fn a_hub_relaying_sixty_four_destinations_a_second_accrues_the_coordinate_rate() {
+        // One frame every 15.625 ms, two hint reads per frame.
+        let mut budget = PeerBudget::coord_hints();
+        let peer = addr(8);
+        let start = Instant::now();
+        let _ = budget.available(&peer, start);
+        for i in 1..=64u64 {
+            let t = start + Duration::from_micros(15_625 * i);
+            let _ = budget.available(&peer, t);
+            let _ = budget.available(&peer, t);
+        }
+        let got = budget.available(&peer, start + Duration::from_secs(1));
+        assert_eq!(
+            got,
+            u64::from(COORD_HINT_WEIGHT_PER_SEC),
+            "accrued in one second"
         );
     }
 }
