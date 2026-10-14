@@ -121,8 +121,9 @@ pub struct RateLimitConfig {
     /// (`node.rate_limit.session_setup_rate`).
     ///
     /// 16/s caps one neighbour's forced half-open occupancy at
-    /// `rate * handshake_timeout_secs` (480 entries at defaults) and its ack
-    /// amplification at `rate * (1 + handshake_max_resends)` (96 acks/s).
+    /// `rate * handshake_timeout_secs` (480 responder candidates at
+    /// defaults) and its ack amplification at `rate` (16 acks/s): a
+    /// responder sends one ack per admitted setup and does not resend it.
     ///
     /// Setup messages naming a peer this node is already established with
     /// are metered on a separate per-link bucket, derived from

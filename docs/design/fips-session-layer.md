@@ -182,16 +182,34 @@ the forward path (e.g., after tree reconvergence).
 
 ### Simultaneous Initiation
 
-When both nodes attempt to establish a session simultaneously ("crossing
-hellos"), a deterministic tie-breaker resolves the conflict, mirroring
-IKEv2's simultaneous initiation resolution (RFC 7296 §2.8):
+When both nodes send a SessionSetup to each other at the same time
+("crossing hellos"), the handshake initiated by the node with the smaller
+address wins, as in IKEv2's simultaneous initiation (RFC 7296 §2.8). A
+SessionSetup proves nothing about its sender until its msg3 arrives, so
+the rule is applied in a way a forged setup cannot use to block the
+address owner's session:
 
-- If `local_node_addr < remote_node_addr`: Continue as initiator, ignore
-  incoming setup
-- If `local_node_addr > remote_node_addr`: Abort own initiation, switch to
-  responder role
+- The winner (smaller address) drops the peer's setup while its own setup
+  is less than 5 s old, since the peer will answer it. If its own setup
+  has gone unanswered for 5 s, it gives up its own leg and answers the
+  peer's setup instead.
+- The loser (larger address) answers the peer's setup and keeps its own
+  initiator leg beside it, with its resends paused. The resends resume
+  once the peer's setup has been held for 5 s with nothing completed, or
+  at once if no half-open setup from the peer is left.
 
-This lowest-address-wins approach ensures exactly one handshake completes.
+Each setup a node answers is held as a half-open responder setup with its
+own handshake and SessionAck, up to four per address. If the loser's own
+leg completes first, it keeps the winner's half-open setups beside its
+session, and a msg3 completing one of them replaces its session, so both
+sides end on the same handshake. The winner, once established, keeps none.
+
+Each half-open setup expires on its own deadline, a handshake timeout
+(30 s by default) after it was admitted, including those the loser keeps
+beside an established session. With four held, a new setup replaces the
+oldest one that is at least 5 s old, preferring one that arrived over the
+same link peer, and is refused if none is that old. A forged setup
+therefore cannot be evicted before it is 5 s old.
 
 ### Data Transfer
 

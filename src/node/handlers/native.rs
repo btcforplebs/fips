@@ -143,6 +143,14 @@ impl Node {
                 }
                 return;
             }
+            // As on the TUN path: an entry holding only responder candidates
+            // that have had the minimum age to complete makes this node
+            // initiate itself.
+            if entry.responder_hold_expired(Self::now_ms()) {
+                let pubkey = peer.public_key(secp256k1::Parity::Even);
+                self.cache_flow_key(&key.peer, pubkey);
+                self.initiate_behind_candidates(key.peer, pubkey).await;
+            }
             self.queue_native(key, payload);
             return;
         }
@@ -159,19 +167,7 @@ impl Node {
         // premessage, so both parities derive the same material.
         let pubkey = peer.public_key(secp256k1::Parity::Even);
 
-        // Cache the key the client supplied before trying the route. If there
-        // is none, the lookup below verifies its answer against this cache, and
-        // `initiate_session` registers the key only after a send succeeds, so
-        // without this the answer is dropped. Only on a miss, the same rule
-        // `cache_session_identity` follows: when no route is known, a key
-        // already cached from DNS, a handshake or a configured peer keeps its
-        // own parity. The presence check refreshes that entry, so it is not
-        // the oldest one when the answer arrives.
-        let mut prefix = [0u8; 15];
-        prefix.copy_from_slice(&key.peer.as_bytes()[0..15]);
-        if self.lookup_by_fips_prefix(&prefix).is_none() {
-            self.register_identity(key.peer, pubkey);
-        }
+        self.cache_flow_key(&key.peer, pubkey);
 
         if let Err(error) = self.initiate_session(key.peer, pubkey).await {
             debug!(
@@ -182,6 +178,24 @@ impl Node {
             self.maybe_initiate_lookup(&key.peer).await;
         }
         self.queue_native(key, payload);
+    }
+
+    /// Cache the key a native flow supplied for `peer` before a session is
+    /// started for it.
+    ///
+    /// If there is no route, the discovery lookup verifies its answer against
+    /// this cache, and `initiate_session` registers the key only after a send
+    /// succeeds, so without this the answer is dropped. Only on a miss, the
+    /// same rule `cache_session_identity` follows: when no route is known, a
+    /// key already cached from DNS, a handshake or a configured peer keeps its
+    /// own parity. The presence check refreshes that entry, so it is not the
+    /// oldest one when the answer arrives.
+    fn cache_flow_key(&mut self, peer: &NodeAddr, pubkey: secp256k1::PublicKey) {
+        let mut prefix = [0u8; 15];
+        prefix.copy_from_slice(&peer.as_bytes()[0..15]);
+        if self.lookup_by_fips_prefix(&prefix).is_none() {
+            self.register_identity(*peer, pubkey);
+        }
     }
 
     /// Hold a native datagram until its destination's session establishes.

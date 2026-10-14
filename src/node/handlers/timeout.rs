@@ -403,10 +403,13 @@ impl Node {
 
     /// Resend session-layer handshake messages and timeout stale handshakes.
     ///
-    /// For sessions in Initiating or AwaitingMsg3 state:
-    /// - If the handshake has exceeded the timeout window, remove the session.
-    /// - If a resend is due and under max resends, resend the stored payload
-    ///   wrapped in a fresh SessionDatagram (so routing can adapt).
+    /// For sessions still being set up:
+    /// - Expire each responder candidate, and this node's initiator leg, once
+    ///   it has exceeded the timeout window; remove the session when it holds
+    ///   neither and any responder hold on it is a timeout window old.
+    /// - If this node's own setup is due a resend and under max resends,
+    ///   resend it wrapped in a fresh SessionDatagram (so routing can adapt).
+    ///   Responder candidates are not resent on a timer.
     ///
     /// For an established initiator still holding its msg3, resend it until
     /// the peer is heard from or the budget is spent (see
@@ -422,12 +425,33 @@ impl Node {
         let backoff = self.config().node.rate_limit.handshake_resend_backoff;
         let ttl = self.config().node.session.default_ttl;
 
-        // First pass: find timed-out sessions to remove
+        // First pass: expire each handshake leg by its own age. Responder
+        // candidates go one by one, from when their setup was admitted,
+        // including those a tie-break loser keeps beside its session; this
+        // node's initiator leg goes from its last activity. An entry goes
+        // when it holds neither and its responder hold, if any, is a
+        // handshake timeout old.
+        for entry in self.sessions.values_mut() {
+            entry.expire_candidates(now_ms, timeout_ms);
+            if entry.is_established() {
+                continue;
+            }
+            if entry.has_initiator_leg()
+                && now_ms.saturating_sub(entry.last_activity()) > timeout_ms
+                && (entry.has_candidates() || entry.responder_hold_open(now_ms, timeout_ms))
+            {
+                entry.drop_initiator_leg();
+            }
+        }
         let timed_out: Vec<crate::NodeAddr> = self
             .sessions
             .iter()
             .filter(|(_, entry)| {
-                !entry.is_established() && now_ms.saturating_sub(entry.last_activity()) > timeout_ms
+                !entry.is_established()
+                    && !entry.has_candidates()
+                    && !entry.responder_hold_open(now_ms, timeout_ms)
+                    && (!entry.has_initiator_leg()
+                        || now_ms.saturating_sub(entry.last_activity()) > timeout_ms)
             })
             .map(|(addr, _)| *addr)
             .collect();
@@ -440,13 +464,34 @@ impl Node {
             self.path_mtu_lookup_release(addr);
         }
 
-        // Second pass: collect resend candidates
+        // A paused initiator leg (this node lost a simultaneous-initiation
+        // tie-break and is answering the peer's setup instead) is no live
+        // attempt once the hold is the minimum age old with nothing
+        // completed: the setup it yielded to may have been forged. Nor once
+        // no candidate is left, since there is then nothing to answer
+        // instead (a forger's msg3 drops its own candidate). Its resends
+        // resume, due now.
+        for entry in self.sessions.values_mut() {
+            if entry.has_initiator_leg()
+                && entry.initiator_paused()
+                && (!entry.has_candidates() || entry.responder_hold_aged(now_ms))
+            {
+                entry.resume_initiator(now_ms);
+            }
+        }
+
+        // Second pass: collect resend candidates. Only this node's own
+        // setup is resent here: a responder candidate sends one ack per
+        // setup it receives and no more, and the initiator's own setup
+        // resend recovers a lost ack.
         let my_addr = *self.node_addr();
         let candidates: Vec<(crate::NodeAddr, Vec<u8>)> = self
             .sessions
             .iter()
             .filter(|(_, entry)| {
                 !entry.is_established()
+                    && entry.has_initiator_leg()
+                    && !entry.initiator_paused()
                     && entry.handshake_payload().is_some()
                     && entry.resend_count() < max_resends
                     && entry.next_resend_at_ms() > 0
@@ -490,9 +535,11 @@ impl Node {
     /// heard from, and stop retaining it once the resend budget is spent.
     ///
     /// The initiator is established the moment msg3 leaves; the responder only
-    /// once it arrives. Nothing else repairs a lost msg3: the responder's
-    /// resent SessionAck reaches an entry that is no longer initiating and is
-    /// refused. The payload is released by the first inbound frame that
+    /// once it arrives. The responder does not resend its SessionAck, and a
+    /// second ack, drawn by a resent setup, is refused by an established
+    /// entry, so a lost msg3 is repaired only here and by the established arm
+    /// of `handle_session_setup`, which answers a setup from the waiting
+    /// responder with this msg3. The payload is released by the first inbound frame that
     /// authenticates on the session (`handle_encrypted_session_msg`) or, here,
     /// when the budget is spent. Runs whether or not periodic rekey is enabled.
     async fn resend_initial_msg3(&mut self, now_ms: u64) {
@@ -656,8 +703,9 @@ impl Node {
 
     /// Remove established sessions that have been idle too long.
     ///
-    /// Only targets sessions in the Established state. Initiating/AwaitingMsg3
-    /// sessions are handled by the handshake timeout.
+    /// Only targets sessions in the Established state. Entries still being set
+    /// up, with an initiator leg or responder candidates, are handled by the
+    /// handshake timeout.
     pub(in crate::node) fn purge_idle_sessions(&mut self, now_ms: u64) {
         let timeout_ms = self.config().node.session.idle_timeout_secs * 1000;
         if timeout_ms == 0 {

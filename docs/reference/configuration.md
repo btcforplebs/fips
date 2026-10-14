@@ -176,8 +176,9 @@ exactly as `established_handshake_*` is, so a stranger flood cannot suppress
 rekey traffic sharing the link.
 
 At the defaults one neighbour can force at most
-`session_setup_rate * handshake_timeout_secs` half-open entries (480) and
-`session_setup_rate * (1 + handshake_max_resends)` acks per second (96). The
+`session_setup_rate * handshake_timeout_secs` half-open responder candidates
+(480) and `session_setup_rate` acks per second (16): a responder sends one ack
+per admitted setup and does not resend it on a timer. The
 node-wide ceiling is still that times the peer count, since the limiter bounds
 each neighbour rather than the aggregate. A legitimate peer whose traffic
 reaches this node over the *same* link as an attacker's shares that

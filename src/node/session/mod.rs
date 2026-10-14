@@ -30,12 +30,136 @@ fn draw_rekey_jitter() -> i64 {
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum EndToEndState {
     /// We initiated: sent SessionSetup with Noise XK msg1, awaiting SessionAck.
+    /// The entry may also hold responder candidates beside this leg.
     Initiating(HandshakeState),
     /// XK responder: processed msg1, sent msg2, awaiting msg3.
-    /// Transitions to Established when msg3 arrives.
+    ///
+    /// The form a responder handshake is handed to `SessionEntry::new` in,
+    /// which tests use to install a half-open entry directly. The entry
+    /// keeps the handshake as a responder candidate and records its state
+    /// as `Responding`.
+    #[cfg_attr(not(test), allow(dead_code))]
     AwaitingMsg3(HandshakeState),
+    /// Responder candidates only, held in the entry's candidate list, each
+    /// awaiting its msg3. Transitions to Established when one completes.
+    Responding,
     /// Handshake complete, NoiseSession available for encrypt/decrypt.
     Established(NoiseSession),
+}
+
+/// Most responder candidates one session entry holds.
+///
+/// A SessionSetup is unauthenticated: its msg1 is a bare ephemeral and the
+/// source address is an envelope field, so anyone can open a half-open
+/// handshake under another node's address. Holding one candidate per
+/// distinct msg1 lets the address's owner be answered beside a forger. An
+/// honest address needs one (two in a simultaneous initiation with a lost
+/// first ack). To keep the owner's setups refused a forger has to keep every
+/// slot younger than `HALF_OPEN_MIN_AGE`, about this many forged setups per
+/// minimum age per address. Candidates count individually toward the
+/// half-open share of the session table, which bounds their memory. No
+/// measured basis.
+pub(crate) const MAX_HALF_OPEN_RESPONDERS: usize = 4;
+
+/// How long a responder candidate is protected from eviction, and how long
+/// an entry holding only responder candidates holds this node's own traffic
+/// before this node initiates itself.
+///
+/// Sized above the initiator's first msg3 resend (`handshake_resend_interval_ms`
+/// 1 s with backoff 2.0 at the defaults), so a genuine msg3 or its first resend
+/// lands inside it, and well above one honest round trip, so an honest
+/// simultaneous initiation completes inside it. A forger holds this node's
+/// own traffic to an address for this long per hold it opens there, and a
+/// hold lasts at least a handshake timeout from its first setup; to keep the
+/// owner's own setups refused it must refresh every candidate slot within
+/// this age. No measured basis.
+pub(crate) const HALF_OPEN_MIN_AGE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// `HALF_OPEN_MIN_AGE` in the session table's millisecond clock.
+pub(crate) const HALF_OPEN_MIN_AGE_MS: u64 = HALF_OPEN_MIN_AGE.as_millis() as u64;
+
+/// One responder handshake held for a SessionSetup naming the entry's
+/// address, awaiting the msg3 that would prove who sent it.
+pub(crate) struct ResponderCandidate {
+    /// The responder handshake, having read the setup's msg1.
+    handshake: HandshakeState,
+    /// The setup's msg1 (the initiator's ephemeral), so an identical resent
+    /// setup draws this candidate's own ack. Empty when unknown.
+    msg1: Vec<u8>,
+    /// The encoded SessionAck this candidate answered with.
+    ack: Option<Vec<u8>>,
+    /// The link peer the setup arrived over, if known.
+    link_peer: Option<NodeAddr>,
+    /// When the setup was admitted (Unix ms).
+    received_at: u64,
+}
+
+impl ResponderCandidate {
+    /// A candidate for a setup admitted at `received_at` over `link_peer`.
+    pub(crate) fn new(
+        handshake: HandshakeState,
+        msg1: Vec<u8>,
+        ack: Vec<u8>,
+        link_peer: NodeAddr,
+        received_at: u64,
+    ) -> Self {
+        Self {
+            handshake,
+            msg1,
+            ack: Some(ack),
+            link_peer: Some(link_peer),
+            received_at,
+        }
+    }
+
+    /// The responder handshake, to try a msg3 against.
+    pub(crate) fn handshake_mut(&mut self) -> &mut HandshakeState {
+        &mut self.handshake
+    }
+
+    /// Give up the handshake, for a completed msg3.
+    pub(crate) fn into_handshake(self) -> HandshakeState {
+        self.handshake
+    }
+}
+
+/// Where a new responder candidate goes in an entry's candidate list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CandidateAdmission {
+    /// Below the bound: added beside the others.
+    Room,
+    /// At the bound: replaces the candidate at this index, the oldest one at
+    /// least `HALF_OPEN_MIN_AGE` old, preferring one from the newcomer's own
+    /// link peer.
+    Evict(usize),
+    /// At the bound with every candidate younger than the minimum age.
+    Refuse,
+}
+
+/// Decide where a candidate arriving over `link_peer` at `now_ms` goes.
+pub(crate) fn admit_candidate(
+    candidates: &[ResponderCandidate],
+    link_peer: &NodeAddr,
+    now_ms: u64,
+) -> CandidateAdmission {
+    if candidates.len() < MAX_HALF_OPEN_RESPONDERS {
+        return CandidateAdmission::Room;
+    }
+    let aged =
+        |c: &&ResponderCandidate| now_ms.saturating_sub(c.received_at) >= HALF_OPEN_MIN_AGE_MS;
+    let oldest = |same_link: bool| {
+        candidates
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| aged(c))
+            .filter(|(_, c)| !same_link || c.link_peer.as_ref() == Some(link_peer))
+            .min_by_key(|(i, c)| (c.received_at, *i))
+            .map(|(i, _)| i)
+    };
+    match oldest(true).or_else(|| oldest(false)) {
+        Some(i) => CandidateAdmission::Evict(i),
+        None => CandidateAdmission::Refuse,
+    }
 }
 
 /// Which key epoch a frame decrypted against in the trial-decrypt
@@ -63,9 +187,12 @@ impl EndToEndState {
         matches!(self, EndToEndState::Initiating(_))
     }
 
-    /// Check if we are an XK responder awaiting msg3.
+    /// Check if we are an XK responder awaiting msg3, with no initiator leg.
     pub(crate) fn is_awaiting_msg3(&self) -> bool {
-        matches!(self, EndToEndState::AwaitingMsg3(_))
+        matches!(
+            self,
+            EndToEndState::AwaitingMsg3(_) | EndToEndState::Responding
+        )
     }
 }
 
@@ -82,6 +209,23 @@ pub(crate) struct SessionEntry {
     remote_pubkey: PublicKey,
     /// Current session state. `None` only during state transitions.
     state: Option<EndToEndState>,
+    /// Responder candidates, one per distinct setup naming this address, each
+    /// awaiting its msg3. Held beside an initiator leg too, so neither blocks
+    /// the other: the first leg to complete establishes the session. On a
+    /// node that lost the initiation tie-break they are also kept beside the
+    /// session its own leg established, and one completing replaces it.
+    candidates: Vec<ResponderCandidate>,
+    /// When this entry first held a responder candidate (Unix ms). Never
+    /// refreshed by later candidates, so a forger cannot hold this node's own
+    /// initiation back by forging again. Kept when a msg3 drops the last
+    /// candidate, so the hold outlives the candidates a forger can remove at
+    /// will; cleared once no candidate is left and it is a handshake timeout
+    /// old, or when a leg completes.
+    opened_at: Option<u64>,
+    /// This node's initiator leg lost a simultaneous-initiation tie-break and
+    /// its setup resends are paused: the winner dropped our setup, and a
+    /// resend reaching it after it established would arm a spurious rekey.
+    initiator_paused: bool,
     /// When the session was created (Unix milliseconds).
     #[cfg_attr(not(test), allow(dead_code))]
     created_at: u64,
@@ -124,10 +268,11 @@ pub(crate) struct SessionEntry {
 
     // === Handshake Resend ===
     /// The last initial-handshake message this side sent and has no proof the
-    /// peer received: SessionSetup while initiating, SessionAck while awaiting
-    /// msg3, and on an established initiator its SessionMsg3 until an inbound
-    /// frame authenticates on the session or the resend budget is spent. The
-    /// state says which one it is, and which sweep resends it.
+    /// peer received: SessionSetup while initiating, and on an established
+    /// initiator its SessionMsg3 until an inbound frame authenticates on the
+    /// session or the resend budget is spent. The state says which one it is,
+    /// and which sweep resends it. A responder candidate keeps its own
+    /// SessionAck, which is resent only in answer to a resent setup.
     handshake_payload: Option<Vec<u8>>,
     /// Number of resends performed.
     resend_count: u32,
@@ -214,10 +359,27 @@ impl SessionEntry {
         now_ms: u64,
         is_initiator: bool,
     ) -> Self {
+        let (state, candidates, opened_at) = match state {
+            EndToEndState::AwaitingMsg3(handshake) => (
+                EndToEndState::Responding,
+                vec![ResponderCandidate {
+                    handshake,
+                    msg1: Vec::new(),
+                    ack: None,
+                    link_peer: None,
+                    received_at: now_ms,
+                }],
+                Some(now_ms),
+            ),
+            other => (other, Vec::new(), None),
+        };
         Self {
             remote_addr,
             remote_pubkey,
             state: Some(state),
+            candidates,
+            opened_at,
+            initiator_paused: false,
             created_at: now_ms,
             last_activity: now_ms,
             session_start_ms: 0,
@@ -270,8 +432,15 @@ impl SessionEntry {
             .expect("session state taken but not restored")
     }
 
-    /// Replace the session state.
+    /// Replace the session state. Establishing drops every responder
+    /// candidate: the session is decided. A tie-break loser whose own leg
+    /// completes takes its candidates out first and puts them back after.
     pub(crate) fn set_state(&mut self, state: EndToEndState) {
+        if state.is_established() {
+            self.candidates.clear();
+            self.opened_at = None;
+            self.initiator_paused = false;
+        }
         self.state = Some(state);
     }
 
@@ -296,14 +465,200 @@ impl SessionEntry {
         self.state.as_ref().is_some_and(|s| s.is_established())
     }
 
-    /// Check if we are the initiator (waiting for ack).
+    /// Check if we are the initiator (waiting for ack). For display; the
+    /// protocol paths use `has_initiator_leg`.
     pub(crate) fn is_initiating(&self) -> bool {
+        self.has_initiator_leg()
+    }
+
+    /// Check if we are an XK responder awaiting msg3 with no initiator leg.
+    /// For display; the protocol paths use `has_candidates`.
+    pub(crate) fn is_awaiting_msg3(&self) -> bool {
+        self.state.as_ref().is_some_and(|s| s.is_awaiting_msg3())
+    }
+
+    // === Handshake legs ===
+
+    /// Whether this node's own initiator handshake is in flight here.
+    pub(crate) fn has_initiator_leg(&self) -> bool {
         self.state.as_ref().is_some_and(|s| s.is_initiating())
     }
 
-    /// Check if we are an XK responder awaiting msg3.
-    pub(crate) fn is_awaiting_msg3(&self) -> bool {
-        self.state.as_ref().is_some_and(|s| s.is_awaiting_msg3())
+    /// Whether any responder candidate awaits its msg3 here.
+    pub(crate) fn has_candidates(&self) -> bool {
+        !self.candidates.is_empty()
+    }
+
+    /// How many responder candidates await their msg3 here.
+    #[cfg(test)]
+    pub(crate) fn candidate_count(&self) -> usize {
+        self.candidates.len()
+    }
+
+    /// Whether a received setup opened a hold on this entry at least
+    /// `HALF_OPEN_MIN_AGE` ago, by `opened_at`, with no leg completed. The
+    /// hold's age counts whether or not its candidates are still here: a
+    /// forger can drop its own candidate with a msg3 whenever it likes.
+    pub(crate) fn responder_hold_aged(&self, now_ms: u64) -> bool {
+        self.opened_at
+            .is_some_and(|t| now_ms.saturating_sub(t) >= HALF_OPEN_MIN_AGE_MS)
+    }
+
+    /// Whether a received setup opened a hold on this entry less than
+    /// `timeout_ms` ago. Such an entry is kept even with no leg left in it,
+    /// so the next setup for the address joins the same hold instead of
+    /// opening a fresh one.
+    pub(crate) fn responder_hold_open(&self, now_ms: u64, timeout_ms: u64) -> bool {
+        self.opened_at
+            .is_some_and(|t| now_ms.saturating_sub(t) <= timeout_ms)
+    }
+
+    /// How much of the half-open share this entry takes: one per responder
+    /// candidate, and one for an open hold whose candidates are gone, since
+    /// that entry is kept on the strength of unproven setups too.
+    pub(crate) fn half_open_count(&self) -> usize {
+        self.candidates
+            .len()
+            .max(usize::from(self.opened_at.is_some()))
+    }
+
+    /// Whether the entry has no initiator leg and a hold at least
+    /// `HALF_OPEN_MIN_AGE` old, so this node should stop waiting for the
+    /// responder candidates and initiate itself.
+    pub(crate) fn responder_hold_expired(&self, now_ms: u64) -> bool {
+        !self.has_initiator_leg() && self.responder_hold_aged(now_ms)
+    }
+
+    /// The stored ack of the candidate whose setup carried `msg1`, if any.
+    pub(crate) fn candidate_ack(&self, msg1: &[u8]) -> Option<&[u8]> {
+        self.candidates
+            .iter()
+            .find(|c| !c.msg1.is_empty() && c.msg1 == msg1)
+            .and_then(|c| c.ack.as_deref())
+    }
+
+    /// Where a candidate arriving over `link_peer` at `now_ms` would go.
+    pub(crate) fn candidate_admission(
+        &self,
+        link_peer: &NodeAddr,
+        now_ms: u64,
+    ) -> CandidateAdmission {
+        admit_candidate(&self.candidates, link_peer, now_ms)
+    }
+
+    /// Hold `candidate`, placed as `admission` decided. The entry's
+    /// `opened_at` is set by its first candidate only.
+    pub(crate) fn add_candidate(
+        &mut self,
+        candidate: ResponderCandidate,
+        admission: CandidateAdmission,
+    ) {
+        self.opened_at.get_or_insert(candidate.received_at);
+        match admission {
+            CandidateAdmission::Room => self.candidates.push(candidate),
+            CandidateAdmission::Evict(i) => self.candidates[i] = candidate,
+            CandidateAdmission::Refuse => {}
+        }
+        if self.state.is_none() {
+            self.state = Some(EndToEndState::Responding);
+        }
+    }
+
+    /// Take every candidate out, to try a msg3 against each.
+    pub(crate) fn take_candidates(&mut self) -> Vec<ResponderCandidate> {
+        std::mem::take(&mut self.candidates)
+    }
+
+    /// Put candidates back after a msg3 was tried against them.
+    pub(crate) fn restore_candidates(&mut self, candidates: Vec<ResponderCandidate>) {
+        self.candidates = candidates;
+    }
+
+    /// Drop candidates whose setup was admitted more than `timeout_ms`
+    /// before `now_ms`. Returns how many went.
+    pub(crate) fn expire_candidates(&mut self, now_ms: u64, timeout_ms: u64) -> usize {
+        let before = self.candidates.len();
+        self.candidates
+            .retain(|c| now_ms.saturating_sub(c.received_at) <= timeout_ms);
+        self.settle_opened(now_ms, timeout_ms);
+        before - self.candidates.len()
+    }
+
+    /// Forget `opened_at` once no candidate is left and the hold is a
+    /// handshake timeout old, so a setup arriving later opens the hold
+    /// afresh. Otherwise it would inherit the age of candidates that no
+    /// longer exist, and a leg it paused would resume at once. Only time
+    /// clears it: a forger cannot hasten that, while dropping its own
+    /// candidate with a msg3 is something it can do as often as it likes,
+    /// and must not restart the hold.
+    fn settle_opened(&mut self, now_ms: u64, timeout_ms: u64) {
+        if self.candidates.is_empty() && !self.responder_hold_open(now_ms, timeout_ms) {
+            self.opened_at = None;
+        }
+    }
+
+    /// Attach this node's own initiator leg to an entry that holds only
+    /// responder candidates, keeping them for a late msg3.
+    ///
+    /// The entry now names the key this node was given, counts as initiated
+    /// by this node, and dates from now, as an entry `initiate_session`
+    /// inserts would.
+    pub(crate) fn attach_initiator(
+        &mut self,
+        handshake: HandshakeState,
+        remote_pubkey: PublicKey,
+        setup_payload: Vec<u8>,
+        now_ms: u64,
+        next_resend_at_ms: u64,
+    ) {
+        self.state = Some(EndToEndState::Initiating(handshake));
+        self.remote_pubkey = remote_pubkey;
+        self.is_initiator = true;
+        self.created_at = now_ms;
+        self.last_activity = now_ms;
+        self.initiator_paused = false;
+        self.set_handshake_payload(setup_payload, next_resend_at_ms);
+    }
+
+    /// Pause this node's own setup resends: it lost the simultaneous
+    /// initiation tie-break and is answering the peer's setup instead.
+    pub(crate) fn pause_initiator(&mut self) {
+        self.initiator_paused = true;
+    }
+
+    /// Whether this node's own setup resends are paused.
+    pub(crate) fn initiator_paused(&self) -> bool {
+        self.initiator_paused
+    }
+
+    /// Resume this node's own setup resends, due at `next_resend_at_ms`.
+    pub(crate) fn resume_initiator(&mut self, next_resend_at_ms: u64) {
+        self.initiator_paused = false;
+        self.next_resend_at_ms = next_resend_at_ms;
+    }
+
+    /// Drop this node's initiator leg (including one already taken out of
+    /// the state), leaving the responder candidates: the entry is again one
+    /// a received setup opened.
+    pub(crate) fn drop_initiator_leg(&mut self) {
+        self.state = Some(EndToEndState::Responding);
+        self.is_initiator = false;
+        self.initiator_paused = false;
+        self.clear_handshake_payload();
+    }
+
+    /// Move every timestamp the handshake legs are aged by `by_ms` into the
+    /// past. Test-only: stands for that much time passing.
+    #[cfg(test)]
+    pub(crate) fn backdate_handshake(&mut self, by_ms: u64) {
+        for c in &mut self.candidates {
+            c.received_at = c.received_at.saturating_sub(by_ms);
+        }
+        if let Some(t) = self.opened_at.as_mut() {
+            *t = t.saturating_sub(by_ms);
+        }
+        self.created_at = self.created_at.saturating_sub(by_ms);
+        self.last_activity = self.last_activity.saturating_sub(by_ms);
     }
 
     /// Get creation time. Used as the probe's session-identity check: an
@@ -419,7 +774,6 @@ impl SessionEntry {
     /// Store the encoded session-layer payload for potential resend.
     ///
     /// For initiators, this is the SessionSetup payload bytes.
-    /// For responders, this is the SessionAck payload bytes.
     /// For an initiator that has just become established, this is its
     /// SessionMsg3 payload bytes, held until the responder is heard from.
     /// The payload is re-wrapped in a fresh SessionDatagram on each resend

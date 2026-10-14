@@ -226,8 +226,8 @@ pub enum SessionReject {
     /// Inbound session-layer message arrived for a `SessionEntry` whose
     /// state is incompatible with the message type: encrypted data while
     /// the session is not yet `Established`, a SessionAck when the
-    /// session is not `Initiating`, or a SessionMsg3 when the session
-    /// is not `AwaitingMsg3`. Tracked via
+    /// session holds no initiator leg, or a SessionMsg3 when it holds no
+    /// responder candidate. Tracked via
     /// [`SessionStats::bad_state`](crate::node::stats::SessionStats).
     BadState,
     /// Inbound XK msg3 completed the handshake, but the initiator's
