@@ -1425,3 +1425,137 @@ async fn a_single_unroutable_datagram_still_produces_its_error() {
     assert_eq!(errors.emit_over_peer_budget.get(), 0);
     assert_eq!(errors.emit_over_dest_interval.get(), 0);
 }
+
+/// Wall-clock milliseconds, the clock the warm path stamps entries with.
+fn wall_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
+// --- Foreign-root refusal at every hint write ---
+
+#[tokio::test]
+async fn an_established_frame_with_foreign_root_source_coords_caches_nothing() {
+    let mut node = make_node();
+    let from = make_node_addr(0xAA);
+    let my_addr = *node.node_addr();
+    let my_coords = node.tree_state.my_coords().clone();
+    let src_addr = make_node_addr(0x01);
+    let foreign_root = make_node_addr(0xF0);
+    assert_ne!(&foreign_root, my_coords.root_id());
+
+    let src_coords = TreeCoordinate::from_addrs(vec![src_addr, foreign_root]).unwrap();
+    let header = build_fsp_header(0, FSP_FLAG_CP, 20);
+    let mut data_payload = header.to_vec();
+    encode_coords(&src_coords, &mut data_payload);
+    encode_coords(&my_coords, &mut data_payload);
+    data_payload.extend_from_slice(&[0xCC; 36]);
+    let encoded = SessionDatagram::new(src_addr, my_addr, data_payload).encode();
+
+    let fwd = &node.metrics().forwarding;
+    let (refused, delivered) = (
+        fwd.coord_warm_foreign_root.get(),
+        fwd.delivered_packets.get(),
+    );
+    node.handle_session_datagram(&from, &encoded[1..], false)
+        .await;
+    let fwd = &node.metrics().forwarding;
+    assert_eq!(
+        fwd.delivered_packets.get(),
+        delivered + 1,
+        "must reach local delivery"
+    );
+    assert!(
+        fwd.coord_warm_foreign_root.get() > refused,
+        "the warm path must have seen and refused the foreign root"
+    );
+
+    assert!(
+        node.coord_cache().get(&src_addr, wall_ms()).is_none(),
+        "a CP frame to this node cached a source coordinate under a foreign root"
+    );
+}
+
+#[tokio::test]
+async fn an_established_frame_to_this_node_with_same_root_source_coords_is_cached() {
+    let mut node = make_node();
+    let from = make_node_addr(0xAA);
+    let my_addr = *node.node_addr();
+    let my_coords = node.tree_state.my_coords().clone();
+    let src_addr = make_node_addr(0x01);
+    let src_coords = TreeCoordinate::from_addrs(vec![src_addr, *my_coords.root_id()]).unwrap();
+
+    let header = build_fsp_header(0, FSP_FLAG_CP, 20);
+    let mut data_payload = header.to_vec();
+    encode_coords(&src_coords, &mut data_payload);
+    encode_coords(&my_coords, &mut data_payload);
+    data_payload.extend_from_slice(&[0xCC; 36]);
+    let encoded = SessionDatagram::new(src_addr, my_addr, data_payload).encode();
+
+    node.handle_session_datagram(&from, &encoded[1..], false)
+        .await;
+    assert_eq!(
+        node.coord_cache().get(&src_addr, wall_ms()),
+        Some(&src_coords),
+        "a same-root source coordinate on a CP frame to this node must be cached"
+    );
+}
+
+#[tokio::test]
+async fn a_hint_write_under_a_foreign_root_is_refused_at_insert_coord_hint() {
+    let mut node = make_node();
+    let addr = make_node_addr(0x01);
+    let foreign_root = make_node_addr(0xF0);
+    assert_ne!(&foreign_root, node.tree_state.my_coords().root_id());
+    let coords = TreeCoordinate::from_addrs(vec![addr, foreign_root]).unwrap();
+
+    let now = wall_ms();
+    node.insert_coord_hint(addr, coords, now);
+    assert!(
+        node.coord_cache().get(&addr, now).is_none(),
+        "a hint under a foreign root was cached through insert_coord_hint"
+    );
+
+    // Control: the same write under this node's root lands.
+    let root = *node.tree_state.my_coords().root_id();
+    let ours = TreeCoordinate::from_addrs(vec![addr, root]).unwrap();
+    node.insert_coord_hint(addr, ours.clone(), now);
+    assert_eq!(node.coord_cache().get(&addr, now), Some(&ours));
+}
+
+#[tokio::test]
+async fn a_foreign_root_write_is_not_counted_as_a_key_mismatch() {
+    let mut node = make_node();
+    let from = make_node_addr(0xAA);
+    let my_addr = *node.node_addr();
+    let my_coords = node.tree_state.my_coords().clone();
+    let foreign_root = make_node_addr(0xF0);
+    assert_ne!(&foreign_root, my_coords.root_id());
+    // A foreign-root coordinate that also names another key first.
+    let src_addr = make_node_addr(0x01);
+    let src_coords = TreeCoordinate::from_addrs(vec![make_node_addr(0x03), foreign_root]).unwrap();
+
+    let header = build_fsp_header(0, FSP_FLAG_CP, 20);
+    let mut data_payload = header.to_vec();
+    encode_coords(&src_coords, &mut data_payload);
+    encode_coords(&my_coords, &mut data_payload);
+    data_payload.extend_from_slice(&[0xCC; 36]);
+    let encoded = SessionDatagram::new(src_addr, my_addr, data_payload).encode();
+
+    let fwd = &node.metrics().forwarding;
+    let (foreign, mismatch) = (
+        fwd.coord_warm_foreign_root.get(),
+        fwd.coord_warm_key_mismatch.get(),
+    );
+    node.handle_session_datagram(&from, &encoded[1..], false)
+        .await;
+    let fwd = &node.metrics().forwarding;
+    assert_eq!(fwd.coord_warm_foreign_root.get(), foreign + 1);
+    assert_eq!(
+        fwd.coord_warm_key_mismatch.get(),
+        mismatch,
+        "a write refused for a foreign root was also counted as a key mismatch"
+    );
+}

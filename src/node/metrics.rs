@@ -69,11 +69,11 @@ pub struct ForwardingMetrics {
     pub decode_error_bytes: Counter,
     pub warm_malformed_packets: Counter,
     pub warm_malformed_bytes: Counter,
-    /// Coordinate-cache warm writes refused because the coordinate names a
-    /// root other than this node's. Such an entry can never route — both
-    /// selectors reject a foreign root — so a write of one is either tree
-    /// churn or a plant, and the counter is the only place the difference
-    /// shows.
+    /// Coordinate-cache hint writes, from any write site, refused because the
+    /// coordinate names a root other than this node's. Such an entry can never
+    /// route — both selectors reject a foreign root — so a write of one is
+    /// either tree churn or a plant, and the counter is the only place the
+    /// difference shows.
     pub coord_warm_foreign_root: Counter,
     /// Coordinate-cache warm writes whose coordinate does not name the address
     /// it is filed under. Counted, not refused. **This is not a security
@@ -155,7 +155,8 @@ impl ForwardingMetrics {
         self.warm_malformed_bytes.add(bytes as u64);
     }
 
-    /// Record a warm write refused for naming a foreign root.
+    /// Record a hint write, from any write site, refused for naming a foreign
+    /// root.
     pub fn record_warm_foreign_root(&self) {
         self.coord_warm_foreign_root.inc();
     }

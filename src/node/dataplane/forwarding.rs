@@ -19,7 +19,7 @@ use crate::proto::link::{SessionDatagram, SessionDatagramRef};
 use crate::proto::routing::{DropReason, LimitVerdict, NextHop, RouteAction, RouteOutcome};
 use crate::proto::stp::TreeCoordinate;
 use std::time::{Duration, Instant};
-use tracing::{debug, trace, warn};
+use tracing::{debug, warn};
 
 impl Node {
     /// Handle an incoming SessionDatagram from a peer.
@@ -227,24 +227,11 @@ impl Node {
     /// reconstructed from the header size so the malformed-frame byte counter
     /// measures the same population as its siblings — which are charged the
     /// outer slice — instead of the inner FSP payload.
-    /// Warm one coordinate-cache entry from a plaintext session header, after
-    /// the two write-side sanity checks.
+    /// Warm one coordinate-cache entry from a plaintext session header.
     ///
-    /// The key and the value both come off the wire unauthenticated, so this
-    /// is the only place a warm write can be filtered at all. Two checks, and
-    /// they are deliberately of different strengths:
-    ///
-    /// **Foreign root: refused.** A coordinate under a root other than ours
-    /// can never route. `StpState::find_next_hop` returns `None` outright on a
-    /// root mismatch, and the bloom fallback compares against a `my_distance`
-    /// of `usize::MAX`, so no candidate is ever strictly closer. Caching one
-    /// therefore buys nothing and costs something real: the entry's presence
-    /// is what `synth_routing_error` reads to choose `PathBroken` over
-    /// `CoordsRequired`, so a foreign-root plant turns this node into a
-    /// one-packet reflector aimed at whatever source the datagram claimed.
-    /// `CoordCache::invalidate_other_roots` already applies this same
-    /// invariant whenever our own tree position moves; this applies it at
-    /// write time instead of waiting for the next move.
+    /// The key and the value both come off the wire unauthenticated. The
+    /// foreign-root refusal applies to every hint write and lives in
+    /// `Node::insert_coord_hint`; this adds the check only the warm path makes.
     ///
     /// **Key mismatch: counted only.** A coordinate whose first element is not
     /// the address it is filed under is wrong, but refusing it here would also
@@ -255,15 +242,10 @@ impl Node {
     /// security check either way — an attacker satisfies it by naming the
     /// victim as its own child, which is the forgery worth making.
     fn warm_coord(&mut self, key: NodeAddr, coords: TreeCoordinate, now_ms: u64) {
-        if coords.root_id() != self.tree_state.my_coords().root_id() {
-            self.metrics().forwarding.record_warm_foreign_root();
-            trace!(addr = %key, "Warm write names a foreign root; not caching");
-            return;
-        }
-        if *coords.node_addr() != key {
+        let mismatch = *coords.node_addr() != key;
+        if self.insert_coord_hint(key, coords, now_ms) && mismatch {
             self.metrics().forwarding.record_warm_key_mismatch();
         }
-        self.insert_coord_hint(key, coords, now_ms);
     }
 
     fn try_warm_coord_cache_ref(&mut self, datagram: &SessionDatagramRef<'_>, outer_len: usize) {

@@ -492,7 +492,7 @@ impl Node {
     ///
     /// Full FSP receive pipeline:
     /// 1. Parse FspEncryptedHeader (12 bytes) → counter, flags, header_bytes
-    /// 2. If CP flag: parse cleartext coords, cache them
+    /// 2. If CP flag: parse past the cleartext coords
     /// 3. Session lookup (must be Established)
     /// 4. AEAD decrypt with AAD = header_bytes
     /// 5. Strip FSP inner header → timestamp, msg_type, inner_flags
@@ -523,17 +523,10 @@ impl Node {
         if header.has_coords() {
             let coord_data = &payload[FSP_HEADER_SIZE..];
             match parse_encrypted_coords(coord_data) {
-                Ok((src_coords, dest_coords, bytes_consumed)) => {
-                    let now_ms = Self::now_ms();
-                    let my_addr = *self.node_addr();
-                    for action in
-                        self.fsp
-                            .plan_cache_coords(*src_addr, my_addr, src_coords, dest_coords)
-                    {
-                        if let FspAction::CacheCoords { addr, coords } = action {
-                            self.insert_coord_hint(addr, coords, now_ms);
-                        }
-                    }
+                // Not cached here: the forwarding path's warm write has
+                // already offered these coordinates to the cache, from this
+                // same datagram and through the same checks.
+                Ok((_, _, bytes_consumed)) => {
                     ciphertext_offset += bytes_consumed;
                 }
                 Err(e) => {

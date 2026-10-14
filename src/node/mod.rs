@@ -3495,14 +3495,36 @@ impl Node {
     /// increment site. The verified path is deliberately not routed through
     /// this: a caller that has checked a proof calls
     /// `CoordCache::insert_verified` directly and says so.
+    ///
+    /// **Foreign root: refused.** A coordinate under a root other than ours
+    /// can never route. `StpState::find_next_hop` returns `None` outright on a
+    /// root mismatch, and the bloom fallback compares against a `my_distance`
+    /// of `usize::MAX`, so no candidate is ever strictly closer. Caching one
+    /// therefore buys nothing and costs something real: the entry's presence
+    /// is what `synth_routing_error` reads to choose `PathBroken` over
+    /// `CoordsRequired`, so a foreign-root plant turns this node into a
+    /// one-packet reflector aimed at whatever source the datagram claimed.
+    /// `CoordCache::invalidate_other_roots` already applies this same
+    /// invariant whenever our own tree position moves; this applies it at
+    /// write time instead of waiting for the next move. It is checked here,
+    /// not at a caller, so that no write site can skip it.
+    ///
+    /// Returns whether the hint was accepted: `false` if it was refused for a
+    /// foreign root.
     pub(crate) fn insert_coord_hint(
         &mut self,
         addr: NodeAddr,
         coords: TreeCoordinate,
         now_ms: u64,
-    ) {
+    ) -> bool {
+        if coords.root_id() != self.tree_state.my_coords().root_id() {
+            self.metrics().forwarding.record_warm_foreign_root();
+            tracing::trace!(addr = %addr, "Hint names a foreign root; not caching");
+            return false;
+        }
         let outcome = self.coord_cache.insert(addr, coords, now_ms);
         self.metrics().forwarding.record_hint_outcome(outcome);
+        true
     }
 
     pub fn find_next_hop(&mut self, dest_node_addr: &NodeAddr) -> Option<&ActivePeer> {
