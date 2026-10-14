@@ -6,7 +6,9 @@
 //! When the pool is full, a newcomer evicts an unverified link that has had
 //! `verify_grace` to complete its handshake, preferring a node's duplicate
 //! links, oldest first; verified links are never evicted, and when no link is
-//! evictable the newcomer is refused.
+//! evictable the newcomer is refused. A newcomer at an address that already
+//! holds a link never replaces it: what the newcomer claims is unproven, and
+//! the pooled link may carry a session.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -107,6 +109,10 @@ pub enum Insert {
     /// the first refusal of a run, which the caller reports once. `ended`
     /// carries the count of an earlier run this refusal closed.
     Refused { first: bool, ended: Option<u64> },
+    /// The address already holds a link, which is left in place; the offered
+    /// link is dropped. Not a capacity refusal, so it neither starts nor
+    /// closes a refusal run.
+    Occupied,
 }
 
 /// Connection pool managing BLE connections.
@@ -280,7 +286,8 @@ impl<S> ConnectionPool<S> {
 
     /// Offer a link to the pool at `now`.
     ///
-    /// A link at an address already pooled replaces it. Otherwise it is
+    /// A link at an address already pooled is refused as
+    /// [`Insert::Occupied`], whatever either link claims. Otherwise it is
     /// admitted while there is room; when the pool is full it evicts an
     /// unverified link past its grace, and is refused when there is none.
     pub fn insert(
@@ -289,7 +296,10 @@ impl<S> ConnectionPool<S> {
         conn: BleConnection<S>,
         now: tokio::time::Instant,
     ) -> Insert {
-        if self.connections.contains_key(&addr) || !self.is_full() {
+        if self.connections.contains_key(&addr) {
+            return Insert::Occupied;
+        }
+        if !self.is_full() {
             self.connections.insert(addr, conn);
             let ended = self.note_admission(now);
             return Insert::Admitted {
@@ -497,18 +507,23 @@ mod tests {
         assert!(pool.contains(&test_addr(8)));
     }
 
-    /// Replacing the link at an address already pooled does not grow the
-    /// pool, and the replacement starts unverified.
+    /// A link offered at an address already pooled is reported occupied,
+    /// whether it claims the pooled link's node or another, and the pooled
+    /// link keeps its claim and its verification.
     #[test]
-    fn test_pool_replace_existing() {
-        let t0 = now();
-        let mut pool: ConnectionPool<()> = ConnectionPool::new(2, GRACE);
-        let _ = pool.insert(test_addr(1), claimed(1, 1, true, t0), t0);
+    fn a_link_offered_at_a_pooled_address_is_reported_occupied_whatever_it_claims() {
+        for claim in [1, 2] {
+            let t0 = now();
+            let mut pool: ConnectionPool<()> = ConnectionPool::new(2, GRACE);
+            let _ = pool.insert(test_addr(1), claimed(1, 1, true, t0), t0);
 
-        let result = pool.insert(test_addr(1), test_conn(1), t0);
-        assert!(matches!(result, Insert::Admitted { evicted: None, .. }));
-        assert_eq!(pool.len(), 1);
-        assert!(!pool.get(&test_addr(1)).unwrap().verified);
+            let result = pool.insert(test_addr(1), claimed(1, claim, false, t0), t0);
+            assert_eq!(result, Insert::Occupied, "claiming node {claim}");
+            assert_eq!(pool.len(), 1);
+            let kept = pool.get(&test_addr(1)).unwrap();
+            assert!(kept.verified);
+            assert_eq!(kept.node_addr, Some(test_node(1)));
+        }
     }
 
     #[test]
@@ -941,5 +956,46 @@ mod tests {
             },
             "once past its new grace the withdrawn link goes"
         );
+    }
+
+    /// A link offered at an address that already holds one, claiming another
+    /// node, is not admitted: the pooled link keeps its address, its claim and
+    /// its verification, whether or not it is verified. The refusal is not a
+    /// capacity refusal, so the next one still starts a run.
+    #[test]
+    fn a_link_offered_at_an_occupied_address_leaves_the_pooled_link_in_place() {
+        for verified in [true, false] {
+            let t0 = now();
+            let mut pool: ConnectionPool<()> = ConnectionPool::new(2, GRACE);
+            let _ = pool.insert(test_addr(1), claimed(1, 2, verified, t0), t0);
+
+            let outcome = pool.insert(test_addr(1), claimed(1, 3, false, t0), t0);
+            assert!(
+                !matches!(outcome, Insert::Admitted { .. }),
+                "a link claiming node 3 was admitted over the link at its address \
+                 (incumbent verified: {verified}): {outcome:?}"
+            );
+            let kept = pool
+                .get(&test_addr(1))
+                .expect("the address is still pooled");
+            assert_eq!(
+                kept.node_addr,
+                Some(test_node(2)),
+                "the address now claims another node (incumbent verified: {verified})"
+            );
+            assert_eq!(kept.verified, verified);
+            assert_eq!(pool.len(), 1);
+
+            let _ = pool.insert(test_addr(2), claimed(2, 4, true, t0), t0);
+            let at = t0 + Duration::from_secs(1);
+            assert_eq!(
+                pool.insert(test_addr(3), claimed(3, 5, false, at), at),
+                Insert::Refused {
+                    first: true,
+                    ended: None
+                },
+                "the capacity refusal latch is untouched"
+            );
+        }
     }
 }
