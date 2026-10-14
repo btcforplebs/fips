@@ -437,6 +437,11 @@ transit, CP-flagged data packets, LookupResponse — write to the same cache.
   to expire. The victim is found through an ordered index, so an insert at
   capacity costs O(log n) rather than a scan of the cache, and ties are
   broken by insertion order, never by address
+- **Address bound**: Besides its entry count, the cache bounds the coordinate
+  addresses it stores at 16 per configured entry. Each entry is charged its
+  coordinate length or 16, whichever is larger, and a write that would exceed
+  the bound evicts like a write to a full cache. Deep coordinates still cache
+  and route; they reduce how many entries fit
 - **Flush on parent change**: When the local node's tree parent changes, the
   entire coordinate cache is flushed. Tree parent changes mean the node's own
   coordinates have changed, making cached coordinates for other nodes

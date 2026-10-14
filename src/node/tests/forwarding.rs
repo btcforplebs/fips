@@ -1513,6 +1513,63 @@ async fn a_session_setup_at_a_full_cache_examines_a_bounded_number_of_entries() 
     );
 }
 
+#[tokio::test]
+async fn a_link_peer_cannot_fill_the_cache_with_deep_coordinates_past_the_address_budget() {
+    let mut node = make_node();
+    let from = make_node_addr(0xAA);
+    let root = *node.tree_state.my_coords().root_id();
+    let capacity = node.coord_cache().max_entries();
+    let dest = make_node_addr(0x02);
+    let dest_coords = coords_of_len(dest, root, 2);
+    let _ = node
+        .coord_cache_mut()
+        .insert(dest, dest_coords.clone(), wall_ms());
+
+    // The deepest source coordinate a SessionSetup carries on a 1280-byte link.
+    let depth_len = 71;
+    let probe = setup_frame(
+        minted_dest(0),
+        coords_of_len(minted_dest(0), root, depth_len),
+        dest,
+        dest_coords.clone(),
+        8,
+    );
+    let link_overhead =
+        1 + crate::proto::fmp::wire::ESTABLISHED_HEADER_SIZE + 4 + crate::noise::TAG_SIZE;
+    assert!(
+        probe.len() + link_overhead <= 1280,
+        "a {}-byte frame does not fit a 1280-byte link",
+        probe.len() + link_overhead
+    );
+
+    for i in 0..(capacity as u32 - 1) {
+        let src = minted_dest(i);
+        let frame = setup_frame(
+            src,
+            coords_of_len(src, root, depth_len),
+            dest,
+            dest_coords.clone(),
+            8,
+        );
+        node.handle_session_datagram(&from, &frame, false).await;
+    }
+    assert!(
+        node.coord_cache()
+            .get(&minted_dest(capacity as u32 - 2), wall_ms())
+            .is_some(),
+        "the last deep source must have been cached"
+    );
+
+    let budget = capacity * 16;
+    assert!(
+        node.coord_cache().stored_addrs() <= budget,
+        "one link peer made the cache store {} coordinate addresses in {} \
+         entries, against a budget of {budget}",
+        node.coord_cache().stored_addrs(),
+        node.coord_cache().len()
+    );
+}
+
 // --- Foreign-root refusal at every hint write ---
 
 #[tokio::test]

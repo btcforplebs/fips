@@ -18,6 +18,24 @@ pub const DEFAULT_COORD_CACHE_SIZE: usize = 50_000;
 /// Default TTL for coordinate cache entries (5 minutes in milliseconds).
 pub const DEFAULT_COORD_CACHE_TTL_MS: u64 = 300_000;
 
+/// Coordinate addresses the cache may store per entry of its configured
+/// capacity, and the least weight any one entry is charged.
+///
+/// Bounds the cache's coordinate storage at `max_entries * ADDRS_PER_ENTRY`
+/// addresses (800,000 at the default capacity, about 26 MB of coordinate
+/// entries) whatever depth the hints claim; a frame can carry a coordinate of
+/// about seventy addresses, which unbounded would be about 116 MB. Honest depth
+/// follows the mesh's hop diameter, so an honest cache fills by entry count
+/// first. Deep coordinates still cache and route; they shrink how many entries
+/// fit. The floor makes a shallow entry cost as much as a depth-fifteen one, so
+/// shallow keys do not buy faster entry turnover. No measured basis.
+pub const ADDRS_PER_ENTRY: usize = 16;
+
+/// The weight an entry holding `coords` is charged against the address bound.
+fn weight_of(coords: &TreeCoordinate) -> u64 {
+    coords.entries().len().max(ADDRS_PER_ENTRY) as u64
+}
+
 /// What a hint write did, which is the only place the precedence rule is
 /// observable.
 ///
@@ -63,6 +81,8 @@ struct Slot {
     /// touched since, which eviction notices and corrects lazily.
     key: (u64, u64),
     place: Place,
+    /// What the entry counts against the address bound; see [`weight_of`].
+    weight: u64,
 }
 
 /// Coordinate cache for routing decisions.
@@ -77,6 +97,10 @@ struct Slot {
 /// work: the index is corrected when eviction reaches a stale key. Ties are
 /// broken by a per-cache insertion sequence, never by address, because peers
 /// choose addresses.
+///
+/// The cache is bounded by entries and by the coordinate addresses it stores
+/// ([`ADDRS_PER_ENTRY`]); a hint write that would exceed either evicts until
+/// it fits.
 #[derive(Clone, Debug)]
 pub struct CoordCache {
     /// NodeAddr -> coordinates mapping.
@@ -88,6 +112,8 @@ pub struct CoordCache {
     parked: BTreeMap<(u64, u64), NodeAddr>,
     /// Insertion sequence for index keys.
     seq: u64,
+    /// Sum of every entry's weight.
+    stored_weight: u64,
     /// Maximum number of entries.
     max_entries: usize,
     /// Default TTL for entries (milliseconds).
@@ -106,6 +132,7 @@ impl CoordCache {
             by_use: BTreeMap::new(),
             parked: BTreeMap::new(),
             seq: 0,
+            stored_weight: 0,
             max_entries,
             default_ttl_ms,
             #[cfg(test)]
@@ -157,13 +184,31 @@ impl CoordCache {
         current_time_ms: u64,
         ttl_ms: u64,
     ) -> HintOutcome {
+        let weight = weight_of(&coords);
         if let Some(slot) = self.entries.get_mut(&addr) {
             if slot.entry.is_verified(current_time_ms) {
                 return HintOutcome::Rejected;
             }
             let changed = slot.entry.coords() != &coords;
-            slot.entry.update(coords, current_time_ms, ttl_ms);
-            self.refile(addr);
+            if weight <= slot.weight {
+                slot.entry.update(coords, current_time_ms, ttl_ms);
+                self.stored_weight -= slot.weight - weight;
+                slot.weight = weight;
+                self.refile(addr);
+            } else {
+                // A growing update makes room like a new key does. The entry
+                // is taken out first so it cannot be its own victim, and goes
+                // back unchanged if no room can be made.
+                let Some(mut slot) = self.remove_slot(&addr) else {
+                    return HintOutcome::Rejected;
+                };
+                if !self.make_room(weight, current_time_ms) {
+                    self.file_new(addr, slot.entry, slot.weight);
+                    return HintOutcome::Rejected;
+                }
+                slot.entry.update(coords, current_time_ms, ttl_ms);
+                self.file_new(addr, slot.entry, weight);
+            }
             return if changed {
                 HintOutcome::Changed
             } else {
@@ -174,38 +219,39 @@ impl CoordCache {
         // Eviction can decline to free a slot when every entry is a live
         // verified one, which is the case the hint must not be allowed to
         // force. Refuse rather than grow past the cap.
-        if self.entries.len() >= self.max_entries && !self.evict_one(current_time_ms) {
+        if !self.make_room(weight, current_time_ms) {
             return HintOutcome::Rejected;
         }
 
         let entry = CacheEntry::new(coords, current_time_ms, ttl_ms);
-        self.file_new(addr, entry);
+        self.file_new(addr, entry, weight);
         HintOutcome::Inserted
     }
 
     /// Insert or update a cache entry from a lookup whose proof was verified.
     ///
     /// Unconditional: a verified value displaces whatever was there, which is
-    /// the point — it is how a poisoned entry gets corrected.
+    /// the point — it is how a poisoned entry gets corrected. It makes room
+    /// within the cache's bounds if it can, and is stored even if it cannot
+    /// (only this node's own lookups write here, so the excess is bounded by
+    /// them).
     pub fn insert_verified(
         &mut self,
         addr: NodeAddr,
         coords: TreeCoordinate,
         current_time_ms: u64,
     ) {
-        if let Some(slot) = self.entries.get_mut(&addr) {
-            slot.entry
-                .update_verified(coords, current_time_ms, self.default_ttl_ms);
-            self.refile(addr);
-            return;
-        }
-
-        if self.entries.len() >= self.max_entries {
-            self.evict_one(current_time_ms);
-        }
-
-        let entry = CacheEntry::new_verified(coords, current_time_ms, self.default_ttl_ms);
-        self.file_new(addr, entry);
+        let weight = weight_of(&coords);
+        let ttl_ms = self.default_ttl_ms;
+        let entry = match self.remove_slot(&addr) {
+            Some(mut slot) => {
+                slot.entry.update_verified(coords, current_time_ms, ttl_ms);
+                slot.entry
+            }
+            None => CacheEntry::new_verified(coords, current_time_ms, ttl_ms),
+        };
+        let _ = self.make_room(weight, current_time_ms);
+        self.file_new(addr, entry, weight);
     }
 
     /// Insert or update a verified cache entry with path MTU information.
@@ -344,6 +390,7 @@ impl CoordCache {
         self.entries.clear();
         self.by_use.clear();
         self.parked.clear();
+        self.stored_weight = 0;
     }
 
     /// Drop entries whose cached destination ancestry contains the given
@@ -380,10 +427,12 @@ impl CoordCache {
         let len_before = self.entries.len();
         let by_use = &mut self.by_use;
         let parked = &mut self.parked;
+        let stored_weight = &mut self.stored_weight;
         self.entries.retain(|_, slot| {
             if keep(&slot.entry) {
                 return true;
             }
+            *stored_weight -= slot.weight;
             match slot.place {
                 Place::ByUse => by_use.remove(&slot.key),
                 Place::Parked => parked.remove(&slot.key),
@@ -400,17 +449,37 @@ impl CoordCache {
     }
 
     /// Add a slot for a key not in the map, filed for eviction by last use.
-    fn file_new(&mut self, addr: NodeAddr, entry: CacheEntry) {
+    fn file_new(&mut self, addr: NodeAddr, entry: CacheEntry, weight: u64) {
         let key = self.next_key(entry.last_used());
         self.by_use.insert(key, addr);
+        self.stored_weight += weight;
         self.entries.insert(
             addr,
             Slot {
                 entry,
                 key,
                 place: Place::ByUse,
+                weight,
             },
         );
+    }
+
+    /// The most weight the cache may store.
+    fn weight_bound(&self) -> u64 {
+        (self.max_entries as u64).saturating_mul(ADDRS_PER_ENTRY as u64)
+    }
+
+    /// Evict until one more entry of `weight` fits both bounds. Returns
+    /// whether it fits; it does not when only live-verified entries remain.
+    fn make_room(&mut self, weight: u64, current_time_ms: u64) -> bool {
+        while self.entries.len() >= self.max_entries
+            || self.stored_weight + weight > self.weight_bound()
+        {
+            if !self.evict_one(current_time_ms) {
+                return false;
+            }
+        }
+        true
     }
 
     /// Re-file an existing slot in `by_use` at its entry's current last use,
@@ -435,6 +504,7 @@ impl CoordCache {
     /// Remove a slot and its index key.
     fn remove_slot(&mut self, addr: &NodeAddr) -> Option<Slot> {
         let slot = self.entries.remove(addr)?;
+        self.stored_weight -= slot.weight;
         match slot.place {
             Place::ByUse => self.by_use.remove(&slot.key),
             Place::Parked => self.parked.remove(&slot.key),
@@ -508,7 +578,9 @@ impl CoordCache {
                 }
                 continue;
             }
-            self.entries.remove(&addr);
+            if let Some(slot) = self.entries.remove(&addr) {
+                self.stored_weight -= slot.weight;
+            }
             return true;
         }
         false
@@ -1137,6 +1209,52 @@ mod tests {
     }
 
     #[test]
+    fn a_cache_filled_with_depth_seventy_hints_stays_within_its_address_budget() {
+        let mut cache = CoordCache::with_defaults();
+        let root = make_node_addr(0);
+        let capacity = DEFAULT_COORD_CACHE_SIZE as u32;
+        let mut newest = None;
+        for i in 0..capacity {
+            let addr = minted_addr(0xfe, i);
+            let _ = cache.insert(addr, coords_of_len(addr, root, 71), 1_000 + u64::from(i));
+            newest = Some(addr);
+        }
+        let newest = newest.unwrap();
+        assert!(
+            cache.contains(&newest, 1_000 + u64::from(capacity)),
+            "the newest hint must be stored"
+        );
+
+        let budget = DEFAULT_COORD_CACHE_SIZE * ADDRS_PER_ENTRY;
+        assert!(
+            cache.stored_addrs() <= budget,
+            "the cache stores {} coordinate addresses in {} entries, against \
+             a budget of {budget}",
+            cache.stored_addrs(),
+            cache.len()
+        );
+    }
+
+    #[test]
+    fn a_depth_five_fill_reaches_max_entries_with_nothing_evicted_early() {
+        let mut cache = CoordCache::with_defaults();
+        let root = make_node_addr(0);
+        let capacity = DEFAULT_COORD_CACHE_SIZE as u32;
+        for i in 0..capacity {
+            let addr = minted_addr(0xfe, i);
+            let _ = cache.insert(addr, coords_of_len(addr, root, 6), 1_000 + u64::from(i));
+        }
+        let now = 1_000 + u64::from(capacity);
+        assert_eq!(cache.len(), DEFAULT_COORD_CACHE_SIZE);
+        assert!(
+            cache.contains(&minted_addr(0xfe, 0), now),
+            "the first entry of an honest fill must still be present"
+        );
+        assert_eq!(cache.eviction_examined(), 0, "nothing may be evicted");
+        assert_eq!(cache.stored_addrs(), DEFAULT_COORD_CACHE_SIZE * 6);
+    }
+
+    #[test]
     fn a_touched_entry_survives_a_flood_of_new_keys() {
         let mut cache = CoordCache::new(1_000, DEFAULT_COORD_CACHE_TTL_MS);
         let root = make_node_addr(0);
@@ -1178,6 +1296,14 @@ mod tests {
                 "{step}: {addr:?} is not filed under its key"
             );
         }
+        for slot in cache.entries.values() {
+            assert_eq!(slot.weight, weight_of(slot.entry.coords()), "{step}");
+        }
+        assert_eq!(
+            cache.stored_weight,
+            cache.entries.values().map(|slot| slot.weight).sum::<u64>(),
+            "{step}: stored weight is not the sum over the map"
+        );
         for (key, addr) in cache.by_use.iter() {
             let slot = cache
                 .entries
@@ -1229,7 +1355,7 @@ mod tests {
             now += u64::from(state % 7);
             let name = match (state >> 8) % 12 {
                 0..=3 => {
-                    let len = 2 + (state >> 4) as usize % 3;
+                    let len = 2 + (state >> 4) as usize % 30;
                     let _ = cache.insert(addr, coords_of_len(addr, root, len), now);
                     "insert"
                 }
@@ -1355,5 +1481,33 @@ mod tests {
                 "entry {i} of the insertion order"
             );
         }
+    }
+
+    #[test]
+    fn a_growing_update_evicts_others_to_stay_within_the_address_budget() {
+        // Room for four entries by count and 64 addresses by weight.
+        let mut cache = CoordCache::new(4, DEFAULT_COORD_CACHE_TTL_MS);
+        let root = make_node_addr(0);
+        let addrs: Vec<NodeAddr> = (0..4u32).map(|i| minted_addr(0xfe, i)).collect();
+        for (i, addr) in addrs.iter().enumerate() {
+            let _ = cache.insert(*addr, coords_of_len(*addr, root, 2), 1_000 + i as u64);
+        }
+        assert_eq!(cache.stored_weight, 64);
+
+        // The oldest entry grows to 40 addresses: it must not be its own
+        // victim, and two others must go to make room for 24 more.
+        assert_eq!(
+            cache.insert(addrs[0], coords_of_len(addrs[0], root, 40), 2_000),
+            HintOutcome::Changed
+        );
+        assert_eq!(
+            cache.get(&addrs[0], 2_000).map(|c| c.entries().len()),
+            Some(40)
+        );
+        assert!(!cache.contains(&addrs[1], 2_000));
+        assert!(!cache.contains(&addrs[2], 2_000));
+        assert!(cache.contains(&addrs[3], 2_000));
+        assert!(cache.stored_weight <= 64);
+        assert_index_matches_map(&cache, "growing update");
     }
 }
