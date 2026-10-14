@@ -166,9 +166,9 @@ async fn test_response_transit_needs_recent_request() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64;
-    node.lookup
-        .recent_requests
-        .insert(444, RecentRequest::new(make_node_addr(0xDD), now_ms));
+    let mut recent = RecentRequest::new(make_node_addr(0xDD), target, now_ms);
+    recent.forwarded_to.push(from);
+    node.lookup.recent_requests.insert(444, recent);
 
     // Handle response — should try to reverse-path forward to 0xDD
     // (will fail silently since 0xDD is not an actual peer)
@@ -606,14 +606,16 @@ async fn test_recent_request_expiry() {
         .as_millis() as u64;
 
     // Insert an old request (11 seconds ago)
-    node.lookup
-        .recent_requests
-        .insert(123, RecentRequest::new(make_node_addr(1), now_ms - 11_000));
+    node.lookup.recent_requests.insert(
+        123,
+        RecentRequest::new(make_node_addr(1), make_node_addr(0xF0), now_ms - 11_000),
+    );
 
     // Insert a recent request
-    node.lookup
-        .recent_requests
-        .insert(456, RecentRequest::new(make_node_addr(2), now_ms));
+    node.lookup.recent_requests.insert(
+        456,
+        RecentRequest::new(make_node_addr(2), make_node_addr(0xF0), now_ms),
+    );
 
     assert_eq!(node.lookup.recent_requests.len(), 2);
 
@@ -3383,5 +3385,307 @@ async fn a_failed_session_retry_after_a_lookup_answer_leaves_packets_held_behind
         node.pending_tun_total_packets(),
         1,
         "the packet stays held behind the handshake"
+    );
+}
+
+// ============================================================================
+// Reverse-path relay of lookup responses at transit nodes
+// ============================================================================
+
+/// A response for `request_id` naming `target` whose proof `forger` signed
+/// with its own key, so the target's key cannot verify it.
+fn forged_response(forger: &Identity, request_id: u64, target: &NodeAddr) -> Vec<u8> {
+    let coords = TreeCoordinate::from_addrs(vec![*target, *forger.node_addr()]).unwrap();
+    let proof = forger.sign(&LookupResponse::proof_bytes(request_id, target, &coords));
+    LookupResponse::new(request_id, *target, coords, proof).encode()
+}
+
+/// Run `origin`'s lookup for `target` one hop per pass. The first time the
+/// node at `forger` holds the request, it answers the neighbour that sent it,
+/// `via`, with a forged response. Returns the number of forgeries sent.
+async fn lookup_raced_by_a_forger(
+    nodes: &mut [spanning_tree::TestNode],
+    origin: usize,
+    target: usize,
+    forger: usize,
+    via: usize,
+) -> usize {
+    let target_addr = *nodes[target].node.node_addr();
+    let via_addr = *nodes[via].node.node_addr();
+    let target_pubkey = nodes[target].node.identity().pubkey_full();
+    nodes[origin]
+        .node
+        .register_identity(target_addr, target_pubkey);
+
+    let sent = nodes[origin].node.initiate_lookup(&target_addr, 8).await;
+    assert!(sent > 0, "precondition: the origin sent its request");
+
+    let mut forged = 0;
+    for _ in 0..12 {
+        process_available_packets(nodes).await;
+        let ids: Vec<u64> = nodes[forger]
+            .node
+            .lookup
+            .recent_requests
+            .keys()
+            .copied()
+            .collect();
+        if forged == 0 && !ids.is_empty() {
+            let forger_identity = Identity::generate();
+            for id in ids {
+                let frame = forged_response(&forger_identity, id, &target_addr);
+                nodes[forger]
+                    .node
+                    .send_encrypted_link_message(&via_addr, &frame)
+                    .await
+                    .expect("the forger reaches its link peer");
+                forged += 1;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    forged
+}
+
+/// Make `peer`'s filter as `node` holds it claim `claimed` as well as what
+/// the peer actually reaches, as an attacker's FilterAnnounce can.
+fn claim_in_filter(node: &mut Node, peer: &NodeAddr, claimed: &NodeAddr) {
+    let mut reaches = vec![*claimed];
+    reaches.push(*peer);
+    set_peer_filter(node, peer, &reaches, 1_000);
+}
+
+#[tokio::test]
+async fn a_forged_response_does_not_stop_the_genuine_response_being_relayed() {
+    // O — T — M — D, and X hangs off T claiming D in its filter. T forwards
+    // the request to both M and X; X is one hop from T and D is two, so X's
+    // forgery reaches T first.
+    const O: usize = 0;
+    const T: usize = 1;
+    const X: usize = 2;
+    const M: usize = 3;
+    const D: usize = 4;
+    let edges = vec![(O, T), (T, X), (T, M), (M, D)];
+    let mut nodes = run_tree_test(5, &edges, false).await;
+    let d_addr = *nodes[D].node.node_addr();
+    let x_addr = *nodes[X].node.node_addr();
+    claim_in_filter(&mut nodes[T].node, &x_addr, &d_addr);
+
+    let forged = lookup_raced_by_a_forger(&mut nodes, O, D, X, T).await;
+
+    assert!(
+        forged > 0,
+        "precondition: X received the request and forged"
+    );
+    assert!(
+        nodes[O].node.metrics().lookup.resp_proof_failed.get() > 0,
+        "precondition: the forgery reached the origin and failed its proof check"
+    );
+    assert!(
+        nodes[D].node.lookup.recent_requests.len() == 1,
+        "precondition: the target received the request and answered it"
+    );
+    assert!(
+        nodes[O]
+            .node
+            .coord_cache()
+            .contains(&d_addr, wall_clock_ms()),
+        "the target's genuine response must still reach the origin after a forgery \
+         was relayed for the same request (transit T dropped it as already forwarded)"
+    );
+
+    cleanup_nodes(&mut nodes).await;
+}
+
+#[tokio::test]
+async fn the_genuine_response_survives_a_forgery_two_hops_up() {
+    // O — T1 — T2 — M — D, and X hangs off T2 claiming D. The forgery and the
+    // genuine response both reach T1 from the same downstream peer, T2, so a
+    // relay budget of one per downstream peer still loses the genuine one
+    // at T1.
+    const O: usize = 0;
+    const T1: usize = 1;
+    const T2: usize = 2;
+    const X: usize = 3;
+    const M: usize = 4;
+    const D: usize = 5;
+    let edges = vec![(O, T1), (T1, T2), (T2, X), (T2, M), (M, D)];
+    let mut nodes = run_tree_test(6, &edges, false).await;
+    let d_addr = *nodes[D].node.node_addr();
+    let x_addr = *nodes[X].node.node_addr();
+    claim_in_filter(&mut nodes[T2].node, &x_addr, &d_addr);
+
+    let forged = lookup_raced_by_a_forger(&mut nodes, O, D, X, T2).await;
+
+    assert!(
+        forged > 0,
+        "precondition: X received the request and forged"
+    );
+    assert!(
+        nodes[O].node.metrics().lookup.resp_proof_failed.get() > 0,
+        "precondition: the forgery reached the origin and failed its proof check"
+    );
+    assert!(
+        nodes[D].node.lookup.recent_requests.len() == 1,
+        "precondition: the target received the request and answered it"
+    );
+    assert!(
+        nodes[O]
+            .node
+            .coord_cache()
+            .contains(&d_addr, wall_clock_ms()),
+        "the target's genuine response must still reach the origin after a forgery \
+         was relayed two hops up the reverse path"
+    );
+
+    cleanup_nodes(&mut nodes).await;
+}
+
+/// A node that has received request 0x5150 for `target` from `upstream` and,
+/// having no other peers, forwarded it nowhere.
+async fn transit_holding_a_request(upstream: &NodeAddr, target: &NodeAddr) -> Node {
+    let mut node = make_node();
+    node.handle_lookup_request(upstream, &lookup_request_payload(0x5150, target))
+        .await;
+    assert!(
+        node.lookup.recent_requests.contains_key(&0x5150),
+        "precondition: the request is recorded for the reverse path"
+    );
+    node
+}
+
+#[tokio::test]
+async fn a_response_from_a_peer_the_request_was_not_forwarded_to_is_not_relayed() {
+    // A response arriving from a peer the request never went to cannot be an
+    // answer this node solicited, and relaying it closes the request to the
+    // genuine one.
+    let upstream = make_node_addr(0xA1);
+    let stranger = make_node_addr(0xA2);
+    let target = make_node_addr(0xA3);
+    let mut node = transit_holding_a_request(&upstream, &target).await;
+    let frame = forged_response(&Identity::generate(), 0x5150, &target);
+
+    node.handle_lookup_response(&stranger, &frame[1..]).await;
+
+    assert_eq!(
+        node.metrics().lookup.resp_forwarded.get(),
+        0,
+        "a response from a peer the request was never forwarded to was relayed"
+    );
+}
+
+#[tokio::test]
+async fn a_response_from_the_requests_upstream_peer_is_not_relayed() {
+    let upstream = make_node_addr(0xB1);
+    let target = make_node_addr(0xB3);
+    let mut node = transit_holding_a_request(&upstream, &target).await;
+    let frame = forged_response(&Identity::generate(), 0x5150, &target);
+
+    node.handle_lookup_response(&upstream, &frame[1..]).await;
+
+    assert_eq!(
+        node.metrics().lookup.resp_forwarded.get(),
+        0,
+        "a response from the peer the request came from was relayed back to it"
+    );
+}
+
+#[tokio::test]
+async fn a_response_for_another_target_is_not_relayed() {
+    // The request for `target` is forwarded to `downstream`, whose filter
+    // reaches it; `downstream` then answers naming a different target.
+    let upstream = make_node_addr(0xC1);
+    let target = make_node_addr(0xC3);
+    let other = make_node_addr(0xC4);
+    let mut node = make_node();
+    let downstream = insert_filter_peer(&mut node, &[target], true);
+    node.handle_lookup_request(&upstream, &lookup_request_payload(0x5150, &target))
+        .await;
+    let lookup_metrics = &node.metrics().lookup;
+    assert!(
+        lookup_metrics.req_forwarded.get() == 1 && lookup_metrics.req_no_tree_peer.get() == 0,
+        "precondition: the request was forwarded to the downstream peer"
+    );
+    let frame = forged_response(&Identity::generate(), 0x5150, &other);
+
+    node.handle_lookup_response(&downstream, &frame[1..]).await;
+
+    assert_eq!(
+        node.metrics().lookup.resp_forwarded.get(),
+        0,
+        "a response naming a target other than the request's was relayed"
+    );
+}
+
+#[tokio::test]
+async fn a_filter_announced_after_the_forward_does_not_make_a_peer_eligible() {
+    // The request goes to `downstream`, the only peer that reaches the target
+    // when it is forwarded. `latecomer` then announces a filter claiming the
+    // target, as a node that learned the request id and target from the flood
+    // can, and answers first.
+    let upstream = make_node_addr(0xD1);
+    let target = make_node_addr(0xD3);
+    let mut node = make_node();
+    let downstream = insert_filter_peer(&mut node, &[target], true);
+    node.handle_lookup_request(&upstream, &lookup_request_payload(0x5150, &target))
+        .await;
+    assert_eq!(
+        node.metrics().lookup.req_forwarded.get(),
+        1,
+        "precondition: the request was forwarded to the downstream peer"
+    );
+    let latecomer = insert_filter_peer(&mut node, &[target], false);
+    assert!(
+        node.peers[&latecomer].may_reach(&target),
+        "precondition: the latecomer's filter now claims the target"
+    );
+
+    let forged = forged_response(&Identity::generate(), 0x5150, &target);
+    node.handle_lookup_response(&latecomer, &forged[1..]).await;
+    assert_eq!(
+        node.metrics().lookup.resp_forwarded.get(),
+        0,
+        "a response from a peer whose filter claimed the target only after the \
+         forward was relayed"
+    );
+
+    let answer = forged_response(&Identity::generate(), 0x5150, &target);
+    node.handle_lookup_response(&downstream, &answer[1..]).await;
+    assert_eq!(
+        node.metrics().lookup.resp_forwarded.get(),
+        1,
+        "the peer the request was forwarded to is still relayed"
+    );
+}
+
+#[tokio::test]
+async fn a_copy_with_a_lowered_path_mtu_is_a_duplicate() {
+    // `path_mtu` is outside the proof and any forwarder rewrites it, so a copy
+    // that differs only there is the same response and is relayed once.
+    let upstream = make_node_addr(0xE1);
+    let target = make_node_addr(0xE3);
+    let mut node = make_node();
+    let downstream = insert_filter_peer(&mut node, &[target], true);
+    node.handle_lookup_request(&upstream, &lookup_request_payload(0x5150, &target))
+        .await;
+    assert_eq!(
+        node.metrics().lookup.req_forwarded.get(),
+        1,
+        "precondition: the request was forwarded to the downstream peer"
+    );
+    let mut response =
+        LookupResponse::decode(&forged_response(&Identity::generate(), 0x5150, &target)[1..])
+            .expect("the response decodes");
+
+    node.handle_lookup_response(&downstream, &response.encode()[1..])
+        .await;
+    response.path_mtu = 1280;
+    node.handle_lookup_response(&downstream, &response.encode()[1..])
+        .await;
+
+    assert_eq!(
+        node.metrics().lookup.resp_forwarded.get(),
+        1,
+        "a copy differing only in path_mtu was relayed a second time"
     );
 }

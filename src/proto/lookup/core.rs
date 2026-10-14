@@ -127,6 +127,35 @@ pub(crate) fn plan_forward(
     }
 }
 
+/// Plan the transit forward of an inbound LookupRequest and record, on the
+/// request's recent-request entry, the link peers it was sent to.
+///
+/// Runs [`plan_forward`]; on `Forward` the selected peers become the
+/// request's `forwarded_to`, the only peers a response to it is accepted
+/// from (see [`classify_response`]). `NoPeers` and `TtlExhausted` record
+/// nothing, so a response to a request this node did not forward is never
+/// eligible. The request must already be recorded by [`classify_request`].
+pub(crate) fn plan_transit_forward(
+    lookup: &mut Lookup,
+    request: &mut LookupRequest,
+    from: &NodeAddr,
+    rv: &impl RoutingView,
+) -> ForwardOutcome {
+    let outcome = plan_forward(request, from, rv);
+    if let ForwardOutcome::Forward { actions, .. } = &outcome
+        && let Some(recent) = lookup.recent_requests.get_mut(&request.request_id)
+    {
+        recent.forwarded_to = actions
+            .iter()
+            .filter_map(|action| match action {
+                LookupAction::SendLink { peer, .. } => Some(*peer),
+                _ => None,
+            })
+            .collect();
+    }
+    outcome
+}
+
 /// Plan the origination of a freshly-generated LookupRequest.
 ///
 /// Selects tree peers whose bloom matches the target and emits one SendLink per
@@ -319,7 +348,7 @@ pub(crate) fn classify_request(
     }
 
     let evicted = make_room(lookup, from, max_recent, peer_count);
-    lookup.record_recent(request.request_id, *from, now_ms);
+    lookup.record_recent(request.request_id, *from, request.target, now_ms);
 
     let outcome = if request.target == *my_addr {
         RequestOutcome::RespondAsTarget
@@ -343,8 +372,13 @@ pub(crate) fn classify_request(
 /// dedup state.
 pub(crate) enum ResponseRoute {
     /// A response for a request we forwarded, but we already reverse-forwarded
-    /// one for this request_id — drop to prevent response routing loops.
+    /// one with the same proof digest — drop, which is what stops a copy
+    /// circulating on a reverse-path cycle.
     AlreadyForwarded,
+    /// A response for a request we transited that cannot be an answer to it,
+    /// for the reason given. Dropped without touching the request's relay
+    /// memory, so it cannot keep the genuine answer from being relayed.
+    Ineligible(Ineligibility),
     /// Transit node: reverse-path forward toward `from_peer`.
     Transit { from_peer: NodeAddr },
     /// We originated this request — the shell verifies the proof and caches.
@@ -355,20 +389,48 @@ pub(crate) enum ResponseRoute {
     Unsolicited,
 }
 
+/// Why a response to a request this node transited cannot be its answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Ineligibility {
+    /// It names a target other than the request's.
+    OtherTarget,
+    /// It came from a peer the request was not sent to.
+    NotSentTo,
+}
+
+impl Ineligibility {
+    /// The `reason` value the shell logs for this refusal.
+    pub(crate) fn token(self) -> &'static str {
+        match self {
+            Self::OtherTarget => "other-target",
+            Self::NotSentTo => "not-sent-to",
+        }
+    }
+}
+
 /// Classify an inbound LookupResponse against the pending lookups and the
 /// recent-request dedup cache, in that order.
 ///
-/// Pure decision over `Lookup` state: sets `response_forwarded` when this is
-/// the first response we transit for the request. No I/O, no view, no metrics.
+/// Pure decision over `Lookup` state: records `digest` in the request's relay
+/// memory when the response is to be relayed. No I/O, no view, no metrics.
 ///
 /// `from` is the link peer the response arrived from and `digest` its
 /// [`LookupResponse::proof_digest`](super::LookupResponse::proof_digest).
+///
+/// A transit cannot verify the proof, so it relays every distinct eligible
+/// response rather than only the first: relaying only the first let any peer
+/// that answered first with a forgery stop the genuine answer at every hop
+/// above it. Eligibility is fixed when the request is forwarded, which keeps
+/// out peers it was not sent to, the peer it came from, and any peer whose
+/// filter claimed the target only afterwards. An eligible sender can still
+/// have each distinct forgery relayed, up to its link rate for the life of
+/// the entry, and the origin pays a verify for each.
 pub(crate) fn classify_response(
     lookup: &mut Lookup,
     request_id: u64,
     target: &NodeAddr,
-    _from: &NodeAddr,
-    _digest: [u8; 8],
+    from: &NodeAddr,
+    digest: [u8; 8],
 ) -> ResponseRoute {
     // Originator-ness is decided first, ahead of the transit dedup record.
     // The response names a target this node has a lookup outstanding for and
@@ -396,13 +458,16 @@ pub(crate) fn classify_response(
 
     match lookup.recent_requests.get_mut(&request_id) {
         Some(recent) => {
-            if recent.response_forwarded {
-                ResponseRoute::AlreadyForwarded
-            } else {
-                recent.response_forwarded = true;
+            if recent.target != *target {
+                ResponseRoute::Ineligible(Ineligibility::OtherTarget)
+            } else if !recent.forwarded_to.contains(from) {
+                ResponseRoute::Ineligible(Ineligibility::NotSentTo)
+            } else if recent.note_relayed(digest) {
                 ResponseRoute::Transit {
                     from_peer: recent.from_peer,
                 }
+            } else {
+                ResponseRoute::AlreadyForwarded
             }
         }
         // Neither a request we transited nor an answer to a lookup we have

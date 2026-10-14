@@ -312,6 +312,29 @@ struct PendingConnect {
     peer_identity: PeerIdentity,
 }
 
+/// Whether `peer_addr` is a tree neighbour of the node at `my_addr`: its
+/// parent, or a child whose declaration names it as parent.
+///
+/// Takes the tree state rather than the node, so a caller holding a mutable
+/// borrow of another part of the node can still ask.
+pub(in crate::node) fn is_tree_peer_of(
+    tree_state: &TreeState,
+    my_addr: &NodeAddr,
+    peer_addr: &NodeAddr,
+) -> bool {
+    // Peer is our parent
+    if !tree_state.is_root() && tree_state.my_declaration().parent_id() == peer_addr {
+        return true;
+    }
+    // Peer is our child (their declaration names us as parent)
+    if let Some(decl) = tree_state.peer_declaration(peer_addr)
+        && decl.parent_id() == my_addr
+    {
+        return true;
+    }
+    false
+}
+
 /// How long a bounded table must stay below its bound before its log latch
 /// clears.
 const BOUND_LOG_HOLD: std::time::Duration = std::time::Duration::from_secs(60);
@@ -3462,17 +3485,7 @@ impl Node {
     /// Returns true if the peer is our current tree parent, or if the peer
     /// has declared us as their parent (making them our child).
     pub(crate) fn is_tree_peer(&self, peer_addr: &NodeAddr) -> bool {
-        // Peer is our parent
-        if !self.tree_state.is_root() && self.tree_state.my_declaration().parent_id() == peer_addr {
-            return true;
-        }
-        // Peer is our child (their declaration names us as parent)
-        if let Some(decl) = self.tree_state.peer_declaration(peer_addr)
-            && decl.parent_id() == self.node_addr()
-        {
-            return true;
-        }
-        false
+        is_tree_peer_of(&self.tree_state, self.node_addr(), peer_addr)
     }
 
     /// Find next hop for a destination node address.

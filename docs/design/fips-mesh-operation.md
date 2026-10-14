@@ -310,12 +310,22 @@ target. A copy that returns after the lookup completed or timed out, or a copy
 of an older attempt on a longer ladder, is recorded and forwarded as transit,
 and a later copy of it is dropped as a duplicate.
 
-**Response-forwarded flag**: Each `recent_requests` entry tracks whether a
-response has already been forwarded for that `request_id`. If a second
-response arrives (e.g., from convergent request paths that reached the
-target via different routes), the transit node drops it. This prevents
-response routing loops where multiple responses for the same request
-circulate through the network.
+**Relay eligibility**: Each `recent_requests` entry records the request's
+target and the link peers the transit forwarded it to, fixed when it was
+forwarded. A response is relayed only if it names that target and arrives from
+one of those peers. A transit cannot verify the proof, so a response from any
+other peer, including the peer the request came from or one whose filter
+claimed the target only after the forward, cannot be told from a forgery and
+is dropped.
+
+**Relayed-response memory**: Each entry also remembers the first eight bytes
+of the proof of the last eight responses relayed for it. A response whose
+digest is remembered is dropped, which stops response routing loops: a copy
+circulating on a reverse-path cycle is relayed once at each node. A response
+with a new digest is relayed however many have gone before, so a forgery
+that arrives first does not stop the genuine response. The cost is that an
+eligible peer can have each distinct forgery it sends relayed to the origin,
+which verifies and discards each one.
 
 **Proof verification**: The source verifies the Schnorr proof upon receipt,
 confirming that the target actually signed the response. The proof covers
@@ -618,7 +628,7 @@ recovery).
 | Discovery retry logic | **Implemented** |
 | Discovery originator backoff | **Implemented** |
 | Discovery transit-side rate limiting | **Implemented** |
-| Discovery response-forwarded dedup | **Implemented** |
+| Discovery response relay eligibility and memory | **Implemented** |
 | Leaf-only operation | Under development |
 | Link cost in parent selection (ETX) | **Implemented** |
 | Link cost in candidate ranking | **Implemented** |

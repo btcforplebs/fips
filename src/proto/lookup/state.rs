@@ -12,36 +12,77 @@ use alloc::vec::Vec;
 use super::limits::{LookupBackoff, LookupForwardRateLimiter};
 use crate::NodeAddr;
 
+/// How many distinct responses one recent request remembers having relayed.
+///
+/// This is a duplicate filter, not a ceiling: a response whose proof digest
+/// is not in the memory is relayed however many have gone before, because a
+/// ceiling of N lets a forger who answers first N times block the genuine
+/// response again. What it bounds is a copy of one response coming round a
+/// reverse-path cycle: that copy is relayed once while its digest is
+/// remembered, so it can come round again only after this many other
+/// distinct responses for the same request have passed this node. The honest
+/// load is one response per request, plus the duplicates a flood that
+/// reached the target by several paths sends back; no measured basis beyond
+/// that. Each slot costs eight bytes in every entry of the dedup cache that
+/// has relayed that many responses; lowering it lets fewer distinct responses
+/// push a looping copy out of the memory.
+pub(crate) const MAX_RELAYED_DIGESTS: usize = 8;
+
 /// Recent request tracking for dedup and reverse-path forwarding.
 ///
 /// When a LookupRequest is forwarded through a node, the node stores the
-/// request_id and which peer sent it. When the corresponding LookupResponse
-/// arrives, it's forwarded back to that peer (reverse-path forwarding).
-/// The `response_forwarded` flag prevents response routing loops.
+/// request_id, which peer sent it, and which peers it was sent on to. When a
+/// LookupResponse for it arrives from one of those peers naming the same
+/// target, it is forwarded back to the sender (reverse-path forwarding). The
+/// `relayed` memory keeps one response from being relayed twice, which is
+/// what stops a response routing loop.
 #[derive(Clone, Debug)]
 pub(crate) struct RecentRequest {
     /// The peer who sent this request to us.
     pub(crate) from_peer: NodeAddr,
+    /// The target the request names. A response naming another is not an
+    /// answer to it.
+    pub(crate) target: NodeAddr,
     /// When we received this request (Unix milliseconds).
     pub(crate) timestamp_ms: u64,
-    /// Whether we've already forwarded a response for this request.
-    /// Prevents response routing loops when convergent request paths
-    /// create bidirectional entries in recent_requests.
-    pub(crate) response_forwarded: bool,
+    /// The link peers this node sent the request on to, fixed when it was
+    /// forwarded and empty if it was not. Only these can answer it: the set
+    /// is recorded rather than read from the live filters when a response
+    /// arrives, because a filter announced after the forward is a claim made
+    /// by a node that already knows the request id and target.
+    pub(crate) forwarded_to: Vec<NodeAddr>,
+    /// Proof digests of the responses relayed for this request, oldest
+    /// first, at most [`MAX_RELAYED_DIGESTS`].
+    pub(crate) relayed: VecDeque<[u8; 8]>,
 }
 
 impl RecentRequest {
-    pub(crate) fn new(from_peer: NodeAddr, timestamp_ms: u64) -> Self {
+    pub(crate) fn new(from_peer: NodeAddr, target: NodeAddr, timestamp_ms: u64) -> Self {
         Self {
             from_peer,
+            target,
             timestamp_ms,
-            response_forwarded: false,
+            forwarded_to: Vec::new(),
+            relayed: VecDeque::new(),
         }
     }
 
     /// Check if this entry has expired (older than expiry_ms).
     pub(crate) fn is_expired(&self, current_time_ms: u64, expiry_ms: u64) -> bool {
         current_time_ms.saturating_sub(self.timestamp_ms) > expiry_ms
+    }
+
+    /// Remember that a response with `digest` was relayed for this request.
+    /// Returns false, and changes nothing, when one already was.
+    pub(crate) fn note_relayed(&mut self, digest: [u8; 8]) -> bool {
+        if self.relayed.contains(&digest) {
+            return false;
+        }
+        if self.relayed.len() >= MAX_RELAYED_DIGESTS {
+            self.relayed.pop_front();
+        }
+        self.relayed.push_back(digest);
+        true
     }
 }
 
@@ -185,9 +226,15 @@ impl Lookup {
     ///
     /// The caller has already established that `request_id` is not cached; a
     /// duplicate must not reach here, or the index would hold it twice.
-    pub(crate) fn record_recent(&mut self, request_id: u64, from: NodeAddr, now_ms: u64) {
+    pub(crate) fn record_recent(
+        &mut self,
+        request_id: u64,
+        from: NodeAddr,
+        target: NodeAddr,
+        now_ms: u64,
+    ) {
         self.recent_requests
-            .insert(request_id, RecentRequest::new(from, now_ms));
+            .insert(request_id, RecentRequest::new(from, target, now_ms));
         self.recent_by_peer
             .entry(from)
             .or_default()
