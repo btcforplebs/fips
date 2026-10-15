@@ -1766,6 +1766,17 @@ run_ciargs() {
     return 0
 }
 
+# The firewall suite's table check against a listing still being written when
+# its match is found: a present rule must not read as absent. Hermetic (docker
+# is a shell function stand-in) and takes about two seconds.
+run_fwtable() {
+    local rc=0
+    info "[fw-table] Checking the firewall suite's table check against its cases"
+    bash "$SCRIPT_DIR/firewall/table-check-test.sh" || rc=$?
+    record "fw-table" $rc
+    return 0
+}
+
 # ── Main ───────────────────────────────────────────────────────────────────
 
 main() {
@@ -1795,6 +1806,7 @@ main() {
     run_nextest_flaky
     run_glibc_floor
     run_ciargs
+    run_fwtable
 
     if [[ "$TEST_ONLY" == true ]]; then
         run_tests

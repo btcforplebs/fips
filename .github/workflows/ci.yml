@@ -123,6 +123,11 @@ jobs:
       # run_ciargs by hand.
       - name: Check ci-local.sh's argument handling
         run: bash testing/lib/ci-args-test.sh
+      # The firewall suite's table check, against a stand-in docker that is
+      # still writing when the match is found. Hermetic. Kept in step with
+      # ci-local.sh's run_fwtable by hand.
+      - name: Check the firewall suite's table check against its cases
+        run: bash testing/firewall/table-check-test.sh
 
   fmt:
     name: Format check

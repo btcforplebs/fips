@@ -30,6 +30,25 @@ actively DROP'd by the fips chain (not silently unrouted).
   once with the real file loaded before the rewrite, so a control socket
   that does not answer fails the case instead of passing it.
 
+## Files
+
+- `test.sh`: the suite; starts the two nodes and runs cases (a) to (e).
+- `generate-configs.sh`: writes the node configs and the drop-in.
+- `docker-compose.yml`: the two-node topology.
+- `table-check.sh`: `table_has`, sourced by `test.sh`; reports whether a
+  container's `inet fips` table contains a given rule.
+- `table-check-test.sh`: hermetic cases for `table_has`, run as a guard by
+  `ci-local.sh` and by GitHub CI.
+
+`table_has` captures the whole `nft list table` output before matching it.
+Piping `docker exec` straight into `grep -q` under `pipefail` fails a rule
+that is present: `grep` exits at its match, the exec client still writing the
+rest of the listing takes SIGPIPE, and the pipeline reports failure. It
+returns 2 when the listing cannot be read, so case (e) tells "the rule is
+absent" apart from "the table could not be listed". `table-check-test.sh`
+replaces `docker` with a stand-in that pauses after the matching line, which
+is the race's shape, and fails against the piped form.
+
 ## Topology
 
 Two FIPS nodes peered over UDP on a Docker bridge network:

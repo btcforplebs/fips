@@ -26,6 +26,9 @@ TESTING_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 COMPOSE_FILE="$SCRIPT_DIR/docker-compose.yml"
 GENERATE_CONFIGS="$SCRIPT_DIR/generate-configs.sh"
 
+# shellcheck source=SCRIPTDIR/table-check.sh
+source "$SCRIPT_DIR/table-check.sh"
+
 CONTAINER_A="fips-fw-container-a${FIPS_CI_NAME_SUFFIX:-}"
 CONTAINER_B="fips-fw-container-b${FIPS_CI_NAME_SUFFIX:-}"
 
@@ -386,8 +389,11 @@ OTHER_IF="notfips0"
 docker exec "$CONTAINER_B" sh -c \
     "sed 's/\"fips0\"/\"${OTHER_IF}\"/g' /etc/fips/fips.nft > /tmp/fips-other-if.nft"
 docker exec "$CONTAINER_B" nft -f /tmp/fips-other-if.nft
-if ! docker exec "$CONTAINER_B" nft list table inet fips \
-    | grep -q "iifname != \"${OTHER_IF}\" return"; then
+TABLE_RC=0
+table_has "$CONTAINER_B" "iifname != \"${OTHER_IF}\" return" || TABLE_RC=$?
+if [ "$TABLE_RC" -eq 2 ]; then
+    fail "(e) could not list the rewritten table on $CONTAINER_B"
+elif [ "$TABLE_RC" -ne 0 ]; then
     fail "(e) the rewritten table is not scoped to ${OTHER_IF}; the sed did not change the scoping rule"
 fi
 
