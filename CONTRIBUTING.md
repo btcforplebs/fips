@@ -148,6 +148,9 @@ Then run the integration suite that exercises your change:
 ./testing/ci-local.sh --only <suite>
 ```
 
+To rerun one suite after a full run has passed, `--rerun <suite>` skips
+the guards, lints and unit tests and builds only the release binaries.
+
 See [testing/README.md](testing/README.md) for the available suites
 and what each covers. Routing, discovery, rekey, NAT, gateway, and
 transport changes all have specific suites; pick the narrowest one

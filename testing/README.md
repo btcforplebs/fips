@@ -230,6 +230,10 @@ FIPS_CI_RUN_ID=mydebug ./ci-local.sh --only static-mesh
 # containers are named fipsci_mydebug_static_fips-node-a, etc.
 ```
 
+`--rerun <suite>` is the fast path for the same debugging: the release
+build and that one suite, with no guards, lints or unit tests. It prints
+a banner saying it is not a full local CI verdict.
+
 ### Preemption-safety and exit codes
 
 `ci-local.sh` is safe to cancel mid-run. A signal trap tears down *every*

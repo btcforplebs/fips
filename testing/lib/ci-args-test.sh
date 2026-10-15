@@ -1,12 +1,14 @@
 #!/bin/bash
 # Tests for ci-local.sh's argument handling: an unknown option or an option
 # missing its value is a usage error (exit 2, message on stderr), and --help
-# still exits 0 with the usage on stdout.
+# still exits 0 with the usage on stdout. --rerun <suite> rejects an unknown
+# suite name and the options it cannot be combined with, before any build.
 #
 # Every case invokes ci-local.sh with arguments that end during parsing, before
 # the load sampler, traps, containers or any build, so the suite is hermetic and
-# takes about a second. Each invocation is bounded by a timeout, so a parse that
-# fell through into a real run fails the case instead of starting one.
+# takes about a second. Should a parse fall through into a real run, cargo,
+# docker and sudo are stand-ins that fail at once, and each invocation is
+# bounded by a timeout, so the case fails without building or starting anything.
 #
 # Run:
 #   ./ci-args-test.sh
@@ -20,7 +22,14 @@ CI_LOCAL="$SCRIPT_DIR/../ci-local.sh"
 FAILURES=0
 OUT_FILE="$(mktemp)"
 ERR_FILE="$(mktemp)"
-trap 'rm -f "$OUT_FILE" "$ERR_FILE"' EXIT
+STUB_DIR="$(mktemp -d)"
+trap 'rm -rf "$OUT_FILE" "$ERR_FILE" "$STUB_DIR"' EXIT
+
+for tool in cargo docker sudo; do
+    printf '#!/bin/sh\necho "ci-args-test: %s called; the parse fell through into a run" >&2\nexit 97\n' \
+        "$tool" >"$STUB_DIR/$tool"
+    chmod +x "$STUB_DIR/$tool"
+done
 
 # Record a single assertion result.
 check() {
@@ -39,7 +48,8 @@ check() {
 # Run ci-local.sh with the given arguments; sets RC, OUT and ERR.
 invoke() {
     RC=0
-    timeout 30 bash "$CI_LOCAL" "$@" >"$OUT_FILE" 2>"$ERR_FILE" || RC=$?
+    PATH="$STUB_DIR:$PATH" timeout 30 bash "$CI_LOCAL" "$@" \
+        >"$OUT_FILE" 2>"$ERR_FILE" || RC=$?
     OUT="$(cat "$OUT_FILE")"
     ERR="$(cat "$ERR_FILE")"
     return 0
@@ -74,6 +84,24 @@ expect_help "-h" -h
 expect_usage_error "--only without a value" "--only needs a value" --only
 expect_usage_error "--jobs without a value" "--jobs needs a value" --jobs
 expect_usage_error "-j without a value" "-j needs a value" -j
+
+expect_usage_error "--rerun without a value" "--rerun needs a value" --rerun
+expect_usage_error "--rerun of an unknown suite" "Unknown suite: no-such-suite" \
+    --rerun no-such-suite
+for opt in --only --build-only --test-only --skip-integration --cross-check; do
+    args=(--rerun firewall "$opt")
+    [ "$opt" = --only ] && args+=(firewall)
+    expect_usage_error "--rerun with $opt" \
+        "--rerun cannot be combined with $opt" "${args[@]}"
+done
+# A known suite whose name is derived from its array (nat-, chaos-) passes the
+# name check, so the conflict is what gets reported.
+expect_usage_error "--rerun nat-cone is a known suite" \
+    "--rerun cannot be combined with --build-only" --rerun nat-cone --build-only
+expect_usage_error "--rerun chaos-tcp-mesh is a known suite" \
+    "--rerun cannot be combined with --build-only" \
+    --rerun chaos-tcp-mesh --build-only
+expect_help "--rerun with --help" --rerun firewall --help
 
 echo ""
 if [ "$FAILURES" -eq 0 ]; then

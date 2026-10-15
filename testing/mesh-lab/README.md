@@ -193,4 +193,5 @@ Docker images and the test scripts.
 
 When in doubt, debug a single suite via `ci-local.sh --only <suite>`
 first to confirm the suite is healthy on idle, then graduate to the
-mesh-lab when you want to chase a flake.
+mesh-lab when you want to chase a flake. `ci-local.sh --rerun <suite>`
+is the fast path for that check: the release build and the one suite.
