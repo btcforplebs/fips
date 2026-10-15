@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex};
 
 /// Generate a deterministic BLE address for test node `n`.
-fn ble_addr(n: u8) -> BleAddr {
+pub(super) fn ble_addr(n: u8) -> BleAddr {
     BleAddr {
         adapter: "hci0".to_string(),
         device: [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, n],
@@ -382,7 +382,7 @@ async fn reaping_a_handshake_leg_keeps_the_peer_link_it_shares() {
 // ============================================================================
 
 /// The BLE configuration every node-level test node starts from.
-fn base_config() -> BleConfig {
+pub(super) fn base_config() -> BleConfig {
     BleConfig {
         adapter: Some("hci0".to_string()),
         mtu: Some(2048),
@@ -396,7 +396,7 @@ fn base_config() -> BleConfig {
 
 /// A BLE test node whose transport runs the pre-handshake key exchange with
 /// the node's own key, as the daemon's transport does, under `config`.
-async fn make_test_node_ble_with(node_num: u8, config: BleConfig) -> TestNode {
+pub(super) async fn make_test_node_ble_with(node_num: u8, config: BleConfig) -> TestNode {
     let mut node = make_node();
     let transport_id = TransportId::new(1);
     let addr = ble_addr(node_num);
@@ -422,7 +422,7 @@ async fn make_test_node_ble_identified(node_num: u8) -> TestNode {
 
 /// Order two nodes so that node 1 holds the larger node address: the
 /// accepting side's inbound tie-break admits only a smaller claimed key.
-fn larger_second(nodes: &mut [TestNode]) {
+pub(super) fn larger_second(nodes: &mut [TestNode]) {
     if nodes[0].node.node_addr() > nodes[1].node.node_addr() {
         nodes.swap(0, 1);
     }
@@ -443,7 +443,7 @@ async fn verified_at(node: &TestNode, addr: &crate::transport::TransportAddr) ->
 
 /// Whether the node pools a link at `addr`. False while the pool lock is
 /// held, so only a wait for presence may use it.
-fn pooled_at(node: &TestNode, addr: &crate::transport::TransportAddr) -> bool {
+pub(super) fn pooled_at(node: &TestNode, addr: &crate::transport::TransportAddr) -> bool {
     ble_of(node).connection_state_sync(addr) == crate::transport::ConnectionState::Connected
 }
 
@@ -464,7 +464,7 @@ async fn until_unpooled(node: &TestNode, addr: &crate::transport::TransportAddr)
 }
 
 /// Let background tasks run until `cond` holds, for at most about a second.
-async fn until(mut cond: impl FnMut() -> bool) -> bool {
+pub(super) async fn until(mut cond: impl FnMut() -> bool) -> bool {
     for _ in 0..200 {
         for _ in 0..16 {
             tokio::task::yield_now().await;
@@ -493,7 +493,7 @@ async fn claim_key(stream: &MockBleStream, pubkey: [u8; 32]) {
 
 /// Open an inbound link to node `i` from `from` that claims `pubkey`. The
 /// remote end is returned and must be kept alive, or the link closes.
-async fn inject_claim(
+pub(super) async fn inject_claim(
     nodes: &[TestNode],
     i: usize,
     from: &BleAddr,
@@ -507,7 +507,7 @@ async fn inject_claim(
 
 /// Node 0's genuine link to node 1, dialled by node 0. Node 1 keys its end by
 /// its own address (see [`wire_ble_connection`]).
-async fn link_genuinely(nodes: &[TestNode]) -> StreamBank {
+pub(super) async fn link_genuinely(nodes: &[TestNode]) -> StreamBank {
     let bank: StreamBank = Arc::new(StdMutex::new(HashMap::new()));
     wire_ble_connection(nodes, 0, 1, &bank).await;
     install_connect_handler(nodes, 0, &bank);

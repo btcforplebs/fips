@@ -11,6 +11,8 @@ mod ble;
 mod bloom;
 mod bloom_poison;
 mod bootstrap;
+#[cfg(ble_available)]
+mod claim_dials;
 mod connected_udp;
 mod control;
 mod coord_forgery;

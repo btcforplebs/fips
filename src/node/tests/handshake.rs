@@ -1739,6 +1739,7 @@ async fn a_crossing_msg1_in_the_connection_oriented_dial_window_is_rejected() {
         transport_id,
         remote_addr: addr.clone(),
         peer_identity,
+        origin: crate::peer::machine::DialOrigin::Addressed,
     });
 
     let bad_state_before = node.stats().handshake.bad_state;

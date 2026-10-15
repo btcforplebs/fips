@@ -473,6 +473,24 @@ impl std::fmt::Debug for HandshakeCrypto {
     }
 }
 
+/// Where an outbound dial's expectation of its peer came from.
+///
+/// A transport neighbour's key claim (a BLE or Ethernet beacon naming a key)
+/// is unproven until the handshake completes, and anyone in radio or link
+/// range can make one. The per-node gates count a claim leg only against
+/// other claims, so claims cannot hold back the node's configured address,
+/// LAN advert or redial. Set at the dial site and carried by the machine for
+/// the whole dial, across the pending-connect to handshake-leg hand-off.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum DialOrigin {
+    /// The address was held for the peer: configuration, a LAN or overlay
+    /// advert, a retry, a traversal handoff. Also every inbound machine.
+    #[default]
+    Addressed,
+    /// A transport neighbour claimed the peer's key.
+    NeighbourClaim,
+}
+
 /// Per-peer control FSM. Holds control-tier lifecycle state only; the
 /// send-critical state is published as `PeerSendState` and mutated via the
 /// emitted [`PeerAction`]s.
@@ -526,6 +544,9 @@ pub(crate) struct PeerMachine {
     // lifecycle, distinct from the hot send-state slots.
     /// The previous index held open during a post-cutover drain window.
     draining_index: Option<SessionIndex>,
+
+    /// Where this machine's dial came from; see [`DialOrigin`].
+    origin: DialOrigin,
 }
 
 impl PeerMachine {
@@ -550,6 +571,7 @@ impl PeerMachine {
             rekey_jitter_secs: 0,
             last_heartbeat_sent_ms: 0,
             draining_index: None,
+            origin: DialOrigin::Addressed,
         }
     }
 
@@ -576,6 +598,7 @@ impl PeerMachine {
             rekey_jitter_secs: 0,
             last_heartbeat_sent_ms: 0,
             draining_index: None,
+            origin: DialOrigin::Addressed,
         }
     }
 
@@ -869,6 +892,17 @@ impl PeerMachine {
     /// sweep's retry address.
     pub(crate) fn conn_expected_identity(&self) -> Option<&PeerIdentity> {
         self.conn.expected_identity()
+    }
+
+    /// Where this machine's dial came from.
+    pub(crate) fn dial_origin(&self) -> DialOrigin {
+        self.origin
+    }
+
+    /// Record where this machine's dial came from. Called once, at the dial
+    /// site, before the machine is first driven.
+    pub(crate) fn set_dial_origin(&mut self, origin: DialOrigin) {
+        self.origin = origin;
     }
 
     /// Remote startup epoch of the surviving carrier, recorded by the

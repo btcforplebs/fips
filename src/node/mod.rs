@@ -43,7 +43,7 @@ use self::reloadable::Reloadable;
 pub(crate) const REKEY_JITTER_SECS: i64 = 15;
 use crate::cache::{CoordCache, Funding, Placed};
 use crate::node::session::SessionEntry;
-use crate::peer::machine::{PeerMachine, TimerKind};
+use crate::peer::machine::{DialOrigin, PeerMachine, TimerKind};
 use crate::peer::{ActivePeer, ConnectivityState};
 use crate::proto::bloom::{BloomFilter, BloomState};
 use crate::proto::fmp::Fmp;
@@ -310,6 +310,8 @@ struct PendingConnect {
     remote_addr: TransportAddr,
     /// The peer identity (for handshake initiation).
     peer_identity: PeerIdentity,
+    /// Where the dial came from, copied from its control machine.
+    origin: DialOrigin,
 }
 
 /// Whether `peer_addr` is a tree neighbour of the node at `my_addr`: its

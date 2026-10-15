@@ -18,7 +18,7 @@ use crate::node::acl::PeerAclContext;
 use crate::node::dataplane::PeerActionCtx;
 use crate::nostr::{BootstrapEvent, NostrRendezvous};
 use crate::nostr::{BootstrapHandoffResult, EstablishedTraversal};
-use crate::peer::machine::{HandshakeCrypto, PeerEvent, PeerMachine};
+use crate::peer::machine::{DialOrigin, HandshakeCrypto, PeerEvent, PeerMachine};
 use crate::proto::fmp::wire::build_msg1;
 use crate::proto::fmp::{Disconnect, DisconnectReason};
 use crate::transport::{Link, LinkDirection, LinkId, TransportAddr, TransportId, packet_channel};
@@ -519,11 +519,33 @@ impl Node {
     /// starts a non-blocking transport connect. The handshake is deferred
     /// until the transport connection is established — the tick handler
     /// polls `connection_state()` and initiates the handshake when ready.
+    ///
+    /// The dial is recorded as [`DialOrigin::Addressed`]; a dial made because
+    /// a transport neighbour claimed the key goes through
+    /// [`initiate_connection_from`](Self::initiate_connection_from).
     pub(super) async fn initiate_connection(
         &mut self,
         transport_id: TransportId,
         remote_addr: TransportAddr,
         peer_identity: PeerIdentity,
+    ) -> Result<(), NodeError> {
+        self.initiate_connection_from(
+            transport_id,
+            remote_addr,
+            peer_identity,
+            DialOrigin::Addressed,
+        )
+        .await
+    }
+
+    /// [`initiate_connection`](Self::initiate_connection), recording where
+    /// the dial came from on its control machine.
+    pub(in crate::node) async fn initiate_connection_from(
+        &mut self,
+        transport_id: TransportId,
+        remote_addr: TransportAddr,
+        peer_identity: PeerIdentity,
+        origin: DialOrigin,
     ) -> Result<(), NodeError> {
         self.authorize_peer(
             &peer_identity,
@@ -577,7 +599,8 @@ impl Node {
         // unregister path in production. It is removed on every failure path in
         // the dial window (below and in `prepare_outbound_msg1` /
         // `poll_pending_connects`), mirroring the connection's own lifetime.
-        let machine = PeerMachine::new_outbound(link_id, peer_identity, Self::now_ms());
+        let mut machine = PeerMachine::new_outbound(link_id, peer_identity, Self::now_ms());
+        machine.set_dial_origin(origin);
         self.peer_machines.insert(link_id, machine);
 
         if is_connection_oriented {
@@ -959,8 +982,14 @@ impl Node {
                 active_refresh = candidate.active_refresh,
                 "Auto-connecting to discovered peer"
             );
+            // The only dial site for a transport neighbour's key claim.
             if let Err(e) = self
-                .initiate_connection(candidate.transport_id, candidate.remote_addr, identity)
+                .initiate_connection_from(
+                    candidate.transport_id,
+                    candidate.remote_addr,
+                    identity,
+                    DialOrigin::NeighbourClaim,
+                )
                 .await
             {
                 warn!(error = %e, "Failed to auto-connect to discovered peer");
@@ -1520,6 +1549,7 @@ impl Node {
                     transport_id = %pending.transport_id,
                     remote_addr = %pending.remote_addr,
                     link_id = %pending.link_id,
+                    origin = ?pending.origin,
                     "Transport connected, starting handshake"
                 );
 
