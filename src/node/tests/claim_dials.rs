@@ -103,6 +103,11 @@ async fn a_claim_leg_is_left_out_of_the_in_flight_dials_other_paths_wait_for() {
         None,
         "a claim leg counts against node 0's per-peer cap"
     );
+    assert_eq!(
+        observed.claims_in_flight_by_peer.get(&n0),
+        Some(&1),
+        "the claim leg is counted among node 0's claims"
+    );
 }
 
 // ============================================================================

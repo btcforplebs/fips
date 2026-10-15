@@ -3216,14 +3216,20 @@ impl Node {
     /// parallel cap, computed as `path_candidate_attempt_budget` does:
     /// `legs(expected == addr) + pending_connects(addr)`. Dials made on a
     /// transport neighbour's claim are left out of all three, because the
-    /// claim is unproven and must not hold back another path to the node.
-    /// The scalar counts stay unpopulated at the ceiling-only posture (no
-    /// layer reads them; see [`Observed`]).
+    /// claim is unproven and must not hold back another path to the node;
+    /// they are counted on their own in `claims_in_flight_by_peer`. The scalar
+    /// counts stay unpopulated at the ceiling-only posture (no layer reads
+    /// them; see [`Observed`]).
     pub(in crate::node) fn observe_peering(&self) -> Observed {
         let connected: HashSet<NodeAddr> = self.peers.keys().copied().collect();
         let mut connecting: HashSet<NodeAddr> = HashSet::new();
         let mut in_flight_by_peer: HashMap<NodeAddr, usize> = HashMap::new();
-        for dial in self.dials_in_flight().filter(|dial| !dial.is_claim()) {
+        let mut claims_in_flight_by_peer: HashMap<NodeAddr, usize> = HashMap::new();
+        for dial in self.dials_in_flight() {
+            if dial.is_claim() {
+                *claims_in_flight_by_peer.entry(dial.peer).or_default() += 1;
+                continue;
+            }
             if dial.leg {
                 connecting.insert(dial.peer);
             }
@@ -3233,6 +3239,7 @@ impl Node {
             connected,
             connecting,
             in_flight_by_peer,
+            claims_in_flight_by_peer,
             lan_in_flight: self.peering.lan.in_flight(),
             ..Observed::default()
         }

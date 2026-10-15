@@ -13,6 +13,8 @@ mod bloom_poison;
 mod bootstrap;
 #[cfg(ble_available)]
 mod claim_dials;
+#[cfg(target_os = "linux")]
+mod claim_slots;
 mod connected_udp;
 mod control;
 mod coord_forgery;
