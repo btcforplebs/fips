@@ -38,7 +38,11 @@
 //! real limit: the transport MTU less the FIPS encapsulation and the four-byte
 //! port header.
 //!
-//! **Platform support.** The listener is built on Linux, FreeBSD and macOS.
+//! **Platform support.** The listener is built on Linux, FreeBSD and macOS,
+//! and on Android and iOS, where an app embeds the node and connects to a
+//! socket inside its own sandbox. Android takes Linux's arms (same kernel) and
+//! iOS takes macOS's (same Darwin `AF_UNIX`); neither is measured by the
+//! `dgram_probe` tests, which run on the host.
 //! Windows is excluded and cannot be included: it has no `SCM_RIGHTS`, so there
 //! is no way to hand a descriptor to another process at all, which is the whole
 //! mechanism. macOS needed only the descriptor's socket type, since it has
@@ -74,17 +78,17 @@ pub mod registry;
 #[cfg(all(test, unix))]
 mod dgram_probe;
 
-#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd", target_os = "macos", target_os = "ios"))]
 pub mod client;
-#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd", target_os = "macos", target_os = "ios"))]
 pub mod fdpass;
-#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd", target_os = "macos", target_os = "ios"))]
 pub mod seqpacket;
 
-#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd", target_os = "macos", target_os = "ios"))]
 pub use unix_impl::NativeApi;
 
-#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd", target_os = "macos", target_os = "ios"))]
 mod unix_impl {
     use super::fdpass;
     use super::link::{Accepted, DropReason, NativeMessage, Outbound, Outcome};
@@ -1408,7 +1412,7 @@ mod unix_impl {
 
 #[cfg(all(
     test,
-    any(target_os = "linux", target_os = "freebsd", target_os = "macos")
+    any(target_os = "linux", target_os = "android", target_os = "freebsd", target_os = "macos", target_os = "ios")
 ))]
 mod tests {
     use super::link::{self, NativeMessage, Outbound};

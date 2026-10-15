@@ -38,9 +38,9 @@ type CmsgBuf = [u64; 8];
 /// only way to be certain no `fork` in another thread wins the race. macOS has
 /// no equivalent flag, so there is nothing to pass and [`recv`] sets
 /// `FD_CLOEXEC` on each descriptor afterwards instead.
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 const RECV_FLAGS: libc::c_int = libc::MSG_CMSG_CLOEXEC;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 const RECV_FLAGS: libc::c_int = 0;
 
 /// Send `line` on `stream`, with `fd` in the ancillary data when given.
@@ -216,7 +216,7 @@ pub(super) fn recv(sock: RawFd, buf: &mut [u8]) -> io::Result<Chunk> {
         // would inherit the descriptor. A failure to set it is reported rather
         // than ignored, because the descriptor is live either way and the
         // caller must not be told the receive was clean.
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         for fd in &fds {
             super::seqpacket::set_cloexec(fd.as_raw_fd())?;
         }

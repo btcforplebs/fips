@@ -139,7 +139,9 @@ impl Node {
         drop(control_tx);
 
         // Native datagram API socket. Experimental, off by default, and built
-        // on Linux, FreeBSD and macOS: Windows has no way to pass a descriptor
+        // on Linux, FreeBSD and macOS, and on Android and iOS for an app that
+        // runs the node in-process and points its own client at a socket in
+        // its sandbox: Windows has no way to pass a descriptor
         // between processes at all, which is the mechanism itself. Bound
         // synchronously so a bad path or a socket already in use is reported
         // here, before the node starts serving, rather than at whatever later
@@ -158,7 +160,7 @@ impl Node {
             // there is no listener the channel exists and nothing ever sends,
             // and the guard keeps it open so the arm never sees a closed
             // receiver.
-            #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))]
+            #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd", target_os = "macos", target_os = "ios"))]
             let guard = {
                 let mut guard = Some(tx.clone());
                 if self.config().node.native_api.enabled {
@@ -178,7 +180,7 @@ impl Node {
                 }
                 guard
             };
-            #[cfg(not(any(target_os = "linux", target_os = "freebsd", target_os = "macos")))]
+            #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "freebsd", target_os = "macos", target_os = "ios")))]
             let guard = Some(tx.clone());
             (rx, guard)
         };
