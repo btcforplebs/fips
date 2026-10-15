@@ -395,25 +395,35 @@ ra_restore() {
 	/etc/init.d/odhcpd restart 2>/dev/null || true
 }
 
-# Swap the dnsmasq .fips forwarding port via UCI and restart dnsmasq.
+# Point dnsmasq's .fips forward at a loopback port via UCI and restart
+# dnsmasq, only when that changes the forward.
 # $1 = target port number
 dnsmasq_swap_fips_upstream() {
 	local port="$1"
-	local server
+	local server loopback=""
 
-	# Remove every loopback .fips forward, then add the one for $port. That
-	# covers the daemon's port, this gateway's, and a stale entry for any other
-	# local port, such as the old default 5353 or a changed gateway.dns.listen.
-	# A .fips forward to another host and servers for other domains are kept.
-	# uci prints a list on one line separated by spaces.
+	# Every loopback .fips forward: the daemon's port, this gateway's, and a
+	# stale entry for any other local port, such as the old default 5353 or a
+	# changed gateway.dns.listen. A .fips forward to another host and servers
+	# for other domains are kept. uci prints a list on one line separated by
+	# spaces.
 	for server in $(uci -q get 'dhcp.@dnsmasq[0].server' 2>/dev/null); do
 		case "$server" in
 		"/fips/::1#"* | "/fips/127.0.0.1#"*)
-			uci -q del_list dhcp.@dnsmasq[0].server="$server" 2>/dev/null
+			loopback="$loopback $server"
 			;;
 		esac
 	done
 
+	# Already forwarding to $port and nowhere else on loopback: change nothing.
+	# A gateway that cannot start exits after every respawn, so committing
+	# /etc/config/dhcp and restarting dnsmasq here each time would cut LAN DNS
+	# and DHCP every time procd starts it again.
+	[ "$loopback" = " /fips/::1#${port}" ] && return 0
+
+	for server in $loopback; do
+		uci -q del_list dhcp.@dnsmasq[0].server="$server" 2>/dev/null
+	done
 	uci add_list dhcp.@dnsmasq[0].server="/fips/::1#${port}"
 	uci commit dhcp
 

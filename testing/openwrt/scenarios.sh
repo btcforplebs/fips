@@ -674,6 +674,31 @@ scenario_swap_cleanup() {
         "the swap back to 5354 leaves only the daemon's loopback forward"
     assert_called "dnsmasq restart" "the swap restarts dnsmasq"
 
+    # A swap to the port dnsmasq already forwards to, as when a gateway that
+    # never started exits, leaves /etc/config/dhcp and dnsmasq alone.
+    : > "$CALLS"
+    : > "$UCI_DIR/log"
+    dnsmasq_swap_fips_upstream 5354 >/dev/null 2>&1
+    assert_equals "$(uci_sorted "$DNSMASQ_OPT")" \
+        "$(sorted_words /lan/192.168.1.2 /fips/192.168.1.5#53 /fips/::1#5354)" \
+        "a swap to the current port keeps the servers as they are"
+    assert_not_called "dnsmasq restart" "a swap to the current port does not restart dnsmasq"
+    if grep -q '^uci commit' "$UCI_DIR/log"; then
+        bad "a swap to the current port committed dhcp: $(tr '\n' ';' < "$UCI_DIR/log")"
+    else
+        ok "a swap to the current port does not commit dhcp"
+    fi
+
+    # The right port beside a stale loopback forward is still a change.
+    install_uci_stub
+    uci_seed "$DNSMASQ_OPT" "/fips/::1#5354" "/fips/127.0.0.1#5354" "/lan/192.168.1.2"
+    : > "$CALLS"
+    dnsmasq_swap_fips_upstream 5354 >/dev/null 2>&1
+    assert_equals "$(uci_sorted "$DNSMASQ_OPT")" \
+        "$(sorted_words /lan/192.168.1.2 /fips/::1#5354)" \
+        "a swap clears a stale loopback forward beside the current one"
+    assert_called "dnsmasq restart" "clearing a stale loopback forward restarts dnsmasq"
+
     PATH="$saved_path"
     return 0
 }
@@ -1022,6 +1047,8 @@ scenario_supervise() {
     if start_gateway_service; then
         wait_command
         assert_on_daemon "a gateway that exits before binding leaves dnsmasq on the daemon"
+        assert_not_called "dnsmasq restart" \
+            "a gateway that exits before binding does not restart dnsmasq"
         if [ "$CMD_RC" -ne 0 ]; then
             ok "the gateway's failure is the exit status procd sees"
         else
