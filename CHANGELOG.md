@@ -7,7 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+#### Docs & contributor tooling
+
+- [`docs/how-to/diagnose-reachability.md`](docs/how-to/diagnose-reachability.md)
+  — an operator how-to for the question "can this node reach that one, by what
+  route, and if not, why not?". It starts from `fipsctl probe` and maps each
+  failing stage and its reason to the next thing to check: `show sessions`
+  rather than `show peers` for nodes reached through a relay, an npub rerolled
+  by an ephemeral identity (`persistent: false`, the default), the target's own
+  link and the relay ACL that may be refusing it, which unknown nodes an ACL
+  lets link (an allowlist alone denies no one, and an accepted inbound link is
+  not logged with its npub at `info`), and `.fips` name resolution, including
+  the v0.3.0 macOS resolver file that pointed at `127.0.0.1` and a
+  `/etc/resolv.conf` that bypasses systemd-resolved. Linked from the how-to
+  index and from the `fipsctl probe` reference, whose description of the `path:`
+  section now matches the real output.
+
 ### Changed
+
+#### Identity and config
+
+- `fips` refuses to start when its config file configures nothing: no
+  `node.identity.nsec`, `node.identity.persistent` off, no transports, no peers
+  and, on Linux, no `gateway` section. Run without `--config`, the same applies
+  to the files found on the search path taken together. This covers an empty
+  file, one holding only comments, a byte-order mark, document markers, `{}` or
+  an empty `node:` section, and one that sets only other settings such as
+  `node.log_level`. Such a config started a node with an ephemeral identity, no
+  transports and no peers, which failed with "no operational transports came up"
+  and pointed at the network instead of the config. Worse, the ephemeral start
+  moved `fips.key` aside to `fips.key.unused`, so once the config was restored
+  the persistent start found no key and generated a new identity. `fips-gateway`
+  already exited on such a config, and now names the file instead of reporting
+  that the configuration has no gateway section. Finding no config file at all
+  still starts on the defaults, and a blank file on the search path beside one
+  that configures the node is still accepted.
 
 #### Linux packages
 
@@ -25,6 +61,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 #### OpenWrt
 
+- The `fips` and `fips-gateway` procd services now respawn without limit.
+  procd stopped respawning either one for good after it exited six times in
+  a row, each time within an hour of starting, so a router whose daemon hit a
+  run of failures, such as a missing interface at boot, stayed off the mesh
+  until someone restarted it by hand. Each exit is still followed by a 5 s
+  delay. The old init script comment said procd would reset its count and
+  try again, which it does not.
 - Release-candidate OpenWrt `.ipk` packages are now versioned `vX.Y.Z~rcN`, so
   opkg sorts them below the final release and the release upgrades a router
   that ran the candidate. The package file name keeps the tag's `-rcN`.
@@ -96,6 +139,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+#### Android
+
+- fips now builds for 32-bit Android (`armeabi-v7a` and `x86`). The DNS
+  responder set `msg_namelen` with a `u32` cast, which does not compile
+  against 32-bit bionic, where `socklen_t` is `i32`.
+
 #### FreeBSD
 
 - With pkg dnsmasq, the DNS setup and teardown scripts now restart dnsmasq
@@ -149,6 +198,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 #### Linux packages
 
+- The `fips` and `fips-gateway` systemd units (tarball, `.deb`, AUR and NixOS)
+  now back off between automatic restarts, waiting 5 s, 7 s, 10 s, 15 s, 21 s
+  and then 30 s per restart, instead of restarting every 5 s for as long as the
+  start keeps failing. A daemon that could not start, for example on an empty
+  config, respawned every 5 s indefinitely. The units still never give up. The
+  longer delay stays in effect after a restart that succeeds, until the unit is
+  stopped and started, restarted while it is running, or `systemctl
+  reset-failed` is run; a `systemctl restart` issued while the unit is waiting
+  to restart does not clear it. systemd older than v254 ignores the new settings
+  and keeps the fixed 5 s delay.
 - The systemd tarball's `install.sh` restarts fips-dns and fips-gateway after
   an upgrade when they were running. It stopped fips first, which stopped both
   through `Requires=fips.service`, then restarted only fips, so `.fips`
