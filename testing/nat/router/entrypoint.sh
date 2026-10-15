@@ -8,6 +8,11 @@ LAN_SUBNET="${LAN_SUBNET:?LAN_SUBNET is required}"
 WAN_SUBNET="${WAN_SUBNET:?WAN_SUBNET is required}"
 TCP_FORWARD_PORTS="${TCP_FORWARD_PORTS:-8443}"
 WAN_GATEWAY="${WAN_GATEWAY:-}"
+# The LAN interface is not there at start: setup-topology.sh moves it in after
+# `docker compose up` returns, and that waits on container starts that have
+# taken seconds each on a busy daemon. Set here rather than in
+# docker-compose.yml so the compose file stays as it is on every branch.
+IFACE_WAIT_SECS="${IFACE_WAIT_SECS:-120}"
 
 find_iface_for_subnet() {
     local subnet="$1"
@@ -21,9 +26,12 @@ find_iface_for_subnet() {
     done < <(ip -o -4 addr show)
 }
 
+# Wait for an interface by name. On a timeout, say so and list the links
+# before failing: the caller runs under `set -e`, so a bare failure here
+# would exit the router with an empty log.
 wait_for_iface() {
     local if_name="$1"
-    local timeout_secs="${2:-30}"
+    local timeout_secs="${2:-$IFACE_WAIT_SECS}"
     local deadline=$((SECONDS + timeout_secs))
 
     while [ "$SECONDS" -lt "$deadline" ]; do
@@ -33,12 +41,14 @@ wait_for_iface() {
         sleep 0.5
     done
 
+    echo "Timed out after ${timeout_secs}s waiting for interface ${if_name}" >&2
+    ip -o link >&2 || true
     return 1
 }
 
 wait_for_subnet_iface() {
     local subnet="$1"
-    local timeout_secs="${2:-30}"
+    local timeout_secs="${2:-$IFACE_WAIT_SECS}"
     local deadline=$((SECONDS + timeout_secs))
     local iface=""
 

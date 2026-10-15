@@ -68,6 +68,7 @@ Run one scenario:
   - relay/STUN/WAN topology plus container definitions
 - `node/`
   - node bootstrap wrapper that waits for the injected veth interface
+    (`IFACE_WAIT_SECS`)
 - `router/`
   - NAT router image and `iptables` setup
 - `stun/`
@@ -78,7 +79,8 @@ Run one scenario:
 - `scripts/generate-configs.sh`
   - derives ephemeral identities and writes per-scenario FIPS configs
 - `scripts/setup-topology.sh`
-  - injects and configures the NAT LAN `veth` pairs in the container namespaces
+  - injects and configures the NAT LAN `veth` pairs in the container
+    namespaces; see "Start order and interface waits"
 - `scripts/nat-test.sh`
   - boots the lab, waits for convergence, and asserts the resulting path
 - `scripts/nostr-relay-test.sh`
@@ -87,6 +89,35 @@ Run one scenario:
 - `scripts/stun-faults-test.sh`
   - cycles the daemon through STUN drop, delay and outage faults and asserts
     graceful behavior at each step
+
+## Start order and interface waits
+
+The `cone` and `symmetric` starts run in this order:
+
+1. `docker compose up -d` starts the relay, STUN, both routers and both nodes.
+   The routers have only their WAN interface and the nodes have none
+   (`network_mode: none`).
+2. Each entrypoint then waits for the interface the harness will give it:
+   a node for an IPv4 address on `eth0` (`node/entrypoint.sh`), a router
+   for `eth1` (`router/entrypoint.sh`).
+3. `scripts/setup-topology.sh` wires the pairs one after the other. For
+   each pair it checks that both containers are still running, then runs
+   one helper container (the router image, `--net=host --pid=host`) that
+   deletes any stale interfaces, creates the `veth` pair and moves each end
+   into its container's namespace. It then renames and addresses the ends
+   with `docker exec`, which is what ends both waits.
+
+The interface waits are bounded by `IFACE_WAIT_SECS`, 120 s by default and
+set in each entrypoint rather than in `docker-compose.yml`. The relay and
+STUN waits in the node entrypoint keep their own `WAIT_TIMEOUT_SECS`
+(30 s). The interface bound covers harness setup, not product behaviour:
+starting a container has been measured at 3 to 15 s at a time while other
+labs start on the same Docker daemon, and the earlier 30 s bound with five
+helper containers per pair was overrun often enough to fail the suite.
+
+When a wait does run out, the container says so in its log and exits, and
+`setup-topology.sh` fails with `<container> exited (code N) before its
+interface was moved`, followed by the end of that container's log.
 
 ## Assertions
 

@@ -6,12 +6,18 @@ DATA_IF="${DATA_IF:-eth0}"
 ROUTE_SUBNET="${ROUTE_SUBNET:-}"
 ROUTE_VIA="${ROUTE_VIA:-}"
 WAIT_TIMEOUT_SECS="${WAIT_TIMEOUT_SECS:-30}"
+# The data interface is not there at start: setup-topology.sh moves it in after
+# `docker compose up` returns, and that waits on container starts that have
+# taken seconds each on a busy daemon. So it gets its own, longer bound; the
+# relay and STUN waits below keep WAIT_TIMEOUT_SECS. Set here rather than in
+# docker-compose.yml so the compose file stays as it is on every branch.
+IFACE_WAIT_SECS="${IFACE_WAIT_SECS:-120}"
 RELAY_HOST="${RELAY_HOST:-}"
 RELAY_PORT="${RELAY_PORT:-7777}"
 STUN_HOST="${STUN_HOST:-}"
 STUN_PORT="${STUN_PORT:-3478}"
 
-deadline=$((SECONDS + WAIT_TIMEOUT_SECS))
+deadline=$((SECONDS + IFACE_WAIT_SECS))
 while [ "$SECONDS" -lt "$deadline" ]; do
     if ip -4 addr show dev "$DATA_IF" 2>/dev/null | grep -q 'inet '; then
         break
@@ -20,7 +26,7 @@ while [ "$SECONDS" -lt "$deadline" ]; do
 done
 
 if ! ip -4 addr show dev "$DATA_IF" 2>/dev/null | grep -q 'inet '; then
-    echo "Timed out waiting for IPv4 on ${DATA_IF}" >&2
+    echo "Timed out after ${IFACE_WAIT_SECS}s waiting for IPv4 on ${DATA_IF}" >&2
     ip addr >&2 || true
     exit 1
 fi
