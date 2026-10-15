@@ -13,6 +13,7 @@
 use crate::dnsmsg::{self, AA, Outcome, Query, Rcode, Screen, TYPE_AAAA};
 use crate::identity::FIPS_ADDRESS_PREFIX;
 use crate::upper::hosts::{HostMap, HostMapReloader};
+use crate::utils::onlink::OnLinkPrefixes;
 use crate::{NodeAddr, PeerIdentity};
 use std::net::Ipv6Addr;
 use tracing::{debug, trace};
@@ -190,6 +191,12 @@ enum ReplyPath {
     Pinned(u32),
     /// Not sent: no path is known to keep the reply out of the mesh.
     Withheld,
+    /// To the query's source by the routing table, but only when the table
+    /// sends it back out of the interface with this index (the one the query
+    /// arrived on) or delivers it locally; otherwise not sent. Used where no
+    /// strict pin to the arrival interface is known to hold (see
+    /// [`returns_by`]).
+    Returning(u32),
 }
 
 /// Choose how to send the reply to a query from `src` that arrived on
@@ -213,21 +220,26 @@ enum ReplyPath {
 /// - a send to a v4-mapped address with an unspecified IPv6 source fails with
 ///   `EINVAL`, so IPv4 clients on a dual-stack socket are never pinned.
 ///
-/// On a wildcard socket, a mesh source with a known arrival interface is
-/// pinned and one with an unknown arrival interface is routed. On a socket
-/// bound to a specific address, a mesh source is answered (pinned) only when
-/// it arrived on the mesh interface; when it arrived on any other interface,
-/// or its arrival interface is unknown, the reply is withheld. With no known
-/// mesh interface (no TUN, an application-supplied TUN, or an unresolved
-/// index) the wildcard rule applies.
+/// With `strict_pin` (Linux): on a wildcard socket, a mesh source with a
+/// known arrival interface is pinned and one with an unknown arrival
+/// interface is routed. On a socket bound to a specific address, a mesh
+/// source is answered (pinned) only when it arrived on the mesh interface;
+/// when it arrived on any other interface, or its arrival interface is
+/// unknown, the reply is withheld. With no known mesh interface (no TUN, an
+/// application-supplied TUN, or an unresolved index) a specific socket
+/// cannot tell the mesh interface apart and cannot hold a pin, so a mesh
+/// source with a known arrival interface gets a [`ReplyPath::Returning`]
+/// reply: sent only if the routing table takes it back out of the arrival
+/// interface.
 ///
-/// The decision is the same on every target; the responder applies it on
-/// Linux only and routes every reply elsewhere.
+/// The decision is one pure function for every target, so its table is
+/// tested on any host; `strict_pin` says whether the target holds a pin.
 fn reply_path(
     src: std::net::SocketAddr,
     arrival_ifindex: Option<u32>,
     mesh_ifindex: Option<u32>,
     wildcard: bool,
+    strict_pin: bool,
 ) -> ReplyPath {
     let std::net::SocketAddr::V6(v6) = src else {
         return ReplyPath::Routed;
@@ -238,8 +250,70 @@ fn reply_path(
     match (arrival_ifindex, mesh_ifindex) {
         (Some(arrival), Some(mesh)) if !wildcard && arrival != mesh => ReplyPath::Withheld,
         (None, Some(_)) if !wildcard => ReplyPath::Withheld,
+        (Some(arrival), None) if !wildcard && strict_pin => ReplyPath::Returning(arrival),
         (Some(arrival), _) => ReplyPath::Pinned(arrival),
         (None, _) => ReplyPath::Routed,
+    }
+}
+
+/// Whether a reply whose route the kernel gives source address `source`
+/// stays out of the mesh: true when the reply goes back out of interface
+/// `arrival`, or is delivered locally.
+///
+/// `source` is what [`probe_source`] reports for the reply's `destination`,
+/// and `prefixes` holds this node's interface prefixes. The egress interface
+/// is inferred from the source the kernel picks: one of the arrival
+/// interface's own prefixes holds it only when the route leaves by that
+/// interface. When `source == destination`, the destination is one of this
+/// node's own addresses (the kernel picks the destination itself as the
+/// source, RFC 6724 rule 1), so the reply never leaves the node. An empty or
+/// failed prefix set holds nothing and so answers false.
+///
+/// The inference needs the egress interface to carry an address of the
+/// destination's family. The daemon's TUN does (its mesh address); an
+/// application-supplied TUN with no IPv6 address does not, and a reply
+/// routed into it would be judged by the LAN source the kernel then picks.
+fn returns_by(
+    source: std::net::IpAddr,
+    destination: std::net::IpAddr,
+    arrival: u32,
+    prefixes: &OnLinkPrefixes,
+) -> bool {
+    source == destination || prefixes.contains_on(source, &[arrival])
+}
+
+/// The source address the kernel picks for a datagram to `destination` by
+/// the routing table.
+///
+/// An unbound UDP socket of the destination's family is connected to it;
+/// connecting a UDP socket sends nothing, and `local_addr` then reports the
+/// source of the chosen route. With source-based policy routing a socket
+/// bound to a specific address can take a different route than this
+/// unbound probe.
+fn probe_source(destination: std::net::SocketAddr) -> std::io::Result<std::net::IpAddr> {
+    let any: std::net::SocketAddr = match destination {
+        std::net::SocketAddr::V4(_) => (std::net::Ipv4Addr::UNSPECIFIED, 0).into(),
+        std::net::SocketAddr::V6(_) => (Ipv6Addr::UNSPECIFIED, 0).into(),
+    };
+    let probe = std::net::UdpSocket::bind(any)?;
+    probe.connect(destination)?;
+    Ok(probe.local_addr()?.ip())
+}
+
+/// Whether a [`ReplyPath::Returning`] reply to `dst`, whose query arrived on
+/// interface `arrival`, may be sent: `Ok(())` when the routing table takes
+/// it back out of `arrival` or delivers it locally, otherwise the reason it
+/// is withheld. A failed probe or interface read withholds.
+fn check_returning(dst: std::net::SocketAddr, arrival: u32) -> Result<(), &'static str> {
+    let source = probe_source(dst).map_err(|_| "reply-route-probe-failed")?;
+    let prefixes = OnLinkPrefixes::read_system();
+    if prefixes.read_failed() {
+        return Err("interface-read-failed");
+    }
+    if returns_by(source, dst.ip(), arrival, &prefixes) {
+        Ok(())
+    } else {
+        Err("reply-route-leaves-by-another-interface")
     }
 }
 
@@ -337,7 +411,7 @@ pub(crate) async fn run_responder(
             let _ = identity_tx.send(id).await;
         }
 
-        let path = reply_path(src, arrival_ifindex, mesh_ifindex, wildcard);
+        let path = reply_path(src, arrival_ifindex, mesh_ifindex, wildcard, true);
         if let Err(e) = send_reply(&socket, &response_bytes, src, path).await {
             debug!(error = %e, "DNS send error");
         }
@@ -345,7 +419,10 @@ pub(crate) async fn run_responder(
 }
 
 /// Send `buf` to `dst` by `path`: on Linux pinned to the arrival interface,
-/// routed, or dropped when withheld; on other targets always routed.
+/// routed, or dropped when withheld; on other targets routed for `Pinned` and
+/// `Withheld`. A `Returning` reply is routed on every target when the table
+/// takes it back out of its arrival interface or delivers it locally, and
+/// dropped otherwise.
 async fn send_reply(
     socket: &tokio::net::UdpSocket,
     buf: &[u8],
@@ -354,6 +431,18 @@ async fn send_reply(
 ) -> std::io::Result<usize> {
     match path {
         ReplyPath::Routed => socket.send_to(buf, dst).await,
+        ReplyPath::Returning(arrival) => match check_returning(dst, arrival) {
+            Ok(()) => socket.send_to(buf, dst).await,
+            Err(reason) => {
+                debug!(
+                    src = %dst,
+                    ifindex = arrival,
+                    reason,
+                    "DNS reply to a mesh source withheld"
+                );
+                Ok(0)
+            }
+        },
         #[cfg(target_os = "linux")]
         ReplyPath::Pinned(ifindex) => send_pinned(socket, buf, dst, ifindex).await,
         #[cfg(target_os = "linux")]
@@ -624,6 +713,10 @@ fn sockaddr_storage_to_socket_addr(
         )),
     }
 }
+
+#[cfg(test)]
+#[path = "tests/dns.rs"]
+mod reply_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1102,7 +1195,7 @@ mod tests {
     /// Build a dual-stack socket bound to `addr` with `IPV6_RECVPKTINFO`
     /// enabled, mirroring the setup done in `Node::bind_dns_socket`.
     #[cfg(unix)]
-    fn bind_pktinfo(addr: std::net::SocketAddr) -> std::net::UdpSocket {
+    pub(super) fn bind_pktinfo(addr: std::net::SocketAddr) -> std::net::UdpSocket {
         use socket2::{Domain, Protocol, Socket, Type};
         use std::os::fd::AsRawFd;
         let sock = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP)).unwrap();
@@ -1210,11 +1303,13 @@ mod tests {
     /// (`fd00::/8`) with a known arrival interface is pinned; everything else
     /// is routed. On a specific bind, a reply to a mesh source is withheld
     /// unless it arrived on the known mesh interface; with no known mesh
-    /// interface the wildcard rule applies. Non-mesh sources are routed on
-    /// either bind.
+    /// interface it is sent only if the route returns it by its arrival
+    /// interface. Non-mesh sources are routed on either bind. This is the
+    /// table for a target that holds a strict pin (Linux); the other one is
+    /// in `tests/dns.rs`.
     #[test]
     fn reply_path_pins_mesh_sources_and_withholds_them_off_the_mesh_on_a_specific_bind() {
-        use ReplyPath::{Pinned, Routed, Withheld};
+        use ReplyPath::{Pinned, Returning, Routed, Withheld};
         let at = |ip: &str| std::net::SocketAddr::new(ip.parse().unwrap(), 4444);
         const WILD: bool = true;
         const SPECIFIC: bool = false;
@@ -1245,12 +1340,12 @@ mod tests {
             ("::ffff:192.0.2.2", Some(2), Some(3), SPECIFIC, Routed),
             ("192.0.2.2", Some(2), Some(3), SPECIFIC, Routed),
             // Specific bind, no known mesh interface.
-            ("fd11:2233::7", Some(2), None, SPECIFIC, Pinned(2)),
+            ("fd11:2233::7", Some(2), None, SPECIFIC, Returning(2)),
             ("fd11:2233::7", None, None, SPECIFIC, Routed),
         ];
         for (ip, arrival, mesh, wildcard, want) in cases {
             assert_eq!(
-                reply_path(at(ip), arrival, mesh, wildcard),
+                reply_path(at(ip), arrival, mesh, wildcard, true),
                 want,
                 "source {ip}, arrival {arrival:?}, mesh {mesh:?}, wildcard {wildcard}"
             );
@@ -1408,17 +1503,17 @@ mod tests {
     /// the `fd00::/8` route, as the daemon's TUN gives it, and an nft counter
     /// of UDP leaving `fips0` from the responder's port. Needs root.
     #[cfg(target_os = "linux")]
-    struct ForgedSourceNetns {
-        node: String,
-        lan: String,
+    pub(super) struct ForgedSourceNetns {
+        pub(super) node: String,
+        pub(super) lan: String,
     }
 
     #[cfg(target_os = "linux")]
     impl ForgedSourceNetns {
-        const PORT: u16 = 5354;
+        pub(super) const PORT: u16 = 5354;
 
         /// Create and configure both namespaces.
-        fn new() -> Self {
+        pub(super) fn new() -> Self {
             // Tests run in parallel in one process, so each pair gets its own
             // sequence number.
             static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -1507,7 +1602,10 @@ mod tests {
 
         /// Run `f` on a thread that has entered namespace `name`, so any
         /// socket it creates belongs to that namespace.
-        fn enter<T: Send + 'static>(name: &str, f: impl FnOnce() -> T + Send + 'static) -> T {
+        pub(super) fn enter<T: Send + 'static>(
+            name: &str,
+            f: impl FnOnce() -> T + Send + 'static,
+        ) -> T {
             use std::os::fd::AsRawFd;
             let path = format!("/run/netns/{name}");
             std::thread::spawn(move || {
@@ -1521,7 +1619,7 @@ mod tests {
         }
 
         /// Index of the responder side's `fips0`.
-        fn mesh_ifindex(&self) -> u32 {
+        pub(super) fn mesh_ifindex(&self) -> u32 {
             Self::enter(&self.node, || {
                 let c = std::ffi::CString::new("fips0").unwrap();
                 unsafe { libc::if_nametoindex(c.as_ptr()) }
@@ -1529,7 +1627,7 @@ mod tests {
         }
 
         /// UDP packets from the responder's port that have left by `fips0`.
-        fn mesh_replies(&self) -> u64 {
+        pub(super) fn mesh_replies(&self) -> u64 {
             let out = std::process::Command::new("ip")
                 .args([
                     "netns", "exec", &self.node, "nft", "list", "counter", "inet", "dnstest",
@@ -1560,7 +1658,7 @@ mod tests {
 
     /// Run a command and panic unless it succeeds.
     #[cfg(target_os = "linux")]
-    fn run_ok(cmd: &str, args: &[&str]) {
+    pub(super) fn run_ok(cmd: &str, args: &[&str]) {
         let out = std::process::Command::new(cmd).args(args).output().unwrap();
         assert!(
             out.status.success(),
@@ -1712,7 +1810,7 @@ mod tests {
     /// Send an AAAA query for a fresh npub from `client` to `to` and expect
     /// an answer with one record, and the resolved identity on `identity_rx`.
     #[cfg(target_os = "linux")]
-    async fn expect_answer(
+    pub(super) async fn expect_answer(
         client: &tokio::net::UdpSocket,
         to: std::net::SocketAddr,
         identity_rx: &mut DnsIdentityRx,
@@ -1737,7 +1835,7 @@ mod tests {
     /// the responder has resolved it, then long enough for its reply to
     /// leave.
     #[cfg(target_os = "linux")]
-    async fn send_unanswered(
+    pub(super) async fn send_unanswered(
         client: &tokio::net::UdpSocket,
         to: std::net::SocketAddr,
         identity_rx: &mut DnsIdentityRx,
@@ -1752,7 +1850,7 @@ mod tests {
     }
 
     /// Build a test DNS query packet for a given name and record type.
-    fn build_test_query(name: &str, rtype: TYPE) -> Vec<u8> {
+    pub(super) fn build_test_query(name: &str, rtype: TYPE) -> Vec<u8> {
         use simple_dns::Question;
 
         let mut packet = Packet::new_query(0x1234);
