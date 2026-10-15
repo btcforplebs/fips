@@ -165,16 +165,23 @@ fn answer(query: &Query<'_>, ttl: u32, hosts: &HostMap) -> (Vec<u8>, Option<DnsR
 /// address (`fd00::/8`) leaves only by the interface the query arrived on;
 /// with the socket bound to a specific address, a query from a mesh source
 /// address that arrived on any interface but the mesh interface gets no
-/// reply, provided the mesh interface's index is known. So on a wildcard
-/// bind, and on a specific bind with a known mesh index, a query arriving on
-/// another interface with a forged mesh source address is not answered into
-/// the mesh by this socket; on a specific bind with no known mesh index it
-/// can be. A node that forwards IPv6 from that interface into the mesh can
-/// still have the reply routed back to it and forward it into the mesh, as
-/// it would any packet from that network to a mesh address. On other
-/// platforms the reply goes to the query's source by the routing table, and
-/// such a query is answered into the mesh, from this node's mesh address;
-/// only a non-loopback bind exposes that to other hosts.
+/// reply when the mesh interface's index is known, and when it is not, the
+/// reply is sent only if the routing table takes it back out of the arrival
+/// interface or delivers it locally. On other platforms no interface pin is
+/// relied on (FreeBSD was measured not to hold one): a reply to a mesh
+/// source is sent only under that same routing-table check, on either bind.
+/// So a query arriving on another interface with a forged mesh source
+/// address is not answered into the mesh by this socket. The check reads
+/// the egress interface from the source address the kernel picks, so it
+/// relies on the mesh interface carrying an address of the reply's family
+/// (the daemon's TUN does; an application-supplied TUN without an IPv6
+/// address would not); and source-based policy routing on Linux can route
+/// the bound socket differently from the check. A node that forwards IPv6
+/// from that interface into the mesh can still have the reply routed back
+/// to it and forward it into the mesh, as it would any packet from that
+/// network to a mesh address. On Windows the arrival interface is not read,
+/// so the reply is routed. Measured on Linux and FreeBSD; macOS and Android
+/// follow the same code path but were not run.
 fn is_mesh_interface_query(arrival_ifindex: Option<u32>, mesh_ifindex: Option<u32>) -> bool {
     match (arrival_ifindex, mesh_ifindex) {
         (Some(arrival), Some(mesh)) => arrival == mesh,
@@ -232,6 +239,14 @@ enum ReplyPath {
 /// reply: sent only if the routing table takes it back out of the arrival
 /// interface.
 ///
+/// Without `strict_pin` (every other target), no pin is relied on: a mesh
+/// source with a known arrival interface always gets a
+/// [`ReplyPath::Returning`] reply, whatever the bind, and one with an unknown
+/// arrival interface is withheld on a specific bind with a known mesh
+/// interface and routed otherwise. Measured on FreeBSD, an `IPV6_PKTINFO`
+/// interface does not hold a reply to that interface: the kernel uses it
+/// only to pick the source and still routes by the table.
+///
 /// The decision is one pure function for every target, so its table is
 /// tested on any host; `strict_pin` says whether the target holds a pin.
 fn reply_path(
@@ -248,11 +263,12 @@ fn reply_path(
         return ReplyPath::Routed;
     }
     match (arrival_ifindex, mesh_ifindex) {
-        (Some(arrival), Some(mesh)) if !wildcard && arrival != mesh => ReplyPath::Withheld,
         (None, Some(_)) if !wildcard => ReplyPath::Withheld,
-        (Some(arrival), None) if !wildcard && strict_pin => ReplyPath::Returning(arrival),
-        (Some(arrival), _) => ReplyPath::Pinned(arrival),
         (None, _) => ReplyPath::Routed,
+        (Some(arrival), _) if !strict_pin => ReplyPath::Returning(arrival),
+        (Some(arrival), Some(mesh)) if !wildcard && arrival != mesh => ReplyPath::Withheld,
+        (Some(arrival), None) if !wildcard => ReplyPath::Returning(arrival),
+        (Some(arrival), _) => ReplyPath::Pinned(arrival),
     }
 }
 
@@ -411,18 +427,19 @@ pub(crate) async fn run_responder(
             let _ = identity_tx.send(id).await;
         }
 
-        let path = reply_path(src, arrival_ifindex, mesh_ifindex, wildcard, true);
+        let strict_pin = cfg!(target_os = "linux");
+        let path = reply_path(src, arrival_ifindex, mesh_ifindex, wildcard, strict_pin);
         if let Err(e) = send_reply(&socket, &response_bytes, src, path).await {
             debug!(error = %e, "DNS send error");
         }
     }
 }
 
-/// Send `buf` to `dst` by `path`: on Linux pinned to the arrival interface,
-/// routed, or dropped when withheld; on other targets routed for `Pinned` and
-/// `Withheld`. A `Returning` reply is routed on every target when the table
-/// takes it back out of its arrival interface or delivers it locally, and
-/// dropped otherwise.
+/// Send `buf` to `dst` by `path`: routed, pinned to the arrival interface
+/// (Linux), or dropped when withheld. A `Returning` reply is routed when the
+/// table takes it back out of its arrival interface or delivers it locally,
+/// and dropped otherwise. [`reply_path`] gives `Pinned` only on Linux; on any
+/// other target a `Pinned` path is treated as `Returning`.
 async fn send_reply(
     socket: &tokio::net::UdpSocket,
     buf: &[u8],
@@ -431,21 +448,11 @@ async fn send_reply(
 ) -> std::io::Result<usize> {
     match path {
         ReplyPath::Routed => socket.send_to(buf, dst).await,
-        ReplyPath::Returning(arrival) => match check_returning(dst, arrival) {
-            Ok(()) => socket.send_to(buf, dst).await,
-            Err(reason) => {
-                debug!(
-                    src = %dst,
-                    ifindex = arrival,
-                    reason,
-                    "DNS reply to a mesh source withheld"
-                );
-                Ok(0)
-            }
-        },
+        ReplyPath::Returning(arrival) => send_returning(socket, buf, dst, arrival).await,
         #[cfg(target_os = "linux")]
         ReplyPath::Pinned(ifindex) => send_pinned(socket, buf, dst, ifindex).await,
-        #[cfg(target_os = "linux")]
+        #[cfg(not(target_os = "linux"))]
+        ReplyPath::Pinned(arrival) => send_returning(socket, buf, dst, arrival).await,
         ReplyPath::Withheld => {
             debug!(
                 src = %dst,
@@ -454,8 +461,28 @@ async fn send_reply(
             );
             Ok(0)
         }
-        #[cfg(not(target_os = "linux"))]
-        ReplyPath::Pinned(_) | ReplyPath::Withheld => socket.send_to(buf, dst).await,
+    }
+}
+
+/// Send `buf` to `dst` by the routing table if the table takes it back out
+/// of interface `arrival` or delivers it locally; otherwise drop it.
+async fn send_returning(
+    socket: &tokio::net::UdpSocket,
+    buf: &[u8],
+    dst: std::net::SocketAddr,
+    arrival: u32,
+) -> std::io::Result<usize> {
+    match check_returning(dst, arrival) {
+        Ok(()) => socket.send_to(buf, dst).await,
+        Err(reason) => {
+            debug!(
+                src = %dst,
+                ifindex = arrival,
+                reason,
+                "DNS reply to a mesh source withheld"
+            );
+            Ok(0)
+        }
     }
 }
 
@@ -586,7 +613,7 @@ fn refresh_hosts(
 /// `IPV6_RECVPKTINFO` not enabled). A `None` ifindex disables filtering
 /// for that packet — fail-open on unknown arrival — and leaves its reply
 /// routed, except a reply to a mesh source on a socket bound to a specific
-/// address, which [`reply_path`] withholds.
+/// address with a known mesh interface, which [`reply_path`] withholds.
 #[cfg(unix)]
 async fn recv_with_pktinfo(
     socket: &tokio::net::UdpSocket,

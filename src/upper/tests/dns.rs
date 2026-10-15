@@ -10,6 +10,97 @@ fn ip(text: &str) -> IpAddr {
     text.parse().expect("test address")
 }
 
+/// Where no strict pin holds (every target but Linux), a reply to a mesh
+/// source with a known arrival interface is sent only if the route returns
+/// it by that interface, on either bind and whether or not the mesh index is
+/// known; one with an unknown arrival interface is withheld on a specific
+/// bind with a known mesh index and routed otherwise. Non-mesh sources are
+/// routed, as with a strict pin.
+#[test]
+fn reply_path_without_a_strict_pin_sends_mesh_source_replies_only_where_they_return() {
+    use ReplyPath::{Returning, Routed, Withheld};
+    let at = |ip: &str| std::net::SocketAddr::new(ip.parse().unwrap(), 4444);
+    const WILD: bool = true;
+    const SPECIFIC: bool = false;
+    let cases = [
+        // Wildcard bind, mesh interface 3.
+        ("fd11:2233::7", Some(2), Some(3), WILD, Returning(2)),
+        ("fd11:2233::7", None, Some(3), WILD, Routed),
+        ("fdab::2", Some(5), Some(3), WILD, Returning(5)),
+        ("2001:db8::2", Some(2), Some(3), WILD, Routed),
+        ("fe80::1", Some(2), Some(3), WILD, Routed),
+        ("::1", Some(1), Some(3), WILD, Routed),
+        ("::ffff:192.0.2.2", Some(2), Some(3), WILD, Routed),
+        ("192.0.2.2", Some(2), Some(3), WILD, Routed),
+        // Wildcard bind, no known mesh interface.
+        ("fd11:2233::7", Some(2), None, WILD, Returning(2)),
+        ("fd11:2233::7", None, None, WILD, Routed),
+        // Specific bind, mesh interface 3.
+        ("fd11:2233::7", Some(2), Some(3), SPECIFIC, Returning(2)),
+        ("fdab::2", Some(5), Some(3), SPECIFIC, Returning(5)),
+        ("fd11:2233::7", None, Some(3), SPECIFIC, Withheld),
+        ("fd11:2233::7", Some(3), Some(3), SPECIFIC, Returning(3)),
+        ("2001:db8::2", Some(2), Some(3), SPECIFIC, Routed),
+        ("::ffff:192.0.2.2", Some(2), Some(3), SPECIFIC, Routed),
+        ("192.0.2.2", Some(2), Some(3), SPECIFIC, Routed),
+        // Specific bind, no known mesh interface.
+        ("fd11:2233::7", Some(2), None, SPECIFIC, Returning(2)),
+        ("fd11:2233::7", None, None, SPECIFIC, Routed),
+    ];
+    for (ip, arrival, mesh, wildcard, want) in cases {
+        assert_eq!(
+            reply_path(at(ip), arrival, mesh, wildcard, false),
+            want,
+            "source {ip}, arrival {arrival:?}, mesh {mesh:?}, wildcard {wildcard}"
+        );
+    }
+}
+
+/// A returning reply to a local destination is delivered: the probe picks
+/// the destination itself as the source. Runs without root on any target.
+#[tokio::test]
+async fn a_returning_reply_to_a_local_address_is_delivered() {
+    let sender = tokio::net::UdpSocket::bind("[::1]:0").await.unwrap();
+    let receiver = tokio::net::UdpSocket::bind("[::1]:0").await.unwrap();
+    let dst = receiver.local_addr().unwrap();
+    send_reply(
+        &sender,
+        b"returning",
+        dst,
+        ReplyPath::Returning(0x7fff_fff0),
+    )
+    .await
+    .unwrap();
+    let mut buf = [0u8; 16];
+    let (len, _) = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        receiver.recv_from(&mut buf),
+    )
+    .await
+    .expect("the returning reply to a local address was not delivered")
+    .unwrap();
+    assert_eq!(&buf[..len], b"returning");
+}
+
+/// A withheld reply is not sent on any target.
+#[tokio::test]
+async fn a_withheld_reply_is_not_sent_on_any_target() {
+    let sender = tokio::net::UdpSocket::bind("[::1]:0").await.unwrap();
+    let receiver = tokio::net::UdpSocket::bind("[::1]:0").await.unwrap();
+    let dst = receiver.local_addr().unwrap();
+    let sent = send_reply(&sender, b"withheld", dst, ReplyPath::Withheld)
+        .await
+        .unwrap();
+    assert_eq!(sent, 0);
+    let mut buf = [0u8; 16];
+    let got = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        receiver.recv_from(&mut buf),
+    )
+    .await;
+    assert!(got.is_err(), "the withheld reply was delivered: {got:?}");
+}
+
 /// A probe source on one of the arrival interface's prefixes returns the
 /// reply by that interface; one on another interface's prefix does not.
 #[test]
