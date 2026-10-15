@@ -56,6 +56,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   saves it, the upgrade now notices, blocks new connections from FIPS peers,
   and says how to restore the configuration from `/tmp/fips-firewall.uci`.
 
+- The gateway's init script gives the LAN its global-scope address,
+  `2001:2:f1b5::1/64`, when the gateway starts and keeps it across stops and
+  restarts. Turning the gateway off deletes it: `service fips-gateway disable`
+  and `stop`, in either order, starting with the gateway turned off in
+  `fips.yaml`, or removing the package. A gateway disabled while running and
+  then rebooted keeps it until `service fips-gateway stop`. Setting and
+  deleting it on every start and stop reloaded the network each time, which on
+  OpenWrt 25.12 recreates `br-lan` and drops the LAN for a few seconds.
+
 #### Windows
 
 - `install-service.ps1` stops when `\etc\fips\fips.key` exists on the system
@@ -113,6 +122,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the gateway ran as a container's PID 1 and killed it part-way through set-up
   otherwise. A stop during the probe now ends it and exits before any NAT
   table or route exists.
+
+- Connections the gateway host itself makes to a virtual IP now reach the
+  mapped node. They were never translated, so they reached the gateway host
+  instead: `ssh <name>.fips` run on the gateway logged into the gateway, and
+  pings and health checks run there measured the gateway itself.
+- Connections to a virtual IP that has no mapping, such as one whose mapping
+  expired or an address written into a configuration by hand, are now refused
+  by the gateway. They reached whatever listened on the gateway host itself,
+  from the LAN and from the gateway host, so a stale DNS answer could open an
+  SSH session on the router instead of the intended node.
 
 #### Identity and config
 
@@ -291,6 +310,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   edited config is kept across upgrades, along with its old "physical port
   names, NOT bridge names" comment, so an upgrade alone will not correct it.
 
+- `build-ipk.sh` and `build-apk.sh` find the binaries in the target directory
+  cargo used, so a build with `CARGO_TARGET_DIR` or a `target-dir` setting no
+  longer fails after compiling. The apk README covers building in an Alpine
+  container and installing on a router without internet access.
+- OpenWrt 24.10 and 25.12 routers set up with `fips-mesh-setup` now form
+  802.11s peerings with each other. Mesh points peer only when they join with
+  the same basic rates, and the two releases chose different ones when none
+  was set, so each heard the other's beacons and never peered.
+  `fips-mesh-setup` now sets `basic_rate '6000 12000 24000'` on every mesh
+  interface it creates, and an upgrade sets it on mesh interfaces made by
+  older packages, keeping a value you set yourself. The rates apply at the
+  next reboot or network reload, which on a router with the gateway enabled
+  happens during the upgrade; a router on the new rates stops peering with one
+  still on the old, so upgrade routers you reach over the mesh one at a time,
+  farthest first. OpenWrt 22.03 and 23.05 cannot set basic rates on a mesh and
+  join a 2.4 GHz mesh with 1, 2, 5.5 and 11 Mb/s, so they no longer peer there
+  with upgraded 24.10 or later routers; the package README gives the setting
+  that keeps them in. `fips-mesh-setup rates` applies the rates by hand after
+  a reinstall.
+
 #### Routing and discovery
 
 - A backward step of the system clock, from an NTP correction, a manual set
@@ -428,6 +467,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   node's other networks. The macOS WireGuard container example now publishes
   the DNS port on `127.0.0.1` only.
 
+- On Linux, a `.fips` query from a mesh address is answered only out of the
+  interface it arrived on. With a non-loopback `dns.bind_addr`, a host on
+  another network could forge a mesh source address and make the node send DNS
+  replies into the mesh from its own address. With a specific (non-wildcard)
+  `dns.bind_addr`, a query from a ULA (`fd00::/8`) source arriving on a
+  non-mesh interface is no longer answered.
+
+#### Firewall
+
+- The Linux mesh firewall (`fips.nft`) names the TUN interface in one place,
+  `fips_if`, which must match `tun.name`. When the loaded firewall polices
+  another interface than the node's TUN, the daemon now warns at start, and
+  the control socket and `fipstop` report every listener as exposed instead of
+  filtered.
+
 #### Gateway
 
 - The gateway translates only traffic that arrives on its configured
@@ -480,6 +534,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mesh address lies inside the pool prefix now gets `SERVFAIL`, since the
   gateway routes the whole prefix to itself and could never reach it.
 
+- The gateway documentation no longer says the mesh firewall restricts port
+  forwards: forwarded traffic does not pass the firewall's input chain. It now
+  gives a forward-chain recipe that does, and corrects how replies reach the
+  mesh, when configuration is read, and what happens to a forward's connection
+  when it is removed.
+
 #### Links and transports
 
 - An inbound TCP or Tor onion connection is now dropped when it goes longer
@@ -500,6 +560,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the pool needs the slot. With BLE `auto_connect` enabled, a device that
   keeps several handshakes claiming a peer in flight can still delay automatic
   connection to that peer.
+
+- A replayed handshake message from a peer that is not currently linked no
+  longer diverts traffic for that peer, and a single replayed message no
+  longer blocks its real handshake for 15 seconds.
+- A BLE device can no longer replace a link at an address that already holds
+  one.
+- A BLE or Ethernet neighbour can no longer stop a node from dialling a peer
+  by presenting links that claim the peer's key, or grow the BLE probe's
+  address memory without bound.
+
+#### OpenWrt
+
+- `fips-mesh-setup` now puts the 802.11s mesh interfaces it creates in a
+  firewall zone of their own, `fips_mesh`, which rejects all IP input and
+  forwarding, and `fips-mesh-setup remove` takes them out again. The mesh is
+  open at the radio layer and the interfaces were in no firewall zone, so on
+  OpenWrt 22.03, whose default input policy is ACCEPT, anyone in radio range
+  could reach router services such as LuCI, SSH and DNS over the mesh. FIPS
+  UDP and mDNS traffic arriving on the mesh is rejected too; FIPS peers over
+  the mesh use the Ethernet transport, which is not IP and is not affected. An
+  interface already placed in another zone is left there, with a warning.
+  Upgrading the package adds existing mesh interfaces to the zone; if the
+  firewall reload or the save fails, IP traffic arriving on them is dropped
+  until the firewall next reloads, and the upgrade says so.
 
 #### Routing and discovery
 
@@ -540,6 +624,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or point-to-point interfaces, while peers on one LAN whose prefix is wider
   than /24 now reach each other directly.
 - The lookup failure table no longer grows without bound.
+
+- A directly linked peer can no longer make each new coordinate cache entry
+  cost a scan of the whole cache, push other destinations out of the cache
+  faster than a fixed rate, or fill the cache with very deep coordinates; the
+  cache is now bounded by the coordinates it stores as well as its entry
+  count, and traffic from a peer over its rate is still forwarded. Coordinates
+  under another tree root are no longer cached from any session message.
+- A peer that forwards a lookup can no longer stop the genuine answer reaching
+  the node that asked by sending a forged one first. One peer repeating
+  lookups for a target no longer stops other peers' lookups for it being
+  forwarded, and the forward limiter no longer stops limiting when full. A
+  forged lookup answer is now logged at debug level.
 
 #### Sessions and rekey
 
@@ -584,6 +680,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and for 30 seconds after it gains one, such packets are still held briefly
   while routing information arrives. Held packets are answered after the
   lookup schedule plus the handshake timeout, 50 seconds by default.
+
+- A forged session setup naming another node no longer holds back this node's
+  own traffic to that node, and a single forged setup no longer blocks that
+  node's own setup. A node answers each session setup it receives with one
+  reply and no longer resends that reply on its own timer, so a forged setup
+  naming another address draws one reply toward it instead of five.
 
 ## [0.5.2] - 2026-09-28
 
