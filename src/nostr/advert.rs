@@ -72,7 +72,8 @@ pub(super) enum AdvertAdmission {
 /// What one prune of the advert cache removed.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct PruneReport {
-    /// Entries dropped because their validity horizon had passed.
+    /// Entries dropped because their validity horizon and the lapse grace
+    /// after it had both passed.
     pub(super) expired: usize,
     /// Unprotected entries removed to bring the cache back to its cap.
     pub(super) evicted: usize,
@@ -90,19 +91,29 @@ struct CacheEntry {
 
 /// The peer advert cache keyed by author npub, with the admission counter
 /// that orders its entries.
+///
+/// An entry past its validity horizon is *lapsed* for `lapse_grace_ms`: it
+/// still holds its slot and counts against the cap, but serves nothing, and
+/// its author's next advert replaces it as an update that keeps its
+/// `admitted_seq`. Only after the grace is the entry dropped. Without the
+/// grace, an honest author that missed one republish during a flood that
+/// keeps the cache full would see its freed slot go to the next flood key
+/// and its next advert refused as a newcomer's.
 #[derive(Default)]
 struct AdvertCache {
     entries: HashMap<String, CacheEntry>,
     next_seq: u64,
+    lapse_grace_ms: u64,
 }
 
 impl AdvertCache {
-    /// Drop every entry whose validity horizon is not after `now_ms`, and
-    /// return how many went.
+    /// Drop every entry whose validity horizon plus the lapse grace is not
+    /// after `now_ms`, and return how many went.
     fn drop_expired(&mut self, now_ms: u64) -> usize {
+        let grace = self.lapse_grace_ms;
         let before = self.entries.len();
         self.entries
-            .retain(|_, entry| entry.cached.valid_until_ms > now_ms);
+            .retain(|_, entry| entry.cached.valid_until_ms.saturating_add(grace) > now_ms);
         before - self.entries.len()
     }
 
@@ -197,6 +208,26 @@ impl AdvertMachine {
         }
     }
 
+    /// Keep an entry that passes its validity horizon in the cache, lapsed,
+    /// for `grace_ms` more (see [`AdvertCache`]). The runtime passes one
+    /// republish interval of this node (`advert_refresh_secs`). That is a
+    /// limit: an honest author republishing less often than this node does
+    /// can still lose its slot during a flood. Without this call the grace
+    /// is zero and an entry is dropped at its horizon.
+    pub(super) fn with_lapse_grace(mut self, grace_ms: u64) -> Self {
+        self.cache
+            .get_mut()
+            .expect("advert-machine cache mutex poisoned")
+            .lapse_grace_ms = grace_ms;
+        self
+    }
+
+    /// The lapse grace, for tests that check what the runtime configured.
+    #[cfg(test)]
+    pub(super) fn lapse_grace_ms(&self) -> u64 {
+        self.lock_cache().lapse_grace_ms
+    }
+
     /// Replace the set of authors whose adverts the cache protects.
     pub(super) fn set_protected(&self, npubs: HashSet<String>) {
         *self.lock_protected() = npubs;
@@ -221,7 +252,7 @@ impl AdvertMachine {
     // --- cache: prune / observe / fetch --------------------------------
 
     /// TTL and size-cap maintenance. Drops entries past their validity
-    /// horizon; then, while the cache is above its cap, removes unprotected
+    /// horizon and lapse grace; then, while the cache is above its cap, removes unprotected
     /// entries, the most recently admitted first. Protected entries are never
     /// removed before they expire, so the cache can stay above its cap by
     /// protected entries alone.
@@ -246,10 +277,11 @@ impl AdvertMachine {
 
     /// Offer an advert event received on the notify loop to the cache.
     ///
-    /// An author already cached has its entry replaced when this advert's
-    /// `created_at` is not older than the cached one. A new author is
-    /// admitted while the cache has room. When the cache is full, expired
-    /// entries are dropped first; then a protected author (a configured peer,
+    /// An author already cached, lapsed or not, has its entry replaced when
+    /// this advert's `created_at` is not older than the cached one, keeping
+    /// its admission order. A new author is admitted while the cache has
+    /// room. When the cache is full, entries past their lapse grace are
+    /// dropped first; then a protected author (a configured peer,
     /// or one with an established link) is still admitted, taking the slot of
     /// the unprotected entry admitted most recently, and anyone else is
     /// refused rather than evicting an entry.
@@ -274,16 +306,19 @@ impl AdvertMachine {
     }
 
     /// Cache-hit lookup for the fetch path: return the cached advert body
-    /// if present, `None` if the driver must fetch from relays.
-    pub(super) fn cached_advert(&self, peer_npub: &str) -> Option<OverlayAdvert> {
+    /// if present and not past its horizon at `now_ms`, `None` if the driver
+    /// must fetch from relays. A lapsed entry is never served.
+    pub(super) fn cached_advert(&self, peer_npub: &str, now_ms: u64) -> Option<OverlayAdvert> {
         self.lock_cache()
             .entries
             .get(peer_npub)
+            .filter(|entry| entry.cached.valid_until_ms > now_ms)
             .map(|entry| entry.cached.advert.clone())
     }
 
-    /// The `created_at` of a cached advert, if any. Used by the stale-check
-    /// refetch path to decide whether a relay result is newer.
+    /// The `created_at` of a cached advert, if any, lapsed entries included.
+    /// Used by the stale-check refetch path to decide whether a relay result
+    /// is newer; it serves no advert.
     pub(super) fn cached_created_at(&self, peer_npub: &str) -> Option<u64> {
         self.lock_cache()
             .entries
@@ -379,8 +414,8 @@ impl AdvertMachine {
     /// retry) without spending its enqueue budget. Authors in `skip` (those
     /// with an established link, and unconfigured authors already queued) are
     /// left out, since the sweep would pass over them and they would only
-    /// take window slots. Our own advert and expired entries are left out
-    /// too.
+    /// take window slots. Our own advert and entries past their horizon,
+    /// lapsed ones included, are left out too.
     pub(super) fn open_discovery_candidates(
         &self,
         max: usize,

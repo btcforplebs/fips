@@ -46,6 +46,20 @@ use crate::utils::onlink::OnLinkPrefixes;
 
 const ADVERT_CACHE_STALE_GRACE_MULTIPLIER: u64 = 2;
 
+/// The advert machine for `config`: entries kept to a grace-extended max
+/// age, the configured cache cap, and one republish interval of lapse grace
+/// after an entry's horizon, so an honest author that misses one republish
+/// keeps its slot during a flood.
+pub(super) fn advert_machine(npub: String, config: &NostrRendezvousConfig) -> AdvertMachine {
+    AdvertMachine::new(
+        npub,
+        config.advertise,
+        config.advert_ttl_secs * 1000 * ADVERT_CACHE_STALE_GRACE_MULTIPLIER,
+        config.advert_cache_max_entries,
+    )
+    .with_lapse_grace(config.advert_refresh_secs.saturating_mul(1000))
+}
+
 fn short_npub(npub: &str) -> String {
     npub.strip_prefix("npub1")
         .filter(|s| s.len() >= 8)
@@ -368,12 +382,7 @@ impl NostrRendezvous {
             config.failure_state_max_entries,
         );
 
-        let advert = AdvertMachine::new(
-            npub.clone(),
-            config.advertise,
-            config.advert_ttl_secs * 1000 * ADVERT_CACHE_STALE_GRACE_MULTIPLIER,
-            config.advert_cache_max_entries,
-        );
+        let advert = advert_machine(npub.clone(), &config);
         let traversal = TraversalMachine::new(
             config.replay_window_secs * 1000,
             config.seen_sessions_max_entries,
@@ -1698,7 +1707,7 @@ impl NostrRendezvous {
         let canonical = target_pubkey.to_bech32().expect("infallible");
         let peer_npub = canonical.as_str();
         self.prune_advert_cache();
-        if let Some(advert) = self.advert.cached_advert(peer_npub) {
+        if let Some(advert) = self.advert.cached_advert(peer_npub, now_ms()) {
             debug!(
                 peer = %short_npub(peer_npub),
                 source = "cache",
@@ -2119,12 +2128,7 @@ impl NostrRendezvous {
             config.warn_log_interval_secs,
             config.failure_state_max_entries,
         );
-        let advert = AdvertMachine::new(
-            npub.clone(),
-            config.advertise,
-            config.advert_ttl_secs * 1000 * ADVERT_CACHE_STALE_GRACE_MULTIPLIER,
-            config.advert_cache_max_entries,
-        );
+        let advert = advert_machine(npub.clone(), &config);
         let traversal = TraversalMachine::new(
             config.replay_window_secs * 1000,
             config.seen_sessions_max_entries,

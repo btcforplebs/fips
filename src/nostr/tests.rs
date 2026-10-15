@@ -2525,3 +2525,202 @@ async fn answering_a_peers_offer_does_not_resend_ours() {
         "an offer we answer must not trigger a re-send"
     );
 }
+
+// --- advert cache: an entry past its horizon keeps its slot for a grace ---
+
+mod advert_lapse {
+    use std::collections::HashSet;
+
+    use rand::SeedableRng;
+    use rand::rngs::StdRng;
+
+    use super::super::advert::{AdvertAdmission, AdvertMachine};
+    use super::{ADVERT_IDENTIFIER, ADVERT_VERSION, OverlayAdvert, OverlayEndpointAdvert};
+    use super::{OverlayTransportKind, nostr_config_with_refresh};
+
+    const T0: u64 = 1_000_000_000;
+    /// The advert horizon an honest author's event gives (`advert_ttl_secs`).
+    const HORIZON: u64 = 3_600_000;
+    /// One republish interval (`advert_refresh_secs`), the grace.
+    const REFRESH: u64 = 1_800_000;
+
+    fn advert() -> OverlayAdvert {
+        OverlayAdvert {
+            identifier: ADVERT_IDENTIFIER.to_string(),
+            version: ADVERT_VERSION,
+            endpoints: vec![OverlayEndpointAdvert {
+                transport: OverlayTransportKind::Udp,
+                addr: "203.0.113.7:9000".to_string(),
+            }],
+            signal_relays: None,
+            stun_servers: None,
+        }
+    }
+
+    /// A cache of `cap` entries with one republish interval of grace, as the
+    /// runtime builds it.
+    fn cache(cap: usize) -> AdvertMachine {
+        AdvertMachine::new("npub1self".to_string(), true, 2 * HORIZON, cap)
+            .with_lapse_grace(REFRESH)
+    }
+
+    fn offer(
+        m: &AdvertMachine,
+        npub: &str,
+        created_at: u64,
+        valid_until_ms: u64,
+        now_ms: u64,
+    ) -> AdvertAdmission {
+        m.observe_advert(npub, advert(), created_at, valid_until_ms, now_ms)
+    }
+
+    /// A cache held full by a flood, with the honest author admitted first.
+    /// Flood adverts omit the expiration tag, so they carry twice the horizon.
+    fn flooded(cap: usize) -> AdvertMachine {
+        let m = cache(cap);
+        assert_eq!(
+            offer(&m, "npub1honest", 1, T0 + HORIZON, T0),
+            AdvertAdmission::Admitted
+        );
+        for i in 1..cap {
+            let key = format!("npub1flood{i}");
+            assert_eq!(
+                offer(&m, &key, 1, T0 + 2 * HORIZON, T0),
+                AdvertAdmission::Admitted
+            );
+        }
+        m
+    }
+
+    /// The honest author misses one republish, so its entry passes its
+    /// horizon while a flood keeps the cache full. Its next advert must take
+    /// its slot back rather than be refused as a newcomer's.
+    #[test]
+    fn an_honest_author_that_misses_one_republish_during_a_flood_keeps_its_slot() {
+        let m = flooded(4);
+        let lapsed = T0 + HORIZON + 1;
+        let _ = m.prune(lapsed);
+        let late = offer(&m, "npub1flood-late", 1, lapsed + 2 * HORIZON, lapsed);
+
+        let republished = T0 + HORIZON + REFRESH / 2;
+        let _ = m.prune(republished);
+        assert_eq!(
+            offer(&m, "npub1honest", 2, republished + HORIZON, republished),
+            AdvertAdmission::Updated,
+            "the honest author's next advert takes its slot back"
+        );
+        assert!(m.cached_advert("npub1honest", republished).is_some());
+        assert!(
+            matches!(late, AdvertAdmission::Refused { .. }),
+            "a flood key took the lapsed slot: {late:?}"
+        );
+    }
+
+    /// The slot an honest author takes back keeps its admission order, so a
+    /// protected author arriving later still displaces the newest flood key
+    /// rather than the returning author.
+    #[test]
+    fn a_returning_author_keeps_its_admission_order() {
+        let m = flooded(4);
+        let republished = T0 + HORIZON + 1;
+        let _ = m.prune(republished);
+        assert_eq!(
+            offer(&m, "npub1honest", 2, republished + HORIZON, republished),
+            AdvertAdmission::Updated
+        );
+        m.set_protected(["npub1configured".to_string()].into_iter().collect());
+        assert_eq!(
+            offer(&m, "npub1configured", 1, republished + HORIZON, republished),
+            AdvertAdmission::Admitted
+        );
+        assert!(m.cached_created_at("npub1honest").is_some());
+        assert!(
+            m.cached_created_at("npub1flood3").is_none(),
+            "the most recently admitted flood key makes room"
+        );
+    }
+
+    /// An entry in its grace holds its slot but serves nothing: neither the
+    /// dial path's cache lookup nor open discovery sees it.
+    #[test]
+    fn a_lapsed_advert_is_served_to_neither_the_dial_path_nor_open_discovery() {
+        let m = flooded(4);
+        let lapsed = T0 + HORIZON + 1;
+        let _ = m.prune(lapsed);
+
+        assert!(m.cached_created_at("npub1honest").is_some(), "slot kept");
+        assert!(m.cached_advert("npub1honest", lapsed).is_none());
+        let window =
+            m.open_discovery_candidates(64, lapsed, &HashSet::new(), &mut StdRng::seed_from_u64(3));
+        assert!(
+            window.iter().all(|(npub, _, _)| npub != "npub1honest"),
+            "a lapsed entry was offered to open discovery"
+        );
+        assert_eq!(window.len(), 3, "the live entries are still offered");
+
+        // A protected author's lapsed entry is not served either.
+        m.set_protected(["npub1honest".to_string()].into_iter().collect());
+        let window =
+            m.open_discovery_candidates(64, lapsed, &HashSet::new(), &mut StdRng::seed_from_u64(3));
+        assert!(window.iter().all(|(npub, _, _)| npub != "npub1honest"));
+    }
+
+    /// Once the grace has passed without a republish, the slot frees as it
+    /// did before, and a newcomer is admitted.
+    #[test]
+    fn a_lapsed_slot_frees_once_one_republish_interval_has_passed() {
+        let m = flooded(4);
+        let still_lapsed = T0 + HORIZON + REFRESH - 1;
+        let report = m.prune(still_lapsed);
+        assert_eq!(report.expired, 0);
+        assert!(m.cached_created_at("npub1honest").is_some());
+
+        let gone = T0 + HORIZON + REFRESH;
+        let report = m.prune(gone);
+        assert_eq!(report.expired, 1);
+        assert!(m.cached_created_at("npub1honest").is_none());
+        assert_eq!(
+            offer(&m, "npub1newcomer", 1, gone + HORIZON, gone),
+            AdvertAdmission::Admitted
+        );
+    }
+
+    /// A protected author arriving at a cache full of live and lapsed entries
+    /// is admitted as before, taking the newest unprotected entry's slot.
+    #[test]
+    fn a_protected_author_still_makes_room_while_an_entry_is_lapsed() {
+        let m = flooded(4);
+        let lapsed = T0 + HORIZON + 1;
+        let _ = m.prune(lapsed);
+        m.set_protected(["npub1configured".to_string()].into_iter().collect());
+        assert_eq!(
+            offer(&m, "npub1configured", 1, lapsed + HORIZON, lapsed),
+            AdvertAdmission::Admitted
+        );
+        assert!(m.cached_created_at("npub1configured").is_some());
+        assert!(m.cached_created_at("npub1flood3").is_none());
+        assert!(
+            m.cached_created_at("npub1honest").is_some(),
+            "the lapsed honest entry keeps its slot"
+        );
+    }
+
+    /// The runtime gives the cache one republish interval of grace, taken
+    /// from this node's own `advert_refresh_secs`.
+    #[test]
+    fn the_runtime_takes_the_grace_from_the_advert_refresh_interval() {
+        let m = super::super::runtime::advert_machine(
+            "npub1self".to_string(),
+            &nostr_config_with_refresh(1_200),
+        );
+        assert_eq!(m.lapse_grace_ms(), 1_200_000);
+    }
+}
+
+/// The default Nostr discovery configuration with `advert_refresh_secs` set.
+fn nostr_config_with_refresh(secs: u64) -> crate::config::NostrRendezvousConfig {
+    crate::config::NostrRendezvousConfig {
+        advert_refresh_secs: secs,
+        ..Default::default()
+    }
+}
