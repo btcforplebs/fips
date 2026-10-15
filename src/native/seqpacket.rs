@@ -70,9 +70,9 @@ pub enum Received {
 /// gets Linux's arm, which is the one that fails loudly: a kernel without
 /// `AF_UNIX` `SOCK_SEQPACKET` refuses the `socketpair` outright rather than
 /// returning something that silently loses messages.
-#[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "freebsd")))]
 const SOCK_TYPE: libc::c_int = libc::SOCK_SEQPACKET;
-#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
 const SOCK_TYPE: libc::c_int = libc::SOCK_DGRAM;
 
 /// Create a connected socket pair of this platform's [`SOCK_TYPE`].
@@ -91,9 +91,9 @@ const SOCK_TYPE: libc::c_int = libc::SOCK_DGRAM;
 /// the reactor while the half handed to the client stays blocking, which is
 /// what a client calling `recv` in a loop expects.
 pub fn pair() -> io::Result<(OwnedFd, OwnedFd)> {
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     let sock_type = SOCK_TYPE | libc::SOCK_CLOEXEC;
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     let sock_type = SOCK_TYPE;
 
     let mut fds = [0 as libc::c_int; 2];
@@ -108,7 +108,7 @@ pub fn pair() -> io::Result<(OwnedFd, OwnedFd)> {
     // syscall means an error below closes them rather than leaking them.
     let pair = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     {
         set_cloexec(pair.0.as_raw_fd())?;
         set_cloexec(pair.1.as_raw_fd())?;
@@ -123,7 +123,7 @@ pub fn pair() -> io::Result<(OwnedFd, OwnedFd)> {
 /// descriptor carries survives. Used both here, where `socketpair` refuses
 /// `SOCK_CLOEXEC`, and by [`super::fdpass`], where `recvmsg` has no
 /// `MSG_CMSG_CLOEXEC` to pass.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 pub(super) fn set_cloexec(fd: RawFd) -> io::Result<()> {
     // SAFETY: the descriptor is open for the call.
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
@@ -177,7 +177,7 @@ pub fn set_sndbuf(fd: &OwnedFd, bytes: usize) -> io::Result<()> {
 /// A quarter second is chosen against the cost, which is one timer per idle
 /// flow and listener. Shortening it buys a faster reclaim of something nothing
 /// is waiting on; lengthening it holds a dead flow's port longer.
-#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
 const CLOSE_RETRY: Duration = Duration::from_millis(250);
 
 /// The daemon's half of a flow's or a listener's socket pair, registered with
@@ -239,14 +239,14 @@ impl Seqpacket {
             // consumes it, so the bound sets detection latency and cannot lose
             // the event. Everywhere else the readiness is authoritative and the
             // wait stays unbounded.
-            #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+            #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
             let mut guard = match tokio::time::timeout(CLOSE_RETRY, self.inner.readable()).await {
                 Ok(ready) => ready?,
                 // The bound expired. The loop retries the syscall, which is the
                 // only thing that can see this platform's close.
                 Err(_elapsed) => continue,
             };
-            #[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
+            #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "freebsd")))]
             let mut guard = self.inner.readable().await?;
             let attempt = guard.try_io(|inner| recv_once(inner.get_ref().as_raw_fd(), buf));
             match attempt {

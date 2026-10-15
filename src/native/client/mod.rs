@@ -62,9 +62,9 @@ pub use secp256k1::XOnlyPublicKey;
 /// development run usually does, is not at this path on any platform. That is
 /// what `connect_at` and `bind_at` are for, and it is why the resolver is
 /// documented rather than hidden.
-#[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "freebsd")))]
 pub const SOCKET: &str = "/run/fips/api.sock";
-#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
 pub const SOCKET: &str = "/var/run/fips/api.sock";
 
 /// Bytes taken from the RPC connection per `recvmsg`.
