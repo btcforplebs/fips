@@ -101,6 +101,7 @@
 # Exit codes:
 #   0   — all stages passed
 #   1   — one or more stages failed
+#   2   — usage error (unknown option or missing value); nothing ran
 #   130 — interrupted by SIGINT  (128 + 2;  run was cancelled, not a failure)
 #   143 — terminated by SIGTERM  (128 + 15; run was cancelled, not a failure)
 #
@@ -298,9 +299,24 @@ list_suites() {
     exit 0
 }
 
+# Print the usage; the caller decides the exit status.
 usage() {
     sed -n '2,/^$/{ s/^# \?//; p }' "$0"
-    exit 0
+    return 0
+}
+
+# A bad command line: say what was wrong, show the usage, and exit 2 before
+# anything runs, so a mistyped flag is never mistaken for a green run.
+usage_error() {
+    echo "$1" >&2
+    usage >&2
+    exit 2
+}
+
+# An option that takes a value must be followed by one.
+need_value() {
+    [[ $# -ge 2 ]] || usage_error "$1 needs a value"
+    return 0
 }
 
 # ── Parse arguments ────────────────────────────────────────────────────────
@@ -313,13 +329,13 @@ while [[ $# -gt 0 ]]; do
         --skip-chaos)       SKIP_CHAOS=true; shift ;;
         --cross-check)      CROSS_CHECK=true; shift ;;
         --with-tor)         WITH_TOR=true; shift ;;
-        --only)             ONLY_SUITE="$2"; shift 2 ;;
-        -j|--jobs)          PARALLEL_JOBS="$2"; shift 2 ;;
+        --only)             need_value "$@"; ONLY_SUITE="$2"; shift 2 ;;
+        -j|--jobs)          need_value "$@"; PARALLEL_JOBS="$2"; shift 2 ;;
         --list)             list_suites ;;
         --check-parity)     exec "$SCRIPT_DIR/check-ci-parity.sh" ;;
         --reap)             exec "$SCRIPT_DIR/ci-cleanup.sh" ;;
-        -h|--help)          usage ;;
-        *)                  echo "Unknown option: $1"; usage ;;
+        -h|--help)          usage; exit 0 ;;
+        *)                  usage_error "Unknown option: $1" ;;
     esac
 done
 
@@ -1739,6 +1755,17 @@ run_glibc_floor() {
     record "glibc-floor" $rc
 }
 
+# This script's own argument handling: an unknown option or a missing value
+# exits 2 before anything runs, and --help exits 0. Each case ends during
+# parsing, so it is static and takes about a second.
+run_ciargs() {
+    local rc=0
+    info "[ci-args] Checking ci-local.sh's argument handling"
+    bash "$SCRIPT_DIR/lib/ci-args-test.sh" || rc=$?
+    record "ci-args" $rc
+    return 0
+}
+
 # ── Main ───────────────────────────────────────────────────────────────────
 
 main() {
@@ -1767,6 +1794,7 @@ main() {
     run_package_versions
     run_nextest_flaky
     run_glibc_floor
+    run_ciargs
 
     if [[ "$TEST_ONLY" == true ]]; then
         run_tests

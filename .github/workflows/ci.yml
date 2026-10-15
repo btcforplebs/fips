@@ -118,6 +118,11 @@ jobs:
       # ci-local.sh's run_glibc_floor by hand.
       - name: Check the glibc floor check against its cases
         run: bash testing/glibc-floor/test.sh
+      # ci-local.sh's argument handling: a bad option exits 2 before anything
+      # runs. Every case ends during parsing. Kept in step with ci-local.sh's
+      # run_ciargs by hand.
+      - name: Check ci-local.sh's argument handling
+        run: bash testing/lib/ci-args-test.sh
 
   fmt:
     name: Format check
