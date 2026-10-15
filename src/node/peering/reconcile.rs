@@ -167,11 +167,13 @@ pub(crate) struct Observed {
     pub pending_connects: usize,
     /// The `peers` map keys (fully authenticated peers).
     pub connected: HashSet<NodeAddr>,
-    /// Peers with an in-flight outbound connection (`is_connecting_to_peer`).
+    /// Peers with an in-flight handshake leg, leaving out legs dialled on a
+    /// transport neighbour's claim.
     pub connecting: HashSet<NodeAddr>,
     /// In-flight legs per peer = connections(expected == addr) +
-    /// pending_connects(addr), used by the LAN layer's per-peer parallel cap.
-    /// Anonymous None-identity legs never key this map.
+    /// pending_connects(addr), leaving out claim dials; used by the LAN
+    /// layer's per-peer parallel cap. Anonymous None-identity legs never key
+    /// this map.
     pub in_flight_by_peer: HashMap<NodeAddr, usize>,
     /// Unconfigured LAN dials still connecting, held against
     /// [`MAX_LAN_DIALS_IN_FLIGHT`].

@@ -102,6 +102,25 @@ fn log_lan_set_full(first_at_bound: bool) {
     }
 }
 
+/// One outbound dial in flight that names the peer it expects; see
+/// [`Node::dials_in_flight`].
+#[derive(Clone, Copy, Debug)]
+pub(in crate::node) struct DialInFlight {
+    /// The peer the dial expects to reach.
+    pub(in crate::node) peer: NodeAddr,
+    /// Where the dial came from.
+    pub(in crate::node) origin: DialOrigin,
+    /// A handshake leg, rather than a transport connect still pending.
+    pub(in crate::node) leg: bool,
+}
+
+impl DialInFlight {
+    /// Whether the dial was made on a transport neighbour's unproven claim.
+    pub(in crate::node) fn is_claim(&self) -> bool {
+        self.origin == DialOrigin::NeighbourClaim
+    }
+}
+
 impl Node {
     /// Replace the runtime peer list.
     ///
@@ -431,8 +450,10 @@ impl Node {
             return Ok(());
         }
 
-        // Check if connection already in progress to this peer
-        if self.is_connecting_to_peer(&peer_node_addr) {
+        // Check if connection already in progress to this peer. A leg dialled
+        // on a transport neighbour's claim does not count: it is unproven, so
+        // it must not hold back the peer's configured address.
+        if self.is_dialling_addressed(&peer_node_addr) {
             debug!(
                 npub = %peer_config.npub,
                 "Connection already in progress, skipping"
@@ -444,13 +465,46 @@ impl Node {
             .await
     }
 
+    /// Whether a handshake leg expecting `peer_node_addr` is in flight, on
+    /// any path and whatever the dial came from.
+    ///
+    /// The NAT traversal paths read this one: they reason about whether any
+    /// handshake state exists for the peer, so a claim leg counts there.
     fn is_connecting_to_peer(&self, peer_node_addr: &NodeAddr) -> bool {
-        self.connections().any(|(_, machine)| {
-            machine
-                .conn_expected_identity()
-                .map(|id| id.node_addr() == peer_node_addr)
-                .unwrap_or(false)
-        })
+        self.dials_in_flight()
+            .any(|dial| dial.leg && dial.peer == *peer_node_addr)
+    }
+
+    /// Whether a handshake leg expecting `peer_node_addr` is in flight that
+    /// was not dialled on a transport neighbour's claim. The configured-dial
+    /// guards read this one, so an unproven claim cannot hold them back.
+    fn is_dialling_addressed(&self, peer_node_addr: &NodeAddr) -> bool {
+        self.dials_in_flight()
+            .any(|dial| dial.leg && !dial.is_claim() && dial.peer == *peer_node_addr)
+    }
+
+    /// Every outbound dial in flight that names the peer it expects: each
+    /// handshake leg with an expected identity, then each pending transport
+    /// connect. The one source for the per-node in-flight counts, so they
+    /// agree on what a claim is.
+    pub(in crate::node) fn dials_in_flight(&self) -> impl Iterator<Item = DialInFlight> + '_ {
+        let legs = self.connections().filter_map(|(_, machine)| {
+            machine.conn_expected_identity().map(|id| DialInFlight {
+                peer: *id.node_addr(),
+                origin: machine.dial_origin(),
+                leg: true,
+            })
+        });
+        let pending = self
+            .peering
+            .pending_connects
+            .iter()
+            .map(|pending| DialInFlight {
+                peer: *pending.peer_identity.node_addr(),
+                origin: pending.origin,
+                leg: false,
+            });
+        legs.chain(pending)
     }
 
     pub(in crate::node) fn is_connecting_to_peer_on_path(
@@ -3159,26 +3213,21 @@ impl Node {
     ///
     /// The `connected` / `connecting` sets gate the floor, retry-dial, overlay,
     /// and LAN layers; `in_flight_by_peer` feeds the LAN layer's per-peer
-    /// parallel cap, computed exactly as the deleted
-    /// `path_candidate_attempt_budget` did: `pending legs(expected == addr) +
-    /// pending_connects(addr)`. The scalar counts stay unpopulated at the
-    /// ceiling-only posture (no layer reads them; see [`Observed`]).
+    /// parallel cap, computed as `path_candidate_attempt_budget` does:
+    /// `legs(expected == addr) + pending_connects(addr)`. Dials made on a
+    /// transport neighbour's claim are left out of all three, because the
+    /// claim is unproven and must not hold back another path to the node.
+    /// The scalar counts stay unpopulated at the ceiling-only posture (no
+    /// layer reads them; see [`Observed`]).
     pub(in crate::node) fn observe_peering(&self) -> Observed {
         let connected: HashSet<NodeAddr> = self.peers.keys().copied().collect();
-        let connecting: HashSet<NodeAddr> = self
-            .connections()
-            .filter_map(|(_, machine)| machine.conn_expected_identity().map(|id| *id.node_addr()))
-            .collect();
+        let mut connecting: HashSet<NodeAddr> = HashSet::new();
         let mut in_flight_by_peer: HashMap<NodeAddr, usize> = HashMap::new();
-        for (_, machine) in self.connections() {
-            if let Some(id) = machine.conn_expected_identity() {
-                *in_flight_by_peer.entry(*id.node_addr()).or_default() += 1;
+        for dial in self.dials_in_flight().filter(|dial| !dial.is_claim()) {
+            if dial.leg {
+                connecting.insert(dial.peer);
             }
-        }
-        for pending in &self.peering.pending_connects {
-            *in_flight_by_peer
-                .entry(*pending.peer_identity.node_addr())
-                .or_default() += 1;
+            *in_flight_by_peer.entry(dial.peer).or_default() += 1;
         }
         Observed {
             connected,
@@ -3239,22 +3288,12 @@ impl Node {
             return 0;
         }
 
+        // Claim dials do not count: an unproven claim must not use up the
+        // budget of a path held for the peer.
         let in_flight_for_peer = self
-            .connections()
-            .filter(|(_, machine)| {
-                machine
-                    .conn_expected_identity()
-                    .map(|identity| identity.node_addr() == peer_node_addr)
-                    .unwrap_or(false)
-            })
-            .count()
-            .saturating_add(
-                self.peering
-                    .pending_connects
-                    .iter()
-                    .filter(|pending| pending.peer_identity.node_addr() == peer_node_addr)
-                    .count(),
-            );
+            .dials_in_flight()
+            .filter(|dial| !dial.is_claim() && dial.peer == *peer_node_addr)
+            .count();
 
         self.outbound_handshake_slots()
             .min(self.outbound_link_slots())
@@ -3362,7 +3401,7 @@ impl Node {
             );
             return Ok(());
         }
-        if self.is_connecting_to_peer(&peer_node_addr) {
+        if self.is_dialling_addressed(&peer_node_addr) {
             debug!(
                 npub = %peer_config.npub,
                 "Connection already in progress, skipping address attempts"
