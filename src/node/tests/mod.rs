@@ -19,6 +19,7 @@ mod decrypt_forged;
 mod disconnect;
 mod discovery;
 mod establish_chartests;
+mod forged_initial_msg2;
 mod forwarding;
 mod handshake;
 mod heartbeat;

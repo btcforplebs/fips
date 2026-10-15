@@ -1745,18 +1745,40 @@ impl Node {
 
             let noise_msg2 = &packet.data[header.noise_msg2_offset..];
             if let Err(e) = machine.complete_handshake(noise_msg2, packet.timestamp_ms) {
+                // Nothing authenticated this msg2 before the read, and the
+                // index it names travels in cleartext in our msg1, so it may
+                // be a forgery. Ending the attempt here would let anyone who
+                // saw the msg1 end every dial with one datagram. When the
+                // handle is back in the leg, the read was rolled back: keep
+                // the attempt, its dispatch entry, its resend schedule and its
+                // deadline, so the genuine msg2 can still complete it. If no
+                // readable msg2 ever arrives, the handshake timeout ends the
+                // attempt as it would for a lost one. Logged at debug because
+                // a forger can send one per datagram.
+                if machine
+                    .leg()
+                    .is_some_and(|leg| leg.noise_handshake.is_some())
+                {
+                    debug!(
+                        link_id = %link_id,
+                        error = %e,
+                        "msg2 did not authenticate, keeping the handshake attempt"
+                    );
+                    self.stats_mut()
+                        .record_reject(RejectReason::Handshake(HandshakeReject::BadState));
+                    return;
+                }
                 warn!(
                     link_id = %link_id,
                     error = %e,
                     "Handshake completion failed"
                 );
-                // Drop the Noise handle (byte-identical point) and record the
-                // failure on the control machine as `send_failed` — the
-                // failure state's home. The machine PHASE stays exactly where
-                // the old failure left it (`SentMsg1`): the stale-connection
-                // sweep reclaims the connection unconditionally via the
-                // machine `is_failed()` at the next tick, before any
-                // projection or resend.
+                // The handle is gone, so the leg cannot continue: record the
+                // failure on the control machine as `send_failed`, the failure
+                // state's home. The machine PHASE stays where it is
+                // (`SentMsg1`): the stale-connection sweep reclaims the
+                // connection unconditionally via the machine `is_failed()` at
+                // the next tick, before any projection or resend.
                 machine.mark_failed();
                 machine.mark_send_failed();
                 self.stats_mut()
