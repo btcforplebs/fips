@@ -124,6 +124,50 @@ pub(in crate::node) enum LanOffer {
     Refused { first_at_bound: bool },
 }
 
+/// The mDNS host labels of the identities this node knows (its configured
+/// and connected peers), each with the node that owns it.
+///
+/// The browser accepts an advert only when its service host is the
+/// advertised npub's own label, but the label carries only 55 bits of the
+/// key: a sender with no private key can mint valid npubs sharing a FIPS
+/// node's label and so name that node's host, possibly on another of this
+/// node's links, under keys whose handshakes never complete. An advert whose
+/// label belongs to a known identity under a different npub is such a
+/// forgery (honest labels collide with probability about 2^-55), and is
+/// refused before it is held.
+///
+/// This covers only the hosts this node knows. A forgery naming a FIPS host
+/// that is neither configured nor connected still passes; judging the advert
+/// by the interface its SRV record arrived on would cover that, and needs
+/// mdns-sd to report it.
+#[derive(Debug, Default)]
+pub(in crate::node) struct KnownLabels {
+    owners: HashMap<String, NodeAddr>,
+}
+
+impl KnownLabels {
+    /// The labels of `known`, keyed in lower case from the canonical npub.
+    pub(in crate::node) fn new<'a>(known: impl IntoIterator<Item = &'a PeerIdentity>) -> Self {
+        let owners = known
+            .into_iter()
+            .filter_map(|identity| Some((label_key(&identity.npub())?, *identity.node_addr())))
+            .collect();
+        Self { owners }
+    }
+
+    /// Whether `identity`'s label belongs to a known identity other than it.
+    pub(in crate::node) fn is_impostor(&self, identity: &PeerIdentity) -> bool {
+        label_key(&identity.npub())
+            .and_then(|label| self.owners.get(&label))
+            .is_some_and(|owner| owner != identity.node_addr())
+    }
+}
+
+/// The lower-case mDNS host label of `npub`.
+fn label_key(npub: &str) -> Option<String> {
+    crate::mdns::advert_label_of(npub).map(|label| label.to_ascii_lowercase())
+}
+
 /// The held LAN candidates, the unconfigured nodes dialled from them that
 /// are still connecting, and the set-full log latch.
 #[derive(Debug, Default)]

@@ -495,7 +495,7 @@ async fn test_connected_udp_activates_on_an_adopted_traversal_transport_and_on_a
 }
 
 /// An on-demand configured peer on a placeholder address nothing dials.
-fn on_demand_peer(npub: String) -> crate::config::PeerConfig {
+pub(super) fn on_demand_peer(npub: String) -> crate::config::PeerConfig {
     crate::config::PeerConfig {
         npub,
         alias: None,
@@ -584,7 +584,7 @@ async fn a_restarted_nostr_engine_receives_the_configured_set_before_any_tick() 
 
 /// A running node with one started UDP transport on loopback, for driving
 /// LAN discovery through the real dial path.
-async fn lan_node() -> Node {
+pub(super) async fn lan_node() -> Node {
     let mut node = make_node();
     let transport_id = TransportId::new(1);
     let (packet_tx, packet_rx) = packet_channel(1024);
@@ -608,7 +608,7 @@ async fn lan_node() -> Node {
 }
 
 /// The interface index the tests' loopback prefix and adverts use.
-const LAN_TEST_IF: u32 = 1;
+pub(super) const LAN_TEST_IF: u32 = 1;
 
 /// One mDNS discovery of a fresh npub at `addr`, arriving on
 /// [`LAN_TEST_IF`].
@@ -628,7 +628,7 @@ fn lan_event_on(addr: &str, interface: u32) -> crate::mdns::LanEvent {
 }
 
 /// 127.0.0.1/32 on interface [`LAN_TEST_IF`].
-fn loopback_prefix() -> crate::utils::onlink::OnLinkPrefixes {
+pub(super) fn loopback_prefix() -> crate::utils::onlink::OnLinkPrefixes {
     crate::utils::onlink::OnLinkPrefixes::from_indexed([(
         "127.0.0.1".parse().unwrap(),
         32,
@@ -636,7 +636,7 @@ fn loopback_prefix() -> crate::utils::onlink::OnLinkPrefixes {
     )])
 }
 
-async fn stop_transports(node: &mut Node) {
+pub(super) async fn stop_transports(node: &mut Node) {
     for transport in node.transports.values_mut() {
         transport.stop().await.ok();
     }

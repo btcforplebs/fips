@@ -327,7 +327,12 @@ impl LanRendezvous {
 /// `fips-` and the npub's first 16 characters. mDNS DNS labels are capped
 /// at 63 bytes; the 11 bech32 characters after `npub1` make collisions on
 /// one LAN unlikely. `None` when `npub` has no 16-character ASCII prefix.
-fn advert_label_of(npub: &str) -> Option<String> {
+///
+/// The label carries 55 bits of the key, so anyone can mint other valid
+/// npubs with the same label without a private key. The node therefore
+/// refuses an advert whose label is a known peer's under another npub
+/// (`KnownLabels` in `node::peering::lan`).
+pub(crate) fn advert_label_of(npub: &str) -> Option<String> {
     let prefix = npub.get(..16)?;
     prefix.is_ascii().then(|| format!("fips-{prefix}"))
 }

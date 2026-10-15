@@ -6,7 +6,7 @@ use super::{Node, NodeError, NodeState};
 use supervisor::{Action, Child, Event, PeeringDesired, SupervisorFsm};
 
 use super::peering::lan::{
-    LanOffer, MAX_PENDING_LAN_CANDIDATES, PendingLan, PendingPair, lan_target_on_link,
+    KnownLabels, LanOffer, MAX_PENDING_LAN_CANDIDATES, PendingLan, PendingPair, lan_target_on_link,
 };
 use super::peering::reconcile::{
     Budget, Candidate, DiscoveryPools, Gate, Observed, PeeringAction, Policy,
@@ -1349,8 +1349,27 @@ impl Node {
             .collect()
     }
 
+    /// The mDNS host labels of the configured and connected peers, read
+    /// afresh so a configuration reload or a dropped link applies on the
+    /// next call. A configured npub that does not parse is left out.
+    fn known_lan_labels(&self) -> KnownLabels {
+        let configured: Vec<crate::PeerIdentity> = self
+            .config()
+            .peers()
+            .iter()
+            .filter_map(|peer| crate::PeerIdentity::from_npub(&peer.npub).ok())
+            .collect();
+        KnownLabels::new(
+            configured
+                .iter()
+                .chain(self.peers.values().map(|peer| peer.identity())),
+        )
+    }
+
     /// Hold each mDNS discovery that names an address on this node's links
-    /// as a pending candidate, then dial what the budget allows.
+    /// as a pending candidate, unless its host label is a configured or
+    /// connected peer's under another npub (see [`KnownLabels`]), then dial
+    /// what the budget allows.
     pub(in crate::node) async fn handle_lan_events(
         &mut self,
         events: Vec<crate::mdns::LanEvent>,
@@ -1358,6 +1377,7 @@ impl Node {
     ) {
         self.prune_connected_lan();
         let configured = self.configured_node_addrs();
+        let known = self.known_lan_labels();
         let now_ms = self.uptime().as_millis() as u64;
 
         // No await in this block: the thread-local generator is not `Send`.
@@ -1400,6 +1420,15 @@ impl Node {
                         continue;
                     }
                 };
+                if known.is_impostor(&identity) {
+                    debug!(
+                        npub = %identity.short_npub(),
+                        addr = %peer.addr,
+                        reason = "known-label",
+                        "lan: advert refused; its host label is a known peer's under another npub"
+                    );
+                    continue;
+                }
                 let pair = PendingPair {
                     node: *identity.node_addr(),
                     identity,

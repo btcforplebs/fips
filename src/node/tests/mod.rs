@@ -27,6 +27,7 @@ mod forged_initial_msg2;
 mod forwarding;
 mod handshake;
 mod heartbeat;
+mod lan_label;
 mod lookup_echo;
 mod mmp_chartests;
 mod probe;

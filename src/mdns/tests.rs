@@ -375,3 +375,38 @@ fn a_cross_scope_advert_with_a_non_ascii_npub_is_logged_without_a_panic() {
         "skip line not logged: {lines:?}"
     );
 }
+
+/// The browser's host check binds an advert to the 55 bits of the npub its
+/// host label carries, no more: an advert under another valid npub sharing a
+/// FIPS node's label, naming that node's host, passes it. The node refuses
+/// such adverts when the label is a known peer's (`node::tests::lan_label`).
+#[test]
+fn an_advert_under_another_npub_sharing_a_fips_hosts_label_passes_the_host_check() {
+    let target = Identity::generate();
+    let mut key = target.pubkey().serialize();
+    let twin = (1..=u8::MAX)
+        .find_map(|flip| {
+            key[31] ^= flip;
+            let found = secp256k1::XOnlyPublicKey::from_slice(&key).ok();
+            key[31] ^= flip;
+            found
+        })
+        .map(|pk| crate::encode_npub(&pk))
+        .expect("a valid twin key");
+    let target_npub = target.npub();
+    assert_ne!(twin, target_npub);
+    assert_eq!(
+        super::advert_label_of(&twin),
+        super::advert_label_of(&target_npub)
+    );
+
+    let own = Identity::generate().npub();
+    let forged = resolved_advert(
+        &fips_host(&target_npub),
+        "10.2.0.5",
+        2121,
+        &[("npub", &twin)],
+    );
+    let fields = super::check_advert(&forged, &own, None).expect("passes the host check");
+    assert_eq!(fields.npub, twin);
+}
