@@ -71,7 +71,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Release-candidate OpenWrt `.ipk` packages are now versioned `vX.Y.Z~rcN`, so
   opkg sorts them below the final release and the release upgrades a router
   that ran the candidate. The package file name keeps the tag's `-rcN`.
-
 - `fips0` now has its own default-deny firewall zone, `fips`, instead of
   joining `lan`. Router services such as LuCI, SSH and DNS are no longer
   reachable from FIPS peers unless a rule opens them. If you manage the router
@@ -98,7 +97,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - If a full overlay cuts the firewall configuration short when the upgrade
   saves it, the upgrade now notices, blocks new connections from FIPS peers,
   and says how to restore the configuration from `/tmp/fips-firewall.uci`.
-
 - The gateway's init script gives the LAN its global-scope address,
   `2001:2:f1b5::1/64`, when the gateway starts and keeps it across stops and
   restarts. Turning the gateway off deletes it: `service fips-gateway disable`
@@ -107,6 +105,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   then rebooted keeps it until `service fips-gateway stop`. Setting and
   deleting it on every start and stop reloaded the network each time, which on
   OpenWrt 25.12 recreates `br-lan` and drops the LAN for a few seconds.
+- Development builds of the OpenWrt packages, from branch pushes, pull
+  requests and manual runs on a branch, are no longer uploaded to Blossom or
+  announced as NIP-94 release events on Nostr relays. Only release tags
+  publish there, so anyone following those events stops receiving untagged
+  builds.
+- OpenWrt 24.10 and 25.12 routers set up with `fips-mesh-setup` now form
+  802.11s peerings with each other. Mesh points peer only when they join with
+  the same basic rates, and the two releases chose different ones when none
+  was set, so each heard the other's beacons and never peered.
+  `fips-mesh-setup` now sets `basic_rate '6000 12000 24000'` on every mesh
+  interface it creates, and an upgrade sets it on mesh interfaces made by
+  older packages, keeping a value you set yourself. The rates apply at the
+  next reboot or network reload, which on a router with the gateway enabled
+  happens during the upgrade; a router on the new rates stops peering with one
+  still on the old, so upgrade routers you reach over the mesh one at a time,
+  farthest first. OpenWrt 22.03 and 23.05 cannot set basic rates on a mesh and
+  join a 2.4 GHz mesh with 1, 2, 5.5 and 11 Mb/s, so they no longer peer there
+  with upgraded 24.10 or later routers; the package README gives the setting
+  that keeps them in. `fips-mesh-setup rates` applies the rates by hand after
+  a reinstall.
+
+#### Rust package
+
+- The Rust package is now named `fips-mesh`, and is published on crates.io
+  under that name, where `fips` belongs to another project. The library is
+  still `fips`, and the binaries, the Debian package and every other package
+  keep their names. `cargo` commands that name the package change from
+  `-p fips` to `-p fips-mesh`, and a crate that depends on FIPS must add
+  `package = "fips-mesh"` to its dependency, for example
+  `fips = { package = "fips-mesh", path = "..." }`, keeping the key `fips` so
+  `use fips::...` is unchanged.
 
 #### Windows
 
@@ -164,14 +193,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mapping's source rewrite used to take it first, so the target saw the
   peer's pool address instead, which changed as mappings came and went and
   could be answered only by a host that routes the pool to the gateway.
-
 - `fips-gateway` now acts on a stop sent while it is still setting up. Its
   shutdown handler was installed only after set-up, which can spend seconds
   probing the daemon's DNS responder, so a stop in that window was lost when
   the gateway ran as a container's PID 1 and killed it part-way through set-up
   otherwise. A stop during the probe now ends it and exits before any NAT
   table or route exists.
-
 - Connections the gateway host itself makes to a virtual IP now reach the
   mapped node. They were never translated, so they reached the gateway host
   instead: `ssh <name>.fips` run on the gateway logged into the gateway, and
@@ -223,7 +250,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   systemd-resolved (`systemctl enable --now`) and then restart
   `fips-dns.service`, since setup uses systemd-resolved only when it is
   running.
-
 - On a host that uses standalone dnsmasq, `fips-dns-setup` now restarts
   dnsmasq instead of reloading it, so `.fips` names resolve without a manual
   restart. A reload does not make dnsmasq re-read its configuration, so the
@@ -240,7 +266,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   until the wait ran out. Dropping the peer's offer now re-sends ours once, so
   the peer can answer it straight away. A peer that already has it ignores
   the copy through its replay check.
-
 - Two nodes that started a handshake to each other at once over Bluetooth LE
   no longer drop the link between them. Resolving the crossed handshake, or
   reaping a stale handshake leg, closed the losing leg's connection by its
@@ -249,7 +274,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   surviving session ran on; the nodes then redialled, and a peer that still
   held the first link closed the second, so the pair churned. A leg's
   connection is now left open when an active peer runs on it.
-
 - The Ethernet transport on Linux no longer leaks a socket when the configured
   interface is missing or invalid, at startup or when the beacon socket is
   reopened after the interface goes away. A running node whose interface was
@@ -290,7 +314,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   connect that fails before its timeout, not only a refused one: an
   unreachable host or network, a reset or any other connect error lands there
   too, with the error in the debug log.
-
 - A UDP peer configured by hostname no longer holds up the node for as long
   as the system resolver takes when it is slow or down. The node waits at
   most 250 ms for a lookup, then carries on. A name that resolved within the
@@ -299,7 +322,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not exist; a handshake sent to that address meanwhile is sent again to the
   new address if the answer has changed it. For a name with no address yet,
   the handshake is sent as soon as the lookup completes.
-
 - A peer is no longer removed when frames carrying its index fail to
   decrypt. Twenty such frames removed the peer and marked its link dead, and
   the index travels in clear, so anyone who had seen one frame of a link could
@@ -331,7 +353,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   but its answer was discarded, and the datagram was held without being
   sent. The node now records the flow's key before starting discovery, and
   retries the session for held native datagrams once discovery answers.
-
 - A native API datagram held for a destination whose session never comes up
   (its lookup or handshake timed out, its peer went away, or no lookup could
   be started) is now discarded instead of held for the life of the daemon.
@@ -368,26 +389,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   member port (for example `lan1` or `eth1`), change it back to `br-lan`. Your
   edited config is kept across upgrades, along with its old "physical port
   names, NOT bridge names" comment, so an upgrade alone will not correct it.
-
 - `build-ipk.sh` and `build-apk.sh` find the binaries in the target directory
   cargo used, so a build with `CARGO_TARGET_DIR` or a `target-dir` setting no
   longer fails after compiling. The apk README covers building in an Alpine
   container and installing on a router without internet access.
-- OpenWrt 24.10 and 25.12 routers set up with `fips-mesh-setup` now form
-  802.11s peerings with each other. Mesh points peer only when they join with
-  the same basic rates, and the two releases chose different ones when none
-  was set, so each heard the other's beacons and never peered.
-  `fips-mesh-setup` now sets `basic_rate '6000 12000 24000'` on every mesh
-  interface it creates, and an upgrade sets it on mesh interfaces made by
-  older packages, keeping a value you set yourself. The rates apply at the
-  next reboot or network reload, which on a router with the gateway enabled
-  happens during the upgrade; a router on the new rates stops peering with one
-  still on the old, so upgrade routers you reach over the mesh one at a time,
-  farthest first. OpenWrt 22.03 and 23.05 cannot set basic rates on a mesh and
-  join a 2.4 GHz mesh with 1, 2, 5.5 and 11 Mb/s, so they no longer peer there
-  with upgraded 24.10 or later routers; the package README gives the setting
-  that keeps them in. `fips-mesh-setup rates` applies the rates by hand after
-  a reinstall.
 
 #### Routing and discovery
 
@@ -396,17 +401,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   size of the step. The spacing between announces to a peer
   (`node.bloom.update_debounce_ms`, 500 ms by default) is now measured on a
   monotonic clock.
-
 - A transit lookup request is no longer forwarded back to the peer it came
   from. That copy was always a duplicate, and a tree child announcing a filter
   that covers most of the mesh turned every lookup between it and the parent
   into a two-way echo, multiplying duplicate traffic and dedup-cache evictions.
-
 - A node whose tree parent moves to a worse root, for example after losing its
   own uplink, now switches at once to a peer still on the better root. It used
   to follow the parent to the worse root and stay there until its next
   periodic parent check, up to a minute later, so the mesh could briefly hold
   two roots.
+- A TreeAnnounce whose link send fails is now kept pending and resent on the
+  next tick, instead of being dropped until a later announce happened to reach
+  that peer.
 
 #### Sessions and rekey
 
@@ -423,7 +429,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stream of failing sends starts one), re-caching the destination's identity
   from the session first so the answer can be verified, and the existing
   session carries on once the coordinates return.
-
 - A link rekey whose msg2 is lost now completes on the initiator's next msg1
   resend. The responder refused every resend while it held the session it had
   answered with, so the initiator abandoned its cycles and the link went
@@ -452,14 +457,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - An unreadable SessionMsg3 no longer discards the half-open session of an
   initial handshake, which left the initiator's genuine msg3 to an unknown
   session.
-
 - A link whose ends had fallen out of step on the K-bit, for example after a
   peer restart, no longer loses every rekey the peer starts. Frames on the
   peer's new session were tried against it only when their K-bit differed from
   ours, so they failed decryption until the peer was removed. Frames on the
   pending session's index now always get that trial, and the K-bits are put
   back in step at the cutover after a restart.
-
 - A same-epoch msg1 that arrives off a peer's live established link, such as a
   TCP dial from a peer already linked over UDP, or a second address on the same
   transport, is no longer taken as a rekey of that link. It was answered on the
@@ -467,14 +470,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   genuine rekeys meanwhile, and could cancel our own. A replayed copy of the
   msg1 a link was set up from is also refused once the link is old enough to
   rekey, instead of arming a 120 s hold for each copy.
-
 - For 30 s after a link came up or rekeyed, every same-epoch msg1 from the
   peer got the msg2 stored for the link's setup msg1, which completes no other
   handshake, so a peer that lost its side of the link and dialled again could
   not reconnect until the link-dead timeout. The stored msg2 now answers only
   the msg1 it was made for. Any other msg1 replaces the session as a peer
   restart does, once nothing authenticated has arrived from the peer for 15 s.
-
 - A link rekey the peer starts within 30 s of the previous one, as the
   message-count trigger does on a busy link, is now answered once 10 s have
   passed since that rekey. Until 30 s had passed it was dropped, or, from a
@@ -496,6 +497,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every other UDP peer's traffic uses.
 
 ### Security
+
+#### Dependencies
+
+- The lockfile moves `rustls` from 0.23.45 to 0.23.46, for four advisories
+  against 0.23.45: RUSTSEC-2026-0346, whose `Debug` output of client session
+  values exposed TLS secrets; RUSTSEC-2026-0347, which sent buffered
+  application data to the outer server after an ECH rejection;
+  RUSTSEC-2026-0348, where Brotli certificate decompression could allocate up
+  to 1 GiB before authentication; and RUSTSEC-2026-0349, where an
+  unauthenticated ServerHello could downgrade later connections to classical
+  key exchange. `rustls` is the TLS client the Nostr relay connections use. The
+  update is within the version range the dependencies already allowed.
 
 #### DNS
 
@@ -525,7 +538,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an application-supplied TUN), and that such a bind answers every host on the
   node's other networks. The macOS WireGuard container example now publishes
   the DNS port on `127.0.0.1` only.
-
 - On Linux, a `.fips` query from a mesh address is answered only out of the
   interface it arrived on. With a non-loopback `dns.bind_addr`, a host on
   another network could forge a mesh source address and make the node send DNS
@@ -550,7 +562,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `fips_if`, which must match `tun.name`. When the loaded firewall polices
   another interface than the node's TUN, the daemon now warns at start, and
   the control socket and `fipstop` report every listener as exposed instead of
-  filtered.
+  filtered. `/etc/fips/fips.nft` is a configuration file. Where it was
+  edited, the `.deb` upgrade asks whether to keep the edited copy or install
+  the new one, and the AUR upgrade keeps the edited copy and writes the new one
+  as `fips.nft.pacnew`. A kept copy still names `fips0`, so on a host that
+  renamed the TUN the name must be changed there by hand.
 
 #### Gateway
 
@@ -603,7 +619,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   change and all of them lie inside the routed prefix. A `.fips` name whose
   mesh address lies inside the pool prefix now gets `SERVFAIL`, since the
   gateway routes the whole prefix to itself and could never reach it.
-
 - The gateway documentation no longer says the mesh firewall restricts port
   forwards: forwarded traffic does not pass the firewall's input chain. It now
   gives a forward-chain recipe that does, and corrects how replies reach the
@@ -619,7 +634,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   indefinitely. The bound follows `node.heartbeat_interval_secs`,
   `node.link_dead_timeout_secs`, `node.tick_interval_secs` and the handshake
   resend settings.
-
 - A BLE device that claims another node's key no longer stops that node's own
   BLE link from being admitted, and links carrying an established FIPS session
   are no longer displaced by new BLE connections. When the BLE pool is full,
@@ -630,7 +644,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the pool needs the slot. With BLE `auto_connect` enabled, a device that
   keeps several handshakes claiming a peer in flight can still delay automatic
   connection to that peer.
-
 - A replayed handshake message from a peer that is not currently linked no
   longer diverts traffic for that peer, and a single replayed message no
   longer blocks its real handshake for 15 seconds.
@@ -679,7 +692,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   error-signal counters `broken_below_quorum`, `broken_demoted`,
   `broken_link_mismatch` and `broken_reporter_mismatch` appear in
   `show_routing`; the last two only count and never refuse a signal.
-
 - A flood of Nostr adverts under new keys can no longer push the adverts of
   configured or linked peers, or adverts cached before the flood, out of the
   cache. When the cache is full, new unconfigured authors wait for room
@@ -703,7 +715,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or point-to-point interfaces, while peers on one LAN whose prefix is wider
   than /24 now reach each other directly.
 - The lookup failure table no longer grows without bound.
-
 - A directly linked peer can no longer make each new coordinate cache entry
   cost a scan of the whole cache, push other destinations out of the cache
   faster than a fixed rate, or fill the cache with very deep coordinates; the
@@ -763,14 +774,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cross-connection, or reaped as stale. After a promotion, the memory it left
   held the session's two traffic keys for as long as the peer stayed
   connected. The security reference is updated to match.
-
 - Packets to a destination the mesh cannot reach now get an ICMPv6 Destination
   Unreachable at once instead of being held indefinitely, which let a gateway
   LAN host fill the table of held destinations. While the node has no peers,
   and for 30 seconds after it gains one, such packets are still held briefly
   while routing information arrives. Held packets are answered after the
   lookup schedule plus the handshake timeout, 50 seconds by default.
-
 - A forged session setup naming another node no longer holds back this node's
   own traffic to that node, and a single forged setup no longer blocks that
   node's own setup. A node answers each session setup it receives with one
