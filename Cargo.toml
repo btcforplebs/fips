@@ -1,5 +1,9 @@
 [package]
-name = "fips"
+# Published on crates.io as `fips-mesh`, since `fips` there is an unrelated
+# crate. Only the package name differs: the library is still `fips` (see
+# [lib]), every binary keeps its name, and the Debian package is pinned to
+# `fips` in [package.metadata.deb], so no installed file or artifact changes.
+name = "fips-mesh"
 version = "0.5.3-dev"
 edition = "2024"
 description = "A distributed, decentralized network routing protocol for mesh nodes connecting over arbitrary transports"
@@ -10,6 +14,10 @@ homepage = "https://fips.network"
 readme = "README.md"
 keywords = ["mesh", "p2p", "decentralized", "overlay-network", "nostr"]
 categories = ["network-programming", "command-line-utilities", "cryptography"]
+
+[lib]
+name = "fips"
+path = "src/lib.rs"
 
 [features]
 default = []
@@ -87,6 +95,8 @@ windows-service = "0.8.1"
 windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock", "Win32_System_IO"] }
 
 [package.metadata.deb]
+# cargo-deb otherwise names the package after the crate, `fips-mesh`.
+name = "fips"
 maintainer = "Johnathan Corgan <johnathan@corganlabs.com>"
 copyright = "2026 Johnathan Corgan"
 license-file = ["LICENSE", "0"]
@@ -138,6 +148,10 @@ conf-files = ["/etc/fips/hosts", "/etc/fips/fips.nft"]
 tempfile = "3.15"
 criterion = { version = "0.8.2", features = ["html_reports"] }
 tokio = { version = "1", features = ["test-util"] }
+
+[[bin]]
+name = "fips"
+path = "src/bin/fips.rs"
 
 [[bin]]
 name = "fipsctl"

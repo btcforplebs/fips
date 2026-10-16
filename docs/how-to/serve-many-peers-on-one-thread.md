@@ -18,12 +18,17 @@ you have not opened a flow before.
 
 ## The whole program
 
-One dependency beyond the crate, `libc`, for `poll` itself:
+One dependency beyond the crate, `libc`, for `poll` itself. The crate's package
+is `fips-mesh` and its library is `fips`, so the dependency key stays `fips`:
 
 ```toml
 [dependencies]
-fips = { git = "https://github.com/jmcorgan/fips" }
 libc = "0.2"
+
+[dependencies.fips]
+package = "fips-mesh"
+git = "https://github.com/jmcorgan/fips"
+tag = "v0.5.3"
 ```
 
 ```rust

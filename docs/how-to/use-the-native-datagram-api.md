@@ -80,19 +80,23 @@ The log line carries the path the daemon resolved, normally
 
 ## Step 2: Link the crate
 
-The client is a module of the `fips` crate itself, so a program links
-the crate and uses `fips::native::client`:
+The client is a module of the `fips` library itself, so a program links
+the crate and uses `fips::native::client`. The package is named
+`fips-mesh`, so the dependency names it with `package` and keeps the key
+`fips`:
 
 ```toml
-[dependencies]
-fips = { git = "https://github.com/jmcorgan/fips" }
+[dependencies.fips]
+package = "fips-mesh"
+git = "https://github.com/jmcorgan/fips"
+tag = "v0.5.3"
 ```
 
 A checkout on the same machine can use a path dependency instead:
 
 ```toml
 [dependencies]
-fips = { path = "../fips" }
+fips = { package = "fips-mesh", path = "../fips" }
 ```
 
 The client is blocking and std-only. It brings no async runtime, so a

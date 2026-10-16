@@ -147,11 +147,12 @@ cargo new --bin napi-listen
 cd napi-listen
 ```
 
-Point it at your FIPS checkout in `Cargo.toml`:
+Point it at your FIPS checkout in `Cargo.toml`. The package is named
+`fips-mesh`; the key `fips` keeps the library's name in `use` paths:
 
 ```toml
 [dependencies]
-fips = { path = "/path/to/your/fips/checkout" }
+fips = { package = "fips-mesh", path = "/path/to/your/fips/checkout" }
 ```
 
 `src/main.rs`:
