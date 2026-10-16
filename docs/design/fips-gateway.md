@@ -787,12 +787,21 @@ half is not in play.
   continue until connection tracking expires them (`conntrack -F` or a
   reboot cuts them at once). A `lan_interface` that is a VLAN device
   on a bridge (for example `br-lan.1` under bridge VLAN filtering)
-  does not work when bridge netfilter is active (`br_netfilter`
-  loaded) and `net.bridge.bridge-nf-pass-vlan-input-dev` is 0, its
-  default: prerouting then sees the parent bridge as the input
-  interface while forwarding sees the VLAN device, so LAN clients'
-  DNAT never matches and the pool drop discards their traffic to the
-  pool.
+  does not serve clients whose frames enter the bridge untagged when
+  `br_netfilter` is loaded and runs the IPv6 hooks for bridged
+  traffic (`net.bridge.bridge-nf-call-ip6tables` 1, its default, or
+  the bridge's `nf_call_ip6tables` option on). It runs the IPv6
+  prerouting hooks at the bridge, with the parent bridge as the input
+  interface and before the bridge assigns the port's VLAN, so LAN
+  clients' DNAT never matches and the pool drop discards their
+  traffic to the pool. `net.bridge.bridge-nf-pass-vlan-input-dev`
+  does not help them, because their frames carry no tag at that
+  point. Frames that arrive tagged skip these hooks unless
+  `net.bridge.bridge-nf-filter-vlan-tagged` is 1, and are then served
+  only with `bridge-nf-pass-vlan-input-dev` 1. With
+  `bridge-nf-call-ip6tables` 0 and the bridge option off, or without
+  `br_netfilter`, the gateway serves the VLAN device. The OpenWrt
+  package sets `bridge-nf-call-ip6tables` to 0.
 - **Identity masking.** All outbound LAN traffic appears on the
   mesh under the gateway's own FIPS identity. Mesh nodes cannot
   determine which LAN host originated a connection. This provides

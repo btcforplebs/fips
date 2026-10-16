@@ -52,8 +52,12 @@ upgrade.
 The package creates a `fips` group; members can run `fipsctl` and
 `fipstop` without root (`pw groupmod fips -m <user>`, then re-login).
 On `pkg upgrade` the services are stopped before the binaries are
-replaced and started again afterwards if enabled; on `pkg delete` they
-are stopped and the `.fips` resolver drop-in is removed.
+replaced, and the package starts them again afterwards if enabled, but
+pkg 2.8.4 ends a daemon that a package script starts once pkg exits
+(measured with `pkg install` of a package file), so that start does not
+last. After an upgrade, run `service fips restart`
+and, if you use it, `service fips_dns restart`. On `pkg delete` the
+services are stopped and the `.fips` resolver drop-in is removed.
 
 ## .fips DNS integration
 

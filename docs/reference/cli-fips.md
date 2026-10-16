@@ -75,6 +75,10 @@ On macOS and FreeBSD both system directories are probed: `/etc/fips`
 first, then `/usr/local/etc/fips`, so the packaged file wins over a
 leftover `/etc/fips` copy from an earlier install. Windows likewise
 probes `\etc\fips` on the current drive, then `C:\ProgramData\fips`.
+The `\etc\fips` probe is deprecated: any local user can create that
+file, so the daemon warns when it loads a config from there, and from
+v0.6.0 the search no longer looks there. Move the settings you need into
+`C:\ProgramData\fips\fips.yaml`.
 
 If the file given with `-c`, or the files found on the search path taken
 together, configure nothing (no `node.identity.nsec`,

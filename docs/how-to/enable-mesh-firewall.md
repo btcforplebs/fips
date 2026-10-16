@@ -70,8 +70,10 @@ listening panel shows the "all listeners exposed" banner.
 
 Because `/etc/fips/fips.nft` is a configuration file, an upgrade that
 changes it while you have edited it asks whether to keep your version
-(dpkg) or installs the new one beside yours (`.pacnew` on Arch). Keep
-your file and carry over any change you want from the new one.
+(dpkg) or installs the new one beside yours (`.pacnew` on Arch). The
+systemd tarball's `install.sh` never replaces an existing file and
+writes the new one as `/etc/fips/fips.nft.template`. Keep your file and
+carry over any change you want from the new one.
 
 ## Gateway port forwards are outside the baseline
 

@@ -19,7 +19,8 @@ reference.
 fipsctl probe <npub-or-hostname>
 ```
 
-The probe runs five stages in order and reports a verdict for each, so
+Replace `<npub-or-hostname>` with the target's npub or a name from the
+hosts file. The probe runs five stages in order and reports a verdict for each, so
 the first stage that fails tells you where to look:
 
 | Stage that fails | What it means | Where to look next |

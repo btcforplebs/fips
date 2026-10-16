@@ -403,6 +403,8 @@ node to use both forwards:
 # /etc/fips/port-forwards.nft
 # The node's tun.name, as in /etc/fips/fips.nft.
 define fips_if = "fips0"
+# The mesh address of each node allowed to use the forwards; replace the
+# example address. `fipsctl address` on that node prints it.
 define allowed_peers = { fd97:1111:2222:3333:4444:5555:6666:7777 }
 
 add table inet fips_port_forwards

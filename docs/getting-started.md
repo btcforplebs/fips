@@ -45,8 +45,10 @@ FIPS is installed by running a binary installer for your
 platform. The installer drops the daemon and CLI tools into
 system locations, installs systemd / launchd / rc.d /
 Windows-service unit files, places a default `fips.yaml`, and
-creates the `fips` system group. There is no `cargo install`
-path: the daemon needs more than just binaries copied into place.
+creates the `fips` system group. `cargo install fips-mesh`
+installs only the four binaries and is not an install path: the
+daemon also needs its service units, a config, the `fips` group
+and the DNS setup.
 
 You can either build the installer yourself from source, or
 download a pre-built one from the release distribution. Both

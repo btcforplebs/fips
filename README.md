@@ -3,7 +3,7 @@
 ![banner](docs/logos/fips_banner.png)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-orange.svg)](https://www.rust-lang.org/)
-[![Status](https://img.shields.io/badge/status-v0.5.2-green.svg)](#status--roadmap)
+[![Status](https://img.shields.io/badge/status-v0.5.3-green.svg)](#status--roadmap)
 
 A self-organizing encrypted mesh network built on Nostr identities,
 capable of operating over arbitrary transports without central
@@ -267,7 +267,7 @@ Nix / NixOS section of [packaging/README.md](packaging/README.md).
   then [fips-architecture.md](docs/design/fips-architecture.md) for
   the protocol stack.
 - **[Release notes](docs/releases/)** — per-version notes, including
-  [v0.5.2](docs/releases/release-notes-v0.5.2.md).
+  [v0.5.3](docs/releases/release-notes-v0.5.3.md).
 
 If you want to contribute, see [CONTRIBUTING.md](CONTRIBUTING.md)
 and [testing/README.md](testing/README.md).
@@ -308,10 +308,11 @@ testing/      Docker-based integration test harnesses + chaos simulation
 
 ## Status & roadmap
 
-FIPS is at **v0.5.2** on the `maint` branch, a maintenance release
-that closes security gaps in the Windows service, the gateway and the
-rekey handshakes, and fixes the gateway, the Linux, OpenWrt and FreeBSD
-packages, and session and discovery recovery after lost messages.
+The current release is **v0.5.3**, a maintenance release
+that closes security gaps in the OpenWrt firewall zones, the gateway,
+the DNS responder, link and session handshakes, and discovery, and fixes
+link rekey recovery, the gateway, transports, and the Linux, OpenWrt,
+FreeBSD and Windows packages.
 [v0.5.0](https://github.com/jmcorgan/fips/releases/tag/v0.5.0) was the
 last feature release, so how much of that release is new to you depends on
 which version you are upgrading from. The core
@@ -319,12 +320,14 @@ protocol
 works end-to-end over UDP, TCP, Ethernet, Tor, Nym, and Bluetooth on a
 global, public test mesh of thousands of nodes.
 
-v0.5.2 and v0.5.1 are maintenance releases; the feature content below
-is v0.5.0's. v0.5.2 moves the gateway's default DNS port to 5365 and the
-Windows config directory to `C:\ProgramData\fips`, and an ephemeral node
-no longer writes `fips.key`; see the
-[v0.5.2 release notes](docs/releases/release-notes-v0.5.2.md) before
-upgrading.
+v0.5.3, v0.5.2 and v0.5.1 are maintenance releases; the feature content
+below is v0.5.0's. v0.5.3 moves OpenWrt's `fips0` into a default-deny
+firewall zone of its own, and sets the 802.11s basic rates so 24.10 and
+25.12 routers peer, which stops an upgraded router peering on 2.4 GHz
+with one not yet upgraded. It also refuses a config file that configures
+nothing, and publishes the Rust package on crates.io as `fips-mesh`.
+See the [v0.5.3 release notes](docs/releases/release-notes-v0.5.3.md)
+before upgrading.
 
 v0.5.0 is a platform-and-lifecycle release. It adds FreeBSD as a
 packaged platform (x86_64 only), OpenWrt setup helpers for an 802.11s
