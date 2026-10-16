@@ -175,25 +175,42 @@ start_container() {
 }
 
 # Stop container $1 with timeout $2 at epoch time $3. Sets STOP_SENT,
-# STOP_ELAPSED (sent to exited, seconds) and EXIT_CODE.
+# STOP_ELAPSED (sent to the process's exit, seconds; empty when the exit
+# time cannot be read), DOCKER_ELAPSED (sent to `docker stop` returning) and
+# EXIT_CODE.
+#
+# The exit is timed from the container's State.FinishedAt, which Docker takes
+# from the runtime's exit event for PID 1, not from `docker stop` returning:
+# that also covers Docker's own teardown of the container, which on a loaded
+# host has taken several seconds after the process was gone (a host-side
+# watch of PID 1 showed it reaped on time while `docker stop` returned 2 to
+# 4 s later). Docker's teardown is not what these cases test.
 stop_at() {
-    local name="$1" timeout="$2" at="$3" done_at
+    local name="$1" timeout="$2" at="$3" done_at finished
     sleep_until "$at"
     STOP_SENT=$(now)
     docker stop -t "$timeout" "$name" >/dev/null 2>&1
     done_at=$(now)
-    STOP_ELAPSED=$(calc "$done_at - $STOP_SENT")
+    DOCKER_ELAPSED=$(calc "$done_at - $STOP_SENT")
+    STOP_ELAPSED=""
+    if finished=$(docker inspect -f '{{.State.FinishedAt}}' "$name" 2>/dev/null) \
+        && finished=$(date -d "$finished" +%s.%N 2>/dev/null); then
+        STOP_ELAPSED=$(calc "$finished - $STOP_SENT")
+    fi
     EXIT_CODE=$(docker inspect -f '{{.State.ExitCode}}' "$name" 2>/dev/null) || EXIT_CODE=unknown
     return 0
 }
 
-# Record the checks common to every case and print the container's log.
+# Record the checks common to every case and print the container's log. An
+# exit time that could not be read, or one before the stop was sent (the
+# process was gone before the stop, so the stop was not tested), fails the
+# bound rather than passing it.
 report_stop() {
     local label="$1" want_code="$2" max_elapsed="$3"
-    echo "  stop sent at anchor + $(calc "$STOP_SENT - $ANCHOR")s; exited after ${STOP_ELAPSED}s with code $EXIT_CODE"
+    echo "  stop sent at anchor + $(calc "$STOP_SENT - $ANCHOR")s; process exited after ${STOP_ELAPSED:-unknown}s with code $EXIT_CODE; docker stop returned after ${DOCKER_ELAPSED}s"
     [ "$EXIT_CODE" = "$want_code" ]
     check "$label: exit code $want_code" $?
-    lt "$STOP_ELAPSED" "$max_elapsed"
+    [ -n "$STOP_ELAPSED" ] && lt 0 "$STOP_ELAPSED" && lt "$STOP_ELAPSED" "$max_elapsed"
     check "$label: exited within ${max_elapsed}s of the stop" $?
     return 0
 }
