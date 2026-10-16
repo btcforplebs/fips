@@ -14,6 +14,20 @@ homepage = "https://fips.network"
 readme = "README.md"
 keywords = ["mesh", "p2p", "decentralized", "overlay-network", "nostr"]
 categories = ["network-programming", "command-line-utilities", "cryptography"]
+# What the published crate carries: the source and what builds and tests it.
+# Docs, CI and the test harness stay in the repository. Patterns are anchored
+# with `/`, since a bare name matches at any depth. `packaging/` ships because
+# lib tests read it (src/packaging_tests.rs at run time, src/config/mod.rs by
+# `include_str!`).
+include = [
+    "/src/**",
+    "/build.rs",
+    "/benches/**",
+    "/README.md",
+    "/LICENSE",
+    "/CHANGELOG.md",
+    "/packaging/**",
+]
 
 [lib]
 name = "fips"
