@@ -984,7 +984,8 @@ impl ActivePeer {
         self.pending_tree_announce = false;
     }
 
-    /// Mark that a tree announce is pending (deferred due to rate limit).
+    /// Mark that a tree announce is pending (deferred by the rate limit or by
+    /// a failed link send).
     pub fn mark_tree_announce_pending(&mut self) {
         self.pending_tree_announce = true;
     }

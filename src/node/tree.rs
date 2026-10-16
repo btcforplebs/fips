@@ -92,8 +92,8 @@ impl Node {
 
     /// Send a TreeAnnounce to a specific peer, respecting rate limits.
     ///
-    /// If the peer is rate-limited, the announce is marked pending for
-    /// delivery on the next tick cycle.
+    /// If the peer is rate-limited, or the link send fails, the announce is
+    /// marked pending for delivery on the next tick cycle.
     pub(super) async fn send_tree_announce_to_peer(
         &mut self,
         peer_addr: &NodeAddr,
@@ -126,9 +126,14 @@ impl Node {
             reason: format!("encode failed: {}", e),
         })?;
 
-        // Send
+        // Send. A failed send leaves the announce pending, as a rate-limited
+        // one is, so the next tick tries it again; the send time is not
+        // recorded, so the retry is not held back by the rate limit.
         if let Err(e) = self.send_encrypted_link_message(peer_addr, &encoded).await {
             self.metrics().tree.send_failed.inc();
+            if let Some(peer) = self.peers.get_mut(peer_addr) {
+                peer.mark_tree_announce_pending();
+            }
             return Err(e);
         }
 
@@ -177,7 +182,8 @@ impl Node {
         }
     }
 
-    /// Send pending rate-limited tree announces whose cooldown has expired.
+    /// Send pending tree announces (rate-limited or failed) whose cooldown
+    /// has expired.
     pub(super) async fn send_pending_tree_announces(&mut self) {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
