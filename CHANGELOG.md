@@ -532,6 +532,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   replies into the mesh from its own address. With a specific (non-wildcard)
   `dns.bind_addr`, a query from a ULA (`fd00::/8`) source arriving on a
   non-mesh interface is no longer answered.
+- On Linux, a responder bound to one specific `dns.bind_addr` with no known
+  mesh interface index (an application-supplied TUN, or an index that did not
+  resolve) no longer sends a reply to a forged mesh source (`fd00::/8`) into
+  the mesh. Such a reply is sent only when the routing table takes it back out
+  of the interface the query arrived on, or delivers it locally, and is
+  withheld otherwise.
+- On FreeBSD, macOS, Android and every other target but Linux, a `.fips`
+  query from a forged mesh source address sent to a non-loopback
+  `dns.bind_addr` no longer gets its reply routed into the mesh. A reply to a
+  mesh source is sent only when the routing table takes it back out of the
+  interface it arrived on, and is withheld otherwise.
 
 #### Firewall
 
@@ -628,6 +639,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A BLE or Ethernet neighbour can no longer stop a node from dialling a peer
   by presenting links that claim the peer's key, or grow the BLE probe's
   address memory without bound.
+- Unproven BLE or Ethernet neighbour claims of a node's key no longer hold
+  back its other dials: they no longer use up a configured peer's per-peer
+  path budget, no longer make the configured-dial guards treat the peer as
+  already connecting, and no longer park the node's LAN (mDNS) candidate until
+  it expires undialled.
+- At `max_peers`, claims of an already connected peer from transport
+  neighbours are held to four in flight per key, so a neighbour beaconing from
+  fresh source MACs can no longer fill every outbound handshake slot and delay
+  the redial of a peer that dropped.
 
 #### OpenWrt
 
@@ -695,6 +715,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lookups for a target no longer stops other peers' lookups for it being
   forwarded, and the forward limiter no longer stops limiting when full. A
   forged lookup answer is now logged at debug level.
+- During an advert flood that keeps the Nostr advert cache full, an honest
+  author that misses one republish keeps its cache slot, unserved, for one
+  republish interval of this node
+  (`node.rendezvous.nostr.advert_refresh_secs`), instead of being refused as a
+  new author until the flood ends. An author that republishes less often than
+  this node's interval can still lose it.
+- LAN discovery refuses an mDNS advert whose host label belongs to a
+  configured or connected peer under a different npub, so a sender with no
+  private key can no longer name a known FIPS node's host under forged npubs
+  and hold the unconfigured LAN dial slots. Hosts this node does not know are
+  not covered.
 
 #### Sessions and rekey
 
@@ -745,6 +776,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   node's own setup. A node answers each session setup it receives with one
   reply and no longer resends that reply on its own timer, so a forged setup
   naming another address draws one reply toward it instead of five.
+- A forged or malformed handshake msg2 no longer ends an initial dial. Anyone
+  who saw the msg1 could end the dial, and every retry, with one datagram; a
+  msg2 that does not authenticate is now discarded, the handshake state it
+  advanced is restored, and the attempt keeps its resend schedule and
+  deadline.
 
 ## [0.5.2] - 2026-09-28
 
