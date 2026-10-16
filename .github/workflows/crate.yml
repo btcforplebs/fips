@@ -1,0 +1,81 @@
+name: Crate
+
+# Checks on every maint push and every v* tag that the root package would
+# publish to crates.io as fips-mesh (testing/check-crate.sh), and publishes it
+# at a release tag. A pre-release tag (v0.5.3-rc1) is checked, not published.
+#
+# Only maint, for now: on master and next the root package depends on the
+# unpublished fips-core by path, which crates.io refuses, so the check would
+# fail there until fips-core is published too.
+on:
+  push:
+    branches: [maint]
+    tags: ["v*"]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Check the crate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev nftables
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          cache: false
+          rustflags: ''
+
+      - name: Check the crate would publish
+        run: bash testing/check-crate.sh
+
+      - name: Upload the packaged crate
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: crate
+          path: target/crate-check/*.crate
+          if-no-files-found: error
+
+  publish:
+    name: Publish to crates.io
+    needs: check
+    # A pushed release tag only. A tag with a pre-release suffix (v0.5.3-rc1)
+    # has a '-' in its name and is not published, and a manual run never
+    # publishes, even one started on a release tag.
+    if: >-
+      github.event_name == 'push'
+      && startsWith(github.ref, 'refs/tags/v')
+      && !contains(github.ref_name, '-')
+    runs-on: ubuntu-latest
+    # The crates-io environment holds CARGO_REGISTRY_TOKEN and requires the
+    # maintainer's approval, so a tag push waits for it before uploading.
+    environment: crates-io
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          cache: false
+          rustflags: ''
+
+      - name: Publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --locked -p fips-mesh
