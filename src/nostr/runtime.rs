@@ -222,6 +222,9 @@ pub struct NostrRendezvous {
     /// a dual-init election that suppresses the peer's offer can re-send ours.
     inflight_offers: Mutex<HashMap<String, InflightOffer>>,
     admission: OfferAdmission,
+    /// Senders whose offers are answered, from `config.offer_allowlist`.
+    /// `None` answers anyone.
+    offer_allowlist: Option<HashSet<PublicKey>>,
     signal_gate: SignalGate,
     /// Inbound traversal signals shed before decryption, since process start.
     shed_signals: AtomicU64,
@@ -354,6 +357,7 @@ impl NostrRendezvous {
             config.replay_window_secs * 1000,
             config.seen_sessions_max_entries,
         );
+        let offer_allowlist = parse_offer_allowlist(&config.offer_allowlist);
         let runtime = Arc::new(Self {
             client,
             keys,
@@ -364,6 +368,7 @@ impl NostrRendezvous {
             traversal,
             pending_answers: Mutex::new(HashMap::new()),
             inflight_offers: Mutex::new(HashMap::new()),
+            offer_allowlist,
             admission,
             signal_gate: SignalGate::new(Instant::now()),
             shed_signals: AtomicU64::new(0),
@@ -874,6 +879,17 @@ impl NostrRendezvous {
                         && offer.message_type == "offer"
                         && offer.recipient_npub == self.npub
                     {
+                        // Before admission and before any STUN: answering is
+                        // what sends this node's reflexive address, so a
+                        // sender outside the allowlist gets silence and never
+                        // holds a slot.
+                        if !self.offer_sender_allowed(&unwrapped.sender) {
+                            debug!(
+                                peer = %short_npub(&sender_npub),
+                                "inbound traversal offer dropped: sender not in offer_allowlist"
+                            );
+                            continue;
+                        }
                         let permit = match self.admission.try_admit(&sender_npub) {
                             Ok(permit) => permit,
                             Err(AdmissionReject::GlobalFull) => {
@@ -935,6 +951,13 @@ impl NostrRendezvous {
                 }
             }
         })
+    }
+
+    /// Whether an offer from `sender` may be answered under `offer_allowlist`.
+    fn offer_sender_allowed(&self, sender: &PublicKey) -> bool {
+        self.offer_allowlist
+            .as_ref()
+            .is_none_or(|allowed| allowed.contains(sender))
     }
 
     fn spawn_advertise_loop(self: Arc<Self>) -> JoinHandle<()> {
@@ -1947,6 +1970,21 @@ pub(super) fn signal_relays(
     retain_pooled_relays(&merged, pool)
 }
 
+/// An empty list answers anyone. A non-empty list answers only the keys that
+/// parse, so a list with no parseable entry refuses everyone: it fails
+/// closed rather than open.
+fn parse_offer_allowlist(entries: &[String]) -> Option<HashSet<PublicKey>> {
+    if entries.is_empty() {
+        return None;
+    }
+    Some(
+        entries
+            .iter()
+            .filter_map(|entry| PublicKey::parse(entry).ok())
+            .collect(),
+    )
+}
+
 #[cfg(test)]
 impl NostrRendezvous {
     /// Build a minimal `NostrRendezvous` for unit tests. No relay client is
@@ -1954,6 +1992,11 @@ impl NostrRendezvous {
     /// `advert_cache` and `npub` are usable. Intended for cache-injection
     /// tests of consumers (e.g. `Node::run_open_discovery_sweep`).
     pub(crate) fn new_for_test() -> Self {
+        Self::new_for_test_with_config(NostrRendezvousConfig::default())
+    }
+
+    /// `new_for_test` with an explicit config.
+    pub(crate) fn new_for_test_with_config(config: NostrRendezvousConfig) -> Self {
         let keys = nostr::Keys::generate();
         let pubkey = keys.public_key();
         let npub = pubkey.to_bech32().expect("bech32 encode");
@@ -1961,7 +2004,6 @@ impl NostrRendezvous {
             .signer(keys.clone())
             .opts(ClientOptions::new().autoconnect(false))
             .build();
-        let config = NostrRendezvousConfig::default();
         let admission = OfferAdmission::new(
             config.max_concurrent_incoming_offers,
             config.max_concurrent_offers_per_npub,
@@ -1983,6 +2025,7 @@ impl NostrRendezvous {
             config.replay_window_secs * 1000,
             config.seen_sessions_max_entries,
         );
+        let offer_allowlist = parse_offer_allowlist(&config.offer_allowlist);
         Self {
             client,
             keys,
@@ -1993,6 +2036,7 @@ impl NostrRendezvous {
             traversal,
             pending_answers: Mutex::new(HashMap::new()),
             inflight_offers: Mutex::new(HashMap::new()),
+            offer_allowlist,
             admission,
             signal_gate: SignalGate::new(Instant::now()),
             shed_signals: AtomicU64::new(0),
@@ -2043,6 +2087,25 @@ impl NostrRendezvous {
     /// This runtime's own npub.
     pub(crate) fn npub_for_test(&self) -> &str {
         &self.npub
+    }
+
+    /// Whether `session_id` reached the answer step of the offer handler.
+    pub(crate) fn session_seen_for_test(&self, session_id: &str) -> bool {
+        self.traversal.session_seen(session_id)
+    }
+
+    /// Run the notify loop on `notifications`, as `start` does on the relay
+    /// pool's channel.
+    pub(crate) fn spawn_notify_loop_for_test(
+        self: Arc<Self>,
+        notifications: broadcast::Receiver<RelayPoolNotification>,
+    ) -> JoinHandle<()> {
+        self.spawn_notify_loop(notifications)
+    }
+
+    /// This runtime's signing keys, so a test can wrap a signal to it.
+    pub(crate) fn keys_for_test(&self) -> &nostr::Keys {
+        &self.keys
     }
 
     /// Run the incoming-offer handler.

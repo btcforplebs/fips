@@ -426,6 +426,14 @@ pub struct NostrRendezvousConfig {
     /// outer bound.
     #[serde(default = "NostrRendezvousConfig::default_max_concurrent_offers_per_npub")]
     pub max_concurrent_offers_per_npub: usize,
+    /// npubs whose inbound traversal offers this node answers. Empty (the
+    /// default) answers any sender, as before. When set, an offer from any
+    /// other npub is dropped before it takes an admission slot and before
+    /// STUN runs, so no answer and therefore no reflexive address is ever
+    /// sent to it. A node that only serves its owner's own devices sets this
+    /// to those devices so its public IP never reaches anyone else.
+    #[serde(default)]
+    pub offer_allowlist: Vec<String>,
     /// Max cached overlay adverts retained from relay traffic.
     /// Bounds memory under ambient advert volume.
     #[serde(default = "NostrRendezvousConfig::default_advert_cache_max_entries")]
@@ -515,6 +523,7 @@ impl Default for NostrRendezvousConfig {
             open_discovery_max_pending: Self::default_open_discovery_max_pending(),
             max_concurrent_incoming_offers: Self::default_max_concurrent_incoming_offers(),
             max_concurrent_offers_per_npub: Self::default_max_concurrent_offers_per_npub(),
+            offer_allowlist: Vec::new(),
             advert_cache_max_entries: Self::default_advert_cache_max_entries(),
             seen_sessions_max_entries: Self::default_seen_sessions_max_entries(),
             attempt_timeout_secs: Self::default_attempt_timeout_secs(),

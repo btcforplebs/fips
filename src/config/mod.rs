@@ -1458,6 +1458,16 @@ impl Config {
             )));
         }
 
+        // A typo here must not silently narrow the allowlist to nothing that
+        // matches, which would refuse the owner's own device with no error.
+        for entry in &nostr.offer_allowlist {
+            if nostr::PublicKey::parse(entry).is_err() {
+                return Err(ConfigError::Validation(format!(
+                    "`node.rendezvous.nostr.offer_allowlist` entry `{entry}` is not an npub or hex public key."
+                )));
+            }
+        }
+
         Ok(())
     }
 
@@ -3326,6 +3336,29 @@ node:
             err.to_string().contains("max_concurrent_offers_per_npub"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn test_validate_offer_allowlist_rejects_a_malformed_entry() {
+        let mut config = Config::default();
+        config.node.rendezvous.nostr.offer_allowlist = vec!["npub1typo".to_string()];
+
+        let err = config.validate().expect_err("validation should fail");
+        assert!(err.to_string().contains("offer_allowlist"), "got: {err}");
+    }
+
+    #[test]
+    fn test_validate_offer_allowlist_accepts_npub_and_hex() {
+        let keys = nostr::Keys::generate();
+        let mut config = Config::default();
+        config.node.rendezvous.nostr.offer_allowlist = vec![
+            nostr::ToBech32::to_bech32(&keys.public_key()).unwrap(),
+            keys.public_key().to_hex(),
+        ];
+
+        config
+            .validate()
+            .expect("npub and hex entries are both valid");
     }
 
     #[test]
