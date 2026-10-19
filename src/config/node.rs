@@ -431,8 +431,10 @@ pub struct NostrRendezvousConfig {
     /// default) answers any sender, as before. When set, an offer from any
     /// other npub is dropped before it takes an admission slot and before
     /// STUN runs, so no answer and therefore no reflexive address is ever
-    /// sent to it. A node that only serves its owner's own devices sets this
-    /// to those devices so its public IP never reaches anyone else.
+    /// sent to it. This gates inbound answers only: offers this node starts
+    /// itself (`policy: open` dialing advertised npubs) still carry its
+    /// reflexive address, and a `public`/`external_addr` transport puts its
+    /// address in the public advert regardless of this list.
     #[serde(default)]
     pub offer_allowlist: Vec<String>,
     /// Max cached overlay adverts retained from relay traffic.
