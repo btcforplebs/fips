@@ -168,6 +168,12 @@ impl TraversalMachine {
         SeenDecision::Fresh { evicted: None }
     }
 
+    /// Whether `session_id` is in the replay cache.
+    #[cfg(test)]
+    pub(super) fn session_seen(&self, session_id: &str) -> bool {
+        self.lock_seen().contains_key(session_id)
+    }
+
     // --- lock helpers ---------------------------------------------------
 
     fn lock_initiators(&self) -> std::sync::MutexGuard<'_, HashSet<String>> {

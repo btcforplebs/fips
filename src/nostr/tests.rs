@@ -2042,3 +2042,109 @@ async fn answering_a_peers_offer_does_not_resend_ours() {
         "an offer we answer must not trigger a re-send"
     );
 }
+
+/// Wrap `offer` from `sender` to `runtime` and feed it to the notify loop as a
+/// relay would deliver it.
+async fn deliver_offer(
+    runtime: &NostrRendezvous,
+    notifications: &tokio::sync::broadcast::Sender<nostr_sdk::prelude::RelayPoolNotification>,
+    sender: &nostr::Keys,
+    offer: &super::TraversalOffer,
+) {
+    let receiver = runtime.keys_for_test().public_key();
+    let rumor = EventBuilder::private_msg_rumor(receiver, serde_json::to_string(offer).unwrap())
+        .build(sender.public_key());
+    let event = build_signal_event(
+        sender,
+        receiver,
+        rumor,
+        Timestamp::from((now_ms() + 30_000) / 1000),
+    )
+    .await
+    .unwrap();
+    notifications
+        .send(nostr_sdk::prelude::RelayPoolNotification::Event {
+            relay_url: RelayUrl::parse("wss://relay.example").unwrap(),
+            subscription_id: nostr::SubscriptionId::new("signals"),
+            event: Box::new(event),
+        })
+        .unwrap();
+}
+
+/// Feed one offer from a throwaway npub, then one from `device`, through the
+/// notify loop, and report whether each reached the answer step. The device
+/// offer goes second so that, once it is seen, the throwaway's has had its
+/// turn on the loop.
+async fn offers_reaching_answer(allowlist: Vec<String>, device: &nostr::Keys) -> (bool, bool) {
+    use nostr::ToBech32;
+    let config = crate::config::NostrRendezvousConfig {
+        offer_allowlist: allowlist,
+        ..Default::default()
+    };
+    let runtime = std::sync::Arc::new(NostrRendezvous::new_for_test_with_config(config));
+    let our_npub = runtime.npub_for_test().to_string();
+    let (tx, rx) = tokio::sync::broadcast::channel(16);
+    let notify = runtime.clone().spawn_notify_loop_for_test(rx);
+
+    let stranger = nostr::Keys::generate();
+    let stranger_npub = stranger.public_key().to_bech32().unwrap();
+    let device_npub = device.public_key().to_bech32().unwrap();
+    let stranger_offer = offer_between("stranger-session", &stranger_npub, &our_npub);
+    let device_offer = offer_between("device-session", &device_npub, &our_npub);
+    deliver_offer(&runtime, &tx, &stranger, &stranger_offer).await;
+    deliver_offer(&runtime, &tx, device, &device_offer).await;
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !runtime.session_seen_for_test("device-session") && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    notify.abort();
+    (
+        runtime.session_seen_for_test("stranger-session"),
+        runtime.session_seen_for_test("device-session"),
+    )
+}
+
+/// With an allowlist, an offer from any other npub gets silence: it never
+/// reaches the answer step, so this node's address is never sent to it. The
+/// listed device is answered as before.
+#[tokio::test]
+async fn offer_allowlist_answers_only_listed_devices() {
+    use nostr::ToBech32;
+    let device = nostr::Keys::generate();
+    let (stranger, device_seen) =
+        offers_reaching_answer(vec![device.public_key().to_bech32().unwrap()], &device).await;
+    assert!(device_seen, "the listed device's offer must be answered");
+    assert!(!stranger, "an unlisted npub's offer must be dropped");
+}
+
+/// An allowlist entry may be hex as well as an npub.
+#[tokio::test]
+async fn offer_allowlist_accepts_hex_entries() {
+    let device = nostr::Keys::generate();
+    let (stranger, device_seen) =
+        offers_reaching_answer(vec![device.public_key().to_hex()], &device).await;
+    assert!(device_seen);
+    assert!(!stranger);
+}
+
+/// No allowlist keeps the old behaviour: any sender is answered.
+#[tokio::test]
+async fn empty_offer_allowlist_answers_anyone() {
+    let device = nostr::Keys::generate();
+    let (stranger, device_seen) = offers_reaching_answer(Vec::new(), &device).await;
+    assert!(device_seen);
+    assert!(stranger, "without an allowlist every sender is answered");
+}
+
+/// A list whose entries all fail to parse refuses everyone rather than
+/// falling back to answering anyone.
+#[tokio::test]
+async fn unparseable_offer_allowlist_fails_closed() {
+    let device = nostr::Keys::generate();
+    let (stranger, device_seen) =
+        offers_reaching_answer(vec!["not-a-key".to_string()], &device).await;
+    assert!(!device_seen);
+    assert!(!stranger);
+}
