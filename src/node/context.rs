@@ -13,9 +13,10 @@
 //! fields through the `Node` accessors (`config()`, `identity()`,
 //! `startup_epoch()`, `is_leaf_only()`, `max_*()`, `uptime()`).
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
-use crate::{Config, Identity};
+use crate::{Config, Identity, NodeAddr, PeerIdentity};
 
 /// Effectively-immutable `Node` state, shared via `Arc<NodeContext>`.
 #[derive(Clone)]
@@ -44,6 +45,11 @@ pub(crate) struct NodeContext {
 
     /// Maximum links (0 = unlimited).
     pub max_links: usize,
+
+    /// Addresses of `node.limits.reserved_npubs`, whose sessions the
+    /// `max_sessions` cap never refuses. Derived from `config` here, so a
+    /// closure that swaps `config` keeps the set it was built with.
+    pub reserved_session_addrs: HashSet<NodeAddr>,
 }
 
 impl NodeContext {
@@ -59,6 +65,7 @@ impl NodeContext {
         max_peers: usize,
         max_links: usize,
     ) -> Self {
+        let reserved_session_addrs = reserved_addrs(&config.node.limits.reserved_npubs);
         Self {
             config,
             identity,
@@ -68,6 +75,18 @@ impl NodeContext {
             max_connections,
             max_peers,
             max_links,
+            reserved_session_addrs,
         }
     }
+}
+
+/// The node addresses of the entries that parse; `Config::validate` rejects
+/// the ones that do not.
+fn reserved_addrs(entries: &[String]) -> HashSet<NodeAddr> {
+    entries
+        .iter()
+        .filter_map(|entry| nostr::PublicKey::parse(entry).ok())
+        .filter_map(|key| secp256k1::XOnlyPublicKey::from_slice(&key.to_bytes()).ok())
+        .map(|key| *PeerIdentity::from_pubkey(key).node_addr())
+        .collect()
 }

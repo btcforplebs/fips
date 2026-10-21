@@ -42,6 +42,17 @@ pub struct LimitsConfig {
     /// end-to-end to many others, such as a gateway.
     #[serde(default = "LimitsConfig::default_max_sessions")]
     pub max_sessions: usize,
+    /// Npubs (or hex keys) whose sessions `max_sessions` never refuses
+    /// (`node.limits.reserved_npubs`).
+    ///
+    /// For a node that serves its owner's own devices alongside strangers:
+    /// strangers filling the session table must not lock the owner out. An
+    /// entry is keyed on the address a SessionSetup claims, so a stranger
+    /// claiming a listed address gets at most that one entry, and the table
+    /// grows past `max_sessions` by at most the length of this list. Empty
+    /// reserves nothing.
+    #[serde(default)]
+    pub reserved_npubs: Vec<String>,
 }
 
 impl Default for LimitsConfig {
@@ -52,6 +63,7 @@ impl Default for LimitsConfig {
             max_links: 256,
             max_pending_inbound: 1000,
             max_sessions: 1024,
+            reserved_npubs: Vec::new(),
         }
     }
 }

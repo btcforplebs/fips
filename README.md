@@ -12,8 +12,9 @@ infrastructure.
 > FIPS is under active development. The protocol and APIs are not
 > yet stable. See [Status & roadmap](#status--roadmap) below.
 
-> **Fork branch `nostr-vault`:** a v0.5.2 stopgap for the Nostr Vault
-> app (leaf-only nodes, offer re-send, leaf never self-roots). Its
+> **Fork branch `nv/v0.5.3`:** a v0.5.3 stopgap for the Nostr Vault
+> app (leaf-only nodes, leaf never self-roots, in-process `add_peer`,
+> mobile native API, `offer_allowlist`, `reserved_npubs`). Its
 > tree-validation relaxation is keyed on the declared parent, unlike
 > upstream `next`'s profile-keyed rule. Retire this branch as a whole
 > when the app moves to v1.0; do not merge it forward or reconcile it

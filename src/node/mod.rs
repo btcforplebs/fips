@@ -2731,6 +2731,11 @@ impl Node {
         self.context.max_links
     }
 
+    /// Whether `addr` is one of `node.limits.reserved_npubs`.
+    pub fn is_reserved_session_addr(&self, addr: &NodeAddr) -> bool {
+        self.context.reserved_session_addrs.contains(addr)
+    }
+
     /// Returns false when we are at or above the configured `max_peers`
     /// cap, suppressing outbound connection-initiation. `max_peers == 0`
     /// is the "no cap" sentinel and always returns true. The inbound

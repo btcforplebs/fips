@@ -6359,9 +6359,14 @@ async fn make_setup_limited_pair(burst: u32, rate: f64) -> Vec<TestNode> {
 /// what gives the forged address a route, without which the ack send fails
 /// and the entry is never inserted even in unlimited code.
 async fn deliver_forged_setup_over_link(nodes: &mut [TestNode]) {
+    let forged_src = *Identity::generate().node_addr();
+    deliver_forged_setup_over_link_from(nodes, forged_src).await;
+}
+
+/// As [`deliver_forged_setup_over_link`], claiming `forged_src`.
+async fn deliver_forged_setup_over_link_from(nodes: &mut [TestNode], forged_src: NodeAddr) {
     let node0_addr = *nodes[0].node.node_addr();
     let node1_addr = *nodes[1].node.node_addr();
-    let forged_src = *Identity::generate().node_addr();
 
     let setup = forge_setup_from_stranger(nodes);
     let datagram = SessionDatagram::new(forged_src, node1_addr, setup).with_ttl(64);
@@ -6510,11 +6515,21 @@ async fn test_a_drained_stranger_bucket_still_admits_a_setup_naming_an_establish
 /// Build a two-node routable mesh with the session table capped for a test
 /// and the setup limiter opened wide, so the cap is the only thing refusing.
 async fn make_session_capped_pair(max_sessions: usize) -> Vec<TestNode> {
+    make_session_capped_pair_reserving(max_sessions, &[]).await
+}
+
+/// As [`make_session_capped_pair`], with `reserved` as both nodes'
+/// `node.limits.reserved_npubs`.
+async fn make_session_capped_pair_reserving(
+    max_sessions: usize,
+    reserved: &[String],
+) -> Vec<TestNode> {
     let configs = (0..2)
         .map(|_| {
             let mut config = Config::new();
             config.node.rekey.enabled = false;
             config.node.limits.max_sessions = max_sessions;
+            config.node.limits.reserved_npubs = reserved.to_vec();
             config.node.rate_limit.session_setup_burst = 10_000;
             config.node.rate_limit.session_setup_rate = 10_000.0;
             config
@@ -6601,6 +6616,43 @@ async fn test_a_setup_that_would_grow_a_full_table_is_refused_and_counted() {
         originated,
         "a refused setup must cost no ack"
     );
+
+    cleanup_nodes(&mut nodes).await;
+}
+
+#[tokio::test]
+async fn test_a_full_session_table_still_admits_a_reserved_npub() {
+    // Strangers holding every slot must not lock out the owner's own device.
+    let device = Identity::generate();
+    let mut nodes = make_session_capped_pair_reserving(1, &[device.npub()]).await;
+    establish_pair_session(&mut nodes).await;
+    assert_eq!(
+        nodes[1].node.sessions.len(),
+        1,
+        "precondition: the table is full"
+    );
+
+    // Positive control: the same full table refuses an unlisted stranger.
+    deliver_forged_setup_over_link(&mut nodes).await;
+    assert_eq!(
+        nodes[1].node.sessions.len(),
+        1,
+        "a stranger must still be refused"
+    );
+    assert_eq!(nodes[1].node.stats().session.table_full, 1);
+
+    deliver_forged_setup_over_link_from(&mut nodes, *device.node_addr()).await;
+    assert_eq!(
+        nodes[1].node.sessions.len(),
+        2,
+        "a reserved npub must get an entry past the cap"
+    );
+    assert_eq!(nodes[1].node.stats().session.table_full, 1);
+
+    // A second claim of the same address joins its entry; the table does
+    // not grow for it.
+    deliver_forged_setup_over_link_from(&mut nodes, *device.node_addr()).await;
+    assert_eq!(nodes[1].node.sessions.len(), 2);
 
     cleanup_nodes(&mut nodes).await;
 }

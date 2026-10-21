@@ -2042,6 +2042,15 @@ impl Config {
             )));
         }
 
+        // A typo here would leave the owner's device unreserved with no error.
+        for entry in &self.node.limits.reserved_npubs {
+            if nostr::PublicKey::parse(entry).is_err() {
+                return Err(ConfigError::Validation(format!(
+                    "`node.limits.reserved_npubs` entry `{entry}` is not an npub or hex public key."
+                )));
+            }
+        }
+
         // A typo here must not silently narrow the allowlist to nothing that
         // matches, which would refuse the owner's own device with no error.
         for entry in &nostr.offer_allowlist {
@@ -4494,6 +4503,15 @@ node:
             err.to_string().contains("max_concurrent_offers_per_npub"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn test_validate_reserved_npubs_rejects_a_malformed_entry() {
+        let mut config = Config::default();
+        config.node.limits.reserved_npubs = vec!["npub1typo".to_string()];
+
+        let err = config.validate().expect_err("validation should fail");
+        assert!(err.to_string().contains("reserved_npubs"), "got: {err}");
     }
 
     #[test]

@@ -2834,6 +2834,13 @@ impl Node {
             return true;
         }
 
+        // A reserved address gets its entry whatever strangers hold. A
+        // stranger claiming it gets that one entry and no more, since the
+        // check above admits nothing new for an address already present.
+        if self.is_reserved_session_addr(addr) {
+            return true;
+        }
+
         if self.sessions.len() >= max_sessions {
             debug!(
                 src = %self.peer_display_name(addr),
@@ -2856,7 +2863,7 @@ impl Node {
     /// entry or join one, so the share bounds their memory.
     pub(in crate::node) fn admit_half_open_candidate(&mut self, addr: &NodeAddr) -> bool {
         let max_sessions = self.config().node.limits.max_sessions;
-        if max_sessions == 0 {
+        if max_sessions == 0 || self.is_reserved_session_addr(addr) {
             return true;
         }
         // Half-open candidates are unauthenticated and are reaped after
