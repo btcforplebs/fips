@@ -3487,6 +3487,12 @@ impl Node {
         self.pending_tun_packets.len()
     }
 
+    /// Give this node a new startup epoch, as a restart would.
+    #[cfg(test)]
+    pub(crate) fn set_startup_epoch_for_test(&mut self, epoch: [u8; 8]) {
+        Arc::make_mut(&mut self.context).startup_epoch = epoch;
+    }
+
     /// Queue a TUN packet for a destination directly (for tests that need a
     /// pending queue without driving the whole outbound path).
     #[cfg(test)]

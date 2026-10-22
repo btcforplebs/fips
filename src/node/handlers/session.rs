@@ -1354,6 +1354,7 @@ impl Node {
             }
 
             // Complete handshake → store as pending new session
+            let remote_epoch = handshake.remote_epoch();
             let session = match handshake.into_session() {
                 Ok(s) => s,
                 Err(e) => {
@@ -1375,6 +1376,20 @@ impl Node {
             let now_ms = Self::now_ms();
             let resend_interval = self.config().node.rate_limit.handshake_resend_interval_ms;
             entry.set_pending_session(session);
+            // A peer that restarted answered our msg1 as a fresh session at
+            // K-bit 0; its new startup epoch in msg2 is how we know.
+            let restarted = matches!(
+                (entry.remote_epoch(), remote_epoch),
+                (Some(old), Some(new)) if old != new
+            );
+            if restarted {
+                entry.note_restart();
+                debug!(
+                    src = %self.peer_display_name(src_addr),
+                    "FSP rekey: msg2 shows the peer restarted, cutover will take K-bit 0"
+                );
+            }
+            entry.set_remote_epoch(remote_epoch);
             entry.set_rekey_completed_ms(now_ms);
             entry.set_rekey_msg3_payload(msg3_payload, now_ms + resend_interval);
             self.sessions.insert(*src_addr, entry);
@@ -1454,6 +1469,7 @@ impl Node {
         }
 
         // Complete the handshake: into_session()
+        let remote_epoch = handshake.remote_epoch();
         let session = match handshake.into_session() {
             Ok(s) => s,
             Err(e) => {
@@ -1483,6 +1499,7 @@ impl Node {
         let now_ms = Self::now_ms();
         let resend_interval = self.config().node.rate_limit.handshake_resend_interval_ms;
         entry.set_state(EndToEndState::Established(session));
+        entry.set_remote_epoch(remote_epoch);
         entry.restore_candidates(kept);
         entry.set_coords_warmup_remaining(self.config().node.session.coords_warmup_packets);
         entry.mark_established(now_ms);
@@ -1676,6 +1693,7 @@ impl Node {
             }
 
             // Complete the handshake → store as pending new session
+            let remote_epoch = handshake.remote_epoch();
             let session = match handshake.into_session() {
                 Ok(s) => s,
                 Err(e) => {
@@ -1696,6 +1714,7 @@ impl Node {
             // counted and logged rather than silent.
             let superseded = entry.pending_new_session().is_some();
             entry.set_pending_session(session);
+            entry.set_remote_epoch(remote_epoch);
             entry.set_rekey_completed_ms(Self::now_ms());
             self.sessions.insert(*src_addr, entry);
             if superseded {
@@ -1793,6 +1812,7 @@ impl Node {
         self.register_identity(*src_addr, remote_pubkey);
 
         // Complete the handshake
+        let remote_epoch = handshake.remote_epoch();
         let session = match handshake.into_session() {
             Ok(s) => s,
             Err(e) => {
@@ -1811,6 +1831,7 @@ impl Node {
             now_ms,
             false,
         );
+        new_entry.set_remote_epoch(remote_epoch);
         new_entry.set_coords_warmup_remaining(self.config().node.session.coords_warmup_packets);
         new_entry.mark_established(now_ms);
         new_entry.init_mmp(&self.config().node.session_mmp);

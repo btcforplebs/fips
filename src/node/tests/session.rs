@@ -6396,6 +6396,81 @@ async fn a_restarted_peers_fresh_session_is_promoted_at_the_peers_k_bit() {
     cleanup_nodes(&mut nodes).await;
 }
 
+/// The initiator-timer half of the same restart: the survivor initiates the
+/// rekey, the restarted peer answers its msg1 as a fresh session at K-bit 0,
+/// and the survivor's liveness timer cuts over before any frame from the peer
+/// arrives. msg2 carries the peer's new startup epoch, so the cutover must
+/// take K-bit 0 rather than toggle to 1.
+#[tokio::test]
+async fn a_rekey_timer_cutover_to_a_restarted_peer_takes_the_peers_k_bit() {
+    let mut nodes = rekey_pair([false, true], Some(1)).await;
+    let node0_addr = *nodes[0].node.node_addr();
+    let node1_addr = *nodes[1].node.node_addr();
+    assert!(
+        !nodes[1]
+            .node
+            .get_session(&node0_addr)
+            .unwrap()
+            .current_k_bit(),
+        "precondition: the first session runs at K-bit 0"
+    );
+
+    // node 0 restarts: a new startup epoch and no session, same identity.
+    nodes[0].node.set_startup_epoch_for_test([0x5A; 8]);
+    nodes[0].node.remove_session(&node1_addr);
+
+    start_rekey(&mut nodes, 1).await;
+    pump_all(&mut nodes).await;
+
+    assert!(holds_pending(&nodes[1], &node0_addr));
+    let peer_entry = nodes[0].node.get_session(&node1_addr).unwrap();
+    assert!(peer_entry.is_established());
+    let peer_k = peer_entry.current_k_bit();
+    assert!(
+        !peer_k,
+        "the restarted peer's fresh session starts at K-bit 0"
+    );
+
+    tokio::time::sleep(Duration::from_millis(2_100)).await;
+    nodes[1].node.check_session_rekey().await;
+
+    let entry = nodes[1].node.get_session(&node0_addr).unwrap();
+    assert!(
+        entry.pending_new_session().is_none(),
+        "the liveness timer must have cut over"
+    );
+    assert_eq!(
+        entry.current_k_bit(),
+        peer_k,
+        "the survivor must send at the restarted peer's K-bit after the timer cutover"
+    );
+
+    cleanup_nodes(&mut nodes).await;
+}
+
+/// Without a restart the same timer cutover still toggles the K-bit.
+#[tokio::test]
+async fn a_rekey_timer_cutover_without_a_restart_toggles_the_k_bit() {
+    let mut nodes = rekey_pair([false, true], Some(1)).await;
+    let node0_addr = *nodes[0].node.node_addr();
+
+    start_rekey(&mut nodes, 1).await;
+    pump_all(&mut nodes).await;
+    assert!(holds_pending(&nodes[1], &node0_addr));
+
+    tokio::time::sleep(Duration::from_millis(2_100)).await;
+    nodes[1].node.check_session_rekey().await;
+
+    let entry = nodes[1].node.get_session(&node0_addr).unwrap();
+    assert!(
+        entry.pending_new_session().is_none(),
+        "the liveness timer must have cut over"
+    );
+    assert!(entry.current_k_bit(), "a plain rekey toggles 0 -> 1");
+
+    cleanup_nodes(&mut nodes).await;
+}
+
 // ============================================================================
 // Integration tests: the per-link-peer session-setup limiter
 // ============================================================================

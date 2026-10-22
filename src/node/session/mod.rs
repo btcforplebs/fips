@@ -304,6 +304,14 @@ pub(crate) struct SessionEntry {
     rekey_state: Option<HandshakeState>,
     /// Pending completed session awaiting K-bit cutover.
     pending_new_session: Option<NoiseSession>,
+    /// The msg2 that completed the held initiator pending carried a startup
+    /// epoch other than the one recorded for the peer: the peer restarted
+    /// and answered our rekey msg1 as a fresh session at K-bit 0. Cleared
+    /// whenever the pending slot is filled or emptied.
+    pending_restart: bool,
+    /// The peer's startup epoch from the last handshake that completed with
+    /// it, initial or rekey. `None` until one completes.
+    remote_epoch: Option<[u8; 8]>,
     /// Whether we initiated the current rekey.
     rekey_initiator: bool,
     /// Dampening: last time peer sent us a rekey msg1 (Unix ms).
@@ -400,6 +408,8 @@ impl SessionEntry {
             previous_last_used_ms: 0,
             rekey_state: None,
             pending_new_session: None,
+            pending_restart: false,
+            remote_epoch: None,
             rekey_initiator: false,
             last_peer_rekey_ms: 0,
             initiated_ms: 0,
@@ -1043,7 +1053,33 @@ impl SessionEntry {
     /// Store a completed rekey session.
     pub(crate) fn set_pending_session(&mut self, session: NoiseSession) {
         self.pending_new_session = Some(session);
+        self.pending_restart = false;
         self.rekey_state = None;
+    }
+
+    /// The peer's startup epoch from the last handshake that completed.
+    pub(crate) fn remote_epoch(&self) -> Option<[u8; 8]> {
+        self.remote_epoch
+    }
+
+    /// Record the peer's startup epoch from a handshake that completed.
+    pub(crate) fn set_remote_epoch(&mut self, epoch: Option<[u8; 8]>) {
+        if epoch.is_some() {
+            self.remote_epoch = epoch;
+        }
+    }
+
+    /// Record that the msg2 which completed the held initiator pending
+    /// revealed a peer restart. The restarted peer took our rekey msg1 as a
+    /// fresh session and sends at K-bit 0, so the timer cutover to this
+    /// pending takes K-bit 0 instead of toggling ours, as
+    /// `ActivePeer::note_restart` does on the link.
+    pub(crate) fn note_restart(&mut self) {
+        debug_assert!(
+            self.pending_new_session.is_some(),
+            "note_restart: no pending session is held"
+        );
+        self.pending_restart = true;
     }
 
     /// Set the rekey handshake state (in-progress XK handshake).
@@ -1094,6 +1130,7 @@ impl SessionEntry {
 
         // Promote pending to current
         self.state = Some(EndToEndState::Established(new_session));
+        self.pending_restart = false;
         self.current_k_bit = k_bit;
         self.session_start_ms = now_ms;
         self.rekey_state = None;
@@ -1117,8 +1154,18 @@ impl SessionEntry {
     /// skew between the two endpoints' cutovers. It does NOT confirm the
     /// peer is on the new epoch — the responder may still be awaiting
     /// msg3 — so msg3 retransmission must continue past this cutover.
+    ///
+    /// The K-bit toggles, or is 0 when the pending's msg2 revealed a peer
+    /// restart ([`note_restart`](Self::note_restart)): the restarted peer
+    /// established our msg1 as a fresh session at K-bit 0 and did not
+    /// toggle, so a toggle here would send at the bit it is not on.
     pub(crate) fn cutover_to_new_session(&mut self, now_ms: u64) -> bool {
-        self.promote_pending(now_ms, !self.current_k_bit)
+        let k_bit = if self.pending_restart {
+            false
+        } else {
+            !self.current_k_bit
+        };
+        self.promote_pending(now_ms, k_bit)
     }
 
     /// Promote the pending session because a peer frame authenticated
@@ -1246,6 +1293,7 @@ impl SessionEntry {
     pub(crate) fn abandon_rekey(&mut self) {
         self.rekey_state = None;
         self.pending_new_session = None;
+        self.pending_restart = false;
         self.rekey_initiator = false;
         self.rekey_completed_ms = 0;
         self.clear_rekey_msg3_payload();
