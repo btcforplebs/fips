@@ -11364,6 +11364,19 @@ async fn make_reserving_pair(
     (nodes, owner, victim)
 }
 
+/// Move node `i`'s last initiation to reserved `addr` `by_ms` into the past,
+/// as [`age_entry`] does for an entry. A stamp older than the clock is
+/// dropped, which reads the same as one that long ago.
+fn age_reserved_initiation(nodes: &mut [TestNode], i: usize, addr: &NodeAddr, by_ms: u64) {
+    let stamps = &mut nodes[i].node.reserved_initiated_ms;
+    if let Some(stamp) = stamps.get(addr).copied() {
+        match stamp.checked_sub(by_ms) {
+            Some(aged) => stamps.insert(*addr, aged),
+            None => stamps.remove(addr),
+        };
+    }
+}
+
 fn established_both_ways(nodes: &[TestNode], owner: usize, victim: usize) -> bool {
     let owner_addr = *nodes[owner].node.node_addr();
     let victim_addr = *nodes[victim].node.node_addr();
@@ -11409,6 +11422,7 @@ async fn reserved_owner_completes_against_a_forger_at_one_setup_a_second(owner_s
     // refused again and starts a fresh one.
     age_entry(&mut nodes, owner, &victim_addr, PAST_MIN_AGE_MS);
     age_entry(&mut nodes, victim, &owner_addr, PAST_MIN_AGE_MS);
+    age_reserved_initiation(&mut nodes, victim, &owner_addr, PAST_MIN_AGE_MS);
     for _ in 0..crate::node::session::MAX_HALF_OPEN_RESPONDERS {
         deliver_forged_setup_naming(&mut nodes, owner, victim).await;
     }
@@ -11544,6 +11558,78 @@ async fn candidates_claiming_a_reserved_npub_count_toward_the_half_open_share() 
             .get_session(&owner_addr)
             .is_some_and(|e| e.has_initiator_leg()),
         "the refusal must start the victim's own leg to the reserved key"
+    );
+    cleanup_nodes(&mut nodes).await;
+}
+
+#[tokio::test]
+async fn a_replayed_setup_claiming_an_unroutable_reserved_npub_initiates_once_per_resend_interval()
+{
+    use crate::identity::encode_nsec;
+
+    // The cap refusal is free and comes before the setup limiter, so one
+    // captured setup replayed must not buy a Noise msg1 and a discovery pass
+    // each time. The reserved key has no route, so a failed initiation
+    // leaves no leg behind to stop the next one.
+    let absent = Identity::generate();
+    let absent_addr = *absent.node_addr();
+    let configs = (0..2)
+        .map(|i| {
+            let id = Identity::generate();
+            let mut config = Config::new();
+            config.node.identity.nsec = Some(encode_nsec(&id.keypair().secret_key()));
+            config.node.rekey.enabled = false;
+            if i == 1 {
+                config.node.limits.max_sessions = 1;
+                config.node.limits.reserved_npubs = vec![absent.npub()];
+            }
+            config
+        })
+        .collect();
+    let mut nodes = run_tree_test_with_configs(configs, &[(0, 1)]).await;
+    verify_tree_convergence(&nodes);
+    populate_all_coord_caches(&mut nodes);
+    let link_peer = *nodes[0].node.node_addr();
+
+    // A stranger's setup fills the victim's one-entry table.
+    deliver_forged_setup_over_link(&mut nodes).await;
+    assert_eq!(
+        nodes[1].node.sessions.len(),
+        1,
+        "precondition: the table is full"
+    );
+
+    let captured = forge_setup_from_stranger(&nodes);
+    let lookup_passes = |node: &Node| {
+        let lookup = &node.metrics().lookup;
+        lookup.req_bloom_miss.get()
+            + lookup.req_initiated.get()
+            + lookup.req_deduplicated.get()
+            + lookup.req_backoff_suppressed.get()
+    };
+    let full_before = nodes[1].node.stats().session.table_full;
+    let passes_before = lookup_passes(&nodes[1].node);
+    const REPLAYS: u64 = 20;
+    for _ in 0..REPLAYS {
+        nodes[1]
+            .node
+            .handle_session_payload(&absent_addr, &link_peer, &captured, 1280, false)
+            .await;
+    }
+
+    assert_eq!(
+        nodes[1].node.stats().session.table_full - full_before,
+        REPLAYS,
+        "precondition: every replay is refused at the cap"
+    );
+    assert!(
+        nodes[1].node.get_session(&absent_addr).is_none(),
+        "precondition: no route, so no leg is registered"
+    );
+    assert_eq!(
+        lookup_passes(&nodes[1].node) - passes_before,
+        1,
+        "replays inside one resend interval must initiate once"
     );
     cleanup_nodes(&mut nodes).await;
 }

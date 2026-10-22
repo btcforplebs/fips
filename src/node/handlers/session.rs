@@ -1115,6 +1115,9 @@ impl Node {
                 // resend of ours that the peer answered as the loser, and
                 // each side would then establish as the initiator of a
                 // different handshake.
+                // A forged setup can make us yield too, once our leg is
+                // `HALF_OPEN_MIN_AGE_MS` old; the real peer still completes,
+                // since only it can answer the candidate or its own leg.
                 let we_win =
                     crate::proto::fsp::initiation_winner(self.identity().node_addr(), src_addr);
                 let unanswered_ms = now_ms.saturating_sub(existing.created_at());
@@ -2877,9 +2880,14 @@ impl Node {
     /// the half-open share. Admitting the setup anyway would hand a forger
     /// guaranteed admission on the owner's address. Initiating instead
     /// answers the owner, whose node completes it, and gives a forger
-    /// nothing: no candidate, no ack, and a handshake it cannot finish. At
-    /// most one initiator leg exists per address, so further refused setups
-    /// cost nothing here; with no route, discovery is asked for one.
+    /// nothing: no candidate, no ack, and a handshake it cannot finish.
+    ///
+    /// The cap refusal comes before the setup rate limiter and before any
+    /// crypto, so one captured setup replayed costs its sender nothing. An
+    /// initiation is a Noise msg1 and, with no route, a discovery pass, and
+    /// a failed send registers no leg. So this initiates at most once per
+    /// `handshake_resend_interval_ms` per address, whatever the entry's
+    /// state; a refused setup inside that window costs a map lookup.
     pub(in crate::node) async fn initiate_for_refused_reserved_setup(
         &mut self,
         src_addr: &NodeAddr,
@@ -2894,6 +2902,16 @@ impl Node {
         {
             return;
         }
+        let now_ms = crate::time::mono_ms();
+        let interval_ms = self.config().node.rate_limit.handshake_resend_interval_ms;
+        if self
+            .reserved_initiated_ms
+            .get(src_addr)
+            .is_some_and(|&last| now_ms.saturating_sub(last) < interval_ms)
+        {
+            return;
+        }
+        self.reserved_initiated_ms.insert(*src_addr, now_ms);
         debug!(
             src = %self.peer_display_name(src_addr),
             "Refused a setup claiming a reserved npub, initiating to it ourselves"

@@ -620,6 +620,10 @@ pub struct Node {
     /// backstop. Monotonic, so a clock step neither underflows the age nor
     /// releases every held destination at once.
     pending_tun_since: HashMap<NodeAddr, handlers::session::HeldStamp>,
+    /// When this node last initiated to each `node.limits.reserved_npubs`
+    /// address after refusing a setup claiming it (monotonic ms). Holds at
+    /// most one entry per listed npub.
+    reserved_initiated_ms: HashMap<NodeAddr, u64>,
     /// Whether routing information may still be arriving, which keeps
     /// packets to destinations no filter reaches held rather than answered.
     routing_hold: handlers::session::RoutingHold,
@@ -999,6 +1003,7 @@ impl Node {
             identity_cache: HashMap::new(),
             pending_tun_packets: HashMap::new(),
             pending_tun_since: HashMap::new(),
+            reserved_initiated_ms: HashMap::new(),
             routing_hold: handlers::session::RoutingHold::default(),
             pending_tun_bound_log: BoundLog::default(),
             pending_native: HashMap::new(),
@@ -1174,6 +1179,7 @@ impl Node {
             identity_cache: HashMap::new(),
             pending_tun_packets: HashMap::new(),
             pending_tun_since: HashMap::new(),
+            reserved_initiated_ms: HashMap::new(),
             routing_hold: handlers::session::RoutingHold::default(),
             pending_tun_bound_log: BoundLog::default(),
             pending_native: HashMap::new(),
