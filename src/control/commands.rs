@@ -17,8 +17,36 @@ pub async fn dispatch(node: &mut Node, command: &str, params: Option<&Value>) ->
         "probe_start" => probe_start(node, params).await,
         "probe_poll" => probe_poll(node, params),
         "probe_cancel" => probe_cancel(node, params).await,
+        "cache_identity" => cache_identity(node, params),
         _ => Response::error(format!("unknown command: {command}")),
     }
+}
+
+/// Put a node's public key in the identity cache, and do nothing else: no
+/// peer entry, no dial, no traversal offer, no lookup, no session.
+///
+/// A mesh address is a hash prefix of the key, so FIPS cannot route to an
+/// address whose key it has never seen: a TUN packet to it is ICMPv6
+/// no-route, and a lookup answer for it cannot be verified. An embedder that
+/// opens a session to an npub over the tree (without dialing it, so the far
+/// end never learns this node's transport address) seeds the key here
+/// first, as the native API does for a flow (`cache_flow_key`).
+///
+/// Params: `{"npub": "npub1..."}`
+fn cache_identity(node: &mut Node, params: Option<&Value>) -> Response {
+    let Some(npub) = params.and_then(|p| p.get("npub")).and_then(|v| v.as_str()) else {
+        return Response::error("missing 'npub' parameter");
+    };
+    let identity = match crate::PeerIdentity::from_npub(npub) {
+        Ok(id) => id,
+        Err(e) => return Response::error(format!("invalid peer npub: {e}")),
+    };
+    if identity.node_addr() == node.node_addr() {
+        return Response::error("cannot cache this node's own identity");
+    }
+    node.register_identity(*identity.node_addr(), identity.pubkey_full());
+    debug!(npub = %npub, "API cached identity");
+    Response::ok(serde_json::json!({ "node_addr": identity.node_addr().to_string() }))
 }
 
 /// Connect to a peer.
@@ -154,6 +182,62 @@ mod tests {
 
     /// A known-good npub that is not this node's own.
     const OTHER_NPUB: &str = "npub180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3evf6u64th6gkwsyjh6w6";
+
+    #[tokio::test]
+    async fn cache_identity_seeds_the_cache_and_nothing_else() {
+        let mut node = test_node();
+        let id = crate::PeerIdentity::from_npub(OTHER_NPUB).unwrap();
+        assert!(
+            !node.has_cached_identity(id.node_addr()),
+            "control: not cached before"
+        );
+        let peers_before = node.peer_count();
+        let resp = dispatch(
+            &mut node,
+            "cache_identity",
+            Some(&json!({"npub": OTHER_NPUB})),
+        )
+        .await;
+        assert_eq!(resp.status, "ok", "{:?}", resp.message);
+        assert!(node.has_cached_identity(id.node_addr()));
+        // No peer added and nothing dialed.
+        assert_eq!(node.peer_count(), peers_before);
+        // No cap: many in a row all land, each under its own key's prefix,
+        // and none displaces another.
+        let mut seeded = vec![*id.node_addr()];
+        for _ in 0..16 {
+            let other = crate::Identity::generate();
+            let resp = dispatch(
+                &mut node,
+                "cache_identity",
+                Some(&json!({"npub": other.npub()})),
+            )
+            .await;
+            assert_eq!(resp.status, "ok");
+            seeded.push(*other.node_addr());
+        }
+        for addr in &seeded {
+            assert!(node.has_cached_identity(addr), "{addr} was displaced");
+        }
+        assert_eq!(node.peer_count(), peers_before);
+    }
+
+    #[tokio::test]
+    async fn cache_identity_rejects_bad_input() {
+        let mut node = test_node();
+        let resp = dispatch(
+            &mut node,
+            "cache_identity",
+            Some(&json!({"npub": "npub1nonsense"})),
+        )
+        .await;
+        assert_eq!(resp.status, "error");
+        let resp = dispatch(&mut node, "cache_identity", None).await;
+        assert_eq!(resp.status, "error");
+        let own = node.npub();
+        let resp = dispatch(&mut node, "cache_identity", Some(&json!({"npub": own}))).await;
+        assert_eq!(resp.status, "error");
+    }
 
     #[tokio::test]
     async fn probe_poll_unknown_id_errors() {
