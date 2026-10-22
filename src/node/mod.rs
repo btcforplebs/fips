@@ -2733,7 +2733,12 @@ impl Node {
 
     /// Whether `addr` is one of `node.limits.reserved_npubs`.
     pub fn is_reserved_session_addr(&self, addr: &NodeAddr) -> bool {
-        self.context.reserved_session_addrs.contains(addr)
+        self.context.reserved_session_keys.contains_key(addr)
+    }
+
+    /// The key `node.limits.reserved_npubs` lists for `addr`, if any.
+    pub(crate) fn reserved_session_key(&self, addr: &NodeAddr) -> Option<secp256k1::PublicKey> {
+        self.context.reserved_session_keys.get(addr).copied()
     }
 
     /// Returns false when we are at or above the configured `max_peers`

@@ -42,14 +42,18 @@ pub struct LimitsConfig {
     /// end-to-end to many others, such as a gateway.
     #[serde(default = "LimitsConfig::default_max_sessions")]
     pub max_sessions: usize,
-    /// Npubs (or hex keys) whose sessions `max_sessions` never refuses
-    /// (`node.limits.reserved_npubs`).
+    /// Npubs (or hex keys) this node keeps reachable however full its
+    /// session table is (`node.limits.reserved_npubs`).
     ///
     /// For a node that serves its owner's own devices alongside strangers:
-    /// strangers filling the session table must not lock the owner out. An
-    /// entry is keyed on the address a SessionSetup claims, so a stranger
-    /// claiming a listed address gets at most that one entry, and the table
-    /// grows past `max_sessions` by at most the length of this list. Empty
+    /// strangers filling the session table, or forging setups that claim a
+    /// listed address, must not lock the owner out. A SessionSetup proves
+    /// nothing about the address it claims, so a listed address gets no
+    /// exemption as a responder: its setups meet the table cap and the
+    /// half-open share like any other. When one is refused, this node
+    /// initiates its own session to the listed key instead, which only the
+    /// key's holder can complete. Those sessions alone may take the table
+    /// past `max_sessions`, by at most the length of this list. Empty
     /// reserves nothing.
     #[serde(default)]
     pub reserved_npubs: Vec<String>,
@@ -1431,6 +1435,14 @@ impl NodeConfig {
     pub fn drain_timeout(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.drain_timeout_secs.unwrap_or(2))
     }
+}
+
+/// The key a `node.limits.reserved_npubs` entry names, or `None` when it does
+/// not parse. `Config::validate` and the node both read entries through this,
+/// so an entry the node would drop is one validation rejects.
+pub(crate) fn reserved_npub_key(entry: &str) -> Option<secp256k1::XOnlyPublicKey> {
+    let key = nostr::PublicKey::parse(entry).ok()?;
+    secp256k1::XOnlyPublicKey::from_slice(&key.to_bytes()).ok()
 }
 
 #[cfg(test)]

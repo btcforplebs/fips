@@ -13,8 +13,10 @@
 //! fields through the `Node` accessors (`config()`, `identity()`,
 //! `startup_epoch()`, `is_leaf_only()`, `max_*()`, `uptime()`).
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::Arc;
+
+use secp256k1::PublicKey;
 
 use crate::{Config, Identity, NodeAddr, PeerIdentity};
 
@@ -46,10 +48,11 @@ pub(crate) struct NodeContext {
     /// Maximum links (0 = unlimited).
     pub max_links: usize,
 
-    /// Addresses of `node.limits.reserved_npubs`, whose sessions the
-    /// `max_sessions` cap never refuses. Derived from `config` here, so a
-    /// closure that swaps `config` keeps the set it was built with.
-    pub reserved_session_addrs: HashSet<NodeAddr>,
+    /// The keys of `node.limits.reserved_npubs` by address: this node
+    /// initiates to one when a setup claiming its address is refused.
+    /// Derived from `config` here, so a closure that swaps `config` keeps
+    /// the map it was built with.
+    pub reserved_session_keys: HashMap<NodeAddr, PublicKey>,
 }
 
 impl NodeContext {
@@ -65,7 +68,7 @@ impl NodeContext {
         max_peers: usize,
         max_links: usize,
     ) -> Self {
-        let reserved_session_addrs = reserved_addrs(&config.node.limits.reserved_npubs);
+        let reserved_session_keys = reserved_keys(&config.node.limits.reserved_npubs);
         Self {
             config,
             identity,
@@ -75,18 +78,20 @@ impl NodeContext {
             max_connections,
             max_peers,
             max_links,
-            reserved_session_addrs,
+            reserved_session_keys,
         }
     }
 }
 
-/// The node addresses of the entries that parse; `Config::validate` rejects
-/// the ones that do not.
-fn reserved_addrs(entries: &[String]) -> HashSet<NodeAddr> {
+/// The keys of the entries that parse, by node address; `Config::validate`
+/// rejects the ones that do not.
+fn reserved_keys(entries: &[String]) -> HashMap<NodeAddr, PublicKey> {
     entries
         .iter()
-        .filter_map(|entry| nostr::PublicKey::parse(entry).ok())
-        .filter_map(|key| secp256k1::XOnlyPublicKey::from_slice(&key.to_bytes()).ok())
-        .map(|key| *PeerIdentity::from_pubkey(key).node_addr())
+        .filter_map(|entry| crate::config::reserved_npub_key(entry))
+        .map(|key| {
+            let peer = PeerIdentity::from_pubkey(key);
+            (*peer.node_addr(), peer.pubkey_full())
+        })
         .collect()
 }

@@ -42,6 +42,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 #[cfg(target_os = "linux")]
 pub use gateway::{ConntrackConfig, GatewayConfig, GatewayDnsConfig, PortForward, Proto};
+pub(crate) use node::reserved_npub_key;
 pub use node::{
     BloomConfig, BuffersConfig, CacheConfig, ControlConfig, LimitsConfig, LookupConfig, MmpConfig,
     NativeApiConfig, NodeConfig, NostrRendezvousConfig, NostrRendezvousPolicy, RateLimitConfig,
@@ -2044,7 +2045,7 @@ impl Config {
 
         // A typo here would leave the owner's device unreserved with no error.
         for entry in &self.node.limits.reserved_npubs {
-            if nostr::PublicKey::parse(entry).is_err() {
+            if node::reserved_npub_key(entry).is_none() {
                 return Err(ConfigError::Validation(format!(
                     "`node.limits.reserved_npubs` entry `{entry}` is not an npub or hex public key."
                 )));

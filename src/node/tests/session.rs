@@ -6621,43 +6621,6 @@ async fn test_a_setup_that_would_grow_a_full_table_is_refused_and_counted() {
 }
 
 #[tokio::test]
-async fn test_a_full_session_table_still_admits_a_reserved_npub() {
-    // Strangers holding every slot must not lock out the owner's own device.
-    let device = Identity::generate();
-    let mut nodes = make_session_capped_pair_reserving(1, &[device.npub()]).await;
-    establish_pair_session(&mut nodes).await;
-    assert_eq!(
-        nodes[1].node.sessions.len(),
-        1,
-        "precondition: the table is full"
-    );
-
-    // Positive control: the same full table refuses an unlisted stranger.
-    deliver_forged_setup_over_link(&mut nodes).await;
-    assert_eq!(
-        nodes[1].node.sessions.len(),
-        1,
-        "a stranger must still be refused"
-    );
-    assert_eq!(nodes[1].node.stats().session.table_full, 1);
-
-    deliver_forged_setup_over_link_from(&mut nodes, *device.node_addr()).await;
-    assert_eq!(
-        nodes[1].node.sessions.len(),
-        2,
-        "a reserved npub must get an entry past the cap"
-    );
-    assert_eq!(nodes[1].node.stats().session.table_full, 1);
-
-    // A second claim of the same address joins its entry; the table does
-    // not grow for it.
-    deliver_forged_setup_over_link_from(&mut nodes, *device.node_addr()).await;
-    assert_eq!(nodes[1].node.sessions.len(), 2);
-
-    cleanup_nodes(&mut nodes).await;
-}
-
-#[tokio::test]
 async fn test_a_full_session_table_still_serves_a_setup_naming_an_existing_entry() {
     // The guard against writing the cap as "refuse strangers". A setup for an
     // entry already present cannot grow the table, and refusing it would break
@@ -11352,6 +11315,235 @@ async fn a_candidate_kept_beside_the_losers_session_expires_on_its_own_deadline(
         Some((true, 0)),
         "a candidate kept beside an established session must expire a \
          handshake timeout after its setup, leaving the session"
+    );
+    cleanup_nodes(&mut nodes).await;
+}
+
+// node.limits.reserved_npubs. A setup claiming a reserved address proves
+// nothing, and owner npubs are public, so the reservation is no exemption for
+// the setup: when one is refused, the node initiates to the reserved key
+// itself, which only the key's holder can complete.
+
+/// A rekey-disabled pair where the victim lists the owner's npub in
+/// `node.limits.reserved_npubs`. The owner has the smaller address when
+/// `owner_smaller`, so it wins the simultaneous-initiation tie-break. Returns
+/// the nodes and `(owner, victim)` indices.
+async fn make_reserving_pair(
+    owner_smaller: bool,
+    max_sessions: usize,
+) -> (Vec<TestNode>, usize, usize) {
+    use crate::identity::encode_nsec;
+
+    let mut ids = [Identity::generate(), Identity::generate()];
+    ids.sort_by(|a, b| a.node_addr().cmp(b.node_addr()));
+    let (owner, victim) = if owner_smaller { (0, 1) } else { (1, 0) };
+    let owner_npub = ids[owner].npub();
+    let configs = ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| {
+            let mut config = Config::new();
+            config.node.identity.nsec = Some(encode_nsec(&id.keypair().secret_key()));
+            config.node.rekey.enabled = false;
+            config.node.limits.max_sessions = max_sessions;
+            if i == victim {
+                config.node.limits.reserved_npubs = vec![owner_npub.clone()];
+            }
+            config
+        })
+        .collect();
+    let mut nodes = run_tree_test_with_configs(configs, &[(0, 1)]).await;
+    verify_tree_convergence(&nodes);
+    populate_all_coord_caches(&mut nodes);
+    assert!(
+        nodes[victim]
+            .node
+            .is_reserved_session_addr(nodes[owner].node.node_addr()),
+        "precondition: the victim reserves the owner"
+    );
+    (nodes, owner, victim)
+}
+
+fn established_both_ways(nodes: &[TestNode], owner: usize, victim: usize) -> bool {
+    let owner_addr = *nodes[owner].node.node_addr();
+    let victim_addr = *nodes[victim].node.node_addr();
+    nodes[owner]
+        .node
+        .get_session(&victim_addr)
+        .is_some_and(|e| e.is_established())
+        && nodes[victim]
+            .node
+            .get_session(&owner_addr)
+            .is_some_and(|e| e.is_established())
+}
+
+/// A forger sends one setup a second claiming the owner, which keeps every
+/// candidate slot younger than the minimum age, and the victim has no
+/// traffic of its own for the owner. The owner's own setups are refused; the
+/// victim must reach it anyway.
+async fn reserved_owner_completes_against_a_forger_at_one_setup_a_second(owner_smaller: bool) {
+    let (mut nodes, owner, victim) = make_reserving_pair(owner_smaller, 1024).await;
+    let owner_addr = *nodes[owner].node.node_addr();
+    let victim_addr = *nodes[victim].node.node_addr();
+    let victim_pubkey = nodes[victim].node.identity().pubkey_full();
+
+    deliver_forged_setup_naming(&mut nodes, owner, victim).await;
+    for _ in 0..5 {
+        age_entry(&mut nodes, victim, &owner_addr, 1_000);
+        deliver_forged_setup_naming(&mut nodes, owner, victim).await;
+    }
+    lose_queued(&mut nodes, owner);
+
+    nodes[owner]
+        .node
+        .initiate_session(victim_addr, victim_pubkey)
+        .await
+        .expect("the owner's initiation must start");
+    drain_to_quiescence(&mut nodes).await;
+
+    // Time passes: the owner's setup goes unanswered for the minimum age
+    // (an owner with the smaller address drops the victim's setups until
+    // then), the forger keeps the slots young, and both legs resend. A
+    // victim with the smaller address yields its own leg to a forged setup
+    // once that leg is the minimum age old; the owner's resend is then
+    // refused again and starts a fresh one.
+    age_entry(&mut nodes, owner, &victim_addr, PAST_MIN_AGE_MS);
+    age_entry(&mut nodes, victim, &owner_addr, PAST_MIN_AGE_MS);
+    for _ in 0..crate::node::session::MAX_HALF_OPEN_RESPONDERS {
+        deliver_forged_setup_naming(&mut nodes, owner, victim).await;
+    }
+    lose_queued(&mut nodes, owner);
+    assert_eq!(
+        candidates_at(&nodes, victim, &owner_addr),
+        crate::node::session::MAX_HALF_OPEN_RESPONDERS,
+        "precondition: the forger holds every slot"
+    );
+    // Aging moves no resend deadline, so the clock passed here does: past
+    // the first resend interval.
+    let resend_due = Node::now_ms()
+        + 2 * nodes[victim]
+            .node
+            .config()
+            .node
+            .rate_limit
+            .handshake_resend_interval_ms;
+    for i in [victim, owner] {
+        nodes[i]
+            .node
+            .resend_pending_session_handshakes(resend_due)
+            .await;
+    }
+    drain_to_quiescence(&mut nodes).await;
+
+    assert!(
+        established_both_ways(&nodes, owner, victim),
+        "a forger holding a reserved address's candidates young must not lock \
+         the owner out"
+    );
+    cleanup_nodes(&mut nodes).await;
+}
+
+#[tokio::test]
+async fn a_reserved_owner_with_the_larger_address_completes_against_a_forger_at_one_setup_a_second()
+{
+    reserved_owner_completes_against_a_forger_at_one_setup_a_second(false).await;
+}
+
+#[tokio::test]
+async fn a_reserved_owner_with_the_smaller_address_completes_against_a_forger_at_one_setup_a_second()
+ {
+    reserved_owner_completes_against_a_forger_at_one_setup_a_second(true).await;
+}
+
+#[tokio::test]
+async fn a_forged_setup_claiming_a_reserved_npub_at_a_full_table_gets_no_candidate() {
+    // A full table must not admit a setup just because it claims a reserved
+    // address: that would hand a forger guaranteed admission on the owner's
+    // address.
+    let (mut nodes, owner, victim) = make_reserving_pair(true, 1).await;
+    assert_eq!(
+        (owner, victim),
+        (0, 1),
+        "the over-link helper forges at node 1"
+    );
+    let owner_addr = *nodes[owner].node.node_addr();
+
+    // A stranger's setup fills the victim's one-entry table.
+    deliver_forged_setup_over_link(&mut nodes).await;
+    lose_queued(&mut nodes, owner);
+    assert_eq!(
+        nodes[victim].node.sessions.len(),
+        1,
+        "precondition: the table is full"
+    );
+    let full_before = nodes[victim].node.stats().session.table_full;
+
+    let forged = forge_setup_naming(&nodes[owner], &nodes[victim]);
+    nodes[victim]
+        .node
+        .handle_session_payload(&owner_addr, &owner_addr, &forged, 1280, false)
+        .await;
+    assert_eq!(
+        candidates_at(&nodes, victim, &owner_addr),
+        0,
+        "a setup claiming a reserved address must meet the table cap"
+    );
+    assert_eq!(
+        nodes[victim].node.stats().session.table_full - full_before,
+        1,
+        "the refusal must be counted"
+    );
+    assert!(
+        nodes[victim]
+            .node
+            .get_session(&owner_addr)
+            .is_some_and(|e| e.has_initiator_leg()),
+        "the refusal must start the victim's own leg to the reserved key"
+    );
+
+    // The forger's claim can only get the real owner a session.
+    drain_to_quiescence(&mut nodes).await;
+    assert!(established_both_ways(&nodes, owner, victim));
+    cleanup_nodes(&mut nodes).await;
+}
+
+#[tokio::test]
+async fn candidates_claiming_a_reserved_npub_count_toward_the_half_open_share() {
+    // A half-open share of two.
+    let (mut nodes, owner, victim) = make_reserving_pair(true, 4).await;
+    let owner_addr = *nodes[owner].node.node_addr();
+
+    deliver_forged_setup_naming(&mut nodes, owner, victim).await;
+    deliver_forged_setup_naming(&mut nodes, owner, victim).await;
+    assert_eq!(
+        candidates_at(&nodes, victim, &owner_addr),
+        2,
+        "precondition: two candidates fill the half-open share"
+    );
+    let refused_before = nodes[victim].node.stats().session.half_open_full;
+
+    let forged = forge_setup_naming(&nodes[owner], &nodes[victim]);
+    nodes[victim]
+        .node
+        .handle_session_payload(&owner_addr, &owner_addr, &forged, 1280, false)
+        .await;
+
+    assert_eq!(
+        candidates_at(&nodes, victim, &owner_addr),
+        2,
+        "a reserved address's candidates must be metered like any other"
+    );
+    assert_eq!(
+        nodes[victim].node.stats().session.half_open_full - refused_before,
+        1,
+        "the refusal must be counted"
+    );
+    assert!(
+        nodes[victim]
+            .node
+            .get_session(&owner_addr)
+            .is_some_and(|e| e.has_initiator_leg()),
+        "the refusal must start the victim's own leg to the reserved key"
     );
     cleanup_nodes(&mut nodes).await;
 }

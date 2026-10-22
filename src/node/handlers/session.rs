@@ -880,7 +880,8 @@ impl Node {
         // in `queue_pending_packet`. Refuse rather than evict: msg1 is
         // unauthenticated here, so evicting would hand a stranger a teardown
         // primitive it does not have.
-        if !self.admit_new_session(src_addr) {
+        if !self.admit_new_entry(src_addr) {
+            self.initiate_for_refused_reserved_setup(src_addr).await;
             return;
         }
 
@@ -1151,9 +1152,11 @@ impl Node {
                     reason = "candidates-young",
                     "Every responder candidate for this address is younger than the minimum age, refusing the setup"
                 );
+                self.initiate_for_refused_reserved_setup(src_addr).await;
                 return;
             }
             if admission == CandidateAdmission::Room && !self.admit_half_open_candidate(src_addr) {
+                self.initiate_for_refused_reserved_setup(src_addr).await;
                 return;
             }
         }
@@ -2821,23 +2824,30 @@ impl Node {
     /// Creates a Noise XK handshake as initiator, wraps msg1 in a
     /// SessionSetup, encapsulates in a SessionDatagram, and routes
     /// toward the destination.
-    /// Whether a session for `addr` may be created, given the table cap.
+    /// Whether this node may create a session for `addr` by initiating it,
+    /// given the table cap.
+    ///
+    /// As [`Self::admit_new_entry`], except that a `node.limits.reserved_npubs`
+    /// address is always admitted: this node's own initiation names the key
+    /// it expects, so only that key's holder can complete it.
+    pub(in crate::node) fn admit_new_session(&mut self, addr: &NodeAddr) -> bool {
+        self.is_reserved_session_addr(addr) || self.admit_new_entry(addr)
+    }
+
+    /// Whether a session entry for `addr` may be created, given the table cap.
     ///
     /// Returns true when an entry already exists, since admitting it cannot
     /// grow the table; a responder candidate joining that entry is checked
     /// against the half-open share by the setup handler, through
     /// `admit_half_open_candidate`. Counts its own refusals, so the two
     /// reasons are distinguishable without turning on debug logging.
-    pub(in crate::node) fn admit_new_session(&mut self, addr: &NodeAddr) -> bool {
+    ///
+    /// The setup handler calls this directly: a SessionSetup proves nothing
+    /// about the address it claims, so a reserved address gets no exemption
+    /// there (see [`Self::initiate_for_refused_reserved_setup`]).
+    pub(in crate::node) fn admit_new_entry(&mut self, addr: &NodeAddr) -> bool {
         let max_sessions = self.config().node.limits.max_sessions;
         if max_sessions == 0 || self.sessions.contains_key(addr) {
-            return true;
-        }
-
-        // A reserved address gets its entry whatever strangers hold. A
-        // stranger claiming it gets that one entry and no more, since the
-        // check above admits nothing new for an address already present.
-        if self.is_reserved_session_addr(addr) {
             return true;
         }
 
@@ -2858,12 +2868,45 @@ impl Node {
         self.admit_half_open_candidate(addr)
     }
 
+    /// After refusing a SessionSetup that claims a `node.limits.reserved_npubs`
+    /// address, initiate this node's own session to that key.
+    ///
+    /// The setup may be forged, since owner npubs are public, and the
+    /// refusal may be one a forger caused: by keeping the address's
+    /// candidates younger than the minimum age, or by filling the table or
+    /// the half-open share. Admitting the setup anyway would hand a forger
+    /// guaranteed admission on the owner's address. Initiating instead
+    /// answers the owner, whose node completes it, and gives a forger
+    /// nothing: no candidate, no ack, and a handshake it cannot finish. At
+    /// most one initiator leg exists per address, so further refused setups
+    /// cost nothing here; with no route, discovery is asked for one.
+    pub(in crate::node) async fn initiate_for_refused_reserved_setup(
+        &mut self,
+        src_addr: &NodeAddr,
+    ) {
+        let Some(key) = self.reserved_session_key(src_addr) else {
+            return;
+        };
+        if self
+            .sessions
+            .get(src_addr)
+            .is_some_and(|e| e.is_established() || e.has_initiator_leg())
+        {
+            return;
+        }
+        debug!(
+            src = %self.peer_display_name(src_addr),
+            "Refused a setup claiming a reserved npub, initiating to it ourselves"
+        );
+        self.initiate_behind_candidates(*src_addr, key).await;
+    }
+
     /// Whether one more responder candidate fits the half-open share of the
     /// session table. Candidates count individually, whether they open an
     /// entry or join one, so the share bounds their memory.
     pub(in crate::node) fn admit_half_open_candidate(&mut self, addr: &NodeAddr) -> bool {
         let max_sessions = self.config().node.limits.max_sessions;
-        if max_sessions == 0 || self.is_reserved_session_addr(addr) {
+        if max_sessions == 0 {
             return true;
         }
         // Half-open candidates are unauthenticated and are reaped after
