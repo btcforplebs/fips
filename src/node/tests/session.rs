@@ -6329,6 +6329,73 @@ async fn test_genuine_peer_restart_reestablishes_session_with_rekey_enabled() {
     cleanup_nodes(&mut nodes).await;
 }
 
+/// A peer that restarts with its kept key opens a fresh session at K-bit 0.
+/// The survivor still holds the old session, takes the setup as a rekey and,
+/// on the peer's first frame, promotes it. It must then send at the bit the
+/// peer is on, not the toggle of its own: fips-ts drops a frame whose K-bit
+/// is neither its current nor its draining epoch's ("epoch mismatch"), so a
+/// web reader that restarted inside the 90 s idle timeout got nothing back.
+#[tokio::test]
+async fn a_restarted_peers_fresh_session_is_promoted_at_the_peers_k_bit() {
+    let mut nodes = run_tree_test(2, &[(0, 1)], false).await;
+    verify_tree_convergence(&nodes);
+    populate_all_coord_caches(&mut nodes);
+    establish_pair_session(&mut nodes).await;
+
+    let node0_addr = *nodes[0].node.node_addr();
+    let node1_addr = *nodes[1].node.node_addr();
+    let node1_pubkey = nodes[1].node.identity().pubkey_full();
+    assert!(
+        !nodes[1]
+            .node
+            .get_session(&node0_addr)
+            .unwrap()
+            .current_k_bit(),
+        "precondition: the first session runs at K-bit 0"
+    );
+
+    nodes[0].node.remove_session(&node1_addr);
+    nodes[0]
+        .node
+        .initiate_session(node1_addr, node1_pubkey)
+        .await
+        .expect("re-initiate_session failed");
+    for _ in 0..3 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        process_available_packets(&mut nodes).await;
+    }
+    let peer_k = nodes[0]
+        .node
+        .get_session(&node1_addr)
+        .unwrap()
+        .current_k_bit();
+    assert!(
+        !peer_k,
+        "the restarted peer's fresh session starts at K-bit 0"
+    );
+
+    nodes[0]
+        .node
+        .send_session_data(&node1_addr, 0, 0, b"after the restart")
+        .await
+        .expect("send_session_data failed");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    process_available_packets(&mut nodes).await;
+
+    let entry = nodes[1].node.get_session(&node0_addr).unwrap();
+    assert!(
+        entry.pending_new_session().is_none(),
+        "the peer's first frame on the new session must complete the cutover"
+    );
+    assert_eq!(
+        entry.current_k_bit(),
+        peer_k,
+        "the survivor must send at the restarted peer's K-bit after the cutover"
+    );
+
+    cleanup_nodes(&mut nodes).await;
+}
+
 // ============================================================================
 // Integration tests: the per-link-peer session-setup limiter
 // ============================================================================

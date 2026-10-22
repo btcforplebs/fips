@@ -638,17 +638,18 @@ impl Node {
                     "Peer FSP new-epoch frame authenticated, FSP rekey cutover complete, promoting new session"
                 );
                 entry.confirm_peer_new_epoch();
-                entry.handle_peer_kbit_flip(now_ms);
+                entry.handle_peer_kbit_flip(now_ms, received_k_bit);
             }
             EpochReaction::Promote => {
-                // Promote now: current → previous, pending → current, flip the
-                // K-bit. The header K-bit is only a hint; the authenticated
-                // decrypt is the gating event.
+                // Promote now: current → previous, pending → current, and
+                // send at the frame's K-bit. The header K-bit is only a hint
+                // for which slot to try; the authenticated decrypt is the
+                // gating event.
                 info!(
                     peer = %self.peer_display_name(src_addr),
                     "Peer FSP new-epoch frame authenticated, FSP rekey cutover complete, promoting new session"
                 );
-                entry.handle_peer_kbit_flip(now_ms);
+                entry.handle_peer_kbit_flip(now_ms, received_k_bit);
             }
             EpochReaction::ConfirmResponder => {
                 // We are the rekey initiator that already cut over on its own

@@ -1072,11 +1072,11 @@ impl SessionEntry {
     /// Promote the pending session to current (the cutover).
     ///
     /// Moves the current session to `previous` (for drain), promotes
-    /// `pending` to `current`, flips the K-bit, stamps the drain window.
-    /// Shared by both cutover triggers: the initiator's liveness timer
-    /// (`cutover_to_new_session`) and a successful `pending` trial-decrypt
-    /// (`handle_peer_kbit_flip`).
-    fn promote_pending(&mut self, now_ms: u64) -> bool {
+    /// `pending` to `current`, sets the K-bit to `k_bit`, stamps the drain
+    /// window. Shared by both cutover triggers: the initiator's liveness
+    /// timer (`cutover_to_new_session`) and a successful `pending`
+    /// trial-decrypt (`handle_peer_kbit_flip`).
+    fn promote_pending(&mut self, now_ms: u64, k_bit: bool) -> bool {
         let new_session = match self.pending_new_session.take() {
             Some(s) => s,
             None => return false,
@@ -1094,7 +1094,7 @@ impl SessionEntry {
 
         // Promote pending to current
         self.state = Some(EndToEndState::Established(new_session));
-        self.current_k_bit = !self.current_k_bit;
+        self.current_k_bit = k_bit;
         self.session_start_ms = now_ms;
         self.rekey_state = None;
         self.rekey_initiator = false;
@@ -1118,7 +1118,7 @@ impl SessionEntry {
     /// peer is on the new epoch — the responder may still be awaiting
     /// msg3 — so msg3 retransmission must continue past this cutover.
     pub(crate) fn cutover_to_new_session(&mut self, now_ms: u64) -> bool {
-        self.promote_pending(now_ms)
+        self.promote_pending(now_ms, !self.current_k_bit)
     }
 
     /// Promote the pending session because a peer frame authenticated
@@ -1129,8 +1129,16 @@ impl SessionEntry {
     /// This unifies the trigger: the header K-bit is only a hint, the
     /// authenticated decrypt is the actual proof. Used by the
     /// trial-decrypt cascade on a successful `pending` decrypt.
-    pub(crate) fn handle_peer_kbit_flip(&mut self, now_ms: u64) -> bool {
-        self.promote_pending(now_ms)
+    ///
+    /// The K-bit is taken from that frame (`frame_k_bit`, authenticated as
+    /// AAD) rather than toggled, as `ActivePeer::adopt_pending` does on the
+    /// link. The two only differ when the peer restarted: it opened a fresh
+    /// session at K-bit 0, our old entry took its setup as a rekey, and a
+    /// toggle would send at the bit the peer is not on. fips-ts drops every
+    /// such frame ("epoch mismatch"), so a reader that restarts with its
+    /// kept key gets nothing back until the old session idles out.
+    pub(crate) fn handle_peer_kbit_flip(&mut self, now_ms: u64, frame_k_bit: bool) -> bool {
+        self.promote_pending(now_ms, frame_k_bit)
     }
 
     /// Check if the drain window has expired.
@@ -1388,7 +1396,7 @@ mod overlapping_epoch_tests {
         assert_eq!(slot, EpochSlot::Pending);
 
         // Receive path promotes on a pending hit.
-        entry.handle_peer_kbit_flip(2_000);
+        entry.handle_peer_kbit_flip(2_000, !k_before);
         assert!(entry.pending_new_session().is_none());
         assert!(entry.previous_highest_counter().is_some());
         assert_ne!(entry.current_k_bit(), k_before);
@@ -1437,7 +1445,7 @@ mod overlapping_epoch_tests {
             .fsp_trial_decrypt(&ct_new, c_new, &hdr_new, !k_before, 2_000)
             .unwrap();
         assert_eq!(slot, EpochSlot::Pending);
-        entry.handle_peer_kbit_flip(2_000);
+        entry.handle_peer_kbit_flip(2_000, !k_before);
 
         // Now an OLD-epoch straggler arrives reordered after cutover.
         let (ct_old, c_old, hdr_old) = seal(&mut cur_send, b"reordered-old", k_before);
