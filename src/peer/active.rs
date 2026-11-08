@@ -240,6 +240,9 @@ pub struct ActivePeer {
     filter_received_at: u64,
     /// Whether we owe them a filter update.
     pending_filter_update: bool,
+    /// Whether their latest FilterAnnounce was refused at the inbound FPR
+    /// cap, so `inbound_filter` (if any) is older than what they hold.
+    inbound_filter_refused: bool,
 
     // === Statistics ===
     /// When this peer was authenticated (Unix milliseconds).
@@ -348,6 +351,7 @@ impl ActivePeer {
             filter_sequence: 0,
             filter_received_at: 0,
             pending_filter_update: true, // Send filter on new connection
+            inbound_filter_refused: false,
             authenticated_at,
             remote_epoch: None,
             last_heartbeat_sent: None,
@@ -437,6 +441,7 @@ impl ActivePeer {
             filter_sequence: 0,
             filter_received_at: 0,
             pending_filter_update: true,
+            inbound_filter_refused: false,
             authenticated_at,
             remote_epoch,
             last_heartbeat_sent: None,
@@ -1003,6 +1008,20 @@ impl ActivePeer {
         self.filter_sequence = sequence;
         self.filter_received_at = current_time_ms;
         self.send.last_seen = current_time_ms;
+        self.inbound_filter_refused = false;
+    }
+
+    /// Record that their latest FilterAnnounce was refused at the inbound FPR
+    /// cap. The prior filter is kept (antipoison), but it is now stale.
+    pub fn mark_filter_refused(&mut self) {
+        self.inbound_filter_refused = true;
+    }
+
+    /// True when we hold no current view of what they reach: no filter has
+    /// been accepted yet, or their latest one was refused at the FPR cap. A
+    /// miss against such a view is not evidence that they cannot reach it.
+    pub fn filter_view_incomplete(&self) -> bool {
+        self.inbound_filter.is_none() || self.inbound_filter_refused
     }
 
     /// Clear peer's inbound filter.
@@ -1783,6 +1802,25 @@ mod tests {
         assert!(peer.may_reach(&target));
         assert!(!peer.filter_is_stale(1800, 500));
         assert!(peer.filter_is_stale(2500, 500));
+    }
+
+    #[test]
+    fn a_refused_announce_leaves_the_kept_filter_marked_incomplete_until_one_is_accepted() {
+        let identity = make_peer_identity();
+        let mut peer = ActivePeer::new(identity, LinkId::new(1), 1000);
+        assert!(peer.filter_view_incomplete(), "no filter yet");
+
+        peer.update_filter(BloomFilter::new(), 1, 1500);
+        assert!(!peer.filter_view_incomplete());
+
+        // Antipoison keeps the prior filter, but it no longer says what the
+        // peer reaches.
+        peer.mark_filter_refused();
+        assert!(peer.inbound_filter().is_some());
+        assert!(peer.filter_view_incomplete());
+
+        peer.update_filter(BloomFilter::new(), 2, 1600);
+        assert!(!peer.filter_view_incomplete());
     }
 
     #[test]

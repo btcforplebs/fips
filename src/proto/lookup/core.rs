@@ -175,7 +175,8 @@ pub(crate) fn plan_transit_forward(
 ///
 /// Selects tree peers whose bloom matches the target and emits one SendLink per
 /// selected peer, encoding the request once (Arc-shared). Returns an empty Vec
-/// when no tree peer matches; the shell treats that as an immediate failure.
+/// when no tree peer matches and there is no parent to fall back to; the shell
+/// treats that as an immediate failure.
 /// Pure — no I/O, metrics, or logs; the shell generates and signs the request.
 ///
 /// NOTE: unlike [`plan_forward`], this does NOT fall back to non-tree
@@ -183,14 +184,28 @@ pub(crate) fn plan_transit_forward(
 /// the pre-sans-IO `initiate_lookup` to keep this extraction behavior-neutral;
 /// it is a known origination gap whose fix adds the fallback branch as a
 /// separate, behavior-changing change.
-pub(crate) fn plan_initiate(request: &LookupRequest, rv: &impl RoutingView) -> Vec<LookupAction> {
-    let targets: Vec<NodeAddr> = rv
+///
+/// `parent_fallback` is the node's tree parent, when it has one. If no tree
+/// peer's filter claims the target, the request goes to the parent alone: a
+/// parent whose FilterAnnounce this node refused (over the inbound FPR cap) or
+/// whose filter has not arrived yet still holds its own peers' filters, so it
+/// can carry the lookup where this node cannot see a match. One send, never a
+/// fan-out, and a lookup it cannot carry times out under the usual attempts.
+pub(crate) fn plan_initiate(
+    request: &LookupRequest,
+    rv: &impl RoutingView,
+    parent_fallback: Option<NodeAddr>,
+) -> Vec<LookupAction> {
+    let mut targets: Vec<NodeAddr> = rv
         .peers_reaching(&request.target)
         .into_iter()
         .filter(|addr| rv.is_tree_peer(addr))
         .collect();
     if targets.is_empty() {
-        return Vec::new();
+        match parent_fallback {
+            Some(parent) => targets.push(parent),
+            None => return Vec::new(),
+        }
     }
     let bytes: Arc<[u8]> = Arc::from(request.encode());
     targets

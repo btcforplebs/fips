@@ -257,7 +257,7 @@ async fn datagrams_on_a_peers_connected_socket_are_counted_in_the_udp_transport_
         transport_id,
         TransportAddr::from_string(&remote.local_addr().unwrap().to_string()),
     );
-    node.activate_connected_udp_sessions().await;
+    node.install_connected_udp_sessions().await;
     assert!(
         node.get_peer(&node_addr).unwrap().connected_udp().is_some(),
         "precondition: the tick activation installed a connected socket"
@@ -372,7 +372,7 @@ async fn a_link_message_the_encrypt_worker_sends_counts_once_in_the_udp_transpor
     );
     assert_eq!(counted.bytes_sent, wildcard_len as u64);
 
-    node.activate_connected_udp_sessions().await;
+    node.install_connected_udp_sessions().await;
     assert!(
         node.get_peer(&node_addr).unwrap().connected_udp().is_some(),
         "precondition: the tick activation installed a connected socket"

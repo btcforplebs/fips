@@ -2527,6 +2527,80 @@ async fn a_native_first_send_through_discovery_is_still_delivered_when_the_tick_
     cleanup_nodes(&mut nodes).await;
 }
 
+/// A node whose parent's FilterAnnounce it refused at the inbound FPR cap
+/// (the public mesh outgrew the 1 KB filter) holds no current view of what
+/// the parent reaches. Its lookup must go to the parent anyway instead of
+/// being skipped as a bloom miss, or nothing beyond its own peers is ever
+/// found.
+#[tokio::test]
+async fn a_lookup_goes_to_the_parent_when_the_parents_filter_was_refused_at_the_fpr_cap() {
+    // Topology: end — node1 — end. The sender is whichever end is not the
+    // root, so node 1 is its tree parent.
+    let edges = vec![(0, 1), (1, 2)];
+    let mut nodes = run_tree_test(3, &edges, false).await;
+    let (sender, target) = if nodes[0].node.tree_state().is_root() {
+        (2, 0)
+    } else {
+        (0, 2)
+    };
+    let parent_addr = *nodes[1].node.node_addr();
+    assert_eq!(
+        *nodes[sender].node.tree_state().my_declaration().parent_id(),
+        parent_addr,
+        "precondition: node 1 is the sender's tree parent"
+    );
+    let target_addr = *nodes[target].node.node_addr();
+    let target_xonly = nodes[target].node.identity().pubkey();
+    let mut arrivals = listen_native(&mut nodes[target].node);
+
+    // Every later announce from the parent is refused, and the one already
+    // held is gone, as on a node that never accepted the seed's filter.
+    nodes[sender].node.replace_context(|ctx| {
+        let mut config = (*ctx.config).clone();
+        config.node.bloom.max_inbound_fpr = 1e-12;
+        ctx.config = std::sync::Arc::new(config);
+    });
+    let parent = nodes[sender]
+        .node
+        .get_peer_mut(&parent_addr)
+        .expect("parent is a peer");
+    parent.clear_filter();
+    parent.mark_filter_refused();
+    let misses = nodes[sender].node.metrics().lookup.req_bloom_miss.get();
+
+    let flow = FlowKey {
+        peer: target_addr,
+        remote: NATIVE_PORT,
+        local: 7001,
+    };
+    nodes[sender]
+        .node
+        .handle_native_outbound(flow, target_xonly, b"through the parent".to_vec())
+        .await;
+
+    let mut arrival = None;
+    for _ in 0..60 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        process_available_packets(&mut nodes).await;
+        if let Ok(seen) = arrivals.try_recv() {
+            arrival = Some(seen);
+            break;
+        }
+    }
+
+    assert_eq!(
+        nodes[sender].node.metrics().lookup.req_bloom_miss.get(),
+        misses,
+        "a refused parent filter is not a bloom miss"
+    );
+    assert!(
+        arrival.is_some(),
+        "the lookup must reach the target through the parent and the datagram arrive"
+    );
+
+    cleanup_nodes(&mut nodes).await;
+}
+
 // ============================================================================
 // TUN packets held for destinations nothing is working to reach
 // ============================================================================

@@ -107,7 +107,7 @@ fn initiate_picks_only_tree_peers_and_never_falls_back() {
         peers: vec![(tree_peer, true, true), (non_tree_peer, false, true)],
     };
     let request = make_request(3);
-    let actions = plan_initiate(&request, &rv);
+    let actions = plan_initiate(&request, &rv, None);
     assert_eq!(action_peers(&actions), vec![tree_peer]);
 }
 
@@ -127,7 +127,7 @@ fn initiate_returns_empty_when_only_non_tree_peers_reach() {
         ],
     };
     let request = make_request(3);
-    assert!(plan_initiate(&request, &rv).is_empty());
+    assert!(plan_initiate(&request, &rv, None).is_empty());
 }
 
 #[test]
@@ -138,7 +138,38 @@ fn initiate_returns_empty_when_nothing_reaches_target() {
         peers: vec![(tree_peer, true, false), (non_tree_peer, false, false)],
     };
     let request = make_request(3);
-    assert!(plan_initiate(&request, &rv).is_empty());
+    assert!(plan_initiate(&request, &rv, None).is_empty());
+}
+
+#[test]
+fn initiate_falls_back_to_the_tree_parent_when_nothing_reaches_target() {
+    // The parent's filter was refused (or has not arrived), so no peer claims
+    // the target; the parent still gets the request, and only the parent.
+    let parent = make_node_addr(6);
+    let child = make_node_addr(7);
+    let non_tree_peer = make_node_addr(8);
+    let rv = MockRoutingView {
+        peers: vec![
+            (parent, true, false),
+            (child, true, false),
+            (non_tree_peer, false, false),
+        ],
+    };
+    let request = make_request(3);
+    let actions = plan_initiate(&request, &rv, Some(parent));
+    assert_eq!(action_peers(&actions), vec![parent]);
+}
+
+#[test]
+fn initiate_prefers_matching_tree_peers_over_the_parent_fallback() {
+    let parent = make_node_addr(6);
+    let child = make_node_addr(7);
+    let rv = MockRoutingView {
+        peers: vec![(parent, true, false), (child, true, true)],
+    };
+    let request = make_request(3);
+    let actions = plan_initiate(&request, &rv, Some(parent));
+    assert_eq!(action_peers(&actions), vec![child]);
 }
 
 #[test]

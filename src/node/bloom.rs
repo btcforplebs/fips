@@ -253,6 +253,9 @@ impl Node {
                 cap = format_args!("{:.4}", max_fpr),
                 "FilterAnnounce above FPR cap — rejected"
             );
+            if let Some(peer) = self.peers.get_mut(from) {
+                peer.mark_filter_refused();
+            }
             return;
         }
 

@@ -25,9 +25,16 @@
 //! Darwin tests found liveness regressions under load. Later testing
 //! showed the problem was mismatched listener/peer `SO_REUSE*` state:
 //! with the live listener and connected sibling in the same reuse group,
-//! the connected `send(2)` path improves the MacBook Wi-Fi sender case
-//! and is now the default. Operators can still disable it with
-//! `FIPS_MACOS_CONNECTED_UDP=0` or `FIPS_CONNECTED_UDP=0` for A/B tests.
+//! the connected `send(2)` path improves the MacBook Wi-Fi sender case.
+//!
+//! This fork (nv/v0.5.3) defaults macOS back to the wildcard socket. On
+//! Nostr Vault's Mac, receive stopped dead the moment the connected socket
+//! was installed for a peer, about a second after each handshake (seen
+//! 2026-10-13 and again 2026-11-08 against the public seeds: `rx_pkts=0`
+//! at every MMP teardown while tx kept going), so no link stayed up. With
+//! the wildcard socket the same link held steady. Opt back in with
+//! `FIPS_MACOS_CONNECTED_UDP=1` (or `FIPS_CONNECTED_UDP=1`); Linux is
+//! unchanged and stays on by default.
 
 use crate::NodeAddr;
 use crate::node::Node;
@@ -49,11 +56,17 @@ impl Node {
     /// gated the same way, so on other targets (android) there is nothing to do.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(in crate::node) async fn activate_connected_udp_sessions(&mut self) {
-        {
-            if !connected_udp_enabled() {
-                return;
-            }
+        if !connected_udp_enabled() {
+            return;
+        }
+        self.install_connected_udp_sessions().await;
+    }
 
+    /// The activation itself, past the platform switch. Tests drive it
+    /// directly so the opt-in path stays covered where it is off by default.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(in crate::node) async fn install_connected_udp_sessions(&mut self) {
+        {
             // Collect candidate NodeAddrs first so we can iterate
             // without holding the &mut on self.peers across awaits.
             let candidates: Vec<NodeAddr> = self
@@ -220,9 +233,17 @@ fn connected_udp_enabled() -> bool {
 
 #[cfg(target_os = "macos")]
 fn connected_udp_enabled() -> bool {
-    env_flag("FIPS_MACOS_CONNECTED_UDP")
-        .or_else(|| env_flag("FIPS_CONNECTED_UDP"))
-        .unwrap_or(true)
+    macos_connected_udp(
+        env_flag("FIPS_MACOS_CONNECTED_UDP"),
+        env_flag("FIPS_CONNECTED_UDP"),
+    )
+}
+
+/// The macOS switch: the platform flag wins, then the generic one, and with
+/// neither set the connected socket stays off (see the module note).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn macos_connected_udp(macos_flag: Option<bool>, generic_flag: Option<bool>) -> bool {
+    macos_flag.or(generic_flag).unwrap_or(false)
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -232,5 +253,25 @@ fn env_flag(name: &str) -> Option<bool> {
         "1" | "true" | "yes" | "on" => Some(true),
         "0" | "false" | "no" | "off" => Some(false),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod macos_default_tests {
+    use super::macos_connected_udp;
+
+    #[test]
+    fn macos_connected_udp_is_off_unless_asked_for() {
+        assert!(!macos_connected_udp(None, None), "off by default");
+        assert!(macos_connected_udp(Some(true), None));
+        assert!(macos_connected_udp(None, Some(true)));
+        assert!(
+            !macos_connected_udp(Some(false), Some(true)),
+            "platform flag wins"
+        );
+        assert!(
+            macos_connected_udp(Some(true), Some(false)),
+            "platform flag wins"
+        );
     }
 }

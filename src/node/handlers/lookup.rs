@@ -742,7 +742,9 @@ impl Node {
         // Tree-peer bloom-match selection + single encode live in the sans-IO
         // core. The core keeps the tree-only (no non-tree fallback) behavior;
         // the shell drives the sends and keeps all metrics/logging.
-        let actions = crate::proto::lookup::plan_initiate(&request, &NodeRoutingView::of(self));
+        let parent = self.lookup_parent_fallback();
+        let actions =
+            crate::proto::lookup::plan_initiate(&request, &NodeRoutingView::of(self), parent);
 
         let peer_count = actions.len();
 
@@ -770,6 +772,27 @@ impl Node {
         peer_count
     }
 
+    /// The tree parent a lookup falls back to when no peer's filter claims
+    /// the target: our parent, if we are not the root, it is a live peer we
+    /// can send to, and we hold no current filter from it (none accepted yet,
+    /// or its latest refused at the inbound FPR cap). A current parent filter
+    /// has no false negatives, so a miss against it is a real miss and gets
+    /// no fallback. `None` otherwise.
+    pub(in crate::node) fn lookup_parent_fallback(&self) -> Option<NodeAddr> {
+        let tree = self.tree_state();
+        if tree.is_root() {
+            return None;
+        }
+        let parent = *tree.my_declaration().parent_id();
+        if parent == *self.node_addr() {
+            return None;
+        }
+        self.peers
+            .get(&parent)
+            .filter(|peer| peer.can_send() && peer.filter_view_incomplete())
+            .map(|_| parent)
+    }
+
     /// Initiate a discovery lookup if one is not already pending for this target.
     ///
     /// Checks: pending dedup, post-failure backoff (off by default), bloom
@@ -787,7 +810,10 @@ impl Node {
         // filter contains the target, it's not in the mesh. Reading `self.peers`
         // here keeps the `&mut self.lookup` borrow in `initiate_gate` from
         // overlapping the immutable peer-table read.
-        let reachable = self.peers.values().any(|peer| peer.may_reach(dest));
+        // A tree parent counts as reachable too: `plan_initiate` hands it the
+        // request when no filter claims the target (see there for why).
+        let reachable = self.peers.values().any(|peer| peer.may_reach(dest))
+            || self.lookup_parent_fallback().is_some();
 
         use crate::proto::lookup::InitiateDecision;
         match crate::proto::lookup::initiate_gate(&mut self.lookup, dest, now_ms, reachable) {
