@@ -167,3 +167,62 @@ async fn test_m1_sequence_not_advanced_allows_recovery() {
     assert_eq!(node.metrics().bloom.fill_exceeded.get(), 1);
     assert_eq!(node.metrics().bloom.accepted.get(), 1);
 }
+
+/// A filter whose leading bytes are all ones, with the smallest such prefix
+/// whose FPR lands in `(lo, hi]`.
+fn filter_with_fpr_in(lo: f64, hi: f64) -> BloomFilter {
+    let len = DEFAULT_FILTER_SIZE_BITS / 8;
+    for ones in 1..=len {
+        let mut bytes = vec![0u8; len];
+        bytes[..ones].fill(0xFF);
+        let filter = BloomFilter::from_bytes(bytes, DEFAULT_HASH_COUNT).unwrap();
+        let fpr = filter.fpr();
+        if fpr > lo && fpr <= hi {
+            return filter;
+        }
+    }
+    panic!("no prefix filter with fpr in ({lo}, {hi}]");
+}
+
+#[tokio::test]
+async fn a_saturated_announce_keeps_the_held_filter_authoritative_but_a_near_cap_one_does_not() {
+    let mut node = make_node();
+    let peer_addr = inject_peer(&mut node);
+    let cap = node.config().node.bloom.max_inbound_fpr;
+
+    let mut clean = BloomFilter::new();
+    clean.insert(&NodeAddr::from_bytes([7u8; 16]));
+    node.handle_filter_announce(&peer_addr, &encode_payload(&FilterAnnounce::new(clean, 1)))
+        .await;
+    assert!(!node.get_peer(&peer_addr).unwrap().filter_view_incomplete());
+
+    // All-ones: refused, and it must not open the ask-the-parent fallback.
+    let all_ones = BloomFilter::from_bytes(
+        vec![0xFFu8; DEFAULT_FILTER_SIZE_BITS / 8],
+        DEFAULT_HASH_COUNT,
+    )
+    .unwrap();
+    node.handle_filter_announce(
+        &peer_addr,
+        &encode_payload(&FilterAnnounce::new(all_ones, 2)),
+    )
+    .await;
+    let peer = node.get_peer(&peer_addr).unwrap();
+    assert_eq!(peer.filter_sequence(), 1, "all-ones refused");
+    assert!(
+        !peer.filter_view_incomplete(),
+        "a saturated filter must not mark the held view incomplete"
+    );
+
+    // Just over the cap, as an honest parent that outgrew the filter.
+    let factor = crate::node::bloom::REFUSED_FILTER_FALLBACK_FACTOR;
+    let near = filter_with_fpr_in(cap, cap * factor);
+    node.handle_filter_announce(&peer_addr, &encode_payload(&FilterAnnounce::new(near, 3)))
+        .await;
+    let peer = node.get_peer(&peer_addr).unwrap();
+    assert_eq!(peer.filter_sequence(), 1, "near-cap filter refused too");
+    assert!(
+        peer.filter_view_incomplete(),
+        "a near-cap refusal marks the held view stale"
+    );
+}

@@ -13,6 +13,12 @@ use super::{Node, NodeError};
 use std::collections::BTreeMap;
 use tracing::{debug, warn};
 
+/// A FilterAnnounce refused at the inbound FPR cap marks the peer's view
+/// incomplete (so a lookup may ask the tree parent) only while its FPR is at
+/// most this many times the cap. Bounds what a parent can draw by saturating
+/// its filter to the share an honest near-cap filter would draw anyway.
+pub(crate) const REFUSED_FILTER_FALLBACK_FACTOR: f64 = 2.0;
+
 impl Node {
     /// Collect inbound filters from all peers for outgoing filter computation.
     ///
@@ -253,8 +259,15 @@ impl Node {
                 cap = format_args!("{:.4}", max_fpr),
                 "FilterAnnounce above FPR cap — rejected"
             );
-            if let Some(peer) = self.peers.get_mut(from) {
-                peer.mark_filter_refused();
+            // Only a near-cap refusal says the kept view is stale (an honest
+            // parent whose reach outgrew the filter). A far-over-cap one,
+            // up to all-ones, is the poisoning shape: it must not open the
+            // ask-the-parent fallback, or a parent could draw every lookup
+            // by announcing a saturated filter.
+            if fpr <= max_fpr * REFUSED_FILTER_FALLBACK_FACTOR {
+                if let Some(peer) = self.peers.get_mut(from) {
+                    peer.mark_filter_refused();
+                }
             }
             return;
         }
