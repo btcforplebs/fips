@@ -240,9 +240,11 @@ pub struct ActivePeer {
     filter_received_at: u64,
     /// Whether we owe them a filter update.
     pending_filter_update: bool,
-    /// Whether their latest FilterAnnounce was refused at the inbound FPR
-    /// cap, so `inbound_filter` (if any) is older than what they hold.
-    inbound_filter_refused: bool,
+    /// Their latest FilterAnnounce if it was refused at the inbound FPR cap
+    /// (within the near-cap band), so `inbound_filter` (if any) is older than
+    /// what they hold. Never used for routing; only to bound the parent
+    /// fallback to the targets it claims.
+    refused_filter: Option<BloomFilter>,
 
     // === Statistics ===
     /// When this peer was authenticated (Unix milliseconds).
@@ -351,7 +353,7 @@ impl ActivePeer {
             filter_sequence: 0,
             filter_received_at: 0,
             pending_filter_update: true, // Send filter on new connection
-            inbound_filter_refused: false,
+            refused_filter: None,
             authenticated_at,
             remote_epoch: None,
             last_heartbeat_sent: None,
@@ -441,7 +443,7 @@ impl ActivePeer {
             filter_sequence: 0,
             filter_received_at: 0,
             pending_filter_update: true,
-            inbound_filter_refused: false,
+            refused_filter: None,
             authenticated_at,
             remote_epoch,
             last_heartbeat_sent: None,
@@ -1008,25 +1010,32 @@ impl ActivePeer {
         self.filter_sequence = sequence;
         self.filter_received_at = current_time_ms;
         self.send.last_seen = current_time_ms;
-        self.inbound_filter_refused = false;
+        self.refused_filter = None;
     }
 
-    /// Record that their latest FilterAnnounce was refused at the inbound FPR
-    /// cap. The prior filter is kept (antipoison), but it is now stale.
-    pub fn mark_filter_refused(&mut self) {
-        self.inbound_filter_refused = true;
+    /// Record their latest FilterAnnounce, refused at the inbound FPR cap.
+    /// The prior filter is kept for routing (antipoison); the refused one is
+    /// held only to say which targets the stale view may be missing.
+    pub fn mark_filter_refused(&mut self, filter: BloomFilter) {
+        self.refused_filter = Some(filter);
     }
 
-    /// True when we hold no current view of what they reach: no filter has
-    /// been accepted yet, or their latest one was refused at the FPR cap. A
-    /// miss against such a view is not evidence that they cannot reach it.
-    pub fn filter_view_incomplete(&self) -> bool {
-        self.inbound_filter.is_none() || self.inbound_filter_refused
+    /// True when a miss against our view of them is not evidence that they
+    /// cannot reach `target`. With a refused filter held, only when that
+    /// filter claims the target: no false negatives, and the share of misses
+    /// it draws is at most its own FPR. Otherwise, only when no filter has
+    /// been accepted yet.
+    pub fn may_reach_beyond_view(&self, target: &NodeAddr) -> bool {
+        match &self.refused_filter {
+            Some(refused) => refused.contains(target),
+            None => self.inbound_filter.is_none(),
+        }
     }
 
     /// Clear peer's inbound filter.
     pub fn clear_filter(&mut self) {
         self.inbound_filter = None;
+        self.refused_filter = None;
         self.filter_sequence = 0;
         self.filter_received_at = 0;
     }
@@ -1805,22 +1814,28 @@ mod tests {
     }
 
     #[test]
-    fn a_refused_announce_leaves_the_kept_filter_marked_incomplete_until_one_is_accepted() {
+    fn a_refused_announce_opens_the_view_only_for_targets_it_claims_until_one_is_accepted() {
         let identity = make_peer_identity();
         let mut peer = ActivePeer::new(identity, LinkId::new(1), 1000);
-        assert!(peer.filter_view_incomplete(), "no filter yet");
+        let claimed = make_node_addr(42);
+        let unclaimed = make_node_addr(43);
+        assert!(peer.may_reach_beyond_view(&unclaimed), "no filter yet");
 
         peer.update_filter(BloomFilter::new(), 1, 1500);
-        assert!(!peer.filter_view_incomplete());
+        assert!(!peer.may_reach_beyond_view(&claimed));
 
-        // Antipoison keeps the prior filter, but it no longer says what the
-        // peer reaches.
-        peer.mark_filter_refused();
+        // Antipoison keeps the prior filter for routing; the refused one only
+        // says which targets that stale view may be missing.
+        let mut refused = BloomFilter::new();
+        refused.insert(&claimed);
+        peer.mark_filter_refused(refused);
         assert!(peer.inbound_filter().is_some());
-        assert!(peer.filter_view_incomplete());
+        assert!(!peer.may_reach(&claimed), "refused filter is not routed on");
+        assert!(peer.may_reach_beyond_view(&claimed));
+        assert!(!peer.may_reach_beyond_view(&unclaimed));
 
         peer.update_filter(BloomFilter::new(), 2, 1600);
-        assert!(!peer.filter_view_incomplete());
+        assert!(!peer.may_reach_beyond_view(&claimed));
     }
 
     #[test]

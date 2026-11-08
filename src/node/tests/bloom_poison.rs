@@ -184,17 +184,33 @@ fn filter_with_fpr_in(lo: f64, hi: f64) -> BloomFilter {
     panic!("no prefix filter with fpr in ({lo}, {hi}]");
 }
 
+/// Share of `n` distinct targets the peer's view sends to the parent fallback.
+fn fallback_draw(node: &Node, peer_addr: &NodeAddr, n: u32) -> f64 {
+    let peer = node.get_peer(peer_addr).unwrap();
+    let hits = (0..n)
+        .filter(|i| {
+            let mut bytes = [0u8; 16];
+            bytes[..4].copy_from_slice(&i.to_be_bytes());
+            bytes[15] = 0xA5;
+            peer.may_reach_beyond_view(&NodeAddr::from_bytes(bytes))
+        })
+        .count();
+    hits as f64 / n as f64
+}
+
 #[tokio::test]
-async fn a_saturated_announce_keeps_the_held_filter_authoritative_but_a_near_cap_one_does_not() {
+async fn a_refused_announce_draws_at_most_its_own_fpr_and_a_saturated_one_draws_nothing() {
     let mut node = make_node();
     let peer_addr = inject_peer(&mut node);
     let cap = node.config().node.bloom.max_inbound_fpr;
+    let factor = crate::node::bloom::REFUSED_FILTER_FALLBACK_FACTOR;
+    const N: u32 = 4000;
 
     let mut clean = BloomFilter::new();
     clean.insert(&NodeAddr::from_bytes([7u8; 16]));
     node.handle_filter_announce(&peer_addr, &encode_payload(&FilterAnnounce::new(clean, 1)))
         .await;
-    assert!(!node.get_peer(&peer_addr).unwrap().filter_view_incomplete());
+    assert_eq!(fallback_draw(&node, &peer_addr, N), 0.0, "current filter");
 
     // All-ones: refused, and it must not open the ask-the-parent fallback.
     let all_ones = BloomFilter::from_bytes(
@@ -207,22 +223,35 @@ async fn a_saturated_announce_keeps_the_held_filter_authoritative_but_a_near_cap
         &encode_payload(&FilterAnnounce::new(all_ones, 2)),
     )
     .await;
-    let peer = node.get_peer(&peer_addr).unwrap();
-    assert_eq!(peer.filter_sequence(), 1, "all-ones refused");
-    assert!(
-        !peer.filter_view_incomplete(),
-        "a saturated filter must not mark the held view incomplete"
+    assert_eq!(
+        node.get_peer(&peer_addr).unwrap().filter_sequence(),
+        1,
+        "all-ones refused"
+    );
+    assert_eq!(
+        fallback_draw(&node, &peer_addr, N),
+        0.0,
+        "a saturated filter must not open the fallback"
     );
 
-    // Just over the cap, as an honest parent that outgrew the filter.
-    let factor = crate::node::bloom::REFUSED_FILTER_FALLBACK_FACTOR;
-    let near = filter_with_fpr_in(cap, cap * factor);
+    // The worst near-cap announce a parent can send without falling out of
+    // the band: it draws about its own FPR, never every miss.
+    let near = filter_with_fpr_in(cap * factor * 0.9, cap * factor);
+    let near_fpr = near.fpr();
     node.handle_filter_announce(&peer_addr, &encode_payload(&FilterAnnounce::new(near, 3)))
         .await;
-    let peer = node.get_peer(&peer_addr).unwrap();
-    assert_eq!(peer.filter_sequence(), 1, "near-cap filter refused too");
+    assert_eq!(
+        node.get_peer(&peer_addr).unwrap().filter_sequence(),
+        1,
+        "near-cap refused too"
+    );
+    let draw = fallback_draw(&node, &peer_addr, N);
     assert!(
-        peer.filter_view_incomplete(),
-        "a near-cap refusal marks the held view stale"
+        draw > 0.0,
+        "a near-cap refusal opens the fallback for what it claims"
+    );
+    assert!(
+        draw <= near_fpr + 0.05,
+        "draw {draw:.3} must be bounded by the refused filter's fpr {near_fpr:.3}"
     );
 }

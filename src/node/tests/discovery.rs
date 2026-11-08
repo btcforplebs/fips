@@ -2565,7 +2565,10 @@ async fn a_lookup_goes_to_the_parent_when_the_parents_filter_was_refused_at_the_
         .get_peer_mut(&parent_addr)
         .expect("parent is a peer");
     parent.clear_filter();
-    parent.mark_filter_refused();
+    // Their refused filter claims the target, as an honest parent's would.
+    let mut refused = crate::proto::bloom::BloomFilter::new();
+    refused.insert(&target_addr);
+    parent.mark_filter_refused(refused);
     let misses = nodes[sender].node.metrics().lookup.req_bloom_miss.get();
 
     let flow = FlowKey {

@@ -266,7 +266,7 @@ impl Node {
             // by announcing a saturated filter.
             if fpr <= max_fpr * REFUSED_FILTER_FALLBACK_FACTOR {
                 if let Some(peer) = self.peers.get_mut(from) {
-                    peer.mark_filter_refused();
+                    peer.mark_filter_refused(announce.filter);
                 }
             }
             return;
