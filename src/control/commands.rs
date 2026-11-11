@@ -18,6 +18,7 @@ pub async fn dispatch(node: &mut Node, command: &str, params: Option<&Value>) ->
         "probe_poll" => probe_poll(node, params),
         "probe_cancel" => probe_cancel(node, params).await,
         "cache_identity" => cache_identity(node, params),
+        "tree_parent" => tree_parent(node),
         _ => Response::error(format!("unknown command: {command}")),
     }
 }
@@ -47,6 +48,22 @@ fn cache_identity(node: &mut Node, params: Option<&Value>) -> Response {
     node.register_identity(*identity.node_addr(), identity.pubkey_full());
     debug!(npub = %npub, "API cached identity");
     Response::ok(serde_json::json!({ "node_addr": identity.node_addr().to_string() }))
+}
+
+/// Whether this node hangs off a spanning tree: `{"is_root": bool, "depth": n}`.
+///
+/// An embedder has only the embedded control channel, which reaches this
+/// dispatch and not the off-loop `show_*` queries. It asks this before it
+/// sends a read over the tree: a node that is its own root (no parent yet,
+/// or the parent just dropped) has no route to anyone it is not peered
+/// with, so a read then only times out. Read-only; it is here because it is
+/// the one dispatch the embedded channel has.
+fn tree_parent(node: &Node) -> Response {
+    let tree = node.tree_state();
+    Response::ok(serde_json::json!({
+        "is_root": tree.is_root(),
+        "depth": tree.my_coords().depth(),
+    }))
 }
 
 /// Connect to a peer.
@@ -220,6 +237,16 @@ mod tests {
             assert!(node.has_cached_identity(addr), "{addr} was displaced");
         }
         assert_eq!(node.peer_count(), peers_before);
+    }
+
+    #[tokio::test]
+    async fn tree_parent_reports_a_lone_node_as_its_own_root() {
+        let mut node = test_node();
+        let resp = dispatch(&mut node, "tree_parent", None).await;
+        assert_eq!(resp.status, "ok", "{:?}", resp.message);
+        let data = resp.data.expect("tree_parent answers with data");
+        assert_eq!(data["is_root"], true, "no peers: this node is the root");
+        assert_eq!(data["depth"], 0);
     }
 
     #[tokio::test]
