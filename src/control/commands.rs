@@ -19,6 +19,7 @@ pub async fn dispatch(node: &mut Node, command: &str, params: Option<&Value>) ->
         "probe_cancel" => probe_cancel(node, params).await,
         "cache_identity" => cache_identity(node, params),
         "tree_parent" => tree_parent(node),
+        "peers" => Response::ok(super::queries::show_peers(node)),
         _ => Response::error(format!("unknown command: {command}")),
     }
 }
@@ -65,6 +66,11 @@ fn tree_parent(node: &Node) -> Response {
         "depth": tree.my_coords().depth(),
     }))
 }
+
+// `peers` answers `{"peers": [...]}`, the same rows `show_peers` gives on the
+// control socket (rendered on the loop, as the socket's snapshot path is
+// byte-identical to). Read-only; on the dispatch for the same reason as
+// `tree_parent`: an embedder's only channel reaches here and not `show_*`.
 
 /// Connect to a peer.
 ///
@@ -237,6 +243,15 @@ mod tests {
             assert!(node.has_cached_identity(addr), "{addr} was displaced");
         }
         assert_eq!(node.peer_count(), peers_before);
+    }
+
+    #[tokio::test]
+    async fn peers_on_a_lone_node_is_an_empty_list() {
+        let mut node = test_node();
+        let resp = dispatch(&mut node, "peers", None).await;
+        assert_eq!(resp.status, "ok", "{:?}", resp.message);
+        let data = resp.data.expect("peers answers with data");
+        assert_eq!(data["peers"], json!([]), "no peers yet");
     }
 
     #[tokio::test]

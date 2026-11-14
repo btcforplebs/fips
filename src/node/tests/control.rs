@@ -677,3 +677,20 @@ async fn show_transports_off_loop_reports_counters_that_moved_since_the_last_tic
         t.stop().await.ok();
     }
 }
+
+/// The embedded control dispatch's `peers` command lists the same peers, with
+/// the same connectivity, as `show_peers` on the control socket.
+#[tokio::test]
+async fn embedded_peers_command_lists_what_show_peers_lists() {
+    let mut node = make_node();
+    let now = Node::now_ms();
+    let fresh = insert_peer_last_seen_at(&mut node, 1, now);
+    let idle = insert_peer_last_seen_at(&mut node, 2, now - 60_000);
+
+    let resp = crate::control::commands::dispatch(&mut node, "peers", None).await;
+    assert_eq!(resp.status, "ok", "{:?}", resp.message);
+    let data = resp.data.expect("peers answers with data");
+    assert_eq!(data["peers"].as_array().map(Vec::len), Some(2));
+    assert_eq!(connectivity_of(&data, &fresh), "connected");
+    assert_eq!(connectivity_of(&data, &idle), "stale");
+}
