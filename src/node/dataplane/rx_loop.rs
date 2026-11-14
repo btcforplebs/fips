@@ -394,6 +394,8 @@ impl Node {
                     // the data-plane dispatch path carries no `show_*` arm. A
                     // `show_*` that somehow arrives (none does) falls through to
                     // `commands::dispatch`, which returns "unknown command".
+                    // The read-only embedder commands (`tree_parent`, `peers`)
+                    // also land here and are answered on the loop.
                     let response = commands::dispatch(
                         self,
                         &request.command,

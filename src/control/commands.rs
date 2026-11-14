@@ -19,6 +19,10 @@ pub async fn dispatch(node: &mut Node, command: &str, params: Option<&Value>) ->
         "probe_cancel" => probe_cancel(node, params).await,
         "cache_identity" => cache_identity(node, params),
         "tree_parent" => tree_parent(node),
+        // `{"peers": [...]}`: the rows `show_peers` gives on the control
+        // socket, rendered on the loop (the socket's snapshot render is
+        // byte-identical). Read-only; here for the same reason as
+        // `tree_parent`: an embedder's only channel reaches this dispatch.
         "peers" => Response::ok(super::queries::show_peers(node)),
         _ => Response::error(format!("unknown command: {command}")),
     }
@@ -66,11 +70,6 @@ fn tree_parent(node: &Node) -> Response {
         "depth": tree.my_coords().depth(),
     }))
 }
-
-// `peers` answers `{"peers": [...]}`, the same rows `show_peers` gives on the
-// control socket (rendered on the loop, as the socket's snapshot path is
-// byte-identical to). Read-only; on the dispatch for the same reason as
-// `tree_parent`: an embedder's only channel reaches here and not `show_*`.
 
 /// Connect to a peer.
 ///
