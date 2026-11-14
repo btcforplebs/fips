@@ -9,6 +9,8 @@ mod acl;
 #[cfg(ble_available)]
 mod ble;
 mod bloom;
+mod bloom_echo;
+mod bloom_hardening;
 mod bloom_poison;
 mod bootstrap;
 #[cfg(ble_available)]
@@ -37,6 +39,7 @@ mod routing;
 mod rx_stall;
 mod second_path_msg1;
 mod session;
+mod session_peer_coords;
 mod spanning_tree;
 mod stored_msg2;
 mod tcp;

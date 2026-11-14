@@ -149,7 +149,7 @@ transport MTU less the FIPS encapsulation and the four-byte port header.
 be dropped further along.
 
 `connect` uses the packaged socket path, `/run/fips/api.sock`, and an
-ephemeral local port from 49152 upward. Use `connect_from(port, addr)`
+ephemeral local port drawn at random from 49152-65535. Use `connect_from(port, addr)`
 when the local port matters, such as when the far end has been told it in
 advance, and `connect_at(path, port, addr)` when the daemon's socket is
 somewhere else.

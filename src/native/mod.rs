@@ -404,11 +404,66 @@ mod unix_impl {
     /// nearest one for the argument that was wrong; the alternative is a bare
     /// message, which reaches the client as `ECONNREFUSED` and says the node
     /// declined rather than that the flow does not exist.
+    ///
+    /// The message is clipped to [`MAX_MESSAGE`] here, because some refusals
+    /// echo client text: an unknown command's name, or serde's reason for a
+    /// parameter, which quotes the value. Without the clip a refusal of a
+    /// [`MAX_COMMAND`]-byte line is over 8 KB, which a macOS local stream
+    /// socket splits, and `fdpass::reply` ends the connection on a short write.
     fn deny(errno: &'static str, message: String) -> Response {
         Response {
             status: "error".to_string(),
             data: Some(serde_json::json!({ "errno": errno })),
-            message: Some(message),
+            message: Some(clip(message)),
+        }
+    }
+
+    /// Most bytes a refusal's message may take once written as a JSON string,
+    /// quotes excluded.
+    ///
+    /// With the envelope (`status`, `data.errno` and the keys, under 80
+    /// bytes) every refusal stays under 600 bytes, well below the 2048-byte
+    /// send low-water mark under which macOS never splits a non-blocking send
+    /// on a local stream socket.
+    pub(super) const MAX_MESSAGE: usize = 512;
+
+    /// Cut `message` so it serialises to at most [`MAX_MESSAGE`] bytes,
+    /// marking the cut with an ellipsis. A message that fits is returned as
+    /// it is.
+    ///
+    /// The bound is on serialised width rather than on characters, because
+    /// serde_json writes a control character as a six-byte `\u00XX`: 512
+    /// characters of `\x01` would serialise to about 3 KB.
+    pub(super) fn clip(message: String) -> String {
+        const MARK: &str = "\u{2026}";
+        if message.chars().map(json_width).sum::<usize>() <= MAX_MESSAGE {
+            return message;
+        }
+        let budget = MAX_MESSAGE - MARK.len();
+        let mut used = 0;
+        let mut end = 0;
+        for (at, ch) in message.char_indices() {
+            used += json_width(ch);
+            if used > budget {
+                break;
+            }
+            end = at + ch.len_utf8();
+        }
+        let mut clipped = message;
+        clipped.truncate(end);
+        clipped.push_str(MARK);
+        clipped
+    }
+
+    /// The bytes serde_json writes for `ch` inside a string, following its
+    /// escape table: a two-byte escape for `"`, `\\` and the five control
+    /// characters with a short form, a six-byte `\u00XX` for every other
+    /// control character, and the UTF-8 encoding otherwise.
+    fn json_width(ch: char) -> usize {
+        match ch {
+            '"' | '\\' | '\u{8}' | '\t' | '\n' | '\u{c}' | '\r' => 2,
+            ch if (ch as u32) < 0x20 => 6,
+            ch => ch.len_utf8(),
         }
     }
 
@@ -1585,6 +1640,30 @@ mod tests {
         format!(
             r#"{{"command":"arrive","params":{{"peer":"{peer}","src_port":{src},"dst_port":{dst},"data":"{data}"}}}}"#
         )
+    }
+
+    /// Ported from upstream 0f1e46fd: a refusal that echoes client text (an
+    /// unknown command's name, serde's reason for a bad parameter) is clipped,
+    /// so an 8 KB line cannot draw an 8 KB reply, which a macOS local stream
+    /// socket splits and the daemon then treats as a broken connection.
+    #[tokio::test]
+    async fn a_refusal_echoing_a_long_command_stays_short() {
+        let (mut connection, _outbound) = connect();
+        let name = "x".repeat(8000);
+        let reply = ask(&mut connection, &format!(r#"{{"command":"{name}"}}"#)).await;
+        assert_eq!(reply["status"], "error", "control: refused: {reply}");
+        let width = serde_json::to_string(&reply).unwrap().len();
+        assert!(width < 600, "a refusal was {width} bytes");
+
+        // Control characters serialise to six bytes each; the clip measures
+        // the serialised width, not characters.
+        let name = "\\u0001".repeat(1500);
+        let reply = ask(&mut connection, &format!(r#"{{"command":"{name}"}}"#)).await;
+        let width = serde_json::to_string(&reply).unwrap().len();
+        assert!(
+            width < 600,
+            "a refusal of control characters was {width} bytes"
+        );
     }
 
     #[tokio::test]

@@ -819,6 +819,11 @@ pub struct Node {
     /// aggregation drift or an ingress bypass.
     last_self_warn: Option<std::time::Instant>,
 
+    // === FilterAnnounce sequence ===
+    /// Random offset and start instant from which a new peer's first
+    /// FilterAnnounce sequence is derived (`seq_floor`).
+    seq_origin: (u64, std::time::Instant),
+
     // === Display Names ===
     /// Human-readable names for configured peers (alias or short npub).
     /// Populated at startup from peer config and updated by `update_peers`.
@@ -1068,6 +1073,7 @@ impl Node {
             estimated_mesh_size: None,
             last_mesh_size_log: None,
             last_self_warn: None,
+            seq_origin: bloom::new_seq_origin(),
             peer_aliases: HashMap::new(),
             peer_acl,
             host_map,
@@ -1241,6 +1247,7 @@ impl Node {
             estimated_mesh_size: None,
             last_mesh_size_log: None,
             last_self_warn: None,
+            seq_origin: bloom::new_seq_origin(),
             peer_aliases: HashMap::new(),
             peer_acl,
             host_map,

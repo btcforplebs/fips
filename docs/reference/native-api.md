@@ -98,8 +98,13 @@ A local port has exactly one owner, a listener or one connected flow, never
 both. A connected flow owns its local port and frees it when the flow closes.
 A flow accepted from a listener shares the listener's port and does not own it,
 so closing an accepted flow frees no port; the port returns when the listener
-drops. Ephemeral allocation sweeps forward from the last claim and wraps once,
-so a port is not immediately reused after release.
+drops. Ephemeral allocation starts at a random port in the range and probes
+forward, wrapping once, to the first free one (RFC 6056, Algorithm 1), so a peer
+cannot count the allocations made between two of its flows. A port just
+released comes back with probability 1/16384 per claim. One peer's inbound
+flows, pending and accepted, may hold no more than a quarter of `max_flows`
+(64 at the default); an arrival past that is dropped as "peer flow limit
+reached". `max_flows` must be at least 1.
 
 ## The Rust surface
 
