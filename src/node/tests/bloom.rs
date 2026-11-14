@@ -733,22 +733,22 @@ use crate::proto::stp::{ParentDeclaration, TreeAnnounce, TreeCoordinate};
 /// Three loopback nodes, P -- M -- C, with M's tree view forced so that P is
 /// M's parent and C either names M as parent (a child) or names an unrelated
 /// node (not a tree peer).
-struct FlipFixture {
-    nodes: Vec<TestNode>,
-    m: NodeAddr,
-    p: NodeAddr,
-    c: NodeAddr,
-    root: NodeAddr,
-    fake: NodeAddr,
+pub(super) struct FlipFixture {
+    pub(super) nodes: Vec<TestNode>,
+    pub(super) m: NodeAddr,
+    pub(super) p: NodeAddr,
+    pub(super) c: NodeAddr,
+    pub(super) root: NodeAddr,
+    pub(super) fake: NodeAddr,
 }
 
 /// Index of M in `FlipFixture::nodes`.
-const M: usize = 1;
+pub(super) const M: usize = 1;
 /// Index of C in `FlipFixture::nodes`.
 const C: usize = 2;
 
 /// Synthetic address carried in C's filter and in no real one.
-fn marker() -> NodeAddr {
+pub(super) fn marker() -> NodeAddr {
     make_node_addr(0xab)
 }
 
@@ -757,7 +757,7 @@ fn marker() -> NodeAddr {
 /// With `child_start`, C's stored declaration names M as parent; otherwise it
 /// names `fake`. Every stored declaration uses sequence 1, so the sequence-5
 /// announces from `deliver_tree_announce` are fresher.
-async fn flip_fixture(child_start: bool) -> FlipFixture {
+pub(super) async fn flip_fixture(child_start: bool) -> FlipFixture {
     let nodes = run_tree_test(3, &[(0, 1), (1, 2)], false).await;
     let p = *nodes[0].node.node_addr();
     let m = *nodes[M].node.node_addr();
@@ -820,7 +820,7 @@ async fn flip_fixture(child_start: bool) -> FlipFixture {
 
 /// Deliver a FilterAnnounce from C to M holding exactly `addrs`, and check M
 /// stored it, so a rejected announce cannot decide a later assertion.
-async fn deliver_filter(fx: &mut FlipFixture, addrs: &[NodeAddr]) {
+pub(super) async fn deliver_filter(fx: &mut FlipFixture, addrs: &[NodeAddr]) {
     let c = fx.c;
     let mut filter = BloomFilter::new();
     for addr in addrs {
@@ -1131,7 +1131,7 @@ fn assert_unswitched(fx: &FlipFixture, guard: &SwitchGuard) {
 }
 
 /// FilterAnnounces M has sent.
-fn sent_count(fx: &FlipFixture) -> u64 {
+pub(super) fn sent_count(fx: &FlipFixture) -> u64 {
     fx.nodes[M].node.metrics().bloom.sent.get()
 }
 

@@ -9,6 +9,7 @@ mod acl;
 #[cfg(ble_available)]
 mod ble;
 mod bloom;
+mod bloom_hardening;
 mod bloom_poison;
 mod bootstrap;
 #[cfg(ble_available)]

@@ -95,10 +95,39 @@ fn test_bloom_state_sequence() {
     let node = make_node_addr(0);
     let mut state = BloomState::new(node);
 
+    let a = make_node_addr(1);
+    let b = make_node_addr(2);
+
     assert_eq!(state.sequence(), 0);
-    assert_eq!(state.next_sequence(), 1);
-    assert_eq!(state.next_sequence(), 2);
-    assert_eq!(state.sequence(), 2);
+    assert_eq!(state.next_sequence(&a, 10), 10);
+    assert_eq!(state.next_sequence(&b, 10), 10);
+    assert_eq!(state.next_sequence(&a, 10), 11);
+    assert_eq!(
+        state.sequence(),
+        3,
+        "sequence() counts every announce built"
+    );
+}
+
+#[test]
+fn test_bloom_state_sequence_to_a_peer_that_returns_exceeds_every_value_sent_before_it_left() {
+    let mut state = BloomState::new(make_node_addr(0));
+    let a = make_node_addr(1);
+
+    let last = (0..3)
+        .map(|_| state.next_sequence(&a, 1000))
+        .last()
+        .unwrap();
+    assert_eq!(last, 1002);
+    state.remove_peer_state(&a);
+
+    // Only a dropped entry starts from the new floor; a kept one would give
+    // last + 1.
+    assert_eq!(
+        state.next_sequence(&a, 1256),
+        1256,
+        "a returning peer must be reseeded from the floor"
+    );
 }
 
 #[test]

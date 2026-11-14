@@ -19,7 +19,34 @@ use tracing::{debug, warn};
 /// its filter to the share an honest near-cap filter would draw anyway.
 pub(crate) const REFUSED_FILTER_FALLBACK_FACTOR: f64 = 2.0;
 
+/// Draw the origin of this node's FilterAnnounce sequence floor: a random
+/// offset in `[1, 2^62)` and the instant it was drawn.
+///
+/// The offset hides the node's uptime, which a peer's first sequence would
+/// otherwise reveal.
+pub(super) fn new_seq_origin() -> (u64, std::time::Instant) {
+    use rand::RngExt;
+    (
+        rand::rng().random_range(1..1u64 << 62),
+        std::time::Instant::now(),
+    )
+}
+
 impl Node {
+    /// The sequence a peer with no sequence entry starts from: the origin's
+    /// offset plus 256 per microsecond since the origin.
+    ///
+    /// One peer's sequence grows by one per announce, and announces to a
+    /// peer go out at most once per tick, so a peer that is removed and
+    /// re-established (which takes a full handshake) is seeded above every
+    /// value it was sent before. 2^62 plus a century of microseconds times
+    /// 256 stays below 2^63.
+    pub(super) fn seq_floor(&self) -> u64 {
+        let (offset, start) = self.seq_origin;
+        let micros = u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX);
+        offset.saturating_add(micros.saturating_mul(256))
+    }
+
     /// Collect inbound filters from all peers for outgoing filter computation.
     ///
     /// Returns a map of (peer_node_addr -> filter) for peers that
@@ -68,7 +95,9 @@ impl Node {
         }
 
         // Build and encode
-        let announce = FilterAnnounce::new(filter, self.bloom_state.next_sequence());
+        let floor = self.seq_floor();
+        let seq = self.bloom_state.next_sequence(peer_addr, floor);
+        let announce = FilterAnnounce::new(filter, seq);
         let sent_filter = announce.filter.clone();
         let encoded = announce.encode().map_err(|e| NodeError::SendFailed {
             node_addr: *peer_addr,
@@ -146,8 +175,26 @@ impl Node {
         Ok(())
     }
 
+    /// Mark every peer whose outgoing filter changed because of inbound
+    /// filters accepted since the last pass.
+    ///
+    /// Inbound announces only note the change, so a burst from one peer costs
+    /// one recompute here rather than one per announce. Several peers may have
+    /// announced, so every peer is a target; a peer is still marked only when
+    /// its outgoing filter differs from what was last sent to it.
+    pub(super) fn flush_inbound_changes(&mut self) {
+        if !self.bloom_state.take_inbound_change() {
+            return;
+        }
+        let peer_addrs: Vec<NodeAddr> = self.peers.keys().copied().collect();
+        let peer_filters = self.peer_inbound_filters();
+        self.bloom_state.mark_changed(&peer_addrs, &peer_filters);
+    }
+
     /// Send pending rate-limited filter announces whose debounce has expired.
     pub(super) async fn send_pending_filter_announces(&mut self) {
+        self.flush_inbound_changes();
+
         // Monotonic: the debounce compares two reads, and a wall-clock step
         // back would hold announces for the size of the step.
         let now_ms = crate::time::mono_ms();
@@ -191,7 +238,8 @@ impl Node {
     /// 1. Decode and validate the message
     /// 2. Check sequence freshness (reject stale/replay)
     /// 3. Store the filter on the peer
-    /// 4. Mark other peers for outgoing filter update
+    /// 4. Note the change; the next send pass marks the peers whose outgoing
+    ///    filter it changed
     pub(super) async fn handle_filter_announce(&mut self, from: &NodeAddr, payload: &[u8]) {
         self.metrics().bloom.received.inc();
 
@@ -212,7 +260,12 @@ impl Node {
         }
         if !announce.is_v1_compliant() {
             self.metrics().bloom.record_reject(BloomReject::NonV1);
-            debug!(from = %self.peer_display_name(from), size_class = announce.size_class, "Non-v1 FilterAnnounce rejected");
+            debug!(
+                from = %self.peer_display_name(from),
+                size_class = announce.size_class,
+                hash_count = announce.hash_count,
+                "Non-v1 FilterAnnounce rejected"
+            );
             return;
         }
 
@@ -297,13 +350,10 @@ impl Node {
             peer.update_filter(announce.filter, announce.sequence, now_ms);
         }
 
-        // Check which peers' outgoing filters actually changed.
-        // All peers receive filters, but only tree peers' inbound filters
-        // are merged into outgoing computation (tree-only propagation).
-        let peer_addrs: Vec<NodeAddr> = self.peers.keys().copied().collect();
-        let peer_filters = self.peer_inbound_filters();
-        self.bloom_state
-            .mark_changed_peers(from, &peer_addrs, &peer_filters);
+        // Which peers' outgoing filters changed is decided once per send
+        // pass (`flush_inbound_changes`), not per announce, so a peer cannot
+        // force a full recompute with every announce it sends.
+        self.bloom_state.note_inbound_change();
     }
 
     /// Read what `peer_addr`'s link shows about delivery of our frames: the
