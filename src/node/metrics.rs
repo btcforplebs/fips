@@ -434,6 +434,9 @@ pub struct BloomMetrics {
     pub unknown_peer: Counter,
     pub stale: Counter,
     pub fill_exceeded: Counter,
+    /// Tree-child announces refused for echoing our filter. Not in the
+    /// show_bloom snapshot (control output unchanged in this port).
+    pub child_role_rejected: Counter,
     pub accepted: Counter,
     pub sent: Counter,
     pub debounce_suppressed: Counter,
@@ -452,6 +455,7 @@ impl BloomMetrics {
             BloomReject::UnknownPeer => self.unknown_peer.inc(),
             BloomReject::Stale => self.stale.inc(),
             BloomReject::FillExceeded => self.fill_exceeded.inc(),
+            BloomReject::ChildRole => self.child_role_rejected.inc(),
         }
     }
 
