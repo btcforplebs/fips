@@ -7835,8 +7835,6 @@ async fn test_a_rekey_setup_to_a_peer_with_no_cached_coordinates_carries_the_pee
         .expect("send_session_data failed");
     pump_until_quiet(&mut nodes).await;
 
-    // node 1's entry for its own address goes too, so what it holds after
-    // the rekey can only have come from the setup.
     nodes[0].node.coord_cache.remove(&node1_addr);
     nodes[1].node.coord_cache.remove(&node1_addr);
     let mismatch_before = nodes[1]
@@ -7862,10 +7860,12 @@ async fn test_a_rekey_setup_to_a_peer_with_no_cached_coordinates_carries_the_pee
         mismatch_before,
         "the rekey setup must not name node 0's coordinates as node 1's"
     );
+    // A coordinate filed under node 1's own address is counted (above) and
+    // never written (33bf4e3b port), so the cache cannot show it.
     assert_eq!(
         cached_path(&nodes[1], &node1_addr),
-        Some(addr_path(&node1_coords)),
-        "the setup's destination coordinates must be node 1's own"
+        None,
+        "node 1 must not file a coordinate under its own address"
     );
     assert!(
         nodes[0]

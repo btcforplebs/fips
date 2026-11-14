@@ -523,14 +523,15 @@ impl Node {
         // Determine where ciphertext starts (after header, optionally after coords)
         let mut ciphertext_offset = FSP_HEADER_SIZE;
 
-        // If CP flag set, parse cleartext coords between header and ciphertext
+        // If CP flag set, parse cleartext coords between header and ciphertext.
+        // The source's are written only once the message authenticates; the
+        // destination's are this node's own and are never written.
+        let mut stated = None;
         if header.has_coords() {
             let coord_data = &payload[FSP_HEADER_SIZE..];
             match parse_encrypted_coords(coord_data) {
-                // Not cached here: the forwarding path's warm write has
-                // already offered these coordinates to the cache, from this
-                // same datagram and through the same checks.
-                Ok((_, _, bytes_consumed)) => {
+                Ok((src_coords, _, bytes_consumed)) => {
+                    stated = src_coords;
                     ciphertext_offset += bytes_consumed;
                 }
                 Err(e) => {
@@ -606,6 +607,23 @@ impl Node {
                 return;
             }
         };
+
+        // The frame authenticated under a key of the session, so the
+        // coordinates the peer states for itself can be written, under its
+        // address. Not charged to a link peer: the key is the session's peer,
+        // so a session's writes touch one entry, and sessions are bounded by
+        // admission.
+        if let Some(coords) = stated
+            && self
+                .insert_coord_hint(*src_addr, coords, now_ms, Funding::Uncharged)
+                .is_none()
+        {
+            debug!(
+                src = %self.peer_display_name(src_addr),
+                reason = "foreign root",
+                "Session peer's coordinate hint refused"
+            );
+        }
 
         // A frame that authenticates on this session, in any epoch slot,
         // proves the peer completed the handshake, so a msg3 still held for

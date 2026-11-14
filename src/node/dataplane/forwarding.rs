@@ -254,8 +254,21 @@ impl Node {
     /// not established, so this counts and does not refuse. It is **not** a
     /// security check either way — an attacker satisfies it by naming the
     /// victim as its own child, which is the forgery worth making.
+    ///
+    /// **This node's own address: never written.** No node files a coordinate
+    /// under its own address. Such a write is still counted as it would have
+    /// been, as a foreign-root refusal or a key mismatch, since the
+    /// destination is where a sender's misfiled coordinate shows.
     fn warm_coord(&mut self, from: &NodeAddr, key: NodeAddr, coords: TreeCoordinate, now_ms: u64) {
         let mismatch = *coords.node_addr() != key;
+        if key == *self.node_addr() {
+            if coords.root_id() != self.tree_state.my_coords().root_id() {
+                self.metrics().forwarding.record_warm_foreign_root();
+            } else if mismatch {
+                self.metrics().forwarding.record_warm_key_mismatch();
+            }
+            return;
+        }
         let now = Instant::now();
         let peers = &self.peers;
         self.coord_hint_budget
@@ -353,6 +366,13 @@ impl Node {
                         flags = prefix.flags,
                         "Not a well-formed encrypted FSP message; not warming coords"
                     );
+                    return;
+                }
+                // The destination writes from this block only once the
+                // message authenticates (`handle_encrypted_session_msg`):
+                // before that, anyone who can deliver a datagram naming a
+                // source could place coordinates for it here.
+                if datagram.dest_addr == *self.node_addr() {
                     return;
                 }
                 let coord_data = &datagram.payload[FSP_HEADER_SIZE..];
