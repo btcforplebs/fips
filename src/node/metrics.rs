@@ -642,6 +642,9 @@ pub struct NativeMetrics {
     pub drop_no_port: Counter,
     pub drop_backlog_full: Counter,
     pub drop_too_many_flows: Counter,
+    /// Arrivals refused because their peer holds its share of the flow
+    /// table. Not in the native snapshot (control output unchanged).
+    pub drop_peer_share: Counter,
     pub drop_pending_queue_full: Counter,
     pub drop_flow_queue_full: Counter,
     pub drop_arrival_queue_full: Counter,
@@ -665,6 +668,7 @@ impl NativeMetrics {
             DropReason::NoPort => self.drop_no_port.inc(),
             DropReason::BacklogFull => self.drop_backlog_full.inc(),
             DropReason::TooManyFlows => self.drop_too_many_flows.inc(),
+            DropReason::PeerShare => self.drop_peer_share.inc(),
             DropReason::PendingQueueFull => self.drop_pending_queue_full.inc(),
             DropReason::FlowQueueFull => self.drop_flow_queue_full.inc(),
             DropReason::ArrivalQueueFull => self.drop_arrival_queue_full.inc(),
@@ -745,6 +749,7 @@ mod tests {
             DropReason::NoPort,
             DropReason::BacklogFull,
             DropReason::TooManyFlows,
+            DropReason::PeerShare,
             DropReason::PendingQueueFull,
             DropReason::FlowQueueFull,
             DropReason::ArrivalQueueFull,
@@ -759,6 +764,7 @@ mod tests {
         assert_eq!(snap.drop_no_port, 1);
         assert_eq!(snap.drop_backlog_full, 1);
         assert_eq!(snap.drop_too_many_flows, 1);
+        assert_eq!(m.drop_peer_share.get(), 1);
         assert_eq!(snap.drop_pending_queue_full, 1);
         assert_eq!(snap.drop_flow_queue_full, 1);
         assert_eq!(snap.drop_arrival_queue_full, 1);

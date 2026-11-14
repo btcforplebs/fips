@@ -13,6 +13,7 @@
 //! exists, the real FSP receive path.
 
 use crate::identity::NodeAddr;
+use rand::RngExt;
 use secp256k1::XOnlyPublicKey;
 use std::collections::HashMap;
 use thiserror::Error;
@@ -61,6 +62,14 @@ pub struct Arrival {
     pub pubkey: XOnlyPublicKey,
 }
 
+/// The fraction of [`Limits::max_flows`] one peer's inbound flows may hold,
+/// as a divisor.
+///
+/// A quarter: 64 flows at the default ceiling of 256, which leaves an honest
+/// peer room for many concurrent flows to one node while keeping a single key
+/// from taking the whole table.
+pub const PEER_SHARE: usize = 4;
+
 /// Bounds on what the registry will hold.
 #[derive(Debug, Clone, Copy)]
 pub struct Limits {
@@ -70,6 +79,16 @@ pub struct Limits {
     pub backlog: usize,
     /// Flows this node holds at once, across every client.
     pub max_flows: usize,
+}
+
+impl Limits {
+    /// Inbound flows one peer may hold at once, pending and accepted.
+    ///
+    /// Derived rather than configured, so the struct keeps its shape. Never
+    /// zero, or a small table would refuse every peer.
+    pub fn per_peer(&self) -> usize {
+        (self.max_flows / PEER_SHARE).max(1)
+    }
 }
 
 /// Why a registry request was refused.
@@ -142,6 +161,8 @@ pub enum DropCause {
     TooManyFlows,
     /// The flow is pending accept and its queue is full.
     QueueFull,
+    /// The peer already holds its share of the node's inbound flows.
+    PeerShare,
 }
 
 /// What holds a local port.
@@ -172,6 +193,10 @@ struct Flow {
     /// records its announcement time; an established one needs its own, or an
     /// observer cannot tell a flow opened an hour ago from one opened just now.
     at: u64,
+    /// Whether a peer opened it by arriving at a listener, as opposed to a
+    /// local client connecting out. Only inbound flows count against a peer's
+    /// share.
+    inbound: bool,
 }
 
 /// A flow announced to a listener and awaiting the client's answer.
@@ -233,7 +258,6 @@ pub struct Registry {
     pending: HashMap<u64, Pending>,
     limits: Limits,
     next_flow: u64,
-    next_ephemeral: u16,
 }
 
 impl Registry {
@@ -247,7 +271,6 @@ impl Registry {
             pending: HashMap::new(),
             limits,
             next_flow: 1,
-            next_ephemeral: PORT_EPHEMERAL_MIN,
         }
     }
 
@@ -402,6 +425,7 @@ impl Registry {
                 pubkey: peer,
                 sink,
                 at: now,
+                inbound: false,
             },
         );
         self.by_id.insert(id, key);
@@ -415,22 +439,21 @@ impl Registry {
 
     /// Claim a free port from the ephemeral range.
     ///
-    /// Sweeps forward from where the last claim left off and wraps once, so a
-    /// port is not reused immediately after it is released.
+    /// Starts at a random port in the range and probes forward, wrapping once,
+    /// to the first one not held (RFC 6056, Algorithm 1). The start is random
+    /// because the local port reaches the peer as the flow's source port: from
+    /// a cursor that only moved forward, a peer given two flows could subtract
+    /// their ports and count the allocations every local program made in
+    /// between, including those to other peers. The cost is that a port just
+    /// released comes back with probability 1/16384 on each claim.
     fn take_ephemeral(&mut self) -> Result<u16, RegistryError> {
         let span = u32::from(u16::MAX - PORT_EPHEMERAL_MIN) + 1;
-        for _ in 0..span {
-            let port = self.next_ephemeral;
-            self.next_ephemeral = if port == u16::MAX {
-                PORT_EPHEMERAL_MIN
-            } else {
-                port + 1
-            };
-            if !self.ports.contains_key(&port) {
-                return Ok(port);
-            }
-        }
-        Err(RegistryError::NoPort)
+        let start = rand::rng().random_range(0..span);
+        (0..span)
+            .map(|step| (start + step) % span + u32::from(PORT_EPHEMERAL_MIN))
+            .map(|port| u16::try_from(port).expect("the probe stays inside the ephemeral range"))
+            .find(|port| !self.ports.contains_key(port))
+            .ok_or(RegistryError::NoPort)
     }
 
     /// Decide where an inbound datagram goes.
@@ -476,6 +499,9 @@ impl Registry {
         if self.flow_count() >= self.limits.max_flows {
             return Delivery::Drop(DropCause::TooManyFlows);
         }
+        if self.inbound_from(peer) >= self.limits.per_peer() {
+            return Delivery::Drop(DropCause::PeerShare);
+        }
         {
             let listener = self.listeners.get(&dst).expect("checked above");
             if listener.pending.len() >= self.limits.backlog {
@@ -517,6 +543,25 @@ impl Registry {
         true
     }
 
+    /// How many inbound flows `peer` holds, pending and accepted.
+    ///
+    /// A scan over at most `max_flows` entries, reached only for a key that is
+    /// neither pending nor established, so traffic on an existing flow does
+    /// not pay for it.
+    fn inbound_from(&self, peer: NodeAddr) -> usize {
+        let accepted = self
+            .flows
+            .iter()
+            .filter(|(key, flow)| flow.inbound && key.peer == peer)
+            .count();
+        let pending = self
+            .pending
+            .values()
+            .filter(|entry| entry.key.peer == peer)
+            .count();
+        accepted + pending
+    }
+
     /// The pending flow carrying `key`, if one was announced.
     fn pending_for(&self, key: &FlowKey) -> Option<u64> {
         self.pending
@@ -549,6 +594,7 @@ impl Registry {
                 pubkey: entry.pubkey,
                 sink,
                 at: now,
+                inbound: true,
             },
         );
         self.by_id.insert(flow, entry.key);
@@ -666,6 +712,133 @@ mod tests {
 
     fn arrivals() -> (Sender<Arrival>, mpsc::Receiver<Arrival>) {
         mpsc::channel(16)
+    }
+
+    // Ported from upstream 05b09770: ephemeral ports from a random start,
+    // and a per-peer share of the flow table.
+
+    /// The local port reaches the peer as the flow's source port. From a
+    /// forward-only cursor, a peer given two flows could subtract them and
+    /// count every listen and connect made in between, to other peers too.
+    #[test]
+    fn ephemeral_ports_do_not_count_the_claims_between_them() {
+        let mut registry = Registry::new(Limits {
+            per_flow: 4,
+            backlog: 2,
+            max_flows: 64,
+        });
+        let ports: Vec<u16> = (0..8u16)
+            .map(|i| {
+                let (tx, _rx) = sink();
+                let (port, _) = registry.connect(key(1), 5000 + i, None, tx, 0).unwrap();
+                port
+            })
+            .collect();
+        assert!(ports.iter().all(|p| *p >= PORT_EPHEMERAL_MIN));
+        let steps = ports
+            .windows(2)
+            .filter(|w| w[1] == w[0].wrapping_add(1))
+            .count();
+        assert!(
+            steps < ports.len() - 1,
+            "eight claims came out as a run of consecutive ports: {ports:?}"
+        );
+    }
+
+    /// A random start still finds the one free port left.
+    #[test]
+    fn the_last_free_ephemeral_port_is_still_found() {
+        let span = usize::from(u16::MAX - PORT_EPHEMERAL_MIN) + 1;
+        let mut registry = Registry::new(Limits {
+            per_flow: 1,
+            backlog: 1,
+            max_flows: span + 1,
+        });
+        let mut held = Vec::new();
+        for port in PORT_EPHEMERAL_MIN..=u16::MAX {
+            if port == 50_000 {
+                continue;
+            }
+            let (tx, _rx) = arrivals();
+            registry.listen(Some(port), tx).unwrap();
+            held.push(port);
+        }
+        let (tx, _rx) = arrivals();
+        assert_eq!(registry.listen(None, tx).unwrap(), 50_000);
+        let (tx, _rx) = arrivals();
+        assert_eq!(
+            registry.listen(None, tx).unwrap_err(),
+            RegistryError::NoPort
+        );
+    }
+
+    /// Deliver from `who` and accept the arrival at once, the way the
+    /// listener task does. `None` when the delivery did not announce a flow.
+    fn arrive_and_accept(registry: &mut Registry, who: u8, src: u16) -> Option<FlowKey> {
+        let flow = match registry.deliver(peer(who), key(who), src, 4242, 0) {
+            Delivery::Arrived(_, arrival) => arrival.flow,
+            _ => return None,
+        };
+        let (tx, _rx) = sink();
+        registry.accept(flow, tx, 0).ok().map(|r| r.0)
+    }
+
+    /// One session peer sending from max_flows source ports filled the
+    /// table: every native connect then failed and every other peer's
+    /// arrival was dropped, until the listener closed.
+    #[test]
+    fn one_peer_cannot_take_the_whole_flow_table() {
+        let mut registry = Registry::new(limits());
+        let (arrival_tx, _arrival_rx) = arrivals();
+        registry.listen(Some(4242), arrival_tx).unwrap();
+
+        let mut accepted = 0;
+        for src in 5000..5000 + limits().max_flows as u16 {
+            if arrive_and_accept(&mut registry, 7, src).is_some() {
+                accepted += 1;
+            }
+        }
+        assert_eq!(accepted, limits().max_flows / 4, "one peer holds a quarter");
+
+        let (tx, _rx) = sink();
+        let connected = registry.connect(key(1), 6000, None, tx, 0);
+        assert!(
+            connected.is_ok(),
+            "a local connect was refused: {connected:?}"
+        );
+        assert!(
+            matches!(
+                registry.deliver(peer(8), key(8), 5000, 4242, 0),
+                Delivery::Arrived(..)
+            ),
+            "a second peer could not reach the listener"
+        );
+    }
+
+    #[test]
+    fn a_pending_arrival_counts_and_outbound_flows_do_not() {
+        let mut registry = Registry::new(Limits {
+            per_flow: 4,
+            backlog: 8,
+            max_flows: 8,
+        });
+        let (arrival_tx, _arrival_rx) = arrivals();
+        registry.listen(Some(4242), arrival_tx).unwrap();
+        // Flows a local program opened to peer 7 do not count against it.
+        for i in 0..2u16 {
+            let (tx, _rx) = sink();
+            registry.connect(key(7), 7000 + i, None, tx, 0).unwrap();
+        }
+        for src in 5000..5002 {
+            assert!(matches!(
+                registry.deliver(peer(7), key(7), src, 4242, 0),
+                Delivery::Arrived(..)
+            ));
+        }
+        assert!(matches!(
+            registry.deliver(peer(7), key(7), 5002, 4242, 0),
+            Delivery::Drop(DropCause::PeerShare)
+        ));
     }
 
     #[test]
