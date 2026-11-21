@@ -27,6 +27,7 @@ pub(super) async fn observe_traversal_addresses(
     socket: &std::net::UdpSocket,
     stun_servers: &[String],
     share_local_candidates: bool,
+    local_candidate_ips: &[IpAddr],
     per_server_timeout: Duration,
 ) -> Result<
     (
@@ -38,7 +39,7 @@ pub(super) async fn observe_traversal_addresses(
 > {
     let local_port = socket.local_addr()?.port();
     let local_addresses = if share_local_candidates {
-        local_addresses_from_port(local_port)
+        local_candidates(local_port, local_candidate_ips)
             .into_iter()
             .map(|ip| TraversalAddress {
                 protocol: "udp".to_string(),
@@ -278,6 +279,19 @@ async fn resolve_udp_target(host: &str, port: u16) -> Result<Option<SocketAddr>,
     }
     let mut results = lookup_host((normalized_host, port)).await?;
     Ok(results.next())
+}
+
+/// The local candidates' IPs: the configured ones when set, else the
+/// interfaces'.
+fn local_candidates(port: u16, configured: &[IpAddr]) -> Vec<String> {
+    if configured.is_empty() {
+        return local_addresses_from_port(port);
+    }
+    let mut addresses = Vec::new();
+    for ip in configured {
+        push_ip(&mut addresses, *ip);
+    }
+    addresses
 }
 
 fn local_addresses_from_port(port: u16) -> Vec<String> {
@@ -643,5 +657,40 @@ mod tests {
         .unwrap();
         responder.join().unwrap();
         assert_eq!(mapped.to_string(), "198.51.100.9:4242");
+    }
+
+    #[tokio::test]
+    async fn configured_local_candidates_replace_the_interfaces() {
+        let socket = bind_stun_caller();
+        let port = socket.local_addr().unwrap().port();
+        let lan: IpAddr = "192.168.4.82".parse().unwrap();
+        let (reflexive, local, server) = super::observe_traversal_addresses(
+            &socket,
+            &[],
+            true,
+            &[lan, lan],
+            std::time::Duration::from_millis(10),
+        )
+        .await
+        .expect("no STUN servers is not an error");
+        assert!(reflexive.is_none() && server.is_none());
+        let got: Vec<(String, u16)> = local.iter().map(|a| (a.ip.clone(), a.port)).collect();
+        assert_eq!(got, vec![("192.168.4.82".to_string(), port)], "only the configured address, once, on the socket's port");
+    }
+
+    #[tokio::test]
+    async fn configured_local_candidates_stay_off_without_sharing() {
+        let socket = bind_stun_caller();
+        let lan: IpAddr = "192.168.4.82".parse().unwrap();
+        let (_, local, _) = super::observe_traversal_addresses(
+            &socket,
+            &[],
+            false,
+            &[lan],
+            std::time::Duration::from_millis(10),
+        )
+        .await
+        .unwrap();
+        assert!(local.is_empty(), "share_local_candidates=false still shares nothing");
     }
 }

@@ -611,6 +611,7 @@ impl NostrRendezvous {
             &socket,
             &self.config.stun_servers,
             false,
+            &[],
             super::stun::ADVERT_STUN_TIMEOUT,
         )
         .await
@@ -1289,6 +1290,7 @@ impl NostrRendezvous {
             &base_socket,
             &self.config.stun_servers,
             self.config.share_local_candidates,
+            &self.config.local_candidate_ips,
             super::stun::TRAVERSAL_STUN_TIMEOUT,
         )
         .await?;
@@ -1626,6 +1628,7 @@ impl NostrRendezvous {
             &base_socket,
             &self.config.stun_servers,
             self.config.share_local_candidates,
+            &self.config.local_candidate_ips,
             super::stun::TRAVERSAL_STUN_TIMEOUT,
         )
         .await?;

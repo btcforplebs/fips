@@ -2061,6 +2061,15 @@ impl Config {
             }
         }
 
+        // An address no peer can send to would only waste a punch attempt.
+        for ip in &nostr.local_candidate_ips {
+            if ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() {
+                return Err(ConfigError::Validation(format!(
+                    "`node.rendezvous.nostr.local_candidate_ips` entry `{ip}` is not an address a LAN peer can reach."
+                )));
+            }
+        }
+
         // A typo here must not silently narrow the allowlist to nothing that
         // matches, which would refuse the owner's own device with no error.
         for entry in &nostr.offer_allowlist {
@@ -4552,6 +4561,22 @@ node:
 
         let err = config.validate().expect_err("validation should fail");
         assert!(err.to_string().contains("offer_allowlist"), "got: {err}");
+    }
+
+    #[test]
+    fn test_validate_local_candidate_ips() {
+        let mut config = Config::default();
+        config.node.rendezvous.nostr.local_candidate_ips =
+            vec!["192.168.4.82".parse().unwrap(), "fd00::5".parse().unwrap()];
+        config.validate().expect("LAN addresses are valid");
+        for bad in ["0.0.0.0", "127.0.0.1", "::", "224.0.0.1"] {
+            config.node.rendezvous.nostr.local_candidate_ips = vec![bad.parse().unwrap()];
+            let err = config.validate().expect_err(bad);
+            assert!(err.to_string().contains("local_candidate_ips"), "got: {err}");
+        }
+        let yaml = "node:\n  rendezvous:\n    nostr:\n      local_candidate_ips: [\"192.168.4.82\"]\n";
+        let parsed: Config = serde_yaml::from_str(yaml).expect("parses from YAML strings");
+        assert_eq!(parsed.node.rendezvous.nostr.local_candidate_ips, vec!["192.168.4.82".parse::<std::net::IpAddr>().unwrap()]);
     }
 
     #[test]

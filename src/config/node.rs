@@ -421,6 +421,16 @@ pub struct NostrRendezvousConfig {
     /// peers are on the same physical LAN and same-LAN punching is wanted.
     #[serde(default)]
     pub share_local_candidates: bool,
+    /// With `share_local_candidates`: offer these LAN addresses, with the
+    /// traversal socket's port, instead of the ones read from this machine's
+    /// interfaces. For a node in a container behind a bridge (StartOS, Docker
+    /// bridge mode), whose own interfaces carry only the bridge address the
+    /// LAN cannot reach: the host masquerades the container's outbound UDP
+    /// from the host's LAN address, keeping the port, so a peer on the same
+    /// LAN reaches the traversal socket at `<host LAN address>:<port>`.
+    /// Empty (the default) reads the interfaces, as before.
+    #[serde(default)]
+    pub local_candidate_ips: Vec<std::net::IpAddr>,
     /// Traversal application namespace and advert identifier suffix.
     #[serde(default = "NostrRendezvousConfig::default_app")]
     pub app: String,
@@ -536,6 +546,7 @@ impl Default for NostrRendezvousConfig {
             dm_relays: Self::default_dm_relays(),
             stun_servers: Self::default_stun_servers(),
             share_local_candidates: false,
+            local_candidate_ips: Vec::new(),
             app: Self::default_app(),
             signal_ttl_secs: Self::default_signal_ttl_secs(),
             policy: NostrRendezvousPolicy::default(),
