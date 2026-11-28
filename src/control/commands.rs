@@ -24,6 +24,10 @@ pub async fn dispatch(node: &mut Node, command: &str, params: Option<&Value>) ->
         // byte-identical). Read-only; here for the same reason as
         // `tree_parent`: an embedder's only channel reaches this dispatch.
         "peers" => Response::ok(super::queries::show_peers(node)),
+        // `{"sessions": [...]}`: `show_sessions`, rendered on the loop. An
+        // end-to-end session can run through another node (a public seed)
+        // when no direct link exists; `peers` lists only the direct links.
+        "sessions" => Response::ok(super::queries::show_sessions(node)),
         _ => Response::error(format!("unknown command: {command}")),
     }
 }
